@@ -35,6 +35,8 @@
 (defconst neomacs-mcp--scan-limit 8)
 (defconst neomacs-mcp--modern "2026-07-28")
 (defconst neomacs-mcp--legacy "2025-11-25")
+(defconst neomacs-mcp--legacy-versions '("2025-11-25" "2025-06-18")
+  "Supported handshake versions, newest first; both use legacy envelopes.")
 (defvar neomacs-mcp--boot nil)
 (defvar neomacs-mcp--generation 0)
 (defvar neomacs-mcp--listener nil)
@@ -191,7 +193,8 @@ Return a bounded printed value; effects are not rolled back on failure."
     (unless (equal version neomacs-mcp--modern)
       (neomacs-mcp--fail -32022 "Unsupported protocol version"
                          (neomacs-mcp--object
-                          "supported" (vector neomacs-mcp--modern neomacs-mcp--legacy)
+                          "supported" (vconcat (list neomacs-mcp--modern)
+                                              neomacs-mcp--legacy-versions)
                           "requested" version)))
     t))
 
@@ -212,15 +215,20 @@ Return a bounded printed value; effects are not rolled back on failure."
                       (neomacs-mcp--modern-p params))))
     (pcase method
       ("initialize"
-       (unless (and (equal (gethash "protocolVersion" params) neomacs-mcp--legacy)
-                    (hash-table-p (gethash "capabilities" params))
-                    (hash-table-p (gethash "clientInfo" params))
-                    (not (process-get peer 'legacy)))
-         (neomacs-mcp--fail -32602 "Expected fresh 2025-11-25 initialization"))
-       (process-put peer 'legacy 'initializing)
-       (neomacs-mcp--object "protocolVersion" neomacs-mcp--legacy
-                            "capabilities" (neomacs-mcp--object "tools" (neomacs-mcp--object))
-                            "serverInfo" (neomacs-mcp--object "name" "Neomacs" "version" "1")))
+       (let ((version (gethash "protocolVersion" params)))
+         (unless (and (stringp version) (> (length version) 0)
+                      (hash-table-p (gethash "capabilities" params))
+                      (hash-table-p (gethash "clientInfo" params))
+                      (not (process-get peer 'legacy)))
+           (neomacs-mcp--fail -32602 "Expected fresh legacy initialization"))
+         (process-put peer 'legacy 'initializing)
+         ;; Echo supported offers; otherwise propose the newest handshake era.
+         ;; Stateless modern requests never negotiate through initialize.
+         (neomacs-mcp--object
+          "protocolVersion" (if (member version neomacs-mcp--legacy-versions)
+                                version neomacs-mcp--legacy)
+          "capabilities" (neomacs-mcp--object "tools" (neomacs-mcp--object))
+          "serverInfo" (neomacs-mcp--object "name" "Neomacs" "version" "1"))))
       ("notifications/initialized"
        (unless (eq (process-get peer 'legacy) 'initializing)
          (neomacs-mcp--fail -32600 "Unexpected initialized notification"))
@@ -234,7 +242,8 @@ Return a bounded printed value; effects are not rolled back on failure."
          ("server/discover"
           (unless modern (neomacs-mcp--fail -32601 "Method not found"))
           (neomacs-mcp--object
-           "resultType" "complete" "supportedVersions" (vector neomacs-mcp--modern neomacs-mcp--legacy)
+           "resultType" "complete" "supportedVersions"
+           (vconcat (list neomacs-mcp--modern) neomacs-mcp--legacy-versions)
            "capabilities" (neomacs-mcp--object "tools" (neomacs-mcp--object))
            "_meta" (neomacs-mcp--object "io.modelcontextprotocol/serverInfo"
                                        (neomacs-mcp--object "name" "Neomacs" "version" "1"))

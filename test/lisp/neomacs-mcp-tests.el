@@ -192,7 +192,7 @@
          (data (nth 3 failure)))
     (should (= -32022 (nth 1 failure)))
     (should (equal "1900-01-01" (gethash "requested" data)))
-    (should (equal ["2026-07-28" "2025-11-25"] (gethash "supported" data)))
+    (should (equal ["2026-07-28" "2025-11-25" "2025-06-18"] (gethash "supported" data)))
     (should (= 2 (hash-table-count data)))))
 
 (ert-deftest neomacs-mcp-modern-ping-complete ()
@@ -209,6 +209,7 @@
 
 ;; Keep the established public ERT entry point inclusive of optional reads.
 (require 'neomacs-mcp-responsive-tests)
+(require 'neomacs-mcp-negotiation-tests)
 
 (provide 'neomacs-mcp-tests)
 ;;; neomacs-mcp-tests.el ends here
