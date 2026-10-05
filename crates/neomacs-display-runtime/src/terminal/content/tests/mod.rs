@@ -8,6 +8,7 @@ fn test_render_cell_creation() {
         c: 'A',
         fg: Color::WHITE,
         bg: Color::BLACK,
+        ansi: None,
         flags: CellFlags::empty(),
     };
     assert_eq!(cell.c, 'A');

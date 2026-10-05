@@ -36,6 +36,8 @@ impl SecondaryTtyRegistry {
         drop(sessions);
     }
 
+    /// Render every displayed attached TTY. The result says only whether the
+    /// selected frame belongs to one, for primary stdout routing.
     pub fn render_selected(&self, eval: &mut neovm_core::emacs_core::Context) -> bool {
         #[cfg(not(unix))]
         {
@@ -50,56 +52,61 @@ impl SecondaryTtyRegistry {
 
     #[cfg(unix)]
     fn render_selected_unix(&self, eval: &mut neovm_core::emacs_core::Context) -> bool {
-        let Some((terminal_id, is_tty)) = eval
-            .frame_manager()
-            .selected_frame()
-            .map(|frame| (frame.terminal_id, frame.effective_window_system().is_none()))
-        else {
-            return false;
-        };
-        if !is_tty
-            || !self
-                .sessions
-                .lock()
-                .expect("secondary TTY registry poisoned")
-                .contains_key(&terminal_id)
-        {
-            return false;
-        }
-
-        let presentations = frame_layout::run_tty_layout_tree(eval);
-        let mut sessions = self
+        let mut terminal_ids: Vec<_> = self
             .sessions
             .lock()
-            .expect("secondary TTY registry poisoned");
-        let Some(session) = sessions.get_mut(&terminal_id) else {
-            return true;
-        };
-        if session.device.is_active()
-            && let Some((root, children)) = presentations
-        {
-            // This terminal's session mutex protects only its native renderer;
-            // Lisp redraw obligations stay on the exclusively borrowed Context.
-            let mut full_redraw = eval.gnu_take_tty_frame_redraw(neovm_core::window::FrameId(
-                root.frame_placement.frame().get(),
-            ));
-            for child in &children {
-                full_redraw |= eval.gnu_take_tty_frame_redraw(neovm_core::window::FrameId(
-                    child.frame_placement.frame().get(),
-                ));
+            .expect("secondary TTY registry poisoned")
+            .keys()
+            .copied()
+            .collect();
+        terminal_ids.sort_unstable();
+        for terminal_id in terminal_ids {
+            let root_id = eval.frame_manager().top_frame_on_terminal(terminal_id);
+            let Some(root_id) = root_id.filter(|id| {
+                eval.frame_manager().get(*id).is_some_and(|frame| {
+                    frame.effective_window_system().is_none() && frame.visibility.is_visible()
+                })
+            }) else {
+                continue;
+            };
+            // Layout can run Lisp callbacks, so the registry lock is never held here.
+            let presentations = frame_layout::run_tty_layout_tree_for_root(eval, root_id);
+            let Some((root, children)) = presentations else {
+                continue;
+            };
+            // A layout callback may replace the terminal's displayed root.
+            if eval.frame_manager().top_frame_on_terminal(terminal_id) != Some(root_id)
+                || !eval.frame_manager().get(root_id).is_some_and(|frame| {
+                    frame.effective_window_system().is_none() && frame.visibility.is_visible()
+                })
+            {
+                continue;
             }
-            if full_redraw {
-                session.rif.force_redraw();
+            let mut sessions = self
+                .sessions
+                .lock()
+                .expect("secondary TTY registry poisoned");
+            if let Some(session) = sessions.get_mut(&terminal_id)
+                && session.device.is_active()
+            {
+                frame_layout::run_tty_rif_redisplay_to(
+                    &mut session.rif,
+                    &root,
+                    &children,
+                    &mut session.device.file,
+                    &session.device.capabilities,
+                );
             }
-            frame_layout::run_tty_rif_redisplay_to(
-                &mut session.rif,
-                &root,
-                &children,
-                &mut session.device.file,
-                &session.device.capabilities,
-            );
         }
-        true
+        eval.frame_manager()
+            .selected_frame()
+            .filter(|frame| frame.effective_window_system().is_none())
+            .is_some_and(|frame| {
+                self.sessions
+                    .lock()
+                    .expect("secondary TTY registry poisoned")
+                    .contains_key(&frame.terminal_id)
+            })
     }
 
     #[cfg(unix)]
@@ -133,23 +140,6 @@ impl SecondaryTtyRegistry {
 
     #[cfg(not(unix))]
     fn resume(&self, _terminal_id: u64) -> Result<(), String> {
-        Err("additional text terminals are not supported on this platform".to_string())
-    }
-
-    #[cfg(unix)]
-    fn write(&self, terminal_id: u64, bytes: &[u8]) -> Result<(), String> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| "secondary TTY registry poisoned".to_string())?;
-        sessions
-            .get_mut(&terminal_id)
-            .ok_or_else(|| "TTY terminal host unavailable".to_string())?
-            .write(bytes)
-    }
-
-    #[cfg(not(unix))]
-    fn write(&self, _terminal_id: u64, _bytes: &[u8]) -> Result<(), String> {
         Err("additional text terminals are not supported on this platform".to_string())
     }
 
@@ -246,10 +236,6 @@ impl TerminalHost for SecondaryTtyHost {
 
     fn delete_terminal(&mut self) -> Result<(), String> {
         self.registry.remove(self.terminal_id)
-    }
-
-    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.registry.write(self.terminal_id, bytes)
     }
 }
 
@@ -481,18 +467,6 @@ impl SecondaryTtySession {
         self.rif.force_redraw();
         self.paused.store(false, Ordering::Release);
         Ok(())
-    }
-
-    /// Raw unbuffered terminal output, GNU's `fwrite`+`fflush` on
-    /// `tty->output' (src/dispnew.c:6838-6843): this terminal's own device,
-    /// never the primary stdout.
-    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
-        use std::io::Write as _;
-        self.device
-            .file
-            .write_all(bytes)
-            .and_then(|()| self.device.file.flush())
-            .map_err(|error| format!("cannot write to the terminal: {error}"))
     }
 }
 

@@ -19,8 +19,6 @@ impl SelfPolicy {
         crate::emacs_core::jit::force_profit_defer_for_test(Some(1));
         force_direct_call_for_test(Some(true));
         force_direct_sites_for_test(Some(DirectSitesMode::SelfOnly));
-        force_direct_self_heat_for_test(Some(direct_call::DirectSelfHeat::Off));
-        force_direct_self_kernel_for_test(Some(false));
         force_direct_shapes_for_test(Some(DirectShapesKnob::ALL));
         force_direct_memory_for_test(Some(memory));
         force_register_abi_for_test(Some(register));
@@ -32,8 +30,6 @@ impl Drop for SelfPolicy {
     fn drop(&mut self) {
         force_direct_call_for_test(None);
         force_direct_sites_for_test(None);
-        force_direct_self_heat_for_test(None);
-        force_direct_self_kernel_for_test(None);
         force_direct_shapes_for_test(None);
         force_direct_memory_for_test(None);
         force_register_abi_for_test(None);
@@ -41,14 +37,6 @@ impl Drop for SelfPolicy {
         crate::emacs_core::jit::force_profit_defer_for_test(None);
     }
 }
-
-#[cfg(test)]
-#[path = "direct_self_heat.rs"]
-mod heat_tests;
-
-#[cfg(test)]
-#[path = "direct_self_kernel.rs"]
-mod kernel_tests;
 
 const PROGRAM: &str = r#"(progn
   (require 'cl-lib)
@@ -224,7 +212,7 @@ fn self_policy_baseline_requires_a_scoped_source_and_actual_call() {
     );
     assert_eq!(direct_call::direct_sites_emitted_for_test(), before);
     {
-        let _source = direct_call::SelfSourceScope::enter_for(bc, true, false);
+        let _source = direct_call::SelfSourceScope::enter_for(bc, true);
         let baseline = build().expect("scoped baseline");
         assert_eq!(baseline.abi, LeafAbi::Register { arity: 1 });
         assert_eq!(direct_call::direct_sites_emitted_for_test(), before + 1);

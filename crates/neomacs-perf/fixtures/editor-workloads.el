@@ -40,18 +40,6 @@
         (error "performance gate rejected %s: %S"
                command neomacs-perf-workload--gate-response)))))
 
-(defun neomacs-perf-workload--sampling-command-ack (command)
-  "Return t only after the existing gate acknowledges COMMAND.
-
-Diagnostic metadata belongs to this invocation.  This adds no shared Lisp
-cache or mutator state and reads the existing observable `gcs-done' counter."
-  (unless (getenv "NEOMACS_PERF_GATE_PORT")
-    (error "GC window diagnostics require an acknowledged sampling gate"))
-  (neomacs-perf-workload--sampling-command command)
-  (unless (equal neomacs-perf-workload--gate-response "ack\n")
-    (error "GC window diagnostics lack a %s acknowledgement" command))
-  t)
-
 (defun neomacs-perf-workload--cpu-us ()
   (car (current-cpu-time)))
 
@@ -109,46 +97,6 @@ first suspect and deserves to be confirmed or cleared by number."
   (font-lock-ensure (line-beginning-position) (line-end-position))
   (redisplay t)
   (delete-char -1)
-  (redisplay t))
-
-;; Review-only workload variants. Resolve the selector and replace the cycle
-;; before the sampling gate; the ordinary edit loop has no diagnostic branch.
-(defvar neomacs-perf-workload--sustained-edit-case
-  (and (equal (getenv "NEOMACS_PERF_WORKLOAD") "sustained-editing")
-       (let ((value (getenv "NEOMACS_PERF_SUSTAINED_EDIT_CASE")))
-         (and (member value '("join" "text-scale-join" "text-scale-typing"))
-              value))))
-
-(when (member neomacs-perf-workload--sustained-edit-case
-              '("join" "text-scale-join"))
-  (defun neomacs-perf-workload--single-edit-cycle ()
-    ;; A newline deletion near the lower visible rows, followed by its exact
-    ;; inverse, with an accepted display after each edit.
-    (end-of-line)
-    (unless (eq (char-after) ?\n)
-      (error "join review fixture lacks a line boundary"))
-    (delete-char 1)
-    (redisplay t)
-    (insert "\n")
-    (redisplay t)))
-
-(defun neomacs-perf-workload--warm-sustained-visible ()
-  "Settle the selected review workload before instruction sampling."
-  (when (member neomacs-perf-workload--sustained-edit-case
-                '("text-scale-join" "text-scale-typing"))
-    (require 'face-remap)
-    (text-scale-set 1))
-  (if (member neomacs-perf-workload--sustained-edit-case
-              '("join" "text-scale-join"))
-      (progn
-        ;; Keep this damage a pure deletion: fontification's widened property
-        ;; spans are a separate conservative horizon-retry case.
-        (font-lock-mode -1)
-        (goto-char (point-min))
-        (forward-line 24)
-        (end-of-line)
-        (set-window-start (selected-window) (point-min)))
-    (goto-char (point-max)))
   (redisplay t))
 
 (defun neomacs-perf-workload--type-phase ()
@@ -630,30 +578,6 @@ so a slow sample can be lined up against the frames around it."
           (insert (format "%d %d %d %d %d\n" (nth 0 record) (nth 1 record)
                           (nth 2 record) (nth 3 record) (nth 4 record))))))))
 
-(defun neomacs-perf-workload--write-gc-window
-    (path scenario iterations before-enable after-enable
-          before-disable after-disable enable-ack disable-ack)
-  "Write invocation-local diagnostic metadata after sampling has stopped.
-
-The four snapshots bracket both gate handshakes.  A reader may derive an
-exact edit-loop GC delta only if both acknowledgements are true and neither
-handshake changed `gcs-done'.  The file is not a scenario-result schema change."
-  (with-temp-file path
-    (insert
-     (json-serialize
-      `((schema . "t34-edit-loop-gc-window-v1")
-        (scenario . ,scenario)
-        (iterations . ,iterations)
-        (editor_pid . ,(emacs-pid))
-        (gc_window . ((scope . "acknowledged-enable-to-disable")
-                      (before_enable . ,before-enable)
-                      (after_enable . ,after-enable)
-                      (before_disable . ,before-disable)
-                      (after_disable . ,after-disable)
-                      (enable_ack . ,(if enable-ack t :json-false))
-                      (disable_ack . ,(if disable-ack t :json-false)))))
-      :false-object :json-false :null-object nil))))
-
 (defun neomacs-perf-workload--maybe-release-startup-gc-ceiling ()
   "Lift Neomacs' startup GC ceiling before measuring, when asked.
 
@@ -669,202 +593,12 @@ GNU has no such variable and ignores this."
              (boundp 'neomacs--startup-gc-ceiling-active))
     (setq neomacs--startup-gc-ceiling-active nil)))
 
-(defun neomacs-perf-workload--run-with-gc-window (gc-window-path)
-  "Run the unchanged workload with invocation-local sampling GC snapshots.
-
-All added state is lexical and owned by this invocation.  The existing
-controller owns the gate and its acknowledgement; this function adds no
-shared cache, Lisp pointer publication, or mutator-thread-local storage.
-`gcs-done' is observed as the existing process aggregate, so simultaneous
-mutators are reflected in that aggregate rather than attributed to one
-mutator.  A capture has one owner of its existing sampling gate."
-  (neomacs-perf-workload--maybe-release-startup-gc-ceiling)
-  (let* ((scenario (neomacs-perf-workload--required-environment "NEOMACS_PERF_WORKLOAD"))
-         (iterations (string-to-number
-                      (neomacs-perf-workload--required-environment
-                       "NEOMACS_PERF_ITERATIONS")))
-         ;; This fixture-only knob is read once, before preparation. Other
-         ;; scenarios never read it; only exact "on" enables the variant.
-         (sustained-visible
-          (and (equal scenario "sustained-editing")
-               (equal (getenv "NEOMACS_PERF_SUSTAINED_VISIBLE") "on")))
-         (sustained-visible-proof nil)
-         (result-path (neomacs-perf-workload--required-environment
-                       "NEOMACS_PERF_RESULT"))
-         (sentinel-path (neomacs-perf-workload--required-environment "SENTINEL"))
-         (gc-before-enable nil) (gc-after-enable nil)
-         (gc-before-disable nil) (gc-after-disable nil)
-         (gc-enable-ack nil) (gc-disable-ack nil)
-         (status "error") (error-message nil) (exit-code 2)
-         (elapsed-us 0) (elapsed-wall-us 0)
-         (gc-start-count 0) (gc-end-count 0)
-         (gc-start-us 0) (gc-end-us 0)
-         (initial-checksum "") (final-checksum "")
-         (initial-point 1) (point-restored nil) (expected-mode "")
-         (actual-mode "")
-         (phases '((bookkeeping . 0) (type . 0) (comment . 0) (kill-yank . 0)
-                   (indent . 0) (regex . 0) (latencies . [])
-                   (mode . 0) (fontify . 0) (replace . 0)
-                   (undo-redo . 0) (isearch . 0) (buffer-switch . 0)
-                   (how-many . 0) (motion . 0))))
-    (condition-case error-data
-        (if sustained-visible
-            (let* ((visible-window (selected-window))
-                   (previous-buffer (window-buffer visible-window))
-                   ;; Match with-temp-buffer's inhibited buffer hooks.
-                   (visible-buffer (generate-new-buffer " *temp*" t)))
-              (unwind-protect
-                  (progn
-                    ;; Restore the old windows before the outer cleanup kills
-                    ;; the temporarily displayed buffer, including on errors.
-                    (save-window-excursion
-                      (with-current-buffer visible-buffer
-                        (neomacs-perf-workload--prepare-buffer scenario)
-                        ;; Display the edited buffer and settle the selected viewport before
-                        ;; collection or counters begin. This setup is specific to ON.
-                        (set-window-buffer visible-window (current-buffer))
-                        (neomacs-perf-workload--warm-sustained-visible)
-                        (setq sustained-visible-proof
-                              `((review_edit_case . ,(or neomacs-perf-workload--sustained-edit-case "off"))
-                                (text_scale_amount . ,(if (boundp 'text-scale-mode-amount) text-scale-mode-amount 0))
-                                (window_live_before . ,(if (window-live-p visible-window) t :json-false))
-                                (selected_window_before . ,(if (eq visible-window (selected-window)) t :json-false))
-                                (window_buffer_matches_before . ,(if (eq (window-buffer visible-window) (current-buffer)) t :json-false))
-                                (point_visible_before . ,(if (pos-visible-in-window-p (point) visible-window) t :json-false))
-                                (point_before . ,(point))))
-                        (unless (and (window-live-p visible-window)
-                                     (eq visible-window (selected-window))
-                                     (eq (window-buffer visible-window) (current-buffer))
-                                     (pos-visible-in-window-p (point) visible-window))
-                          (error "visible sustained fixture did not display its edited buffer"))
-                        (setq expected-mode (symbol-name major-mode)
-                              initial-checksum (neomacs-perf-workload--checksum)
-                              initial-point (point))
-                        (garbage-collect)
-                        (setq gc-start-count gcs-done
-                              gc-end-count gc-start-count
-                              gc-start-us (round (* 1000000 gc-elapsed))
-                              gc-end-us gc-start-us)
-                        (setq gc-before-enable gcs-done)
-                        (setq gc-enable-ack
-                              (neomacs-perf-workload--sampling-command-ack "enable"))
-                        (setq gc-after-enable gcs-done)
-                        (let ((started (neomacs-perf-workload--cpu-us))
-                              (wall-started (float-time)))
-                          (unwind-protect
-                              (setq phases (neomacs-perf-workload--execute scenario iterations)
-                                    elapsed-us (max 1 (- (neomacs-perf-workload--cpu-us) started))
-                                    elapsed-wall-us
-                                    (max 1 (round (* 1000000 (- (float-time) wall-started)))))
-                            (setq gc-before-disable gcs-done)
-                            (setq gc-disable-ack
-                                  (neomacs-perf-workload--sampling-command-ack "disable"))
-                            (setq gc-after-disable gcs-done)
-                            (setq gc-end-count gcs-done
-                                  gc-end-us (round (* 1000000 gc-elapsed)))))
-                        ;; Read boundary evidence only after counters were disabled.
-                        (setq sustained-visible-proof
-                              (append sustained-visible-proof
-                                      `((window_live_after . ,(if (window-live-p visible-window) t :json-false))
-                                        (selected_window_after . ,(if (eq visible-window (selected-window)) t :json-false))
-                                        (window_buffer_matches_after . ,(if (eq (window-buffer visible-window) (current-buffer)) t :json-false))
-                                        (point_visible_after . ,(if (pos-visible-in-window-p (point) visible-window) t :json-false))
-                                        (point_after . ,(point)))))
-                        (unless (and (window-live-p visible-window)
-                                     (eq visible-window (selected-window))
-                                     (eq (window-buffer visible-window) (current-buffer))
-                                     (pos-visible-in-window-p (point) visible-window))
-                          (error "visible sustained fixture lost its edited window"))
-                        (setq final-checksum (neomacs-perf-workload--checksum)
-                              point-restored (= (point) initial-point)
-                              actual-mode (symbol-name major-mode))))
-                    (unless (and (window-live-p visible-window)
-                                 (eq visible-window (selected-window))
-                                 (eq (window-buffer visible-window) previous-buffer))
-                      (error "visible sustained fixture did not restore its window"))
-                    (setq sustained-visible-proof
-                          (append sustained-visible-proof
-                                  '((window_configuration_restored . t)))))
-                (when (buffer-live-p visible-buffer)
-                  (kill-buffer visible-buffer))
-                (setq sustained-visible-proof
-                      (append sustained-visible-proof
-                              `((temporary_buffer_killed . ,(if (buffer-live-p visible-buffer) :json-false t))))))
-              (when (buffer-live-p visible-buffer)
-                (error "visible sustained fixture did not kill its temporary buffer"))
-              (setq status "ok" exit-code 0))
-        (with-temp-buffer
-          (neomacs-perf-workload--prepare-buffer scenario)
-          (setq expected-mode (symbol-name major-mode)
-                initial-checksum (neomacs-perf-workload--checksum)
-                initial-point (point))
-          (garbage-collect)
-          (setq gc-start-count gcs-done
-                gc-end-count gc-start-count
-                gc-start-us (round (* 1000000 gc-elapsed))
-                gc-end-us gc-start-us)
-          (setq gc-before-enable gcs-done)
-          (setq gc-enable-ack
-                (neomacs-perf-workload--sampling-command-ack "enable"))
-          (setq gc-after-enable gcs-done)
-          (let ((started (neomacs-perf-workload--cpu-us))
-                (wall-started (float-time)))
-            (unwind-protect
-                (setq phases (neomacs-perf-workload--execute scenario iterations)
-                      elapsed-us (max 1 (- (neomacs-perf-workload--cpu-us) started))
-                      elapsed-wall-us
-                      (max 1 (round (* 1000000 (- (float-time) wall-started)))))
-              (setq gc-before-disable gcs-done)
-              (setq gc-disable-ack
-                    (neomacs-perf-workload--sampling-command-ack "disable"))
-              (setq gc-after-disable gcs-done)
-              (setq gc-end-count gcs-done
-                    gc-end-us (round (* 1000000 gc-elapsed)))))
-          (setq final-checksum (neomacs-perf-workload--checksum)
-                point-restored (= (point) initial-point)
-                actual-mode (symbol-name major-mode)
-                status "ok" exit-code 0)))
-      (error
-       (setq error-message (error-message-string error-data))
-       (message "%s failed: %s" scenario error-message)))
-    (when (processp neomacs-perf-workload--gate-process)
-      (delete-process neomacs-perf-workload--gate-process))
-    (when sustained-visible
-      ;; Result wire fields are strict. Keep its schema unchanged and record
-      ;; ON-only boundary/lifecycle proof beside scenario-result.json instead.
-      (with-temp-file (concat result-path ".visible-window.json")
-        (insert
-         (json-serialize
-          (append `((schema_version . 1)
-                    (scenario . "sustained-editing")
-                    (knob . "NEOMACS_PERF_SUSTAINED_VISIBLE")
-                    (value . "on") (status . ,status)
-                    (error . ,error-message))
-                  sustained-visible-proof)
-          :false-object :json-false :null-object nil))))
-    (neomacs-perf-workload--write-result
-     result-path scenario status iterations elapsed-us elapsed-wall-us iterations
-     initial-checksum final-checksum point-restored expected-mode actual-mode phases
-     gc-start-count gc-end-count gc-start-us gc-end-us error-message)
-    (neomacs-perf-workload--maybe-write-latency-trace)
-    (neomacs-perf-workload--write-gc-window
-     gc-window-path scenario iterations gc-before-enable gc-after-enable
-     gc-before-disable gc-after-disable gc-enable-ack gc-disable-ack)
-    (write-region "done\n" nil sentinel-path nil 'silent)
-    (kill-emacs exit-code)))
-
 (defun neomacs-perf-workload--run ()
   (neomacs-perf-workload--maybe-release-startup-gc-ceiling)
   (let* ((scenario (neomacs-perf-workload--required-environment "NEOMACS_PERF_WORKLOAD"))
          (iterations (string-to-number
                       (neomacs-perf-workload--required-environment
                        "NEOMACS_PERF_ITERATIONS")))
-         ;; This fixture-only knob is read once, before preparation. Other
-         ;; scenarios never read it; only exact "on" enables the variant.
-         (sustained-visible
-          (and (equal scenario "sustained-editing")
-               (equal (getenv "NEOMACS_PERF_SUSTAINED_VISIBLE") "on")))
-         (sustained-visible-proof nil)
          (result-path (neomacs-perf-workload--required-environment
                        "NEOMACS_PERF_RESULT"))
          (sentinel-path (neomacs-perf-workload--required-environment "SENTINEL"))
@@ -881,85 +615,6 @@ mutator.  A capture has one owner of its existing sampling gate."
                    (undo-redo . 0) (isearch . 0) (buffer-switch . 0)
                    (how-many . 0) (motion . 0))))
     (condition-case error-data
-        (if sustained-visible
-            (let* ((visible-window (selected-window))
-                   (previous-buffer (window-buffer visible-window))
-                   ;; Match with-temp-buffer's inhibited buffer hooks.
-                   (visible-buffer (generate-new-buffer " *temp*" t)))
-              (unwind-protect
-                  (progn
-                    ;; Restore the old windows before the outer cleanup kills
-                    ;; the temporarily displayed buffer, including on errors.
-                    (save-window-excursion
-                      (with-current-buffer visible-buffer
-                        (neomacs-perf-workload--prepare-buffer scenario)
-                        ;; Display the edited buffer and settle the selected viewport before
-                        ;; collection or counters begin. This setup is specific to ON.
-                        (set-window-buffer visible-window (current-buffer))
-                        (neomacs-perf-workload--warm-sustained-visible)
-                        (setq sustained-visible-proof
-                              `((review_edit_case . ,(or neomacs-perf-workload--sustained-edit-case "off"))
-                                (text_scale_amount . ,(if (boundp 'text-scale-mode-amount) text-scale-mode-amount 0))
-                                (window_live_before . ,(if (window-live-p visible-window) t :json-false))
-                                (selected_window_before . ,(if (eq visible-window (selected-window)) t :json-false))
-                                (window_buffer_matches_before . ,(if (eq (window-buffer visible-window) (current-buffer)) t :json-false))
-                                (point_visible_before . ,(if (pos-visible-in-window-p (point) visible-window) t :json-false))
-                                (point_before . ,(point))))
-                        (unless (and (window-live-p visible-window)
-                                     (eq visible-window (selected-window))
-                                     (eq (window-buffer visible-window) (current-buffer))
-                                     (pos-visible-in-window-p (point) visible-window))
-                          (error "visible sustained fixture did not display its edited buffer"))
-                        (setq expected-mode (symbol-name major-mode)
-                              initial-checksum (neomacs-perf-workload--checksum)
-                              initial-point (point))
-                        (garbage-collect)
-                        (setq gc-start-count gcs-done
-                              gc-end-count gc-start-count
-                              gc-start-us (round (* 1000000 gc-elapsed))
-                              gc-end-us gc-start-us)
-                        (neomacs-perf-workload--sampling-command "enable")
-                        (let ((started (neomacs-perf-workload--cpu-us))
-                              (wall-started (float-time)))
-                          (unwind-protect
-                              (setq phases (neomacs-perf-workload--execute scenario iterations)
-                                    elapsed-us (max 1 (- (neomacs-perf-workload--cpu-us) started))
-                                    elapsed-wall-us
-                                    (max 1 (round (* 1000000 (- (float-time) wall-started)))))
-                            (neomacs-perf-workload--sampling-command "disable")
-                            (setq gc-end-count gcs-done
-                                  gc-end-us (round (* 1000000 gc-elapsed)))))
-                        ;; Read boundary evidence only after counters were disabled.
-                        (setq sustained-visible-proof
-                              (append sustained-visible-proof
-                                      `((window_live_after . ,(if (window-live-p visible-window) t :json-false))
-                                        (selected_window_after . ,(if (eq visible-window (selected-window)) t :json-false))
-                                        (window_buffer_matches_after . ,(if (eq (window-buffer visible-window) (current-buffer)) t :json-false))
-                                        (point_visible_after . ,(if (pos-visible-in-window-p (point) visible-window) t :json-false))
-                                        (point_after . ,(point)))))
-                        (unless (and (window-live-p visible-window)
-                                     (eq visible-window (selected-window))
-                                     (eq (window-buffer visible-window) (current-buffer))
-                                     (pos-visible-in-window-p (point) visible-window))
-                          (error "visible sustained fixture lost its edited window"))
-                        (setq final-checksum (neomacs-perf-workload--checksum)
-                              point-restored (= (point) initial-point)
-                              actual-mode (symbol-name major-mode))))
-                    (unless (and (window-live-p visible-window)
-                                 (eq visible-window (selected-window))
-                                 (eq (window-buffer visible-window) previous-buffer))
-                      (error "visible sustained fixture did not restore its window"))
-                    (setq sustained-visible-proof
-                          (append sustained-visible-proof
-                                  '((window_configuration_restored . t)))))
-                (when (buffer-live-p visible-buffer)
-                  (kill-buffer visible-buffer))
-                (setq sustained-visible-proof
-                      (append sustained-visible-proof
-                              `((temporary_buffer_killed . ,(if (buffer-live-p visible-buffer) :json-false t))))))
-              (when (buffer-live-p visible-buffer)
-                (error "visible sustained fixture did not kill its temporary buffer"))
-              (setq status "ok" exit-code 0))
         (with-temp-buffer
           (neomacs-perf-workload--prepare-buffer scenario)
           (setq expected-mode (symbol-name major-mode)
@@ -984,25 +639,12 @@ mutator.  A capture has one owner of its existing sampling gate."
           (setq final-checksum (neomacs-perf-workload--checksum)
                 point-restored (= (point) initial-point)
                 actual-mode (symbol-name major-mode)
-                status "ok" exit-code 0)))
+                status "ok" exit-code 0))
       (error
        (setq error-message (error-message-string error-data))
        (message "%s failed: %s" scenario error-message)))
     (when (processp neomacs-perf-workload--gate-process)
       (delete-process neomacs-perf-workload--gate-process))
-    (when sustained-visible
-      ;; Result wire fields are strict. Keep its schema unchanged and record
-      ;; ON-only boundary/lifecycle proof beside scenario-result.json instead.
-      (with-temp-file (concat result-path ".visible-window.json")
-        (insert
-         (json-serialize
-          (append `((schema_version . 1)
-                    (scenario . "sustained-editing")
-                    (knob . "NEOMACS_PERF_SUSTAINED_VISIBLE")
-                    (value . "on") (status . ,status)
-                    (error . ,error-message))
-                  sustained-visible-proof)
-          :false-object :json-false :null-object nil))))
     (neomacs-perf-workload--write-result
      result-path scenario status iterations elapsed-us elapsed-wall-us iterations
      initial-checksum final-checksum point-restored expected-mode actual-mode phases
@@ -1011,16 +653,8 @@ mutator.  A capture has one owner of its existing sampling gate."
     (write-region "done\n" nil sentinel-path nil 'silent)
     (kill-emacs exit-code)))
 
-;; Read the diagnostic once for this fixture process.  With it absent, the
-;; ordinary entry form and timed run remain literal copies of main.
-(let ((gc-window-path (getenv "NEOMACS_PERF_GC_WINDOW_FILE")))
-  (if gc-window-path
-      (if noninteractive
-          (neomacs-perf-workload--run-with-gc-window gc-window-path)
-        (run-at-time 0 nil #'neomacs-perf-workload--run-with-gc-window
-                     gc-window-path))
 (if noninteractive
     (neomacs-perf-workload--run)
   (run-at-time 0 nil #'neomacs-perf-workload--run))
-))
+
 ;;; editor-workloads.el ends here

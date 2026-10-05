@@ -1,6 +1,6 @@
 use super::*;
 use crate::emacs_core::error::{expect_args, expect_args_range, expect_min_args};
-use crate::emacs_core::eval::{CheckedNativeCallback, LispArgVec, native_callback_cache_enabled};
+use crate::emacs_core::eval::LispArgVec;
 use smallvec::SmallVec;
 use std::sync::LazyLock;
 
@@ -166,35 +166,6 @@ impl MapCallee {
             } => eval.apply1_resolved_subr(designator, subr, epoch, item),
         }
     }
-}
-
-/// Select the native body capability once for this mapping activation.
-/// The caller's existing root scope retains its designator and sequence; the
-/// immutable proof contains no Lisp references and stays with this mutator.
-/// The epoch must be captured before resolving the callee, so publication
-/// cannot pair an older body with a newer function-cell epoch.
-#[inline]
-fn mapcar1_with_callee(
-    eval: &mut super::eval::Context,
-    len: usize,
-    values: MapSink<'_>,
-    sequence: Value,
-    callee: &MapCallee,
-    checked_epoch: u64,
-) -> Result<usize, Flow> {
-    if let MapCallee::Subr {
-        designator, subr, ..
-    } = *callee
-        && native_callback_cache_enabled()
-        && let Some(proof) = CheckedNativeCallback::resolve(subr, 1)
-    {
-        return mapcar1_eval(eval, len, values, sequence, |eval, item| {
-            eval.apply1_checked_subr(designator, subr, checked_epoch, proof, item)
-        });
-    }
-    mapcar1_eval(eval, len, values, sequence, |eval, item| {
-        callee.call(eval, item)
-    })
 }
 
 /// Where [`mapcar1_eval_from`] puts each callback's result.
@@ -490,16 +461,10 @@ pub(crate) fn builtin_mapcar_2(
     // the list is built straight from the slots (cons allocation cannot
     // collect, so the slice needs no further rooting).
     let base = eval.reserve_vm_frame_root_slots(len);
-    let checked_epoch = eval.obarray.function_epoch();
     let callee = MapCallee::resolve(eval, func);
-    let map_result = mapcar1_with_callee(
-        eval,
-        len,
-        MapSink::RootSlots(base),
-        seq,
-        &callee,
-        checked_epoch,
-    );
+    let map_result = mapcar1_eval(eval, len, MapSink::RootSlots(base), seq, |eval, item| {
+        callee.call(eval, item)
+    });
     let result_list =
         map_result.map(|mapped| Value::list_from_slice(eval.vm_frame_root_slots(base, mapped)));
     eval.restore_vm_roots(roots);
@@ -521,9 +486,10 @@ pub(crate) fn builtin_mapc_2(
             return Err(flow);
         }
     };
-    let checked_epoch = eval.obarray.function_epoch();
     let callee = MapCallee::resolve(eval, func);
-    let result = mapcar1_with_callee(eval, len, MapSink::Discard, seq, &callee, checked_epoch);
+    let result = mapcar1_eval(eval, len, MapSink::Discard, seq, |eval, item| {
+        callee.call(eval, item)
+    });
     eval.restore_vm_roots(roots);
     result.map(|_| ())?;
     Ok(seq)
@@ -565,26 +531,13 @@ pub(crate) fn builtin_mapconcat(eval: &mut super::eval::Context, args: Vec<Value
         if func.as_symbol_id() == Some(identity_symbol_id()) && sequence.is_cons() {
             Ok(mapconcat_identity_list(sequence, &mut parts))
         } else {
-            if native_callback_cache_enabled() {
-                let checked_epoch = eval.obarray.function_epoch();
-                let callee = MapCallee::resolve(eval, func);
-                mapcar1_with_callee(
-                    eval,
-                    len,
-                    MapSink::Collect(&mut parts),
-                    sequence,
-                    &callee,
-                    checked_epoch,
-                )
-            } else {
-                mapcar1_eval(
-                    eval,
-                    len,
-                    MapSink::Collect(&mut parts),
-                    sequence,
-                    |eval, item| apply1(eval, func, item),
-                )
-            }
+            mapcar1_eval(
+                eval,
+                len,
+                MapSink::Collect(&mut parts),
+                sequence,
+                |eval, item| apply1(eval, func, item),
+            )
         };
     let mapped = match mapconcat_result {
         Ok(mapped) => mapped,
@@ -703,7 +656,6 @@ pub(crate) enum SortPredicate {
         designator: Value,
         subr: Value,
         epoch: u64,
-        proof: Option<CheckedNativeCallback>,
     },
     /// Identified from the captured implementation, never the symbol's name.
     StringLessp {
@@ -770,9 +722,6 @@ pub(super) fn capture_sort_predicate(
             designator: function,
             subr: function,
             epoch,
-            proof: native_callback_cache_enabled()
-                .then(|| CheckedNativeCallback::resolve(function, 2))
-                .flatten(),
         });
     }
     Some(SortPredicate::Generic(function))
@@ -849,19 +798,11 @@ impl SortRuntime for super::eval::Context {
         {
             return captured;
         }
-        let callback_epoch = self.obarray().function_epoch();
         match self.resolve_mapped_subr_callee(predicate) {
             Some((subr, epoch)) => SortPredicate::Subr {
                 designator: predicate,
                 subr,
-                epoch: if native_callback_cache_enabled() {
-                    callback_epoch
-                } else {
-                    epoch
-                },
-                proof: native_callback_cache_enabled()
-                    .then(|| CheckedNativeCallback::resolve(subr, 2))
-                    .flatten(),
+                epoch,
             },
             None => SortPredicate::Generic(predicate),
         }
@@ -882,11 +823,7 @@ impl SortRuntime for super::eval::Context {
                 designator,
                 subr,
                 epoch,
-                proof,
-            } => match proof {
-                Some(proof) => self.apply2_checked_subr(designator, subr, epoch, proof, arg0, arg1),
-                None => self.apply2_resolved_subr(designator, subr, epoch, arg0, arg1),
-            },
+            } => self.apply2_resolved_subr(designator, subr, epoch, arg0, arg1),
             SortPredicate::StringLessp { subr, epoch } => {
                 self.apply2_sort_string_lessp(subr, epoch, arg0, arg1)
             }

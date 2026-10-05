@@ -103,7 +103,7 @@ fn spec_slots_arm_a_direct_entry_only_for_exact_frameless_register_callees() {
 }
 
 /// Direct sites go where they pay their compile back
-/// (`DirectSitesMode::Unbounded`, explicitly selected): a caller whose body loops or
+/// (`DirectSitesMode::Unbounded`, the default): a caller whose body loops or
 /// calls itself, or a re-tier of one that proved hot; a straight-line caller
 /// keeps the shim call. `NEOVM_JIT_DIRECT_SITES=all` emits them in every
 /// body.
@@ -265,12 +265,10 @@ fn run_in_with(
     program: &'static str,
     observe: &'static str,
 ) -> Run {
-    let backend = jit_opt_mode();
     std::thread::Builder::new()
         .name(format!("direct-call-{mode:?}"))
         .stack_size(128 * 1024 * 1024)
         .spawn(move || {
-            let _backend = opt_mode_scope_for_test(backend);
             crate::test_utils::init_test_tracing();
             force_profit_gate_for_test(false);
             crate::emacs_core::jit::inline::force_inline_for_test(Some(false));
@@ -643,9 +641,6 @@ fn a_redefinition_under_a_direct_activation_keeps_the_old_code_running() {
 /// Tier-0 with the frame still pushed, and the caller continues natively.
 #[test]
 fn deopts_in_a_direct_callee_resume_and_return_to_the_caller() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     const PROGRAM: &str = r#"(progn
   (defun neovm--dco-add (x y) (if (> x 0) (+ x y) (- y x)))
   (defun neovm--dco-car (x y) (if y (car x) x))

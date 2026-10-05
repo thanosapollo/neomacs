@@ -1,6 +1,9 @@
 [workspace]
+# Private local provider; keep standalone provider tests outside this workspace.
+exclude = ["local-deps/rio-vt-0.5.5"]
 members = [
     "crates/neomacs",
+    "crates/neomacs-mcp",
     "crates/neomacs-terminfo",
     "crates/neomacs-allocator",
     "crates/neomacs-diagnostics",
@@ -458,8 +461,9 @@ strip = "none"
 # Never vendor dependencies into this repository. Always fork the crate on
 # GitHub and make changes on the fork's `patch` branch. Reference an exact Git
 # revision here and document the branch beside each dependency.
-# Fork branch: patch (includes Wayland/X11 fixes, continuous XI2 units, and Windows precision touchpad panning).
-winit = { git = "https://github.com/eval-exec/winit", rev = "2290f91c602f8efdf102972457a25e8b6e36f90c" }
+# Fork branch: patch (includes inherited fixes and explicit Wayland connections
+# with failed-construction retry; deferred daemon startup never mutates display env).
+winit = { git = "https://github.com/thanosapollo/winit", rev = "6884804b87b93c228b97ba683ddcc7d0acb4d023" }
 # Fork branch: neomacs-present-timing.
 # Native presentation IDs/timestamps; see the Vulkan timing seam in this fork.
 wgpu-hal = { git = "https://github.com/eval-exec/wgpu", rev = "9717f9fe277beec2c98df550662a626f8fc0248c" }
@@ -479,3 +483,5 @@ freetype-sys = { git = "https://github.com/eval-exec/freetype-sys", rev = "a4eb0
 # to the registry's `zune-jpeg` 0.5.15 and `zune-core` 0.5.1.
 zune-jpeg = { git = "https://github.com/eval-exec/zune-image", rev = "39dd805e32d74b2092405b5da0bec86747f04e34" }
 zune-core = { git = "https://github.com/eval-exec/zune-image", rev = "39dd805e32d74b2092405b5da0bec86747f04e34" }
+# Private source-only composition, not an upstream vendoring policy change.
+rio-vt = { path = "local-deps/rio-vt-0.5.5" }

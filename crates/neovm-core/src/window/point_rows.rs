@@ -88,8 +88,6 @@ fn point_row_iter_mode() -> PointRowIterMode {
 enum PointCellRole {
     Glyph,
     OverlaidMarker,
-    InsertionBoundary,
-    SyntheticBoundary,
 }
 
 /// The usual glyph/insertion slot: exactly sixteen bytes, with checked bounds.
@@ -124,8 +122,6 @@ impl PointCell {
             role: match point.role {
                 DisplayPointRole::Glyph => PointCellRole::Glyph,
                 DisplayPointRole::OverlaidMarker => PointCellRole::OverlaidMarker,
-                DisplayPointRole::InsertionBoundary => PointCellRole::InsertionBoundary,
-                DisplayPointRole::SyntheticBoundary => PointCellRole::SyntheticBoundary,
             },
         })
     }
@@ -430,8 +426,6 @@ impl DisplayPointRow {
                     role: match cell.role {
                         PointCellRole::Glyph => DisplayPointRole::Glyph,
                         PointCellRole::OverlaidMarker => DisplayPointRole::OverlaidMarker,
-                        PointCellRole::InsertionBoundary => DisplayPointRole::InsertionBoundary,
-                        PointCellRole::SyntheticBoundary => DisplayPointRole::SyntheticBoundary,
                     },
                     x: i64::from(cell.x),
                     y: self.y + i64::from(cell.y_offset),
@@ -481,7 +475,7 @@ impl DisplayPointRow {
             if point.buffer_pos != pos {
                 break;
             }
-            if point.role.is_position() {
+            if point.role == DisplayPointRole::Glyph {
                 return Some(point);
             }
             if marker.is_none() {
@@ -645,7 +639,7 @@ impl DisplayPointRows {
         let mut marker = None;
         for row in &self.rows {
             if let Some(point) = row.point_for_buffer_pos(pos) {
-                if point.role.is_position() {
+                if point.role == DisplayPointRole::Glyph {
                     return Some(point);
                 }
                 if marker.is_none() {

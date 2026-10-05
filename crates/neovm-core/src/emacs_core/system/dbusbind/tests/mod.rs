@@ -6,6 +6,7 @@ std::cfg_select! {
         mod connection;
         mod signal;
         mod types;
+        mod marshalling;
     }
     _ => {}
 }

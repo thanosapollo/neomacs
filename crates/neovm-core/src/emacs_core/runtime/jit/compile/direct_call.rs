@@ -1,6 +1,6 @@
 //! Direct native calls between compiled leaves (design
 //! `p1-1-direct-native-calls` §3.4-§3.5, P1.0 S2.1c; `NEOVM_JIT_DIRECT_CALL`,
-//! default on with profitable exact self sites).
+//! default off).
 //!
 //! A speculated `Op::Call` site of a byte-code callee runs GNU's `Bcall`
 //! protocol inline instead of calling `neovm_jit_call_spec`, when the site's
@@ -67,13 +67,8 @@ pub(crate) static DIRECT_COLD_EXITS: AtomicU64 = AtomicU64::new(0);
 
 #[path = "direct_call/framed.rs"]
 mod framed;
-#[path = "direct_call/heat.rs"]
-mod heat;
 #[path = "direct_call/memory.rs"]
 mod memory;
-pub(crate) use heat::DirectSelfHeat;
-#[path = "direct_call/profile.rs"]
-mod profile;
 #[path = "direct_call/self_only.rs"]
 mod self_only;
 #[cfg(test)]
@@ -403,9 +398,6 @@ pub(crate) fn emit_direct_bytecode_call(
     DIRECT_SITES_EMITTED_HERE.with(|c| c.set(c.get() + 1));
     let flags = MemFlagsData::trusted();
     let ptr_ty = rt.ptr_ty;
-    let site_profile =
-        profile::register_site(rt.direct_sites.get().saturating_sub(1) as usize, None);
-    profile::emit_attempt(fb, ptr_ty, site_profile.as_deref());
     let status_var = fb.declare_var(types::I64);
     let result = fb.declare_var(types::I64);
     let slow = fb.create_block();
@@ -563,7 +555,6 @@ pub(crate) fn emit_direct_bytecode_call(
         next(fb, wrong_key);
     }
     fb.seal_block(slow);
-    profile::emit_hit(fb, ptr_ty, site_profile.as_deref());
     // The callee's register words: the given arguments in its `nonrest`
     // slots, nil for each slot the call lacks, then the `&rest` list of the
     // arguments past them -- GNU `funcall_lambda`'s frame (`Flist` of the
@@ -1071,5 +1062,3 @@ pub(crate) fn render_direct_call_stats() -> Option<String> {
         )
     })
 }
-
-pub(crate) use profile::{note_arming, render_stats as render_direct_profile_stats};

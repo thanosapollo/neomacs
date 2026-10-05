@@ -701,11 +701,6 @@ pub(crate) fn install(
         asm_dump::restash(asm);
         let tier = match leaf.obs.osr_pc {
             Some(pc) => super::stats::perf_map::LabelTier::Osr(pc as usize),
-            None if super::compile::jit_opt_mode() == super::compile::OptMode::Opt
-                && super::compile::opt_census::is_opt_leaf(&leaf) =>
-            {
-                super::stats::perf_map::LabelTier::Opt
-            }
             None => match leaf.tier() {
                 super::compile::LeafTier::Mir => super::stats::perf_map::LabelTier::Mir,
                 super::compile::LeafTier::Baseline | super::compile::LeafTier::Aot => {
@@ -715,7 +710,6 @@ pub(crate) fn install(
         };
         let default_name = match tier {
             super::stats::perf_map::LabelTier::Mir => "__neovm_mir_leaf",
-            super::stats::perf_map::LabelTier::Opt => "__neovm_opt_leaf",
             super::stats::perf_map::LabelTier::Baseline
             | super::stats::perf_map::LabelTier::Osr(_) => "__neovm_jit_leaf",
         };

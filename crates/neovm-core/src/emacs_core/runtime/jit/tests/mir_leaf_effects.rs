@@ -36,8 +36,7 @@ fn compile(ev: &Context, f: &ByteCodeFunction, effects: bool, leaf: LeafKnob) ->
 
 /// The classification: leaf trampolines, value shims and pure table entries
 /// have their leaf's declared effects, with no GC, Lisp or deopt; a rooted
-/// table entry, `set` and every non-builtin op are `UNKNOWN`. Direct `aset`
-/// writes or allocates without entering Lisp or collecting. Only
+/// table entry, `aset`, `set` and every non-builtin op are `UNKNOWN`. Only
 /// the sites that call a leaf's body are leaf calls for MIR admission: the
 /// inline-lowered `aref`/`setcar`/`setcdr` and the leafless pure entries
 /// are not.
@@ -60,7 +59,6 @@ fn opcode_site_effects_follow_the_lowering() {
             Op::Equal,
             Op::Get,
             Op::Aref,
-            Op::Aset,
             Op::Setcar,
             Op::Setcdr,
             Op::SymbolValue,
@@ -72,7 +70,7 @@ fn opcode_site_effects_follow_the_lowering() {
             assert!(effects.contains(Effects::MAY_SIGNAL), "{op:?}");
             let leaf_backed = !matches!(
                 op,
-                Op::Aref | Op::Aset | Op::Setcar | Op::Setcdr | Op::SymbolFunction | Op::Nreverse
+                Op::Aref | Op::Setcar | Op::Setcdr | Op::SymbolFunction | Op::Nreverse
             );
             assert_eq!(
                 opcode_site_is_leaf_call(&op, false),
@@ -94,6 +92,7 @@ fn opcode_site_effects_follow_the_lowering() {
             );
         }
         for op in [
+            Op::Aset,
             Op::Set,
             Op::Fset,
             Op::Put,
@@ -104,8 +103,6 @@ fn opcode_site_effects_follow_the_lowering() {
             assert_eq!(opcode_site_effects(&op, false), Effects::UNKNOWN, "{op:?}");
         }
         assert!(opcode_site_effects(&Op::Setcar, false).contains(Effects::WRITE_HEAP));
-        assert!(opcode_site_effects(&Op::Aset, false).contains(Effects::WRITE_HEAP));
-        assert!(opcode_site_effects(&Op::Aset, true).contains(Effects::ALLOCATES));
         assert!(opcode_site_effects(&Op::Nth, false).is_read_only() == false);
     }
     force_leaf_knob_for_test(None);
@@ -144,9 +141,6 @@ fn nth_loop() -> ByteCodeFunction {
 /// is live across the leaf call).
 #[test]
 fn a_leaf_call_admits_a_loop_into_the_mir_tier() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     let mut ev = Context::new();
     let ctx = &mut ev as *mut Context as *mut u8;
     let f = nth_loop();
@@ -205,9 +199,6 @@ fn a_leaf_call_admits_a_loop_into_the_mir_tier() {
 ///     (lambda (l n) (+ (1+ n) (nth 1 l)))
 #[test]
 fn a_leaf_call_keeps_raw_values_raw() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     let mut ev = Context::new();
     let ctx = &mut ev as *mut Context as *mut u8;
     let f = function(

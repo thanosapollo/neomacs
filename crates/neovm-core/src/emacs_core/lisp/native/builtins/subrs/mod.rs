@@ -7865,9 +7865,7 @@ pub(crate) fn register_subrs(ctx: &mut crate::emacs_core::eval::Context) {
     ctx.register_subr(
         SubrSpec::new(
             "redraw-display",
-            NativeFn::ContextVec(
-                crate::emacs_core::dispnew::pure::builtin_redraw_display_in_context,
-            ),
+            NativeFn::ContextVec(crate::emacs_core::dispnew::pure::builtin_redraw_display),
             SubrArity::new(0, Some(0)),
         )
         .interactive(crate::emacs_core::interactive::BuiltinInteractiveSpec::String("")),
@@ -7954,7 +7952,9 @@ pub(crate) fn register_subrs(ctx: &mut crate::emacs_core::eval::Context) {
     ));
     ctx.register_subr(SubrSpec::new(
         "x-display-list",
-        NativeFn::ContextVec(|_ctx, args| crate::emacs_core::display::builtin_x_display_list(args)),
+        NativeFn::ContextVec(|ctx, args| {
+            crate::emacs_core::display::builtin_x_display_list(ctx, args)
+        }),
         SubrArity::new(0, Some(0)),
     ));
     ctx.register_subr(SubrSpec::new(

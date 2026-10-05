@@ -18,8 +18,6 @@ use super::header::{
 };
 use super::value::{TAG_MASK, TaggedValue};
 
-mod string_observed;
-
 thread_local! {
     static COLLECTION_REVISION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -33,12 +31,6 @@ thread_local! {
 pub struct LispCollectionRevision(u64);
 
 impl LispCollectionRevision {
-    /// Exact mutation count for regression tests, including sequence wrap.
-    #[cfg(test)]
-    pub(crate) fn steps_since_for_test(self, earlier: Self) -> u64 {
-        self.0.wrapping_sub(earlier.0)
-    }
-
     pub fn current() -> Self {
         Self(COLLECTION_REVISION.with(std::cell::Cell::get))
     }
@@ -134,44 +126,6 @@ pub fn set_cons_cdr(cell: TaggedValue, value: TaggedValue) -> bool {
     unsafe {
         (*((cell.bits() & !TAG_MASK) as *mut ConsCell)).set_cdr(value);
     }
-    true
-}
-
-/// Complete a cached native BLV store without turning its implementation
-/// access into a Lisp collection read. The caller has validated its variable
-/// shape and executes under this Context's exclusive mutator installation;
-/// this path allocates no Lisp object, calls no Lisp and has no safe point.
-///
-/// Certificates, revisions and the observation envelope remain mutator-local.
-/// Exact marks use shared atomic lifetime metadata, but do not supply a
-/// cross-mutator journal. Ordinary tracking and GEN1 retain the full setter.
-#[cfg(feature = "jit")]
-#[inline]
-pub(crate) fn set_compiled_cons_cdr(cell: TaggedValue, value: TaggedValue) -> bool {
-    use super::collection_reads::{CompiledJournalMode, compiled_journal_mode, is_observed};
-    if compiled_journal_mode() != CompiledJournalMode::Observed
-        || super::gc::current_heap_generational_enabled()
-        || super::gc::current_write_tracking_enabled()
-    {
-        return set_cons_cdr(cell, value);
-    }
-    if !cell.is_cons() {
-        return false;
-    }
-    let address = cell.bits() & !TAG_MASK;
-    let (lo, hi) = super::collection_reads::compiled_observation_window();
-    if lo <= address && address < hi && is_observed(cell.bits()) {
-        super::gc::TaggedHeap::record_compiled_collection_write(cell.bits());
-    } else {
-        // A refusal into the original BLV shim learns the same empty gap as
-        // the native cons guard. Its return does not rejoin a pre-store block,
-        // so unobserved BLV loops keep their original register allocation.
-        super::gc::neovm_jit_unobserved_collection_owner(cell.bits() as i64);
-    }
-    note_heap_slot_write(cell, HeapWriteKind::ConsCdr, 1, value);
-    // SAFETY: the Cons tag names a live validated BLV owner. The barrier has
-    // completed, and no callback or collection intervenes before this store.
-    unsafe { (*((cell.bits() & !TAG_MASK) as *mut ConsCell)).set_cdr(value) };
     true
 }
 
@@ -363,8 +317,6 @@ pub fn with_lisp_string_mut<R>(
     note_heap_write(value, HeapWriteKind::StringData);
     #[cfg(debug_assertions)]
     let _guard = HeapMutClosureGuard::enter();
-    // SAFETY: the owner is retained through this mutation, including unwind.
-    let _observation = unsafe { string_observed::StringStorageObservationGuard::new(ptr) };
     Some(f(unsafe { &mut (*ptr).data }))
 }
 
@@ -383,13 +335,7 @@ pub fn set_string_byte_same_char_count(value: TaggedValue, byte_pos: usize, byte
     };
     let ptr = ptr as *mut StringObj;
     // SAFETY: a live string object; the caller holds the only mutation.
-    unsafe {
-        (*ptr)
-            .data
-            .set_byte_same_char_count_with_owned_observer(byte_pos, byte, |storage| {
-                string_observed::observe_materialized_string_storage(ptr, storage);
-            });
-    }
+    unsafe { (*ptr).data.set_byte_same_char_count(byte_pos, byte) };
     true
 }
 

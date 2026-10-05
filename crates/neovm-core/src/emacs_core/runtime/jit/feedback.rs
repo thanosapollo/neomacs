@@ -17,9 +17,8 @@
 //!
 //! Every structure here holds only integers, `SymId`s and Rust-heap
 //! `Weak`s: none holds a Lisp `Value`, so the collector never traces
-//! feedback and feedback never dangles. Existing call/numeric accessors keep
-//! their contracts; the optional array-kind table explicitly supports several
-//! mutators joining immutable physical-kind bits with relaxed atomic ORs.
+//! feedback and feedback never dangles. Relaxed atomics throughout: the
+//! mutator is the only writer.
 //!
 //! # The call-target lattice
 //!
@@ -32,9 +31,6 @@
 //! (`jit_layout::BYTECODE_RUNTIME_WORD_OFFSET`). The site keeps a `Weak` of
 //! every source it saw, so no source address is reused while the site
 //! remembers it (no ABA).
-
-#[path = "feedback/arrays.rs"]
-pub(crate) mod arrays;
 
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};

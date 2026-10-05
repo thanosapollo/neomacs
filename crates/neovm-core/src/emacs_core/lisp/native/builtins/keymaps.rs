@@ -1083,6 +1083,8 @@ pub(crate) fn builtin_current_minor_mode_maps_impl(
 
 pub(crate) struct KeymapIterationPlan {
     pub(crate) bindings: Vec<(Value, Value)>,
+    // Unconsumed spine: composed components followed by the ordinary parent,
+    // the ordinary parent alone, or nil. Preserve its original cons identity.
     pub(crate) parent: Value,
 }
 
@@ -1109,7 +1111,9 @@ pub(crate) fn plan_keymap_iteration(keymap: Value) -> KeymapIterationPlan {
 
         let entry = cursor.cons_car();
         if is_list_keymap(&entry) {
-            parent = entry;
+            // Leave the entire component spine for the caller, not just its
+            // first map. An ordinary parent is handled by the cursor arm above.
+            parent = cursor;
             break;
         }
 
@@ -1208,10 +1212,10 @@ pub(super) fn builtin_map_keymap(eval: &mut super::eval::Context, args: Vec<Valu
     Ok(Value::NIL)
 }
 
-/// `(map-keymap-internal FUNCTION KEYMAP)` -> parent keymap or nil.
+/// `(map-keymap-internal FUNCTION KEYMAP)` -> unconsumed keymap spine or nil.
 ///
-/// Call FUNCTION for each binding in KEYMAP (not its parents).
-/// Returns the parent keymap if it has one.
+/// Call FUNCTION for each local binding, stopping before composed components
+/// or an ordinary parent. Return that exact remaining spine (or nil).
 pub(super) fn builtin_map_keymap_internal(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
@@ -1223,15 +1227,15 @@ pub(super) fn builtin_map_keymap_internal(
 }
 
 /// Core implementation: iterate over one level of keymap entries,
-/// calling `function(event, binding)` for each. Returns the parent
-/// keymap (or nil if none).
+/// calling `function(event, binding)` for each. Returns the unconsumed
+/// component/parent spine (or nil if none).
 fn map_keymap_internal_impl(
     eval: &mut super::eval::Context,
     function: Value,
     keymap: Value,
 ) -> EvalResult {
     let plan = plan_keymap_iteration(keymap);
-    // The planned (event, binding) pairs and the parent keymap live in a
+    // The planned (event, binding) pairs and the unconsumed spine live in a
     // Rust Vec while FUNCTION runs per entry — arbitrary Lisp that can GC.
     // Unrooted, the first callback's collection frees the remaining
     // entries and the iteration walks freed objects. GNU's map_keymap
@@ -1253,6 +1257,10 @@ fn map_keymap_internal_impl(
     result?;
     Ok(plan.parent)
 }
+
+#[cfg(test)]
+#[path = "tests/keymap_continuation.rs"]
+mod continuation_tests;
 
 /// (keymap-parent KEYMAP) -> keymap or nil
 pub(super) fn builtin_keymap_parent(

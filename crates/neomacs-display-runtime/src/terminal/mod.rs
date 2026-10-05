@@ -5,6 +5,7 @@
 
 pub mod colors;
 pub mod content;
+mod directory;
 pub mod view;
 
 pub use content::TerminalContent;

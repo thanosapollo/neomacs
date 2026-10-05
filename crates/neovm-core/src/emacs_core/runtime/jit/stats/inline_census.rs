@@ -79,7 +79,6 @@ struct Source {
 enum CompileOutcome {
     Pending,
     Compiled(LeafTier),
-    Opt,
     NotProfitable,
     NotCompilable,
 }
@@ -89,14 +88,13 @@ impl CompileOutcome {
         match self {
             Self::Pending => "pending",
             Self::Compiled(tier) => tier.name(),
-            Self::Opt => "opt",
             Self::NotProfitable => "not_profitable",
             Self::NotCompilable => "not_compilable",
         }
     }
 
     fn compiled(self) -> bool {
-        matches!(self, Self::Compiled(_) | Self::Opt)
+        matches!(self, Self::Compiled(_))
     }
 }
 
@@ -168,25 +166,6 @@ pub(crate) fn note_compile_outcome(
     let mut census = census().lock().unwrap_or_else(|p| p.into_inner());
     if let Some(source) = census.sources.get_mut(&f.source_id) {
         source.outcome = outcome;
-    }
-}
-
-/// Selected compiles retain their producer identity outside the physical
-/// main LeafTier domain. Non-Opt outcomes use the original helper verbatim.
-pub(crate) fn note_selected_compile_outcome(
-    f: &ByteCodeFunction,
-    result: &Result<CompiledLeaf, CompileError>,
-) {
-    if !matches!(result, Ok(leaf) if super::super::compile::opt_census::is_opt_leaf(leaf)) {
-        note_compile_outcome(f, result);
-        return;
-    }
-    if !enabled() {
-        return;
-    }
-    let mut census = census().lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(source) = census.sources.get_mut(&f.source_id) {
-        source.outcome = CompileOutcome::Opt;
     }
 }
 

@@ -15,7 +15,9 @@ use crate::emacs_core::Context;
 use crate::emacs_core::Value;
 use crate::emacs_core::error::{Flow, LispCondition, signal};
 use crate::emacs_core::xdisp::LineWrap;
-use crate::window::{DisplayRowSnapshot, FrameId, WindowDisplaySnapshot, WindowId};
+use crate::window::{
+    DisplayPointRole, DisplayRowSnapshot, FrameId, WindowDisplaySnapshot, WindowId,
+};
 
 /// Which of GNU's TWO screen-line engines answers a motion question.
 ///
@@ -303,7 +305,7 @@ fn row_goal_stops(
         // recorded the 45 probes it cost, and ledger 212 residual 1 named the
         // reading it could not make come out -- it was reading
         // `move_it_in_display_line_to`, and the deciding code is its CALLER.
-        .filter(move |point| admit_edge || point.role.is_position())
+        .filter(move |point| admit_edge || point.role == DisplayPointRole::Glyph)
         .map(|point| RowGoalStop {
             col: point.col,
             x: point.x,

@@ -6,9 +6,6 @@
 
 use std::fs;
 pub mod interaction;
-/// Account-free Telega frontend fixture: deterministic synthetic chats,
-/// locally generated avatars, and a `telega-server`-protocol mock process.
-pub mod telega_fixture;
 use std::io;
 use std::io::Read;
 

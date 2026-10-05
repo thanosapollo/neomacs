@@ -15,16 +15,6 @@ use crate::display_row::transition::DisplayRowTransitionContinuation;
 use crate::neovm_bridge::LayoutBufferView;
 use crate::types::WindowParams;
 
-/// Numeric result owned by one exclusive source walk; it carries no buffer or
-/// Lisp references and introduces no shared mutable state between mutators.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BufferSourceVisibleLoopOutcome {
-    Complete,
-    /// GNU move_it_to(ZV) reached a fresh buffer row before EOB strings.
-    MiniSourcePositionReached,
-    SyncHorizonExhausted,
-}
-
 impl<'rows, 'emit, 'surface> BufferSourceLoopMutableState<'rows, 'emit, 'surface> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_visible_steps<'request, B: LayoutBufferView>(
@@ -37,8 +27,7 @@ impl<'rows, 'emit, 'surface> BufferSourceLoopMutableState<'rows, 'emit, 'surface
         params: &'request WindowParams,
         active_face_state: &mut DisplayRowActiveFaceState,
         buffer: &B,
-    ) -> BufferSourceVisibleLoopOutcome
-    where
+    ) where
         'surface: 'request,
     {
         // P4.8(b): walk-scoped, because a refusal window is a claim about
@@ -140,54 +129,6 @@ impl<'rows, 'emit, 'surface> BufferSourceLoopMutableState<'rows, 'emit, 'surface
             }
         }
 
-        if loop_context.exhausted_sync_horizon(
-            self.progress.byte_idx(),
-            text.len(),
-            self.progress.charpos(),
-        ) {
-            // An artificial byte boundary is never a semantic EOB. Accept it
-            // only if the genuine row transition recorded exact sync first;
-            // otherwise retry before the EOB prelude or tail runs.
-            let synchronized =
-                self.source_render
-                    .output_render()
-                    .with_output_target_parts(|mut output, _, _| {
-                        output.builder().has_edit_sync_reached()
-                    });
-            return if synchronized {
-                BufferSourceVisibleLoopOutcome::Complete
-            } else {
-                BufferSourceVisibleLoopOutcome::SyncHorizonExhausted
-            };
-        }
-
-        // GNU move_it_to(ZV) tests Buffer/GET_FROM_BUFFER before fetching
-        // the next display element on a new row (xdisp.c:11096). A completed
-        // hard newline at ZV therefore stops before its empty-row prefix or
-        // EOB overlay strings. Presentation keeps both tails.
-        if params.mini_measurement == crate::types::MiniWindowMeasurement::ToEnd
-            && self.progress.byte_idx() == text.len()
-            && self.progress.charpos() == loop_context.accessible_end()
-            && text.last() == Some(&b'\n')
-            && self.row_source_start.covers(self.progress.charpos())
-            && !self
-                .row_source_start
-                .covers(self.progress.charpos().saturating_sub(1))
-            && self.source_render.output_rows().last().is_some_and(|row| {
-                row.end_source == neovm_core::window::DisplayRowEndSource::Buffer
-                    && row.end_buffer_pos
-                        == Some(neovm_core::buffer::LispCharPos1::new(
-                            self.progress.charpos(),
-                        ))
-            })
-            && self
-                .source_render
-                .output_render()
-                .with_output_target_parts(|_, _, eval| eval.gnu_redisplay_hooks_policy_enabled())
-        {
-            return BufferSourceVisibleLoopOutcome::MiniSourcePositionReached;
-        }
-
         // A trailing newline begins the next visual row at the same moment it
         // consumes the final source byte.  That row is still a real, visible
         // EOB row, but the byte-driven loop above cannot enter once more to
@@ -204,7 +145,6 @@ impl<'rows, 'emit, 'surface> BufferSourceLoopMutableState<'rows, 'emit, 'surface
             self.row_carryover.line_numbers.mark_beyond_accessible_end();
             self.render_row_prelude(row_prelude_context, params, active_face_state, buffer);
         }
-        BufferSourceVisibleLoopOutcome::Complete
     }
 
     pub(crate) fn render_row_prelude<B: LayoutBufferView>(

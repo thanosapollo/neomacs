@@ -1088,9 +1088,10 @@ impl ProcessWaitBackend {
         interest: ProcessWaitBackendInterest,
     ) -> Option<ProcessWaitEvents> {
         if let Some(ref poller) = self.poller {
-            if crate::emacs_core::os_signal::pending() {
-                return Some(ProcessWaitEvents::notification_wakeup());
-            }
+            // A pending wake must not make the ready descriptor set incomplete.
+            // Harvest level-ready read/write sources without blocking, even when
+            // the notifier (or signal) was published before entering this wait.
+            let signal_pending = crate::emacs_core::os_signal::pending();
             #[cfg(unix)]
             if let Some(fd) = self.signal_fd {
                 // Rearm one-shot interest. A signal between the pending check
@@ -1101,11 +1102,14 @@ impl ProcessWaitBackend {
                     .modify(source, polling::Event::readable(usize::MAX - 1))
                     .ok()?;
             }
-            if interest.wants_notifications()
-                && self.notification_pending.swap(false, Ordering::AcqRel)
-            {
-                return Some(ProcessWaitEvents::notification_wakeup());
-            }
+            let notification_pending = interest.wants_notifications()
+                && self.notification_pending.swap(false, Ordering::AcqRel);
+            let pending_wakeup = signal_pending || notification_pending;
+            let timeout = if pending_wakeup {
+                Duration::ZERO
+            } else {
+                timeout
+            };
 
             let deadline = Instant::now() + timeout;
             loop {
@@ -1118,8 +1122,11 @@ impl ProcessWaitBackend {
                 let mut events = polling::Events::new();
                 match poller.wait(&mut events, Some(wait_time)) {
                     Ok(_) => {
-                        let mut notification_wakeup = interest.wants_notifications()
+                        // Read the bit even when an earlier wake is retained:
+                        // short-circuiting here would leave a stale notification.
+                        let newly_notified = interest.wants_notifications()
                             && self.notification_pending.swap(false, Ordering::AcqRel);
+                        let mut notification_wakeup = pending_wakeup || newly_notified;
                         let mut ready_processes = Vec::new();
                         let mut writable_processes = Vec::new();
                         for event in events.iter() {
@@ -3892,6 +3899,33 @@ pub(super) enum ProcessOutputRead {
     NoSource,
 }
 
+/// Bound a returning live-stream read/filter loop, not a terminal status drain.
+/// Nonblocking reads alone do not yield when a producer keeps replenishing its
+/// source. Each stream gets its own allowance so stdout cannot starve stderr or
+/// the next process. The byte limit is a checkpoint after a read (at most one
+/// configured read chunk can overshoot it); the read count also bounds tiny
+/// reads and decoder-only deliveries. A single Lisp callback is not preempted.
+///
+/// Leave the source and decoder intact on exhaustion. Raw poll sources are
+/// level triggered; the shared wait also queries rustls-buffered plaintext
+/// before blocking, since an empty TCP socket does not imply drained TLS input.
+#[derive(Default)]
+pub(super) struct LiveProcessReadBudget {
+    reads: usize,
+    bytes: usize,
+}
+
+impl LiveProcessReadBudget {
+    const MAX_READS: usize = 16;
+    const MAX_BYTES: usize = 64 * 1024;
+
+    fn exhausted_after_read(&mut self, bytes_read: usize) -> bool {
+        self.reads += 1;
+        self.bytes = self.bytes.saturating_add(bytes_read);
+        self.reads >= Self::MAX_READS || self.bytes >= Self::MAX_BYTES
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProcessOutputDrainDisposition {
     Output,
@@ -6493,6 +6527,46 @@ impl ProcessManager {
             .wait_for_events(&self.processes, timeout, interest)
     }
 
+    /// Merge userspace TLS readiness before blocking. Only sources this service
+    /// request can consume shorten the wait; suspended/retired sources and a
+    /// different TargetOnly process must not create a permanent wake loop.
+    pub(crate) fn wait_for_backend_events_for_service(
+        &mut self,
+        timeout: Duration,
+        interest: ProcessWaitBackendInterest,
+        request: ProcessOutputServiceRequest,
+    ) -> Option<ProcessWaitEvents> {
+        let buffered = if interest.wants_processes() {
+            let candidates = request.live_processes(self.live_process_ids());
+            candidates
+                .into_iter()
+                .filter(|id| {
+                    self.processes.get_mut(id).is_some_and(|process| {
+                        process_has_readable_process_io(process)
+                            && process
+                                .live_io
+                                .tls_stream
+                                .as_mut()
+                                .is_some_and(|tls| tls.has_buffered_process_output())
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        // Still poll once to include other descriptors and notifications. An
+        // early return of only TLS IDs would starve other streams under load.
+        let timeout = if buffered.is_empty() {
+            timeout
+        } else {
+            Duration::ZERO
+        };
+        let mut events = self.wait_for_backend_events(timeout, interest)?;
+        events.ready_processes.extend(buffered);
+        events.ready_processes = dedupe_process_ids(events.ready_processes);
+        Some(events)
+    }
+
     /// Remove only the filesystem node captured at bind, not a replacement
     /// left by hooks. Ordinary delete-process semantics remain unchanged.
     #[cfg(unix)]
@@ -8538,6 +8612,7 @@ impl super::super::eval::Context {
         &mut self,
         stderr_id: ProcessId,
         target_process: Option<ProcessId>,
+        mut live_budget: Option<LiveProcessReadBudget>,
     ) -> Result<ProcessOutputServiceOutcome, Flow> {
         let mut outcome = ProcessOutputServiceOutcome::default();
         let is_target = target_process.is_none_or(|target| target == stderr_id);
@@ -8556,6 +8631,13 @@ impl super::super::eval::Context {
                             .map(|p| p.filter)
                             .unwrap_or(Value::NIL);
                         self.run_process_filter_callback(stderr_id, filter, &data)?;
+                    }
+                    if (bytes_read == 0 && data.is_empty())
+                        || live_budget
+                            .as_mut()
+                            .is_some_and(|budget| budget.exhausted_after_read(bytes_read))
+                    {
+                        return Ok(outcome);
                     }
                 }
                 ProcessOutputRead::Eof | ProcessOutputRead::NoSource => {
@@ -8579,6 +8661,7 @@ impl super::super::eval::Context {
         let mut outcome = ProcessOutputServiceOutcome::default();
         let mut saw_output = false;
         let is_target = target_process == Some(pid);
+        let mut live_budget = LiveProcessReadBudget::default();
 
         loop {
             let sink = self.process_output_sink(pid);
@@ -8595,6 +8678,16 @@ impl super::super::eval::Context {
                             .map(|p| p.filter)
                             .unwrap_or(Value::NIL);
                         self.run_process_filter_callback(pid, filter, &data)?;
+                    }
+                    if (bytes_read == 0 && data.is_empty())
+                        || live_budget.exhausted_after_read(bytes_read)
+                    {
+                        let disposition = if saw_output {
+                            ProcessOutputDrainDisposition::Output
+                        } else {
+                            ProcessOutputDrainDisposition::Blocked
+                        };
+                        return Ok((outcome, disposition));
                     }
                 }
                 ProcessOutputRead::WouldBlock => {
@@ -9093,6 +9186,7 @@ impl super::super::eval::Context {
             let mut saw_output = false;
             let mut saw_eof_after_output = false;
             let mut handled_terminal_eof = false;
+            let mut live_budget = LiveProcessReadBudget::default();
             loop {
                 match read_result {
                     ProcessOutputRead::Data { data, bytes_read } => {
@@ -9108,7 +9202,9 @@ impl super::super::eval::Context {
                                 .unwrap_or(Value::NIL);
                             self.run_process_filter_callback(pid, filter, &data)?;
                         }
-                        if bytes_read == 0 && data.is_empty() {
+                        if (bytes_read == 0 && data.is_empty())
+                            || live_budget.exhausted_after_read(bytes_read)
+                        {
                             break;
                         }
                     }
@@ -9207,7 +9303,9 @@ impl super::super::eval::Context {
                 // GNU's wait loop does a no-wait follow-up pass after reading
                 // target output (`wait = MINIMUM`), which vacuums up immediately
                 // available bytes and EOF/status transitions before returning.
-                // Keep this non-blocking: stop as soon as the source would block.
+                // Keep this non-blocking and bounded even while a live producer
+                // replenishes it. Return through the shared wait scheduler so
+                // newly due timers/input and the other streams can progress.
                 read_result = {
                     let sink = self.process_output_sink(pid);
                     self.read_process_output_recording_coding(pid, sink)?
@@ -9246,6 +9344,7 @@ impl super::super::eval::Context {
                     let stderr_outcome = self.drain_associated_stderr_output_without_notifying(
                         stderr_id,
                         target_process,
+                        Some(LiveProcessReadBudget::default()),
                     )?;
                     outcome.absorb(stderr_outcome);
                 }
@@ -9330,10 +9429,10 @@ impl super::super::eval::Context {
         Ok(outcome)
     }
 
-    /// GNU `status_notify` drains the terminated process's complete output
-    /// topology before publishing its status and running its sentinel.  Return
-    /// the resulting wait activity so output completes only a wait whose
-    /// target admits that stream; running the sentinel merely services it.
+    /// GNU `status_notify` publishes changed status and runs its sentinel.
+    /// Terminal transitions drain complete output first; nonterminal returning
+    /// streams use live budgets. Output completes only a wait admitting that
+    /// stream, while the notification itself merely services the process.
     pub(super) fn run_process_status_notification(
         &mut self,
         pid: ProcessId,
@@ -9349,9 +9448,19 @@ impl super::super::eval::Context {
         // exits, so it must not depend on some later edit to repaint.
         self.mark_chrome_dirty_all();
 
-        // Drain the owner's primary stream before exposing its terminal
-        // status.  In GNU this happens while `status_notify` walks every
-        // process whose tick changed.
+        // Continued/stop notifications also enter this method. Only a genuine
+        // terminal transition owns a complete output-before-sentinel drain.
+        // Match settlement's pending-status precedence without publishing it.
+        let terminal_status = |proc: &Process| {
+            let status = if proc.pending_status.is_nil() {
+                &proc.status
+            } else {
+                &proc.pending_status
+            };
+            process_status_is_terminal_for_notify(status)
+        };
+        let terminal_drain = self.processes.get(pid).is_some_and(terminal_status);
+        let mut live_budget = (!terminal_drain).then(LiveProcessReadBudget::default);
         let mut saw_owner_output = false;
         while let ProcessOutputRead::Data { data, bytes_read } = {
             let sink = self.process_output_sink(pid);
@@ -9369,6 +9478,13 @@ impl super::super::eval::Context {
                     .unwrap_or(Value::NIL);
                 self.run_process_filter_callback(pid, filter, &data)?;
             }
+            if (bytes_read == 0 && data.is_empty())
+                || live_budget
+                    .as_mut()
+                    .is_some_and(|budget| budget.exhausted_after_read(bytes_read))
+            {
+                break;
+            }
         }
         if let Some(proc) = self.processes.get_mut(pid)
             && process_should_defer_explicit_coding_status_after_output(proc, saw_owner_output)
@@ -9378,20 +9494,29 @@ impl super::super::eval::Context {
         }
 
         // A `:stderr` destination is represented by an implicit pipe process,
-        // but it is still part of this child's output topology.  The child has
-        // exited, so every byte it wrote is now readable before EOF.  Drain
-        // those bytes through the stderr process's own filter before the main
-        // sentinel runs; asynchronous clients commonly inspect that buffer in
-        // the sentinel.  Keep wait accounting attached to the stderr process,
+        // but it is still part of this child's output topology. On terminal
+        // transitions deliver every byte through its own filter before the
+        // owner's sentinel; live status notifications give it a separate
+        // returning-read allowance. Keep wait accounting attached to stderr,
         // as GNU does when WAIT_PROC names only the owner.
         let stderr_id = self
             .processes
             .get(pid)
             .and_then(|proc| process_value_to_id(&proc.stderrproc));
         if let Some(stderr_id) = stderr_id.filter(|id| self.processes.get(*id).is_some()) {
-            outcome.absorb(
-                self.drain_associated_stderr_output_without_notifying(stderr_id, target_process)?,
-            );
+            outcome.absorb(self.drain_associated_stderr_output_without_notifying(
+                stderr_id,
+                target_process,
+                (!terminal_drain).then(LiveProcessReadBudget::default),
+            )?);
+        }
+
+        // Filters can stage a terminal status or delete this process. A live
+        // visit may have left unread bytes in either stream; keep a newly
+        // terminal notification pending for its complete drain on the next
+        // visit rather than retiring it with a truncated sentinel observation.
+        if !terminal_drain && self.processes.get(pid).is_some_and(terminal_status) {
+            return Ok(outcome);
         }
 
         // GNU `status_notify` settles the status, builds the message and takes

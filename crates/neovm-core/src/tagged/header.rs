@@ -206,13 +206,8 @@ pub struct GcHeader {
     /// world-stopped promotion, like `tenured`, so the GC thread reads it
     /// without a race.
     pub generation: GenBits,
-    /// Byte 7: a sticky collection-read observation, independent of all GC
-    /// marks and remembered state. Mutators publish observations with Release
-    /// and compiled writers query with Acquire. It remains set while this
-    /// object lives; destruction/reinitialization clears it before reuse.
-    /// Shared marks do not make the existing mutator-local certificates
-    /// coherent with another mutator's concurrent collection mutations.
-    pub(crate) collection_observed: AtomicU8,
+    /// Byte 7, reserved for P3.2 L1's slot class (P3.0 §3.1); always 0.
+    reserved_class: u8,
     /// Intrusive linked list of all GC-managed objects (for sweep).
     pub next: *mut GcHeader,
 }
@@ -337,13 +332,6 @@ pub(crate) enum RememberedState {
     Logged = 1,
 }
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CollectionObservedState {
-    Unobserved = 0,
-    Observed = 1,
-}
-
 // The header byte map (P3.0 §3.1; owner P3.1 C2.1/C2.2). P3.2 fills the
 // reserved bytes; compiled code bakes byte 2 (`GC_HEADER_TENURED_OFFSET`,
 // with byte 3 as one `u16`).
@@ -354,17 +342,13 @@ const _: () = assert!(std::mem::offset_of!(GcHeader, remembered) == 3);
 const _: () = assert!(std::mem::offset_of!(GcHeader, reserved_type_tag) == 4);
 const _: () = assert!(std::mem::offset_of!(GcHeader, flags) == 5);
 const _: () = assert!(std::mem::offset_of!(GcHeader, generation) == 6);
-const _: () = assert!(std::mem::offset_of!(GcHeader, collection_observed) == 7);
+const _: () = assert!(std::mem::offset_of!(GcHeader, reserved_class) == 7);
 const _: () = assert!(std::mem::offset_of!(GcHeader, next) == 8);
 
 /// `tenured` and `remembered` are adjacent bytes: compiled code tests both
 /// with one 16-bit load (see [`GcHeader::NEEDS_REMEMBERING_U16`]).
 #[cfg_attr(not(feature = "jit"), allow(dead_code))]
 pub(crate) const GC_HEADER_TENURED_OFFSET: usize = std::mem::offset_of!(GcHeader, tenured);
-/// The sticky collection observation byte used by compiled string stores.
-#[cfg_attr(not(feature = "jit"), allow(dead_code))]
-pub(crate) const GC_HEADER_COLLECTION_OBSERVED_OFFSET: usize =
-    std::mem::offset_of!(GcHeader, collection_observed);
 const _: () = assert!(std::mem::offset_of!(GcHeader, remembered) == GC_HEADER_TENURED_OFFSET + 1);
 const _: () = assert!(std::mem::size_of::<GcHeader>() == 16);
 
@@ -395,42 +379,8 @@ impl GcHeader {
             reserved_type_tag: 0,
             flags: HeaderFlags::NONE,
             generation: GenBits::NONE,
-            collection_observed: AtomicU8::new(CollectionObservedState::Unobserved as u8),
+            reserved_class: 0,
             next: std::ptr::null_mut(),
-        }
-    }
-
-    /// Publish this object's sticky observation before recording its read.
-    #[inline]
-    pub(crate) fn mark_collection_observed(&self) -> bool {
-        if self.collection_observed() {
-            return false;
-        }
-        self.collection_observed
-            .fetch_or(CollectionObservedState::Observed as u8, Ordering::Release)
-            == CollectionObservedState::Unobserved as u8
-    }
-
-    #[inline]
-    pub(crate) fn collection_observed(&self) -> bool {
-        self.collection_observed.load(Ordering::Acquire)
-            != CollectionObservedState::Unobserved as u8
-    }
-
-    /// Clear a dying object's mark under collector/mutator exclusion. No
-    /// observation or collection write to this object may still be in flight.
-    #[inline]
-    pub(crate) fn clear_collection_observed(&self) {
-        let cleared = self.collection_observed()
-            && crate::tagged::gc::clear_noncons_collection_observed_metadata(
-                self as *const Self as usize,
-            );
-        self.collection_observed
-            .store(CollectionObservedState::Unobserved as u8, Ordering::Release);
-        if cleared {
-            // Clear both representations before publishing reclamation to
-            // other mutators' recent-read probes and before freeing/reuse.
-            crate::tagged::gc::advance_collection_observation_epoch();
         }
     }
 

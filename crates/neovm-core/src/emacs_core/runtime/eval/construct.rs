@@ -86,9 +86,6 @@ impl Context {
         ev.input_rx = None;
         ev.eval_task_rx = None;
         ev.redisplay_fn = None;
-        ev.mode_line_display_flow = None;
-        ev.redisplay_prepare_fn = None;
-        ev.gnu_redisplay_hooks = redisplay_hooks::RedisplayHookOwnership::initial();
         ev.display_idle_maintenance_fn = None;
         ev.scroll_preview_fn = None;
         ev.frame_snapshot_fn = None;
@@ -100,9 +97,6 @@ impl Context {
         ev.face_change_count = 0;
         ev.display_var_change_count = 0;
         ev.redisplay_generation = 0;
-        ev.body_redisplay_all = 0;
-        ev.body_redisplay_by_window.clear();
-        ev.body_redisplay_by_buffer.clear();
         ev.menu_bar_rebuild_generation = 0;
         ev.media_generation = 0;
         ev.last_redisplay_signature = None;
@@ -2252,8 +2246,6 @@ impl Context {
             eval_task_rx: None,
             quit_requested: QuitRequest::new(),
             redisplay_fn: None,
-            mode_line_display_flow: None,
-            redisplay_prepare_fn: None,
             font_shape_fn: None,
             gstring_shape_cache: HashMap::new(),
             display_idle_maintenance_fn: None,
@@ -2263,6 +2255,7 @@ impl Context {
             scroll_goal: None,
             display_host: None,
             tty_frame_host_factory: None,
+            gui_display_initializer: None,
             visual_config: neomacs_display_protocol::VisualConfig::default(),
             pending_menu_bar_popup_anchor: None,
             coding_systems: CodingSystemManager::new(),
@@ -2274,12 +2267,8 @@ impl Context {
             display_var_change_count: 0,
             input_progress: Default::default(),
             redisplay_generation: 0,
-            body_redisplay_all: 0,
-            body_redisplay_by_window: FxHashMap::default(),
-            body_redisplay_by_buffer: FxHashMap::default(),
             menu_bar_rebuild_generation: 0,
             chrome_dirty: Default::default(),
-            gnu_redisplay_hooks: redisplay_hooks::RedisplayHookOwnership::initial(),
             context_instance_id: next_context_instance_id(),
             media_generation: 0,
             last_redisplay_signature: None,
@@ -2316,7 +2305,7 @@ impl Context {
                 crate::emacs_core::bytecode::vm::SymbolByteCodeCallCache::new(),
             interpreter_stacks: crate::emacs_core::bytecode::vm::InterpreterStackPool::new(),
             jit_bind_stack: Vec::new(),
-            _reserved_opcode_epoch: std::cell::Cell::new(u64::MAX),
+            aset_fast_path_epoch: std::cell::Cell::new(u64::MAX),
             apply_fast_path_epoch: std::cell::Cell::new(u64::MAX),
             named_call_cache: FxHashMap::with_capacity_and_hasher(
                 NAMED_CALL_CACHE_CAPACITY,

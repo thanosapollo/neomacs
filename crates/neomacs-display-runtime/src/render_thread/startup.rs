@@ -1,5 +1,9 @@
 //! Native event-loop startup before font-owned window geometry is available.
 
+#[cfg(test)]
+#[path = "startup/tests/first_frame.rs"]
+mod first_frame_tests;
+
 use super::RenderApp;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use std::{cell::RefCell, rc::Rc};
@@ -102,8 +106,11 @@ pub(super) enum InitialWindow {
     },
 }
 
-enum Phase<F> {
-    Preparing { initial: InitialWindow, create: F },
+enum Phase {
+    Preparing {
+        initial: InitialWindow,
+        app: Box<RenderApp>,
+    },
     Running(Box<RenderApp>),
     Stopped,
 }
@@ -118,15 +125,38 @@ enum Outcome {
     GpuFailed(String),
 }
 
-struct StartingApp<F> {
-    phase: Phase<F>,
+pub(super) struct StartingApp {
+    phase: Phase,
     can_create_surfaces: bool,
     outcome: Rc<RefCell<Outcome>>,
     evaluator: Option<Receiver<Result<InitialWindowSize, String>>>,
-    gpu_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    retained: bool,
 }
 
-impl<F: FnOnce(InitialWindowSize) -> RenderApp> ApplicationHandler for StartingApp<F> {
+impl StartingApp {
+    pub(super) fn retained() -> Self {
+        Self {
+            phase: Phase::Stopped,
+            can_create_surfaces: false,
+            outcome: Default::default(),
+            evaluator: None,
+            retained: true,
+        }
+    }
+    pub(super) fn install(&mut self, receiver: InitialWindowReceiver, app: RenderApp) {
+        self.retire();
+        self.phase = Phase::Preparing {
+            initial: InitialWindow::Waiting(receiver),
+            app: Box::new(app),
+        };
+    }
+    pub(super) fn retire(&mut self) {
+        self.evaluator = None;
+        self.phase = Phase::Stopped;
+    }
+}
+
+impl ApplicationHandler for StartingApp {
     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         self.can_create_surfaces = true;
         if let Phase::Running(app) = &mut self.phase {
@@ -158,12 +188,23 @@ impl<F: FnOnce(InitialWindowSize) -> RenderApp> ApplicationHandler for StartingA
     }
 
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
-        if let Phase::Preparing { initial, .. } = &mut self.phase {
+        if let Phase::Preparing { initial, app } = &mut self.phase {
+            // Consume CPU-owned configuration and frame identity even while no
+            // initial geometry exists. The bounded producer cannot deadlock the
+            // evaluator that must eventually publish that geometry.
+            if app.process_startup_commands() {
+                *self.outcome.borrow_mut() = Outcome::EvaluatorExited;
+                self.phase = Phase::Stopped;
+                if !self.retained {
+                    event_loop.exit();
+                }
+                return;
+            }
             if let InitialWindow::Waiting(receiver) = initial {
                 let result = match receiver.0.try_recv() {
                     Ok(result) => result,
                     Err(TryRecvError::Empty) => {
-                        event_loop.set_control_flow(ControlFlow::Wait);
+                        event_loop.set_control_flow(app.startup_control_flow());
                         return;
                     }
                     Err(TryRecvError::Disconnected) => {
@@ -180,7 +221,9 @@ impl<F: FnOnce(InitialWindowSize) -> RenderApp> ApplicationHandler for StartingA
                     Err(error) => {
                         *self.outcome.borrow_mut() = Outcome::Failed(error);
                         self.phase = Phase::Stopped;
-                        event_loop.exit();
+                        if !self.retained {
+                            event_loop.exit();
+                        }
                         return;
                     }
                 }
@@ -195,20 +238,39 @@ impl<F: FnOnce(InitialWindowSize) -> RenderApp> ApplicationHandler for StartingA
                 // 0) from panic. Completion after readiness is not itself an error.
                 *self.outcome.borrow_mut() = Outcome::EvaluatorExited;
                 self.phase = Phase::Stopped;
-                event_loop.exit();
+                if !self.retained {
+                    event_loop.exit();
+                }
                 return;
             }
-            if !self.can_create_surfaces {
-                event_loop.set_control_flow(ControlFlow::Wait);
+            if !self.can_create_surfaces
+                || (app.comms.keep_alive_without_frames
+                    && app.frame_windows.primary_window().is_none())
+            {
+                // Geometry can precede consumption (or outlive revocation) of
+                // RealizeFrame. Keep the healthy root idle until a live frame
+                // transaction has supplied the primary, including at staging pressure.
+                event_loop.set_control_flow(app.startup_control_flow());
                 return;
             }
             if let Phase::Preparing {
                 initial: InitialWindow::Ready { size, evaluator },
-                create,
+                mut app,
             } = std::mem::replace(&mut self.phase, Phase::Stopped)
             {
-                let mut app = Box::new(create(size));
-                app.gpu_startup_cancelled = self.gpu_cancelled.clone();
+                if !app.comms.keep_alive_without_frames {
+                    app.pending_content_size = size;
+                    if let Some(primary) = app.frame_windows.primary_window_mut()
+                        && let super::frame_windows::FrameLifecycle::Pending {
+                            width, height, ..
+                        } = &mut primary.lifecycle
+                    {
+                        *width = size.width;
+                        *height = size.height;
+                    }
+                }
+                // Deferred primary dimensions belong to the consumed transaction,
+                // never to a previous canceled frame's independent geometry reply.
                 app.can_create_surfaces(event_loop);
                 self.evaluator = evaluator;
                 self.phase = Phase::Running(app);
@@ -219,17 +281,48 @@ impl<F: FnOnce(InitialWindowSize) -> RenderApp> ApplicationHandler for StartingA
         }) {
             *self.outcome.borrow_mut() = Outcome::EvaluatorExited;
             self.phase = Phase::Stopped;
-            event_loop.exit();
+            if !self.retained {
+                event_loop.exit();
+            }
             return;
         }
         if let Phase::Running(app) = &mut self.phase {
-            app.about_to_wait(event_loop);
+            if app.comms.keep_alive_without_frames && self.can_create_surfaces && app.gpu.is_none()
+            {
+                if app.process_startup_commands() {
+                    *self.outcome.borrow_mut() = Outcome::EvaluatorExited;
+                    self.phase = Phase::Stopped;
+                    if !self.retained {
+                        event_loop.exit();
+                    }
+                    return;
+                }
+                if app.startup_error.is_none()
+                    && app.gpu_startup.is_none()
+                    && app.frame_windows.primary_window().is_some()
+                {
+                    app.can_create_surfaces(event_loop);
+                }
+            }
+            if app.startup_error.is_none() {
+                app.about_to_wait(event_loop);
+            }
             if let Some(error) = app.startup_error.take() {
-                *self.outcome.borrow_mut() = Outcome::GpuFailed(error);
-                self.phase = Phase::Stopped;
-                event_loop.exit();
+                if self.retained {
+                    app.cancel_gpu_startup();
+                    let frame = app.frame_windows.primary_event_frame_id();
+                    app.frame_windows.reject_ready(frame, &error);
+                    app.frame_windows.take_primary_window();
+                    app.frame_windows.clear_primary_mapping();
+                } else {
+                    *self.outcome.borrow_mut() = Outcome::GpuFailed(error);
+                    self.phase = Phase::Stopped;
+                    event_loop.exit();
+                }
             } else if app.gpu.is_some() {
-                self.evaluator = None;
+                if !app.comms.keep_alive_without_frames {
+                    self.evaluator = None;
+                }
                 *self.outcome.borrow_mut() = Outcome::Running;
             }
         }
@@ -248,12 +341,21 @@ pub(super) fn run(
     event_loop.set_control_flow(ControlFlow::Wait);
     let outcome = Rc::new(RefCell::new(Outcome::Preparing));
     let gpu_cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let size = match &initial {
+        InitialWindow::Ready { size, .. } => *size,
+        InitialWindow::Waiting(_) => InitialWindowSize {
+            width: 0,
+            height: 0,
+        },
+    };
+    let mut app = Box::new(create(size));
+    app.gpu_startup_cancelled = gpu_cancelled.clone();
     let result = event_loop.run_app(StartingApp {
-        phase: Phase::Preparing { initial, create },
+        phase: Phase::Preparing { initial, app },
         can_create_surfaces: false,
         outcome: Rc::clone(&outcome),
         evaluator: None,
-        gpu_cancelled: gpu_cancelled.clone(),
+        retained: false,
     });
     let successful_exit = || {
         if gpu_cancelled.load(std::sync::atomic::Ordering::Relaxed) {

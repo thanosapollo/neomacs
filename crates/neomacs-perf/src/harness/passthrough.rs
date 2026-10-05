@@ -3,25 +3,6 @@
 //! harness engine so new runtime knobs do not grow `harness.rs`.
 
 const BENCHMARK_PASSTHROUGH_ENVIRONMENT: &[&str] = &[
-    // Independent redisplay controls; preserve upstream policy forwarding.
-    "NEOMACS_PERF_SUSTAINED_VISIBLE",
-    "NEOMACS_PERF_SUSTAINED_EDIT_CASE",
-    "NEOMACS_EDIT_SYNC_STILL",
-    "NEOMACS_EDIT_SYNC_LAZY_PROOF",
-    "NEOMACS_RETAINED_FACE_GATHER",
-    "NEOMACS_LAYOUT_PROPERTY_KEYS_INLINE",
-    "NEOMACS_EDIT_SYNC_PROVE_FIRST",
-    "NEOMACS_EDIT_SYNC_DENSE_INDEX",
-    "NEOMACS_EDIT_SYNC_FONTIFY_COVERAGE",
-    "NEOMACS_EDIT_SYNC_SHIFT_SKIP",
-    "NEOMACS_EDIT_SYNC_SOURCE_BUDGET",
-    "NEOMACS_MODE_LINE_PROP_BORROW",
-    "NEOMACS_MODE_LINE_PROP_SLICE",
-    "NEOMACS_MODE_LINE_PLAIN_FIELD",
-    "NEOMACS_MODE_LINE_NUMERIC_PADDING",
-    "NEOMACS_REDISPLAY_GNU_HOOKS",
-    "NEOMACS_WATCHED_PROP_DEMAND",
-    "NEOMACS_POSN_OBJECT_EXTENT",
     "PATH",
     "LD_LIBRARY_PATH",
     "DYLD_LIBRARY_PATH",
@@ -56,9 +37,6 @@ const BENCHMARK_PASSTHROUGH_ENVIRONMENT: &[&str] = &[
     // Percentiles cannot say whether a slow keystroke was computing or
     // waiting, and those call for opposite work.
     "NEOMACS_PERF_LATENCY_TRACE_FILE",
-    // Request-owned GC sidecar; the controller still owns the gate port.
-    // Capture this exact path in input provenance when diagnostics are enabled.
-    "NEOMACS_PERF_GC_WINDOW_FILE",
     // GC pacing sweep: the live-proportional term as a percentage of the live
     // heap. 0 leaves GNU's `gc-cons-threshold`/`gc-cons-percentage` contract
     // exactly; the built-in default is 50.
@@ -70,7 +48,7 @@ const BENCHMARK_PASSTHROUGH_ENVIRONMENT: &[&str] = &[
     // P3.5 redisplay knobs (same-binary A/B; explicit off retains baseline arms).
     // Buffer-text snapshots: `copy` or `share` (default, copy-on-write).
     "NEOMACS_TEXT_SNAPSHOT",
-    // TTY silent frames: `off` or `on` (default).
+    // TTY silent frames: `off` (default) or `on`.
     "NEOMACS_TTY_SILENT",
     // TTY damage-proportional repaint: `off`, `verify` or `on` (default), and
     // the per-frame verify report.
@@ -97,10 +75,10 @@ const BENCHMARK_PASSTHROUGH_ENVIRONMENT: &[&str] = &[
     // The visible automatic-composition scan's ASCII fast path and memo: `on`.
     "NEOMACS_COMPOSITION_FASTPATH",
     // P3.5 U3.7. An edit frame's mode line by GNU's optimization-1 guard:
-    // `legacy` or `gnu` (default); on/1/true/yes select GNU.
+    // `legacy` (default) or `gnu`.
     "NEOMACS_MODE_LINE_GATE",
     // Edit replays synchronize with the rows below the edit (GNU
-    // try_window_id): `prove` or `sync` (default); on/1/true/yes select Sync.
+    // try_window_id): `prove` (default) or `sync`.
     "NEOMACS_LAYOUT_EDIT_SYNC",
     // A window whose start moved back reuses its old rows: `on`.
     "NEOMACS_LAYOUT_SCROLL_BACK",
@@ -132,7 +110,6 @@ const BENCHMARK_PASSTHROUGH_ENVIRONMENT: &[&str] = &[
     // Folded two-character suffix search and GNU sort predicate capture.
     "NEOVM_REGEX_SUFFIX_LITERAL",
     "NEOVM_SORT_CAPTURE",
-    "NEOVM_CALLBACK_CACHE",
     // P4.1 Stage 0 cconv memo (`off`/`stats`/`on`/`verify`) and the native
     // no-lexvars closure path (`on`).
     "NEOVM_CCONV_MEMO",
@@ -168,7 +145,6 @@ const BENCHMARK_PASSTHROUGH_ENVIRONMENT: &[&str] = &[
     "NEOVM_ASSOC_RESOLVED",
     "NEOVM_HASH_TEST_PARITY",
     "NEOVM_COMPARE_STRINGS_PARITY",
-    "NEOVM_MODE_LINE_FLOW",
     "NEOVM_MAPHASH_BYTECODE",
     "NEOVM_VM_STACK_RETURN",
 ];

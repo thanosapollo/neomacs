@@ -327,8 +327,6 @@ pub(crate) struct LeafRow {
     pub(crate) regalloc: RegallocChoice,
     pub(crate) clif_insts: u32,
     pub(crate) obs: LeafObsSnapshot,
-    /// Immutable compiler census, copied only while collecting exit rows.
-    pub(crate) opt: super::compile::opt_census::OptStats,
 }
 
 impl LeafRow {
@@ -341,11 +339,6 @@ impl LeafRow {
             regalloc: leaf.regalloc,
             clif_insts: leaf.clif_insts,
             obs: leaf.obs.snapshot(),
-            opt: if super::compile::jit_opt_mode() == super::compile::OptMode::Opt {
-                super::compile::opt_census::snapshot_leaf(leaf)
-            } else {
-                super::compile::opt_census::OptStats::default()
-            },
         }
     }
 }
@@ -651,12 +644,7 @@ fn compile_osr_leaf_timed(
     ));
     // Same feedback the tier-up compile sees: without it every Float site
     // read FixnumOnly and an OSR'd float loop deopted straight back.
-    let _numeric = if super::compile::array_snapshot::selected() {
-        super::compile::snapshot::publish_numeric_feedback_with_arrays(func)
-    } else {
-        let _numeric = super::compile::publish_numeric_feedback(func);
-        super::compile::snapshot::FrontFeedbackScope::Main { _scope: _numeric }
-    };
+    let _numeric = super::compile::publish_numeric_feedback(func);
     // Static inlining also applies to a running loop. The transfer keeps
     // the original header as its cache key and observation pc, while native
     // lowering enters its corresponding instruction in the fused body.
@@ -719,14 +707,7 @@ fn compile_osr_leaf_timed(
         .then(|| stats::perf_map::LeafLabelScope::enter(id, name_hint, func));
     drop(gate_phase);
     let lower_phase = stats::enter_phase(stats::CompilePhase::Lower);
-    let opt_params = (super::compile::jit_opt_mode() == super::compile::OptMode::Opt
-        && func.jit_runtime().reopt_level() < ReoptLevel::BaselineOnly)
-        .then_some(super::opt::ir::ParamShape {
-            required: func.params.required.len(),
-            optional: func.params.optional.len(),
-            has_rest: func.params.rest.is_some(),
-        });
-    let mut leaf = match super::compile::opt_backend::lower_best(
+    let mut leaf = match super::compile::lower_leaf_full_osr(
         ops,
         constants,
         native_arity,
@@ -734,7 +715,6 @@ fn compile_osr_leaf_timed(
         Some(obarray),
         Some(fused_osr_pc),
         func.jit_runtime().patched_prefix(),
-        opt_params,
     ) {
         Ok(leaf) => leaf,
         Err(e) => {
@@ -2249,15 +2229,6 @@ fn request_upgrade(
     // Recheck admission now that the compile will actually start. A Due
     // leaf holds no reservation, so intervening work may have filled the ledger.
     if !super::tier2::reserve_compile(&old) {
-        // An opt request can become unaffordable between Due admission and
-        // this compile seam. Retain the original T1/history and close Use/HOF
-        // until a fresh affordable sample window; every legacy branch below
-        // remains main's admission/re-arm policy.
-        if super::compile::jit_opt_mode() == super::compile::OptMode::Opt
-            && super::tier2::wait_for_opt_budget(&old, kind)
-        {
-            return old;
-        }
         if old.is_aot_backed() {
             super::tier2::upgrade_deferred(rt, &old);
         } else {

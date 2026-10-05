@@ -7,6 +7,39 @@ use winit::dpi::PhysicalPosition;
 use winit::window::UserAttentionType;
 
 impl RenderApp {
+    pub(super) fn retire_cancelled_frames(&mut self) {
+        let cancelled: Vec<_> = self
+            .frame_leases
+            .iter()
+            .filter_map(|(frame, live)| {
+                (!live.load(std::sync::atomic::Ordering::Acquire)).then_some(*frame)
+            })
+            .collect();
+        for frame in cancelled {
+            self.frame_leases.remove(&frame);
+            if let Some(waits) = &self.comms.native_window_waits {
+                waits.remove(frame);
+            }
+            self.handle_window(WindowCommand::DestroyWindow {
+                frame: crate::thread_comm::FrameRef::Frame(frame),
+            });
+        }
+    }
+
+    pub(super) fn refresh_frame_opacity(&mut self) {
+        // Never hold this CPU lock across GPU work or callback-capable code.
+        let controls = self
+            .comms
+            .frame_opacity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for window in self.frame_windows.windows.values_mut() {
+            if window.render.apply_frame_opacity(&controls) {
+                window.request_redraw();
+            }
+        }
+    }
+
     fn remove_pending_child_subtree(&mut self, frame_id: u64) {
         let mut subtree = std::collections::HashSet::from([frame_id]);
         loop {
@@ -31,6 +64,7 @@ impl RenderApp {
 
     pub(super) fn handle_window(&mut self, cmd: WindowCommand) {
         match cmd {
+            WindowCommand::RefreshFrameOpacity => self.refresh_frame_opacity(),
             WindowCommand::ScrollPreview(intent) => {
                 if let Some(state) = self.frame_windows.get_mut(intent.frame)
                     && matches!(
@@ -247,6 +281,57 @@ impl RenderApp {
                     window.request_user_attention(attention);
                 }
             }
+            WindowCommand::RealizeFrame {
+                frame,
+                width,
+                height,
+                title,
+                geometry_hints,
+                fullscreen,
+                visual,
+                adopt_primary,
+                reply,
+                live,
+                deadline,
+            } => {
+                if !live.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                let id = frame.raw_id();
+                if let Some(waits) = &self.comms.native_window_waits {
+                    if waits.terminal() {
+                        let _ = reply.send(Err(
+                            "Native connection closed during frame preparation".into(),
+                        ));
+                        return;
+                    }
+                    waits.register(id, live.clone(), deadline);
+                }
+                self.frame_leases.insert(id, live);
+                if let Some(visual) = visual {
+                    self.handle_config(crate::thread_comm::ConfigCommand::SetVisualConfig(visual));
+                }
+                if adopt_primary && self.frame_windows.primary_window().is_some() {
+                    self.handle_window(WindowCommand::SetWindowTitle { title });
+                    self.handle_window(WindowCommand::SetFrameGeometryHints {
+                        frame: crate::thread_comm::FrameRef::Primary,
+                        geometry_hints,
+                    });
+                    self.handle_window(WindowCommand::AdoptPrimaryFrame { frame });
+                } else {
+                    self.handle_window(WindowCommand::CreateWindow {
+                        frame,
+                        width,
+                        height,
+                        title,
+                        geometry_hints,
+                    });
+                }
+                if let Some(mode) = fullscreen {
+                    self.handle_window(WindowCommand::SetWindowFullscreen { frame, mode });
+                }
+                self.frame_windows.await_ready(id, reply);
+            }
             WindowCommand::CreateWindow {
                 frame,
                 width,
@@ -262,6 +347,20 @@ impl RenderApp {
                     height,
                     title
                 );
+                if self.gpu.is_none()
+                    && self.comms.keep_alive_without_frames
+                    && self.frame_windows.primary_window().is_none()
+                {
+                    self.frame_windows.prepare_primary(
+                        emacs_frame_id,
+                        width,
+                        height,
+                        title,
+                        Some(geometry_hints),
+                    );
+                    self.pending_content_size = super::startup::InitialWindowSize { width, height };
+                    return;
+                }
                 self.frame_windows.request_create(
                     emacs_frame_id,
                     width,
@@ -297,6 +396,9 @@ impl RenderApp {
                         .send_input(InputEvent::PresentationRetired { presentation });
                 }
                 if self.frame_windows.is_primary_frame_id(emacs_frame_id) {
+                    self.cancel_gpu_startup();
+                    self.frame_windows
+                        .reject_ready(emacs_frame_id, "Native frame creation cancelled");
                     self.frame_windows.take_primary_window();
                     self.frame_windows.clear_primary_mapping();
                 } else {
@@ -307,11 +409,27 @@ impl RenderApp {
                 let emacs_frame_id = frame.raw_id();
                 tracing::info!("AdoptPrimaryFrame request: frame_id=0x{:x}", emacs_frame_id);
                 self.frame_windows.adopt_primary_frame_id(emacs_frame_id);
+                if self
+                    .frame_windows
+                    .get(emacs_frame_id)
+                    .and_then(|state| state.window())
+                    .is_some_and(|window| window.has_focus())
+                {
+                    self.comms
+                        .frame_opacity
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .focus(emacs_frame_id, true);
+                    self.refresh_frame_opacity();
+                }
                 // The window's scheduling identity moves from the pending id
                 // (0) to the adopted Emacs frame id; retire the old entry so
                 // its deadlines and request token cannot go stale.
                 self.frame_coordinator
                     .remove_window(super::frame_sched::NativeWindowId(0));
+            }
+            WindowCommand::AwaitFrameReady { frame, reply } => {
+                self.frame_windows.await_ready(frame.raw_id(), reply);
             }
             WindowCommand::ShowChildFrame { frame_id } => {
                 tracing::info!(

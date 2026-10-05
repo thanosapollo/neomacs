@@ -2,8 +2,7 @@
 //! port gives a native key that has no keysym, and the name lookup that keeps
 //! such a key bindable.
 //!
-//! For input supplied as a keysym (rather than committed text), GNU decides
-//! what a keystroke is by *range*. Its
+//! GNU decides what a keystroke is by *range* before anything else.  Its
 //! backends classify with the X protocol's own macros (`IsCursorKey`,
 //! `IsMiscFunctionKey`, `IsKeypadKey`, `IsFunctionKey`,
 //! `src/pgtkterm.c:5218-5221`), and `keyboard.c`'s `modify_event_symbol`

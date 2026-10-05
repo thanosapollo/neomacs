@@ -74,7 +74,6 @@ pub(crate) struct ResolvedAssocPredicate {
     epoch: u64,
     target: AssocTarget,
     pub(crate) pure: Option<PureAssocPredicate>,
-    native: Option<CheckedNativeCallback>,
 }
 
 impl Context {
@@ -131,9 +130,6 @@ impl Context {
                 epoch,
                 target,
                 pure,
-                native: (pure.is_none() && native_callback_cache_enabled())
-                    .then(|| CheckedNativeCallback::resolve(function, 2))
-                    .flatten(),
             });
         }
         None
@@ -152,16 +148,6 @@ impl Context {
         arg1: Value,
     ) -> EvalResult {
         if predicate.target == AssocTarget::Builtin && predicate.pure.is_none() {
-            if let Some(proof) = predicate.native {
-                return self.apply2_checked_subr(
-                    designator,
-                    predicate.callable,
-                    predicate.epoch,
-                    proof,
-                    arg0,
-                    arg1,
-                );
-            }
             return self.apply2_resolved_subr(
                 designator,
                 predicate.callable,

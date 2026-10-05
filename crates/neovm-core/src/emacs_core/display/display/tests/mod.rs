@@ -1,3 +1,4 @@
+mod deferred_gui_test;
 use crate::emacs_core::error::{FlowKind, FlowResultExt as _};
 mod menu_buttons_test;
 mod menu_semantics_test;

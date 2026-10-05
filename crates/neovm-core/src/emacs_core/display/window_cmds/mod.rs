@@ -21,11 +21,11 @@ use crate::emacs_core::xdisp::motion::MotionEngine;
 use crate::window::WindowChromeLine;
 use crate::window::body::{WindowBodyAxis, WindowBodyCellSize, WindowBodyUnit};
 use crate::window::{
-    CombinationLimit, CursorTypeSymbol, DeleteResize, ForcedBodyRedisplay, FrameDeletion,
-    FrameDeletionSelectionPolicy, FrameDivider, FrameFocusTracking, FrameFullscreen, FrameId,
-    FrameManager, FrameParam, FrameParamKey, FrameVisibility, Rect, SelectedFrameAfterDeletion,
-    SplitDirection, SplitPlacement, Window, WindowBufferDisplayDefaults, WindowFringeDefaults,
-    WindowId, WindowMargins, WindowScrollBarDefaults, is_valid_horizontal_scroll_bar_value,
+    CombinationLimit, CursorTypeSymbol, DeleteResize, FrameDeletion, FrameDeletionSelectionPolicy,
+    FrameDivider, FrameFocusTracking, FrameFullscreen, FrameId, FrameManager, FrameParam,
+    FrameParamKey, FrameVisibility, Rect, SelectedFrameAfterDeletion, SplitDirection,
+    SplitPlacement, Window, WindowBufferDisplayDefaults, WindowFringeDefaults, WindowId,
+    WindowMargins, WindowScrollBarDefaults, is_valid_horizontal_scroll_bar_value,
     is_valid_vertical_scroll_bar_value, window_first_child_id, window_next_sibling_id,
     window_parent_id, window_prev_sibling_id,
 };
@@ -34,9 +34,6 @@ use std::collections::HashSet;
 use strum::{EnumString, IntoStaticStr};
 
 mod body_geometry;
-mod redisplay_core_defaults;
-
-pub(crate) use redisplay_core_defaults::restore_gnu_configuration_hook_default;
 
 fn navigation_transition_direction(value: Value) -> Result<TransitionDirection, Flow> {
     value
@@ -2389,8 +2386,6 @@ pub(crate) fn builtin_set_window_cursor_type(
     }
 
     frames.set_window_cursor_type(wid, cursor_type);
-    // GNU window.c:8658 marks even a same-value cursor assignment.
-    eval.gnu_mark_window_redisplay(wid);
     Ok(cursor_type)
 }
 
@@ -2470,15 +2465,8 @@ pub(crate) fn builtin_set_window_parameter(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
-    expect_args("set-window-parameter", &args, 3)?;
-    let gnu_filtered_parameter = crate::emacs_core::eval::gnu_redisplay_hooks_enabled()
-        && args[1].as_symbol_id().is_some_and(|parameter| {
-            eval.obarray.get_property_id(parameter, intern(":filtered")) == Some(Value::T)
-        })
-        && eval
-            .special_variable_value_by_id(intern("window-auto-redraw-on-parameter-change"))
-            .is_none_or(|enabled| enabled.is_truthy());
     let (frames, buffers) = (&mut eval.frames, &mut eval.buffers);
+    expect_args("set-window-parameter", &args, 3)?;
     let _ = ensure_selected_frame_id_in_state(frames, buffers);
     let wid = resolve_window_object_id_with_pred_in_state(
         frames,
@@ -2487,23 +2475,7 @@ pub(crate) fn builtin_set_window_parameter(
         WindowDomain::Any,
     )?;
     let value = args[2];
-    let redraw_frame = if gnu_filtered_parameter
-        && frames.window_parameter(wid, &args[1]).unwrap_or(Value::NIL) != value
-    {
-        frames.find_window_frame_id(wid).filter(|frame| {
-            frames
-                .get(*frame)
-                .is_some_and(|frame| frame.effective_window_system().is_some())
-        })
-    } else {
-        None
-    };
-    // This owner runs before setting the alist, as GNU does. No Lisp callback
-    // or allocation safepoint occurs while reading the existing parameter.
-    if let Some(frame) = redraw_frame {
-        crate::emacs_core::dispnew::pure::publish_gnu_frame_redraw(eval, frame);
-    }
-    eval.frames.set_window_parameter(wid, args[1], value);
+    frames.set_window_parameter(wid, args[1], value);
     // A window parameter named after one of the chrome formats OVERRIDES the
     // buffer-local value (`eval_status_line_format_value` consults the window
     // parameter first), so setting one changes this window's chrome with none
@@ -2847,7 +2819,6 @@ pub(crate) fn builtin_set_window_start(
     };
     if let Some(window) = chrome_dirty_window {
         eval.mark_chrome_dirty_window(window);
-        eval.gnu_mark_window_mode_line(window);
     }
     Ok(result)
 }
@@ -2869,25 +2840,19 @@ pub(crate) fn builtin_set_window_point(
     expect_args("set-window-point", &args, 2)?;
     let (fid, wid) =
         resolve_window_id_with_pred_in_state(frames, buffers, args.first(), WindowDomain::Live)?;
-    let globally_selected = frames.selected_frame().map(|frame| frame.selected_window);
     let pos = parse_integer_or_marker_arg(&args[1])?;
     let is_minibuffer = frames
         .get(fid)
         .is_some_and(|frame| frame.minibuffer_window == Some(wid));
-    let result = match pos {
+    match pos {
         IntegerOrMarkerArg::Int(pos) => {
             if !is_minibuffer
                 && let Some(clamped) =
                     clamped_window_position_in_state(frames, buffers, fid, wid, pos)
             {
-                let selected_live_window = if crate::emacs_core::eval::gnu_redisplay_hooks_enabled()
-                {
-                    globally_selected == Some(wid)
-                } else {
-                    frames
-                        .get(fid)
-                        .is_some_and(|frame| frame.selected_window == wid)
-                };
+                let selected_live_window = frames
+                    .get(fid)
+                    .is_some_and(|frame| frame.selected_window == wid);
                 let mut buffer_to_move = None;
                 if let Some(window) = frames
                     .get_mut(fid)
@@ -2923,14 +2888,9 @@ pub(crate) fn builtin_set_window_point(
             })?;
             if let Some(clamped) = clamped_window_position_in_state(frames, buffers, fid, wid, pos)
             {
-                let selected_live_window = if crate::emacs_core::eval::gnu_redisplay_hooks_enabled()
-                {
-                    globally_selected == Some(wid)
-                } else {
-                    frames
-                        .get(fid)
-                        .is_some_and(|frame| frame.selected_window == wid)
-                };
+                let selected_live_window = frames
+                    .get(fid)
+                    .is_some_and(|frame| frame.selected_window == wid);
                 let mut buffer_to_move = None;
                 if let Some(window) = frames
                     .get_mut(fid)
@@ -2956,12 +2916,7 @@ pub(crate) fn builtin_set_window_point(
                 Ok(Value::fixnum(1))
             }
         }
-    };
-    // GNU window.c:1929-1933 publishes only the nonselected marker path.
-    if globally_selected != Some(wid) {
-        eval.gnu_mark_window_redisplay(wid);
     }
-    result
 }
 /// `(window-use-time &optional WINDOW)` -> integer.
 pub(crate) fn builtin_window_use_time(
@@ -3366,7 +3321,6 @@ pub(crate) fn builtin_set_window_hscroll(
     let (fid, wid) =
         resolve_window_id_with_pred_in_state(frames, buffers, args.first(), WindowDomain::Live)?;
     let cols = expect_fixnum(&args[1])?.max(0) as usize;
-    let mut changed = false;
     if let Some(Window::Leaf {
         hscroll,
         suspend_auto_hscroll,
@@ -3375,16 +3329,12 @@ pub(crate) fn builtin_set_window_hscroll(
         .get_mut(fid)
         .and_then(|frame| frame.find_window_mut(wid))
     {
-        changed = *hscroll != cols;
         *hscroll = cols;
         // GNU `set_window_hscroll` (src/window.c:1289) suspends auto hscroll
         // so an explicit set-window-hscroll is not immediately overridden by
         // the auto-hscroll redisplay pass; it is un-suspended once window
         // point explicitly moves (hscroll_window_tree STEP 4).
         *suspend_auto_hscroll = true;
-    }
-    if changed {
-        eval.gnu_mark_window_redisplay(wid);
     }
     Ok(Value::fixnum(cols as i64))
 }
@@ -3452,10 +3402,6 @@ pub(crate) fn builtin_scroll_left(eval: &mut super::eval::Context, args: Vec<Val
         // scroll position is honored until window point explicitly moves.
         *suspend_auto_hscroll = true;
     }
-    // Both GNU commands use changed-only set_window_hscroll.
-    if next != base {
-        eval.gnu_mark_window_redisplay(wid);
-    }
     Ok(Value::fixnum(next))
 }
 /// `(scroll-right &optional SET-MINIMUM ARG)` -> new horizontal scroll amount.
@@ -3502,10 +3448,6 @@ pub(crate) fn builtin_scroll_right(
         }
         *suspend_auto_hscroll = true;
     }
-    // Both GNU commands use changed-only set_window_hscroll.
-    if next != base {
-        eval.gnu_mark_window_redisplay(wid);
-    }
     Ok(Value::fixnum(next))
 }
 /// `(window-vscroll &optional WINDOW PIXELWISE)` -> number.
@@ -3539,15 +3481,9 @@ pub(crate) fn builtin_set_window_vscroll(
     let next_vscroll = expect_number(&args[1])?;
     let pixelwise = args.get(2).is_some_and(|v| v.is_truthy());
     let preserve = args.get(3).is_some_and(|v| v.is_truthy());
-    let previous = frames.window_vscroll(wid, true);
-    let result = frames
+    Ok(frames
         .set_window_vscroll(wid, next_vscroll, pixelwise, preserve)
-        .unwrap_or(Value::fixnum(0));
-    let changed = frames.window_vscroll(wid, true) != previous;
-    if changed {
-        eval.gnu_mark_window_redisplay(wid);
-    }
-    Ok(result)
+        .unwrap_or(Value::fixnum(0)))
 }
 /// `(set-window-margins WINDOW LEFT-WIDTH &optional RIGHT-WIDTH)` -> changed-p.
 pub(crate) fn builtin_set_window_margins(
@@ -3573,11 +3509,6 @@ pub(crate) fn builtin_set_window_margins(
         let next = WindowMargins::new(left, right);
         if *margins != next {
             *margins = next;
-            if let Some(frame) = frames.get_mut(fid) {
-                frame.tty_posn_apply_window_adjustment(wid);
-            }
-            // GNU apply_window_adjustment (window.c:8415-8421).
-            eval.gnu_mark_window_redisplay(wid);
             return Ok(Value::T);
         }
     }
@@ -3709,30 +3640,19 @@ pub(crate) fn builtin_set_window_fringes(
     } else {
         left
     };
-    let before = frames
-        .window_fringes(wid)
-        .map(|(left, right, outside, _)| (left, right, outside));
-    let changed = frames.set_window_fringes(
-        wid,
-        left,
-        right,
-        args.get(3).is_some_and(|value| value.is_truthy()),
-        args.get(4).is_some_and(|value| value.is_truthy()),
-    );
-    let geometry_changed = frames
-        .window_fringes(wid)
-        .map(|(left, right, outside, _)| (left, right, outside))
-        != before;
-    let is_gui = frames
-        .find_window_frame_id(wid)
-        .and_then(|frame| frames.get(frame))
-        .is_some_and(|frame| frame.effective_window_system().is_some());
-    if geometry_changed && is_gui {
-        // GNU set_window_fringes raises global ALL before apply_window_adjustment.
-        eval.gnu_mark_windows_all();
-        eval.gnu_mark_window_redisplay(wid);
-    }
-    Ok(Value::bool_val(changed))
+    Ok(
+        if frames.set_window_fringes(
+            wid,
+            left,
+            right,
+            args.get(3).is_some_and(|value| value.is_truthy()),
+            args.get(4).is_some_and(|value| value.is_truthy()),
+        ) {
+            Value::T
+        } else {
+            Value::NIL
+        },
+    )
 }
 /// `(window-scroll-bars &optional WINDOW)` -> scroll-bar tuple.
 pub(crate) fn builtin_window_scroll_bars(
@@ -3815,32 +3735,20 @@ pub(crate) fn builtin_set_window_scroll_bars(
             vec![Value::string("Invalid type of horizontal scroll bar")],
         ));
     }
-    let before = frames.window_scroll_bars(wid).map(
-        |(width, cols, vertical, height, lines, horizontal, _)| {
-            (width, cols, vertical, height, lines, horizontal)
+    Ok(
+        if frames.set_window_scroll_bars(
+            wid,
+            width,
+            vertical_type,
+            height,
+            horizontal_type,
+            args.get(5).is_some_and(|value| value.is_truthy()),
+        ) {
+            Value::T
+        } else {
+            Value::NIL
         },
-    );
-    let changed = frames.set_window_scroll_bars(
-        wid,
-        width,
-        vertical_type,
-        height,
-        horizontal_type,
-        args.get(5).is_some_and(|value| value.is_truthy()),
-    );
-    let geometry_changed = frames.window_scroll_bars(wid).map(
-        |(width, cols, vertical, height, lines, horizontal, _)| {
-            (width, cols, vertical, height, lines, horizontal)
-        },
-    ) != before;
-    let is_gui = frames
-        .find_window_frame_id(wid)
-        .and_then(|frame| frames.get(frame))
-        .is_some_and(|frame| frame.effective_window_system().is_some());
-    if geometry_changed && is_gui {
-        eval.gnu_mark_window_redisplay(wid);
-    }
-    Ok(Value::bool_val(changed))
+    )
 }
 
 /// `(window-scroll-bar-width &optional WINDOW)` -> integer.
@@ -4024,22 +3932,6 @@ fn remapped_window_body_cell_size(
     Some(WindowBodyCellSize::new(
         font.font.char_width(),
         font.font.line_height(),
-    ))
-}
-
-/// Logical body dimensions for GNU window-change records, without Lisp or
-/// display-motion queries. The caller owns its Context exclusively; these
-/// borrowed managers contain no new cache or cross-mutator state.
-pub(crate) fn hook_window_body_dimensions(
-    frames: &FrameManager,
-    buffers: &BufferManager,
-    fid: FrameId,
-    wid: WindowId,
-) -> Result<(i64, i64), Flow> {
-    let window = get_leaf(frames, fid, wid)?;
-    Ok((
-        window_body_width_pixels(frames, fid, window),
-        body_geometry::body_height_pixels(frames, buffers, fid, wid)?,
     ))
 }
 
@@ -4735,8 +4627,6 @@ pub(crate) fn builtin_delete_window_internal(
         // window rebuilds the menu. This and an ordinary-window buffer swap
         // are separate mutation sites with the same typed GNU
         // `windows_or_buffers_changed` rebuild reason.
-        eval.gnu_mark_frame_redisplay(fid);
-        eval.gnu_mark_frame_window_change(fid);
         eval.request_menu_bar_rebuild(super::eval::MenuBarRebuildReason::WindowsOrBuffersChanged);
         Ok(Value::NIL)
     } else {
@@ -4777,7 +4667,6 @@ pub(crate) fn builtin_delete_other_windows_internal(
         }
         root_wid
     };
-    let changes_tree = keep_wid != root_wid;
     if !frames.keep_only_window_in_subtree(fid, keep_wid, root_wid) {
         return Err(signal(
             "error",
@@ -4801,10 +4690,6 @@ pub(crate) fn builtin_delete_other_windows_internal(
     };
     if let Some(buffer_id) = selected_buffer {
         buffers.switch_current(buffer_id);
-    }
-    if changes_tree {
-        eval.gnu_mark_frame_redisplay(fid);
-        eval.gnu_mark_frame_window_change(fid);
     }
     Ok(Value::NIL)
 }
@@ -4979,24 +4864,10 @@ pub(crate) fn select_window(
             vec![Value::symbol("window-live-p"), window_value(wid)],
         ));
     }
-    let old_selected = eval
-        .frames
-        .selected_frame()
-        .map(|frame| frame.selected_window);
     let selection_changed = eval
         .frames
         .selected_frame()
         .is_none_or(|frame| frame.selected_window != wid);
-    if selection_changed {
-        // Publish while the old window is still globally selected. GNU
-        // window.c:542-553 treats non-nil NORECORD other than this symbol
-        // as global SOME without marking either individual window.
-        eval.gnu_mark_selection(
-            old_selected,
-            wid,
-            norecord.is_nil() || norecord.is_symbol_named("mark-for-redisplay"),
-        );
-    }
     let (record_selection, run_buffer_list_hook, frame_changed, reset_input_frame) = {
         let (frames, buffers) = (&mut eval.frames, &mut eval.buffers);
         let selected_fid = ensure_selected_frame_id_in_state(frames, buffers);
@@ -5061,22 +4932,17 @@ pub(crate) fn select_window(
         )
     };
     if frame_changed {
+        super::frame::sync_gui_frame_focus_redirects(eval)?;
         eval.sync_keyboard_terminal_owner();
     }
     if selection_changed {
-        // GNU window.c marks old/new chrome only for recorded selection or
-        // mark-for-redisplay. Temporary hook selection raises SOME through
-        // gnu_mark_selection without invalidating retained mode-line output.
-        if eval.gnu_redisplay_hooks_policy_enabled() {
-            if norecord.is_nil() || norecord.is_symbol_named("mark-for-redisplay") {
-                if let Some(old) = old_selected {
-                    eval.mark_chrome_dirty_window(old);
-                }
-                eval.mark_chrome_dirty_window(wid);
-            }
-        } else {
-            eval.mark_chrome_dirty_all();
-        }
+        // GNU `select_window` marks BOTH the old and the new window for
+        // redisplay "since the selected-window has a different mode-line".
+        // Whichever window is non-selected makes `wset_redisplay` raise
+        // `windows_or_buffers_changed` (xdisp.c:870-877), including for a
+        // NORECORD selection used by `with-selected-window`.  The same typed
+        // event invalidates both window chrome and the selected buffer's menu.
+        eval.mark_chrome_dirty_all();
         eval.request_menu_bar_rebuild(super::eval::MenuBarRebuildReason::WindowsOrBuffersChanged);
     }
     if record_selection && run_buffer_list_hook {
@@ -5194,7 +5060,6 @@ impl WindowBufferDisplayEffect {
         // wset_redisplay pair.  It already crosses the broad menu boundary for
         // every nonselected window, exactly as `wset_redisplay` does.
         eval.mark_chrome_dirty_window(window);
-        eval.gnu_mark_window_mode_line(window);
 
         // Do not promote `OrdinaryWindowChanged` directly to a menu rebuild.
         // GNU records FRAME_WINDOW_CHANGE here, but `prepare_menu_bars` runs
@@ -5435,12 +5300,6 @@ pub(crate) fn builtin_set_window_buffer(
                 scroll_bars: next_scroll_bars,
             },
         );
-        // GNU clears current rows even for the same buffer when margins are
-        // reset. Adjustment can then repopulate only a changed real allocation;
-        // the entire operation precedes eager window-scroll-functions.
-        if !keep_margins && let Some(frame) = frames.get_mut(fid) {
-            frame.tty_posn_apply_window_adjustment(wid);
-        }
         // Mirror GNU: non-T dedication (side, soft, etc.) is cleared
         // when the buffer changes (switch-to-buffer / set-window-buffer).
         if old_state.is_some_and(|(old_buf, _, _, ded)| {
@@ -5464,13 +5323,6 @@ pub(crate) fn builtin_set_window_buffer(
     }
     display_effect.apply(eval);
     builtin_run_window_scroll_functions(eval, vec![window_value(wid)])?;
-    // GNU sets this after the eager scroll callbacks (window.c:4427).
-    if matches!(
-        display_effect,
-        WindowBufferDisplayEffect::OrdinaryWindowChanged(_)
-    ) {
-        eval.gnu_mark_frame_window_change(fid);
-    }
     Ok(Value::NIL)
 }
 
@@ -6057,13 +5909,6 @@ fn scroll_lines_in_state(
 pub(crate) fn builtin_scroll_up(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     expect_max_args("scroll-up", &args, 1)?;
     let arg = args.first().cloned();
-    if crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
-        let frame = ensure_selected_frame_id(eval);
-        if let Some(window) = eval.frames.get(frame).map(|frame| frame.selected_window) {
-            // GNU window.c:6163, before Lisp-bearing motion queries.
-            eval.gnu_mark_window_redisplay(window);
-        }
-    }
     if crate::emacs_core::xdisp::motion::paging::try_scroll(eval, arg, 1)? {
         eval.invalidate_redisplay();
         return Ok(Value::NIL);
@@ -6086,13 +5931,6 @@ pub(crate) fn builtin_scroll_up(eval: &mut super::eval::Context, args: Vec<Value
 pub(crate) fn builtin_scroll_down(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     expect_max_args("scroll-down", &args, 1)?;
     let arg = args.first().cloned();
-    if crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
-        let frame = ensure_selected_frame_id(eval);
-        if let Some(window) = eval.frames.get(frame).map(|frame| frame.selected_window) {
-            // GNU window.c:6163, before Lisp-bearing motion queries.
-            eval.gnu_mark_window_redisplay(window);
-        }
-    }
     if crate::emacs_core::xdisp::motion::paging::try_scroll(eval, arg, -1)? {
         eval.invalidate_redisplay();
         return Ok(Value::NIL);
@@ -6382,12 +6220,6 @@ pub(crate) fn builtin_recenter(eval: &mut super::eval::Context, args: Vec<Value>
         return Ok(Value::NIL);
     };
 
-    if redraw == RecenterRedraw::FullFrame {
-        // GNU redraws before display motion; a callback/error must already
-        // observe the frame/window marks (window.c:7265-7272).
-        crate::emacs_core::dispnew::pure::publish_gnu_frame_redraw(eval, fid);
-    }
-
     // Move back `target_line` SCREEN lines, through the same display-motion
     // seam `vertical-motion` and window scrolling use. GNU's positive-ARG
     // branch runs the display iterator for exactly this --  `start_display`,
@@ -6430,11 +6262,11 @@ pub(crate) fn builtin_recenter(eval: &mut super::eval::Context, args: Vec<Value>
         }
     }
 
-    // GNU window.c:7454 marks even a same-start recenter.
-    eval.gnu_mark_window_redisplay(wid);
     match redraw {
         RecenterRedraw::Window => eval.invalidate_redisplay(),
-        RecenterRedraw::FullFrame => {}
+        RecenterRedraw::FullFrame => {
+            eval.request_menu_bar_rebuild(super::eval::MenuBarRebuildReason::FullFrameRedraw)
+        }
     }
     Ok(Value::NIL)
 }
@@ -7048,16 +6880,46 @@ pub(crate) fn builtin_x_create_frame(
     mut args: Vec<Value>,
 ) -> EvalResult {
     expect_args("x-create-frame", &args, 1)?;
-    if eval.daemon.is_some() && eval.display_host.is_none() {
+    if eval.gui_display_initializer.is_some() {
+        let display = parse_gui_frame_params(args.first())
+            .all
+            .get(&intern("display"))
+            .copied();
+        let display = display
+            .filter(|value| !value.is_nil())
+            .map(|value| {
+                value
+                    .as_lisp_string()
+                    .and_then(|text| text.as_utf8_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        signal(
+                            LispCondition::WrongTypeArgument,
+                            vec![Value::symbol("stringp"), value],
+                        )
+                    })
+            })
+            .transpose()?;
+        eval.initialize_gui_display(display.as_deref())?;
+    } else if eval.daemon.is_some() && eval.display_host.is_none() {
         return Err(signal(
             "error",
-            vec![Value::string(
-                "Graphical frames are not yet supported by the headless Neomacs daemon; use a TTY client",
-            )],
+            vec![Value::string("Graphical display host unavailable")],
         ));
     }
     // GNU gui_display_get_arg resolves frame alist, default-frame-alist,
     // then the display resource. Keep explicit nil distinct from absence.
+    let explicit = parse_gui_frame_params(args.first());
+    let defaults = eval.eval_symbol_by_id(intern("default-frame-alist")).ok();
+    let defaults = parse_gui_frame_params(defaults.as_ref());
+    for name in ["alpha", "alpha-background"] {
+        let key = intern(name);
+        if !explicit.all.contains_key(&key)
+            && let Some(value) = defaults.all.get(&key)
+        {
+            args[0] = Value::cons(Value::cons(Value::symbol(name), *value), args[0]);
+        }
+    }
     let font_key = intern("font");
     if !parse_gui_frame_params(args.first())
         .all
@@ -7081,6 +6943,15 @@ pub(crate) fn builtin_x_create_frame(
         };
         if let Some(font) = font {
             args[0] = Value::cons(Value::cons(Value::symbol("font"), font), args[0]);
+        } else if let Some(font) = eval
+            .display_host
+            .as_ref()
+            .and_then(|host| host.default_gui_font())
+        {
+            args[0] = Value::cons(
+                Value::cons(Value::symbol("font"), Value::string(font)),
+                args[0],
+            );
         }
     }
     tracing::debug!(
@@ -7097,7 +6968,47 @@ pub(crate) fn builtin_x_create_frame(
         &mut eval.display_host,
         args,
     );
+    let result = result.and_then(|frame| {
+        let fid = FrameId(frame.as_frame_id().expect("x-create-frame returns a frame"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let ready = loop {
+            if let Err(flow) = eval.maybe_quit() {
+                break Err(flow);
+            }
+            match eval
+                .display_host
+                .as_mut()
+                .map(|host| host.poll_gui_frame_ready(fid))
+                .unwrap_or(Some(Ok(())))
+            {
+                Some(Ok(())) => break Ok(frame),
+                Some(Err(message)) => break Err(signal("error", vec![Value::string(message)])),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                None => {
+                    break Err(signal(
+                        "error",
+                        vec![Value::string("Native frame creation timed out")],
+                    ));
+                }
+            }
+        };
+        if ready.is_err() {
+            if let Some(host) = eval.display_host.as_mut() {
+                let _ = host.destroy_gui_frame(fid);
+            }
+            let _ = eval.frames.delete_frame(fid);
+        }
+        ready
+    });
     eval.sync_keyboard_terminal_owner();
+    if let Ok(value) = &result
+        && let Some(id) = value.as_frame_id()
+    {
+        super::frame::sync_gui_frame_alpha(eval, FrameId(id))?;
+        super::frame::sync_gui_frame_focus_redirects(eval)?;
+    }
     result
 }
 
@@ -7110,6 +7021,17 @@ pub(crate) fn x_create_frame_impl(
     expect_args("x-create-frame", &args, 1)?;
 
     let parsed = parse_gui_frame_params(args.first());
+    for (key, value) in &parsed.all {
+        match FrameParamKey::from_symbol_id(*key) {
+            FrameParamKey::Known(FrameParam::Alpha) => {
+                crate::window::frame_alpha::pair(*value)?;
+            }
+            FrameParamKey::Known(FrameParam::AlphaBackground) => {
+                crate::window::frame_alpha::component(*value, 1.0)?;
+            }
+            _ => {}
+        }
+    }
     tracing::debug!(
         "x_create_frame_impl: display_host_available={} params={:?}",
         display_host.is_some(),
@@ -7136,10 +7058,17 @@ pub(crate) fn x_create_frame_impl(
                 Some((public_font, font_parameter))
             })
     };
+    let gui_terminal = display_host.as_ref().and_then(|host| host.gui_terminal());
     let inherited_display_identity = parent_id
         .and_then(|parent_id| frames.get(parent_id))
         .or_else(|| frames.selected_frame())
+        .filter(|frame| frame.effective_window_system().is_some())
         .map(|frame| frame.display_identity().clone())
+        .or_else(|| {
+            gui_terminal.as_ref().map(|(_, identity)| {
+                crate::window::FrameDisplayIdentity::Graphical(identity.clone())
+            })
+        })
         .unwrap_or_default();
     let metrics = parent_id
         .and_then(|parent_id| frames.get(parent_id))
@@ -7157,6 +7086,24 @@ pub(crate) fn x_create_frame_impl(
                 // A frame's minibuffer defaults to one text line (GNU
                 // `make-frame`); see current_gui_frame_metrics_in_state.
                 .unwrap_or_else(|| parent.char_height.max(1.0)),
+        })
+        .or_else(|| {
+            display_host
+                .as_ref()
+                .and_then(|host| host.gui_frame_metrics())
+                .map(
+                    |(char_width, char_height, font_pixel_size, device_scale_factor)| {
+                        GuiFrameMetrics {
+                            width_px: 80 * char_width as u32,
+                            height_px: 40 * char_height as u32,
+                            char_width,
+                            char_height,
+                            font_pixel_size,
+                            device_scale_factor,
+                            minibuffer_height: char_height,
+                        }
+                    },
+                )
         })
         .unwrap_or_else(|| current_gui_frame_metrics_in_state(frames));
     let host_size = current_primary_window_size(&*display_host);
@@ -7230,7 +7177,17 @@ pub(crate) fn x_create_frame_impl(
     } else {
         buffers.find_buffer_by_name(" *Minibuf-0*")
     };
-    let fid = frames.create_frame_value(name, width_px, height_px, current_buffer_id);
+    let fid = if let Some((terminal_id, _)) = gui_terminal {
+        frames.create_frame_value_on_terminal(
+            name,
+            terminal_id,
+            width_px,
+            height_px,
+            current_buffer_id,
+        )
+    } else {
+        frames.create_frame_value(name, width_px, height_px, current_buffer_id)
+    };
     {
         let frame = frames
             .get_mut(fid)
@@ -7354,15 +7311,21 @@ pub(crate) fn x_create_frame_impl(
             .get(fid)
             .map(|frame| frame.gui_geometry_hints())
             .ok_or_else(|| signal("error", vec![Value::string("Frame not found")]))?;
-        host.realize_gui_frame(super::eval::GuiFrameHostRequest {
+        let realized = host.realize_gui_frame(super::eval::GuiFrameHostRequest {
             frame_id: fid,
             width: width_px,
             height: height_px,
             title: host_title,
             geometry_hints,
             fullscreen: parsed.fullscreen,
-        })
-        .map_err(|message| signal("error", vec![Value::string(message)]))?;
+        });
+        if let Err(message) = realized {
+            // Realization can admit native work before a later step fails.
+            // Retire that exact frame even when there is no readiness receiver.
+            let _ = host.destroy_gui_frame(fid);
+            let _ = frames.delete_frame(fid);
+            return Err(signal("error", vec![Value::string(message)]));
+        }
     }
     if is_child_frame {
         tracing::info!(
@@ -7524,17 +7487,6 @@ pub(crate) fn delete_frame_owned(
             .frames
             .replacement_frame_for_deletion(fid, selection_policy)
         {
-            if let Some(new_window) = eval
-                .frames
-                .get(replacement)
-                .map(|frame| frame.selected_window)
-            {
-                let old_window = eval
-                    .frames
-                    .selected_frame()
-                    .map(|frame| frame.selected_window);
-                eval.gnu_mark_selection(old_window, new_window, true);
-            }
             if !eval.frames.select_frame(replacement) {
                 return Err(signal(
                     "error",
@@ -7551,6 +7503,7 @@ pub(crate) fn delete_frame_owned(
             sync_selected_window_buffer_in_state(&eval.frames, &mut eval.buffers, replacement);
         }
     }
+    super::frame::sync_gui_frame_focus_redirects(eval)?;
     match eval.frames.delete_frame(fid) {
         FrameDeletion::NotFound => {
             return Err(signal("error", vec![Value::string("Cannot delete frame")]));
@@ -7568,24 +7521,43 @@ pub(crate) fn delete_frame_owned(
         } => {}
     }
     if let Some(host) = eval.display_host.as_mut() {
-        if was_gui_child_frame {
+        // Lisp deletion has committed. A failed opacity notification must not
+        // skip native destruction or leave a deferred window lease live.
+        let opacity_result = host.retire_gui_frame_alpha(fid);
+        let destruction_result = if was_gui_child_frame {
             tracing::info!(
                 frame_id = fid.0,
                 "child_frame_lifecycle: core_delete_notify_remove"
             );
             host.remove_gui_child_frame(fid)
-                .map_err(|message| signal("error", vec![Value::string(message)]))?;
         } else if was_top_level_gui_frame {
             host.destroy_gui_frame(fid)
-                .map_err(|message| signal("error", vec![Value::string(message)]))?;
-        }
+        } else {
+            Ok(())
+        };
+        let result = match (opacity_result, destruction_result) {
+            (Err(opacity), Err(destruction)) => Err(format!(
+                "{opacity}; native GUI destruction failed: {destruction}"
+            )),
+            (Err(message), _) | (_, Err(message)) => Err(message),
+            (Ok(()), Ok(())) => Ok(()),
+        };
+        result.map_err(|message| signal("error", vec![Value::string(message)]))?;
     }
     let terminal_is_empty = eval.frames.frame_list().into_iter().all(|frame_id| {
         eval.frames
             .get(frame_id)
             .is_none_or(|frame| frame.terminal_id != terminal_id)
     });
+    // A live display connection owns its terminal independently of its frames.
+    // Closing the last GUI frame must not invalidate the next make-frame.
+    let terminal_owned_by_display = eval
+        .display_host
+        .as_ref()
+        .and_then(|host| host.gui_terminal())
+        .is_some_and(|(id, _)| id == terminal_id);
     if mode.allows_terminal_cascade()
+        && !terminal_owned_by_display
         && terminal_is_empty
         && !eval.frames.frame_list().is_empty()
         && let Some(terminal) =
@@ -7601,13 +7573,6 @@ pub(crate) fn delete_frame_owned(
         )?;
     }
     eval.sync_keyboard_terminal_owner();
-    // GNU frame.c:3096 raises update_mode_lines ALL after deleting a
-    // non-tooltip frame and before the after-deletion hooks. Neo's window
-    // frame manager does not represent tooltip pseudo-frames.
-    if crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
-        eval.gnu_mark_mode_lines_all();
-        eval.request_global_mode_line_update();
-    }
     if mode.runs_hooks_immediately() {
         let after_delete_hook = crate::emacs_core::hook_runtime::hook_symbol_by_name(
             eval,
@@ -7719,14 +7684,6 @@ pub fn register_bootstrap_vars(obarray: &mut crate::emacs_core::symbol::Obarray)
         "window-state-change-hook",
     ] {
         obarray.define_special_variable(name, Value::NIL);
-    }
-    // GNU window.c:9383–9398 initializes this C-owned default before Lisp
-    // runs. The GNU transaction uses Fdefault_value, so a missing binding
-    // must be repaired at its owner, rather than hidden by the reader. Each
-    // Context's exclusive bootstrap owns this cell; no shared Lisp cache.
-    // Preserve the legacy unbound projection while the policy is disabled.
-    if crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
-        obarray.define_special_variable("window-configuration-change-hook", Value::NIL);
     }
     obarray.set_symbol_value("window-sides-vertical", Value::NIL);
     // `window-sides-slots` and `fit-frame-to-buffer-sizes` are deliberately NOT
@@ -7902,11 +7859,6 @@ pub(crate) fn builtin_window_resize_apply(
 
     // Recalculate minibuffer position after tree resize.
     frame.recalculate_minibuffer_bounds();
-    frame.tty_posn_adjust_current_matrices();
-    // GNU window_resize_apply marks FRAME_WINDOW_CHANGE, and its public
-    // pixel primitive additionally calls fset_redisplay (window.c:4994).
-    eval.gnu_mark_frame_redisplay(fid);
-    eval.gnu_mark_frame_window_change(fid);
 
     Ok(Value::T)
 }
@@ -7982,99 +7934,38 @@ pub(crate) fn builtin_window_resize_apply_total(
 
 /// (force-window-update &optional OBJECT) -> t/nil
 ///
-/// GNU `Fforce_window_update` (`src/window.c:4492`):
+/// GNU `Fforce_window_update` (`src/window.c:4488`):
 ///
-/// - nil OBJECT: mark every window (`windows_or_buffers_changed`), return t.
-/// - a live WINDOW: mark that window's body and its displayed buffer, return t.
-/// - a buffer or buffer name: return t iff that live buffer is shown in some
-///   window, marking every window displaying it.
-/// - anything else (a dead window, an undisplayed or dead buffer, a string
-///   naming no buffer, an arbitrary object): return nil without signaling.
+/// - nil OBJECT: mark everything for redisplay, return t.
+/// - a live WINDOW: mark that window, return t.
+/// - a buffer/string: return t iff that buffer is shown in some window.
 ///
-/// Body invalidation travels through [`ForcedBodyRedisplay`] so it is explicit
-/// and typed, and never through the generic redisplay generation: a
-/// presentation-only redisplay request must not relayout body text.
-///
-/// Each successful branch also raises GNU's global `update_mode_lines`
-/// trigger through the existing chrome/menu boundary. This does not widen
-/// the independently scoped body invalidation.
+/// Explicit force requests invalidate the redisplay signature even when the
+/// visible window state is unchanged. A live window also yields t (oracle
+/// test cx409), as GNU does.
 pub(crate) fn builtin_force_window_update(
     eval: &mut crate::emacs_core::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
     expect_max_args("force-window-update", &args, 1)?;
-    let target = if let Some(object) = args.first().filter(|value| !value.is_nil()) {
-        if let Some(id) = object.as_window_id() {
-            let window = WindowId(id);
-            if !eval.frames.is_live_window_id(window) {
-                return Ok(Value::NIL);
-            }
-            ForcedBodyRedisplay::Window(window)
-        } else {
-            // Unknown names and killed buffers do not signal. GNU's buffer
-            // walk requires exact contents on a visible frame and excludes
-            // minibuffers; explicit window forcing still accepts a live mini.
-            let buffer = match object.kind() {
-                ValueKind::Veclike(VecLikeType::Buffer) => object
-                    .as_buffer_id()
-                    .filter(|id| eval.buffers.get(*id).is_some()),
-                ValueKind::String => find_buffer_by_name_arg(&eval.buffers, object)?,
-                _ => None,
-            };
-            let Some(buffer) = buffer else {
-                return Ok(Value::NIL);
-            };
-            let base_frame = ensure_selected_frame_id(eval);
-            let displayed = frame_ids_for_all_frames_scope(
-                &eval.frames,
-                base_frame,
-                AllFramesScope::VisibleFrames,
-            )
-            .into_iter()
-            .filter_map(|id| eval.frames.get(id))
-            .any(|frame| {
-                frame.window_list().into_iter().any(|window| {
-                    frame.find_window(window).and_then(Window::buffer_id) == Some(buffer)
-                })
-            });
-            if !displayed {
-                return Ok(Value::NIL);
-            }
-            ForcedBodyRedisplay::Buffer(buffer)
-        }
-    } else {
-        ForcedBodyRedisplay::AllWindows
+    let Some(object) = args.first().filter(|v| !v.is_nil()) else {
+        // nil OBJECT: force all windows.
+        eval.invalidate_redisplay();
+        return Ok(Value::T);
     };
 
-    // Explicit forcing always moves the retained-body revision, independently
-    // of the optional GNU hook owner. Both policies use this one body request.
-    eval.force_body_redisplay(target);
-    if crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
-        match target {
-            ForcedBodyRedisplay::AllWindows => eval.gnu_mark_windows_all(),
-            ForcedBodyRedisplay::Window(window) => eval.gnu_mark_window_redisplay(window),
-            ForcedBodyRedisplay::Buffer(buffer) => {
-                let mut windows = Vec::new();
-                for fid in eval.frames.frame_list() {
-                    if let Some(frame) = eval.frames.get(fid)
-                        && frame.visibility.is_visible()
-                    {
-                        for window in frame.window_list() {
-                            if frame.find_window(window).and_then(Window::buffer_id) == Some(buffer)
-                            {
-                                windows.push(window);
-                            }
-                        }
-                    }
-                }
-                for window in windows {
-                    eval.gnu_mark_window_redisplay(window);
-                }
-            }
-        }
+    // A live window forces just that window and returns t.
+    if let Some(id) = object.as_window_id()
+        && eval.frames.is_live_window_id(WindowId(id))
+    {
+        eval.invalidate_redisplay();
+        return Ok(Value::T);
     }
-    eval.request_mode_line_update(crate::emacs_core::eval::ModeLineUpdateTarget::AllBuffers);
-    Ok(Value::T)
+
+    // A buffer (or buffer name) shown in at least one window also returns t in
+    // GNU; otherwise (dead window, unshown buffer, anything else) the value is
+    // nil -- the safe default neomacs already produced for those cases.
+    Ok(Value::NIL)
 }
 
 // ===========================================================================
@@ -8082,7 +7973,3 @@ pub(crate) fn builtin_force_window_update(
 // ===========================================================================
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "tests/selection_chrome.rs"]
-mod selection_chrome_tests;

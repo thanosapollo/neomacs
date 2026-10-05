@@ -2,6 +2,11 @@ use super::*;
 use crate::emacs_core::error::{FlowKind, FlowResultExt};
 use crate::emacs_core::value::list_to_vec;
 
+#[path = "callback_interop.rs"]
+mod callback_interop;
+#[path = "string_interop.rs"]
+mod string_interop;
+
 unsafe extern "C" fn dummy_module_function(
     _env: *mut emacs_env,
     _nargs: isize,

@@ -351,19 +351,19 @@ fn convert_single_display_event(event: &DisplayEvent) -> Option<KbInputEvent> {
             KbInputEvent::raw_tty_bytes(bytes.clone(), *emacs_frame_id)
         }),
         DisplayEvent::Key {
-            key,
+            keysym,
             modifiers,
             pressed,
             emacs_frame_id,
         } => {
             tracing::debug!(
-                "input_bridge: key={:?} mods=0x{:x} pressed={}",
-                *key,
+                "input_bridge: key keysym=0x{:04x} mods=0x{:x} pressed={}",
+                *keysym,
                 *modifiers,
                 *pressed
             );
             let event = keyboard::render_key_transport_to_input_event(
-                *key,
+                *keysym,
                 *modifiers,
                 *pressed,
                 *emacs_frame_id,
@@ -500,6 +500,18 @@ fn convert_single_display_event(event: &DisplayEvent) -> Option<KbInputEvent> {
         }
         #[cfg(feature = "neo-term")]
         DisplayEvent::TerminalExited { id } => Some(KbInputEvent::TerminalExited { id: *id }),
+        #[cfg(feature = "neo-term")]
+        DisplayEvent::TerminalSettled { id, completion } => Some(KbInputEvent::TerminalSettled {
+            id: *id,
+            completion: completion.clone(),
+        }),
+        #[cfg(feature = "neo-term")]
+        DisplayEvent::TerminalDirectoryChanged { id, directory } => {
+            Some(KbInputEvent::TerminalDirectoryChanged {
+                id: *id,
+                directory: directory.clone(),
+            })
+        }
         #[cfg(feature = "neo-term")]
         DisplayEvent::TerminalTitleChanged { id, title } => {
             Some(KbInputEvent::TerminalTitleChanged {

@@ -53,8 +53,6 @@ pub(crate) fn pure_entry_refs<S: sink::LeafSink>(
         call_census: false,
         direct_framed: false,
         hof: false,
-        collection_journal: false,
-        collection_observation_gate: false,
     };
     Ok(RtRefs::new(
         sink.shim_ids(call_conv, ptr_ty, groups)?,
@@ -262,7 +260,7 @@ fn credit_generic(
 /// The profiling shims receive a live, mutator-owned leaf observation.
 /// Closed windows inspect no Lisp values and immediately use the plain shim.
 #[inline]
-pub(super) fn credit_window_open(obs: *const LeafObs) -> bool {
+fn credit_window_open(obs: *const LeafObs) -> bool {
     // SAFETY: generated callers hold the containing leaf for the activation.
     let obs = unsafe { &*obs };
     obs.t2.state.get() == crate::emacs_core::jit::tier2::T2State::Idle

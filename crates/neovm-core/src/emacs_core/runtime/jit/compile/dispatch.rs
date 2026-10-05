@@ -302,9 +302,15 @@ pub extern "C" fn neovm_jit_builtin2(ctx: *mut u8, idx: i64, a: i64, b: i64, out
 /// such a shim returns is the result's own bits, and no Lisp value carries
 /// tag `0b001`, so one tag test tells the two apart.
 pub const VALUE_SHIM_SIGNAL: i64 = 0b0001;
+/// The other sentinel word of [`neovm_jit_aset`]: `aset` is redefined or
+/// advised, so the site must run its rooted general call instead.
+pub const VALUE_SHIM_NEED_GENERIC: i64 = 0b1001;
+
 const _: () = {
     use crate::tagged::value::{TAG_FLOAT, TAG_VECLIKE};
     let tag = VALUE_SHIM_SIGNAL as usize & TAG_MASK;
+    assert!(tag == VALUE_SHIM_NEED_GENERIC as usize & TAG_MASK);
+    assert!(VALUE_SHIM_SIGNAL != VALUE_SHIM_NEED_GENERIC);
     assert!(tag & FIXNUM_CHECK_MASK != FIXNUM_CHECK_VALUE);
     assert!(tag != TAG_SYMBOL && tag != TAG_CONS && tag != TAG_STRING);
     assert!(tag != TAG_VECLIKE && tag != TAG_FLOAT);
@@ -397,9 +403,6 @@ thread_local! {
     /// Test hook: how many times compiled code called `neovm_jit_setcar` or
     /// `neovm_jit_setcdr` (a store its inline path left to the shim).
     pub(crate) static LIST_STORE_SHIM_CALLS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-    /// Test hook: exact observation queries after a compiled Cons window hit.
-    pub(crate) static CONS_OBSERVATION_QUERIES: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -563,7 +566,7 @@ pub extern "C" fn neovm_jit_setcar(ctx: *mut u8, cell: i64, new_car: i64) -> i64
     LIST_STORE_SHIM_CALLS.with(|c| c.set(c.get() + 1));
     let cell = Value::from_bits(cell as usize);
     let new_car = Value::from_bits(new_car as usize);
-    if compiled_cons_store(cell, new_car, false) {
+    if crate::tagged::mutate::set_cons_car(cell, new_car) {
         return new_car.bits() as i64;
     }
     list_slow(ctx, pure_setcar, cell, new_car)
@@ -578,67 +581,10 @@ pub extern "C" fn neovm_jit_setcdr(ctx: *mut u8, cell: i64, new_cdr: i64) -> i64
     LIST_STORE_SHIM_CALLS.with(|c| c.set(c.get() + 1));
     let cell = Value::from_bits(cell as usize);
     let new_cdr = Value::from_bits(new_cdr as usize);
-    if compiled_cons_store(cell, new_cdr, true) {
+    if crate::tagged::mutate::set_cons_cdr(cell, new_cdr) {
         return new_cdr.bits() as i64;
     }
     list_slow(ctx, pure_setcdr, cell, new_cdr)
-}
-
-/// A window hit can be an unobserved hole in the observation envelope.
-/// Keep the GC barrier on every accepted store, but journal only an exact
-/// observed owner in GEN0 observed mode unless explicit write tracking requires
-/// the interpreter's full setter bookkeeping. No safe point intervenes.
-#[inline]
-fn compiled_cons_store(cell: Value, value: Value, cdr: bool) -> bool {
-    use crate::tagged::collection_reads::{
-        CompiledJournalMode, compiled_journal_mode, is_observed,
-    };
-    if compiled_journal_mode() != CompiledJournalMode::Observed
-        || crate::tagged::gc::current_heap_generational_enabled()
-        || crate::tagged::gc::current_write_tracking_enabled()
-    {
-        return if cdr {
-            crate::tagged::mutate::set_cons_cdr(cell, value)
-        } else {
-            crate::tagged::mutate::set_cons_car(cell, value)
-        };
-    }
-    if !cell.is_cons() {
-        return false;
-    }
-    let address = cell.bits() & !TAG_MASK;
-    let (lo, hi) = crate::tagged::collection_reads::compiled_observation_window();
-    let observed = if lo <= address && address < hi {
-        #[cfg(test)]
-        CONS_OBSERVATION_QUERIES.with(|count| count.set(count.get() + 1));
-        is_observed(cell.bits())
-    } else {
-        false
-    };
-    if observed {
-        crate::tagged::gc::TaggedHeap::record_compiled_collection_write(cell.bits());
-    } else {
-        // Complete the first refused store here, then publish its proven
-        // empty gap for later native stores. Ordinary dump, tracking and
-        // concurrent-GC requirements remain authoritative in this helper.
-        crate::tagged::gc::neovm_jit_unobserved_collection_owner(cell.bits() as i64);
-    }
-    let kind = if cdr {
-        crate::tagged::gc::HeapWriteKind::ConsCdr
-    } else {
-        crate::tagged::gc::HeapWriteKind::ConsCar
-    };
-    crate::tagged::gc::note_heap_slot_write(cell, kind, usize::from(cdr), value);
-    let owner = address as *mut crate::tagged::header::ConsCell;
-    // SAFETY: the Cons tag names a live cell, and the GC barrier completed.
-    unsafe {
-        if cdr {
-            (*owner).set_cdr(value);
-        } else {
-            (*owner).set_car(value);
-        }
-    }
-    true
 }
 
 #[cold]
@@ -665,19 +611,10 @@ fn list_slow(ctx: *mut u8, builtin: JitBuiltin2Pure, a: Value, b_: Value) -> i64
 /// [`builtin_aset_args`](b::builtin_aset_args) then handles (or signals).
 /// Must agree with it wherever it stores.
 #[inline(always)]
-fn aset_fast(ctx: &Context, array: Value, index: Value, value: Value) -> bool {
-    use crate::tagged::collection_reads::{CompiledJournalMode, compiled_journal_mode};
+fn aset_fast(array: Value, index: Value, value: Value) -> bool {
     let Some(idx) = index.as_fixnum().and_then(|i| usize::try_from(i).ok()) else {
         return false;
     };
-    // No callback or safe point can change this process-immutable policy.
-    // Reuse it in the outlined store instead of reading the OnceLock twice.
-    let journal = compiled_journal_mode();
-    if journal != CompiledJournalMode::Off
-        && let Some(stored) = aset_journaled_vector(ctx, array, idx, value, journal)
-    {
-        return stored;
-    }
     if array.veclike_type() == Some(crate::tagged::header::VecLikeType::Vector) {
         // One pass over what `set_vector_slot` would check again: owned
         // storage (a mapped pdump vector copies itself on the slow path),
@@ -740,64 +677,12 @@ fn aset_fast(ctx: &Context, array: Value, index: Value, value: Value) -> bool {
     false
 }
 
-/// The native vector setter's projected write must precede its observed
-/// pointer projection. Inspect the immutable header and backing guards
-/// without observing them, then reuse the interpreter's fused recorder.
-/// A failed guard leaves all effects to the existing generic path.
-///
-/// Threading: no state is retained here. The caller's mutator owns the
-/// existing collection journal and heap barrier; the slot store remains
-/// atomic for the concurrent collector, as in the ordinary fast path.
-#[inline]
-fn aset_journaled_vector(
-    ctx: &Context,
-    array: Value,
-    idx: usize,
-    value: Value,
-    journal: crate::tagged::collection_reads::CompiledJournalMode,
-) -> Option<bool> {
-    if !array.is_veclike() {
-        return None;
-    }
-    let header = (array.bits() & !TAG_MASK) as *const crate::tagged::header::VecLikeHeader;
-    // SAFETY: a live veclike, with an immutable subtype header. There is
-    // no callback or GC safe point between the guards and this mutation.
-    let (data, kind) = match unsafe { (*header).type_tag } {
-        crate::tagged::header::VecLikeType::Vector => (
-            unsafe { &mut (*(header as *mut crate::tagged::header::VectorObj)).data },
-            crate::tagged::gc::HeapWriteKind::VectorSlot,
-        ),
-        crate::tagged::header::VecLikeType::Record => (
-            unsafe { &mut (*(header as *mut crate::tagged::header::RecordObj)).data },
-            crate::tagged::gc::HeapWriteKind::RecordSlot,
-        ),
-        _ => return None,
-    };
-    if !data.is_owned() || idx >= data.as_slice().len() {
-        return Some(false);
-    }
-    if journal == crate::tagged::collection_reads::CompiledJournalMode::Eager
-        // The shim's installed Context already supplies the executing heap.
-        // Its generation mode is immutable; avoid resolving that heap again
-        // through TLS before the ordinary collector barrier resolves it.
-        || ctx.tagged_heap.generational_enabled()
-        || crate::tagged::gc::current_write_tracking_enabled()
-        // The subtype guard above already established this live header.
-        || unsafe { (*header).gc.collection_observed() }
-    {
-        crate::tagged::gc::TaggedHeap::record_compiled_collection_write(array.bits());
-    }
-    crate::tagged::gc::note_heap_slot_write(array, kind, idx, value);
-    data.store_atomic(idx, value);
-    Some(true)
-}
-
-/// `Op::Aset` (GNU `Baset`) from compiled code: VALUE's bits, or
-/// [`VALUE_SHIM_SIGNAL`]. Like GNU's inline store / `Faset` call, this never
-/// consults `aset`'s function cell. Nothing here reaches a safe point: the
-/// stores and [`builtin_aset_args`](b::builtin_aset_args) run no Lisp and never
-/// collect, so the site roots nothing.
-/// SAFETY: same vmctx contract as [`neovm_jit_call`].
+/// `Op::Aset` (GNU `Baset`) from compiled code: VALUE's bits, or one of the
+/// two `VALUE_SHIM_*` words. Nothing here reaches a safe point — the stores
+/// and [`builtin_aset_args`](b::builtin_aset_args) run no Lisp and never
+/// collect — so the site roots nothing; a redefined or advised `aset` (which
+/// runs Lisp) answers [`VALUE_SHIM_NEED_GENERIC`] before anything is stored.
+/// SAFETY: same vmctx contract as [`neovm_jit_call`]; only read here.
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // C-ABI shim: raw ptrs per documented SAFETY contract; only ever called from generated code.
 #[unsafe(no_mangle)]
 pub extern "C" fn neovm_jit_aset(ctx: *mut u8, array: i64, index: i64, value: i64) -> i64 {
@@ -806,12 +691,34 @@ pub extern "C" fn neovm_jit_aset(ctx: *mut u8, array: i64, index: i64, value: i6
     let array = Value::from_bits(array as usize);
     let index = Value::from_bits(index as usize);
     let value = Value::from_bits(value as usize);
-    // SAFETY: seam-provided dormant Context; read-only heap policy access.
-    let ctx_ref = unsafe { &*(ctx as *const Context) };
-    if aset_fast(ctx_ref, array, index, value) {
+    {
+        // SAFETY: seam-provided dormant Context; only the epoch cell is written.
+        let ctx = unsafe { &*(ctx as *const Context) };
+        let epoch = ctx.obarray.function_epoch();
+        if ctx.aset_fast_path_epoch.get() != epoch && !aset_regate(ctx, epoch) {
+            return VALUE_SHIM_NEED_GENERIC;
+        }
+    }
+    if aset_fast(array, index, value) {
         return value.bits() as i64;
     }
     aset_slow(ctx, array, index, value)
+}
+
+/// Ask the obarray whether `aset` is still the builtin, and remember the
+/// answer for this function epoch when it is. The per-call check was 44 of
+/// the shim's 103 instructions.
+#[cold]
+#[inline(never)]
+fn aset_regate(ctx: &Context, epoch: u64) -> bool {
+    if !crate::emacs_core::bytecode::vm::named_builtin_fast_path_allowed_in(
+        ctx,
+        Vm::aset_builtin_id(),
+    ) {
+        return false;
+    }
+    ctx.aset_fast_path_epoch.set(epoch);
+    true
 }
 
 #[cold]
@@ -924,11 +831,13 @@ pub extern "C" fn neovm_jit_builtin_slice(
     })
 }
 
-/// Primitive opcode dispatch for `Op::CallBuiltin`/`Op::CallBuiltinSym`
-/// through the dedicated `Vm::*_for_jit` helpers. Both execute the primitive
-/// directly, matching GNU bytecode, with mutating-first-arg string writeback
-/// and the trailing quit poll. Genuine `Bcall` sites use the call shims.
-/// `variant`: 0 = CallBuiltin, 1 = CallBuiltinSym.
+/// Named-builtin dispatch for `Op::CallBuiltin`/`Op::CallBuiltinSym`/
+/// `Op::Aset` — re-enters the runtime through the dedicated `Vm::*_for_jit`
+/// helpers, which mirror the interpreter arms exactly (override-aware named
+/// dispatch for CallBuiltin/Aset, advice-bypassing direct dispatch for
+/// CallBuiltinSym, mutating-first-arg string writeback, trailing quit poll).
+/// `variant`: 0 = CallBuiltin, 1 = CallBuiltinSym, 2 = Aset (the rooted
+/// general call behind [`neovm_jit_aset`]'s [`VALUE_SHIM_NEED_GENERIC`]).
 /// SAFETY: same vmctx contract as [`neovm_jit_call`].
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // C-ABI shim: raw ptrs per documented SAFETY contract; only ever called from generated code.
 #[unsafe(no_mangle)]
@@ -943,9 +852,45 @@ pub extern "C" fn neovm_jit_named_builtin(
     jit_shim_contain!(ctx, STATUS_SIGNAL, {
         let nargs = nargs as usize;
         let saved = save_scratch_gc_roots();
-        // SAFETY: the generated code stored exactly `nargs` words in its
-        // call-args stack slot immediately before this call.
-        debug_assert!(matches!(variant, 0 | 1), "primitive opcode shim variant");
+        // SAFETY (all three reads below): the generated code stored exactly
+        // `nargs` words at `args_ptr` (its call-args stack slot) immediately
+        // before this call.
+        //
+        // `Op::Aset` takes its three arguments POSITIONALLY and everything it
+        // reaches wants a slice, so it gets no argument vector: on `dhrystone`
+        // — which is essentially all `Op::Aset` from compiled code — building
+        // one here and a second one inside `aset_for_jit` was 141 Ir of this
+        // shim's 481 Ir/call. The values still need scratch rooting: nothing
+        // between reading them off the native slot and the callee's own root
+        // scope keeps them alive.
+        if variant == 2 {
+            // The lowering only emits variant 2 for `Op::Aset`, which is
+            // exactly three arguments; pad defensively but catch a codegen
+            // change in debug builds rather than silently asetting nil.
+            debug_assert_eq!(nargs, 3, "Op::Aset shim expects three arguments");
+            let mut a = [Value::NIL; 3];
+            for (i, slot) in a.iter_mut().enumerate().take(nargs.min(3)) {
+                *slot = Value::from_bits(unsafe { *args_ptr.add(i) } as usize);
+                push_scratch_gc_root(*slot);
+            }
+            // SAFETY: see neovm_jit_call's function-level contract.
+            let ctx = unsafe { &mut *(ctx as *mut Context) };
+            let mut vm = Vm::from_context(ctx);
+            let result = vm.aset_for_jit(a[0], a[1], a[2]);
+            let status = match result {
+                Ok(value) => {
+                    // SAFETY: `out` is the generated code's result stack slot.
+                    unsafe { *out = value.bits() as i64 };
+                    STATUS_OK
+                }
+                Err(flow) => {
+                    stash_pending_flow(flow);
+                    STATUS_SIGNAL
+                }
+            };
+            restore_scratch_gc_roots(saved);
+            return status;
+        }
         let mut args = LispArgVec::new();
         for i in 0..nargs {
             let v = Value::from_bits(unsafe { *args_ptr.add(i) } as usize);

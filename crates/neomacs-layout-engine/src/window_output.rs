@@ -224,7 +224,6 @@ pub(crate) struct TextWindowBegin {
     pub(crate) text_clip_bounds: Rect,
     pub(crate) selected: bool,
     pub(crate) first_row: DisplayTextRowBegin,
-    pub(crate) row_capacity: crate::output::window_request::OutputWindowRowCapacity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -236,7 +235,6 @@ pub(crate) struct TextWindowOutputBegin {
     pub(crate) text_bounds: Rect,
     pub(crate) text_clip_bounds: Rect,
     pub(crate) selected: bool,
-    pub(crate) row_capacity: crate::output::window_request::OutputWindowRowCapacity,
 }
 
 impl From<TextWindowBegin> for TextWindowOutputBegin {
@@ -249,7 +247,6 @@ impl From<TextWindowBegin> for TextWindowOutputBegin {
             text_bounds: request.text_bounds,
             text_clip_bounds: request.text_clip_bounds,
             selected: request.selected,
-            row_capacity: request.row_capacity,
         }
     }
 }
@@ -265,7 +262,6 @@ impl TextWindowOutputBegin {
             self.text_clip_bounds,
             self.selected,
         )
-        .with_row_capacity(self.row_capacity)
     }
 }
 
@@ -1718,14 +1714,6 @@ impl WindowOutputEmitter {
         );
     }
 
-    #[cfg(any(test, feature = "redisplay-test-policy"))]
-    pub(crate) fn set_posn_object_extent_mode_for_test(
-        &mut self,
-        mode: neovm_core::window::PosnObjectExtentMode,
-    ) {
-        self.geometry.test_posn_object_extent_mode = Some(mode);
-    }
-
     pub(crate) fn begin_update(&self, evaluator: &mut Context) {
         let _ = self.with_live_update(evaluator, |update| update.begin_update());
     }
@@ -1854,11 +1842,6 @@ impl WindowOutputEmitter {
             evaluator.window_display_snapshot_freshness(frame_id, window_id, buffer_id)
         });
         let snapshot = WindowDisplaySnapshot {
-            #[cfg(any(test, feature = "redisplay-test-policy"))]
-            test_posn_object_extent_mode: Some(
-                evaluator.frame_manager().posn_object_extent_mode(frame_id),
-            ),
-            posn_matrix: None,
             window_id,
             cell_origin,
             regions,
@@ -1877,7 +1860,6 @@ impl WindowOutputEmitter {
             buffer_modiff,
             layout_freshness,
             window_end_record: None,
-            ..Default::default()
         };
         if self.publish_live
             && let Some(frame) = evaluator.frame_manager_mut().get_mut(frame_id)

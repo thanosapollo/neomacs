@@ -199,9 +199,7 @@ thread_local! {
     /// The write barrier's owner window (`barrier_window.rs`): every owner
     /// it covers takes the out-of-line barrier, every other store is plain
     /// unless its owner is a tenured non-cons the remembered set has not
-    /// recorded. Rust non-cons stores test it; compiled GEN0 observed stores
-    /// additionally cover certificate owners in their JitHeapState window.
-    /// Published by
+    /// recorded. Rust non-cons stores and compiled stores test it; published by
     /// `TaggedHeap::publish_barrier_window` at every writer of its inputs
     /// and re-derived whenever a heap is (re)installed.
     static TAGGED_HEAP_BARRIER_WINDOW: Cell<BarrierWindow> =
@@ -224,15 +222,6 @@ thread_local! {
     #[cfg(test)]
     static TEST_FALLBACK_TAGGED_HEAP: std::cell::RefCell<Option<Box<TaggedHeap>>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// Query the installed mutator's existing write-tracking protocol mirror.
-/// Context installation and mode changes refresh this scalar; no heap pointer
-/// or Lisp identity is cached or dereferenced, and each mutator owns its mode.
-#[cfg(feature = "jit")]
-#[inline]
-pub(crate) fn current_write_tracking_enabled() -> bool {
-    TAGGED_HEAP_WRITE_TRACKING_MODE.with(|mode| mode.get() != WriteTrackingMode::Disabled)
 }
 
 const BARRIER_CACHE_SLOTS: usize = 64;
@@ -2668,15 +2657,6 @@ mod incremental;
 
 mod cons_block_trailer;
 use cons_block_trailer::*;
-mod collection_observed;
-pub(crate) use collection_observed::{
-    advance_collection_observation_epoch, clear_noncons_collection_observed_metadata,
-    collection_observation_epoch, collection_observed, collection_observed_metadata,
-    cons_collection_observed_word, has_collection_observations, mark_collection_observed,
-};
-use collection_observed::{
-    clear_cons_observed_block, clear_cons_observed_dead, has_noncons_collection_observations,
-};
 mod cons_blocks;
 /// The cons-block trailer's shape, for `jit_layout::heap`.
 #[cfg_attr(not(feature = "jit"), allow(unused_imports))]
@@ -2693,12 +2673,7 @@ mod gc_thread;
 pub use gc_thread::*;
 
 mod barrier_window;
-#[cfg(feature = "jit")]
-pub(crate) use barrier_window::neovm_jit_unobserved_collection_owner;
-pub(crate) use barrier_window::{
-    BarrierWindow, CompiledObservationGate, current_collection_dump_window,
-    publish_collection_observation_window,
-};
+pub(crate) use barrier_window::BarrierWindow;
 
 mod jit_state;
 

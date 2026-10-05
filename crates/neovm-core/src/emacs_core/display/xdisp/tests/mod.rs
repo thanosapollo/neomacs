@@ -17,28 +17,6 @@ use malachite::Integer;
 
 mod approx_window_text_test;
 
-#[cfg(test)]
-mod mode_line_prop_borrow_test;
-
-#[cfg(test)]
-mod mode_line_plain_field_test;
-
-#[cfg(test)]
-mod mode_line_numeric_padding_test;
-
-#[cfg(test)]
-mod mode_line_incremental_lifetimes;
-
-#[cfg(test)]
-mod posn_extent_fixture_test;
-
-#[cfg(test)]
-mod posn_boundary_anchor_test;
-
-#[cfg(test)]
-mod posn_frame_pool_test;
-use posn_extent_fixture_test::{PosnExtentFixtureGuard, install_accepted_tty_fixture_rows};
-
 fn interactive_context() -> Context {
     let mut eval = Context::new();
     eval.set_variable("noninteractive", Value::NIL);
@@ -1614,8 +1592,6 @@ fn mode_line_display_does_not_flush_a_terminal_min_width_run() {
 
 #[test]
 fn mode_line_display_closes_a_min_width_run_when_another_one_starts() {
-    // This historical flattening expectation exercises explicit OFF.
-    let _legacy_padding = mode_line_numeric_padding_test::PaddingPolicyGuard::set(false);
     crate::test_utils::init_test_tracing();
     let mut eval = interactive_context();
     let buffer_id = eval.buffers.current_buffer().expect("current buffer").id;
@@ -4334,10 +4310,6 @@ fn test_window_line_height_eval_reports_text_rows_relative_to_text_area() {
 
 #[test]
 fn test_posn_at_point_eval_uses_exact_redisplay_snapshot() {
-    // This test's original bare snapshot intentionally models the legacy
-    // physical-dimension contract. The paired ON assertions below supply
-    // explicit current-matrix facts (or preserve cold Undrawn provenance).
-    let _legacy_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::Off);
     crate::test_utils::init_test_tracing();
     let mut eval = interactive_context();
     let buf_id = eval.buffers.current_buffer().expect("current buffer").id;
@@ -4434,29 +4406,10 @@ fn test_posn_at_point_eval_uses_exact_redisplay_snapshot() {
         super::super::print::print_value(&result),
         "(#<window 1> 5 (72 . 34) 0 nil 5 (9 . 2) nil (0 . 0) (7 . 17))"
     );
-
-    // The original fixture has pixel dimensions but no terminal current
-    // matrix. Preserve that legacy contract above; now supply raw row99,
-    // including the deliberately different body-row mapping2.
-    let _tty_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::On);
-    install_accepted_tty_fixture_rows(&mut eval, frame_id, &[(selected_window, 99, 10)]);
-    let tty = builtin_posn_at_point(
-        &mut eval,
-        vec![Value::fixnum(5), Value::make_window(selected_window.0)],
-    )
-    .expect("TTY accepted extent");
-    assert_eq!(
-        super::super::print::print_value(&tty),
-        "(#<window 1> 5 (72 . 34) 0 nil 5 (9 . 2) nil (0 . 0) (1 . 0))"
-    );
 }
 
 #[test]
 fn test_posn_at_point_reports_text_area_relative_y_below_window_chrome() {
-    // This test's original bare snapshot intentionally models the legacy
-    // physical-dimension contract. The paired ON assertions below supply
-    // explicit current-matrix facts (or preserve cold Undrawn provenance).
-    let _legacy_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::Off);
     crate::test_utils::init_test_tracing();
     let mut eval = interactive_context();
     let buf_id = eval.buffers.current_buffer().expect("current buffer").id;
@@ -4513,26 +4466,10 @@ fn test_posn_at_point_reports_text_area_relative_y_below_window_chrome() {
         super::super::print::print_value(&result),
         "(#<window 1> 1 (54 . 291) 0 nil 1 (0 . 15) nil (0 . 0) (7 . 17))"
     );
-
-    let _tty_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::On);
-    install_accepted_tty_fixture_rows(&mut eval, frame_id, &[(selected_window, 17, 1)]);
-    let tty = builtin_posn_at_point(
-        &mut eval,
-        vec![Value::fixnum(1), Value::make_window(selected_window.0)],
-    )
-    .expect("TTY accepted extent below chrome");
-    assert_eq!(
-        super::super::print::print_value(&tty),
-        "(#<window 1> 1 (54 . 291) 0 nil 1 (0 . 15) nil (0 . 0) (1 . 0))"
-    );
 }
 
 #[test]
 fn posn_at_point_recomputes_a_terminal_window_redisplay_has_not_drawn_yet() {
-    // This test's original bare snapshot intentionally models the legacy
-    // physical-dimension contract. The paired ON assertions below supply
-    // explicit current-matrix facts (or preserve cold Undrawn provenance).
-    let _legacy_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::Off);
     // Ledger 201, row 1.  GNU answers `posn-at-point` with no redisplay at all:
     // `Fposn_at_point` goes through `Fpos_visible_in_window_p` ->
     // `pos_visible_p`, which runs `start_display` from `w->start` and
@@ -4634,31 +4571,6 @@ fn posn_at_point_recomputes_a_terminal_window_redisplay_has_not_drawn_yet() {
         calls.get(),
         1,
         "one row walk answers the query, as GNU's single move_it_to does"
-    );
-
-    // A query-only row walk must not become an accepted current matrix.
-    let _tty_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::On);
-    let tty = builtin_posn_at_point(
-        &mut eval,
-        vec![Value::fixnum(1), Value::make_window(window_id.0)],
-    )
-    .expect("cold TTY exact geometry");
-    assert_eq!(
-        super::super::print::print_value(&tty),
-        "(#<window 1> 1 (54 . 17) 0 nil 1 (0 . 1) nil (0 . 0) (0 . 0))"
-    );
-    assert_eq!(
-        calls.get(),
-        2,
-        "each query performs exactly one canonical row walk"
-    );
-    assert!(
-        eval.frames
-            .get(frame_id)
-            .expect("frame")
-            .redisplay_snapshot(window_id)
-            .is_none(),
-        "query geometry must not publish accepted TTY glyph extents"
     );
 }
 
@@ -5059,10 +4971,6 @@ fn frame_relative_posn_at_x_y_rejects_new_surface_area_outside_stale_presentatio
 
 #[test]
 fn test_posn_at_x_y_eval_uses_exact_redisplay_snapshot() {
-    // This test's original bare snapshot intentionally models the legacy
-    // physical-dimension contract. The paired ON assertions below supply
-    // explicit current-matrix facts (or preserve cold Undrawn provenance).
-    let _legacy_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::Off);
     crate::test_utils::init_test_tracing();
     let mut eval = interactive_context();
     let buf_id = eval.buffers.current_buffer().expect("current buffer").id;
@@ -5152,25 +5060,6 @@ fn test_posn_at_x_y_eval_uses_exact_redisplay_snapshot() {
         super::super::print::print_value(&whole_window),
         "(#<window 1> 5 (30 . 20) 0 nil 5 (3 . 1) nil (0 . 0) (21 . 30))"
     );
-
-    let _tty_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::On);
-    install_accepted_tty_fixture_rows(&mut eval, frame_id, &[(selected_window, 1, 4)]);
-    for (x, whole) in [(30, Value::NIL), (38, Value::T)] {
-        let tty = builtin_posn_at_x_y(
-            &mut eval,
-            vec![
-                Value::fixnum(x),
-                Value::fixnum(20),
-                Value::make_window(selected_window.0),
-                whole,
-            ],
-        )
-        .expect("TTY accepted click extent");
-        assert_eq!(
-            super::super::print::print_value(&tty),
-            "(#<window 1> 5 (30 . 20) 0 nil 5 (3 . 1) nil (0 . 0) (1 . 0))"
-        );
-    }
 }
 
 /// One terminal-shaped text row of a fixture snapshot: a single position at
@@ -5233,10 +5122,6 @@ fn fixture_chrome_row(row: i64, y: i64, width: i64) -> crate::window::DisplayRow
 
 #[test]
 fn posn_at_x_y_on_the_mode_line_answers_the_mode_line() {
-    // This test's original bare snapshot intentionally models the legacy
-    // physical-dimension contract. The paired ON assertions below supply
-    // explicit current-matrix facts (or preserve cold Undrawn provenance).
-    let _legacy_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::Off);
     // Ledger 209, ledger 205's residual 2. GNU's `make_lispy_position` asks
     // `window_from_coordinates (f, mx, my, &part, ...)` FIRST
     // (src/keyboard.c:5793) and branches on ON_MODE_LINE before any buffer
@@ -5319,43 +5204,10 @@ fn posn_at_x_y_on_the_mode_line_answers_the_mode_line() {
         super::super::print::print_value(&above_it),
         "(#<window 1> 1 (0 . 0) 0 nil 1 (0 . 0) nil (0 . 0) (8 . 16))"
     );
-
-    let _tty_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::On);
-    install_accepted_tty_fixture_rows(&mut eval, frame_id, &[(selected_window, 0, 1)]);
-    let tty = builtin_posn_at_x_y(
-        &mut eval,
-        vec![
-            Value::fixnum(0),
-            Value::fixnum(0),
-            Value::make_window(selected_window.0),
-        ],
-    )
-    .expect("TTY body beside mode line");
-    assert_eq!(
-        super::super::print::print_value(&tty),
-        "(#<window 1> 1 (0 . 0) 0 nil 1 (0 . 0) nil (0 . 0) (1 . 0))"
-    );
-    let chrome = builtin_posn_at_x_y(
-        &mut eval,
-        vec![
-            Value::fixnum(40),
-            Value::fixnum(352),
-            Value::make_window(selected_window.0),
-        ],
-    )
-    .expect("named mode-line contract");
-    assert_eq!(
-        super::super::print::print_value(&chrome),
-        "(#<window 1> mode-line (40 . 352) 0 nil nil (5 . 22) nil (0 . 0) (8 . 16))"
-    );
 }
 
 #[test]
 fn posn_at_x_y_at_y_zero_of_a_window_with_a_header_line_answers_row_minus_one() {
-    // This test's original bare snapshot intentionally models the legacy
-    // physical-dimension contract. The paired ON assertions below supply
-    // explicit current-matrix facts (or preserve cold Undrawn provenance).
-    let _legacy_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::Off);
     // Ledger 209. `posn-at-x-y`'s Y is WINDOW-relative and GNU's own doc string
     // says so -- "Note that the text area includes the header-line and the
     // tab-line of the window" (src/keyboard.c:13011-13013) -- so Y = 0 in a
@@ -5429,43 +5281,10 @@ fn posn_at_x_y_at_y_zero_of_a_window_with_a_header_line_answers_row_minus_one() 
         super::super::print::print_value(&first_text_row),
         "(#<window 1> 1 (0 . 0) 0 nil 1 (0 . 0) nil (0 . 0) (8 . 16))"
     );
-
-    let _tty_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::On);
-    install_accepted_tty_fixture_rows(&mut eval, frame_id, &[(selected_window, 1, 1)]);
-    let tty = builtin_posn_at_x_y(
-        &mut eval,
-        vec![
-            Value::fixnum(0),
-            Value::fixnum(16),
-            Value::make_window(selected_window.0),
-        ],
-    )
-    .expect("TTY first text row below header");
-    assert_eq!(
-        super::super::print::print_value(&tty),
-        "(#<window 1> 1 (0 . 0) 0 nil 1 (0 . 0) nil (0 . 0) (1 . 0))"
-    );
-    let header = builtin_posn_at_x_y(
-        &mut eval,
-        vec![
-            Value::fixnum(0),
-            Value::fixnum(0),
-            Value::make_window(selected_window.0),
-        ],
-    )
-    .expect("named header-line contract");
-    assert_eq!(
-        super::super::print::print_value(&header),
-        "(#<window 1> header-line (0 . 0) 0 nil nil (0 . -1) nil (0 . 0) (8 . 16))"
-    );
 }
 
 #[test]
 fn posn_at_x_y_past_a_window_with_no_mode_line_resolves_the_window_below_it() {
-    // This test's original bare snapshot intentionally models the legacy
-    // physical-dimension contract. The paired ON assertions below supply
-    // explicit current-matrix facts (or preserve cold Undrawn provenance).
-    let _legacy_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::Off);
     // Ledger 209, ledger 205's residual 3. `Fposn_at_x_y` converts a WINDOW
     // argument into FRAME pixels and hands them to `make_lispy_position`
     // (src/keyboard.c:13036-13052); the window the caller named is an ORIGIN
@@ -5548,39 +5367,6 @@ fn posn_at_x_y_past_a_window_with_no_mode_line_resolves_the_window_below_it() {
     assert_eq!(
         super::super::print::print_value(&inside_the_body),
         "(#<window 1> 1 (0 . 352) 0 nil 1 (0 . 0) nil (0 . 0) (8 . 16))"
-    );
-
-    let _tty_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::On);
-    install_accepted_tty_fixture_rows(
-        &mut eval,
-        frame_id,
-        &[(selected_window, 0, 1), (minibuffer_window, 0, 1)],
-    );
-    let tty = builtin_posn_at_x_y(
-        &mut eval,
-        vec![
-            Value::fixnum(0),
-            Value::fixnum(368),
-            Value::make_window(selected_window.0),
-        ],
-    )
-    .expect("TTY re-resolved minibuffer extent");
-    assert_eq!(
-        super::super::print::print_value(&tty),
-        "(#<window 2> 1 (0 . 0) 0 nil 1 (0 . 0) nil (0 . 0) (1 . 0))"
-    );
-    let inside = builtin_posn_at_x_y(
-        &mut eval,
-        vec![
-            Value::fixnum(0),
-            Value::fixnum(352),
-            Value::make_window(selected_window.0),
-        ],
-    )
-    .expect("TTY origin window extent");
-    assert_eq!(
-        super::super::print::print_value(&inside),
-        "(#<window 1> 1 (0 . 352) 0 nil 1 (0 . 0) nil (0 . 0) (1 . 0))"
     );
 }
 
@@ -5739,10 +5525,6 @@ fn test_posn_at_x_y_batch_wraps_long_visual_lines_like_gnu_tty() {
 
 #[test]
 fn test_posn_at_point_eval_returns_nil_outside_visible_snapshot_span() {
-    // This test's original bare snapshot intentionally models the legacy
-    // physical-dimension contract. The paired ON assertions below supply
-    // explicit current-matrix facts (or preserve cold Undrawn provenance).
-    let _legacy_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::Off);
     crate::test_utils::init_test_tracing();
     let mut eval = interactive_context();
     let buf_id = eval.buffers.current_buffer().expect("current buffer").id;
@@ -5832,30 +5614,6 @@ fn test_posn_at_point_eval_returns_nil_outside_visible_snapshot_span() {
     assert_eq!(
         super::super::print::print_value(&hidden_gap),
         "(#<window 1> 14 (56 . 18) 0 nil 14 (6 . 0) nil (0 . 0) (8 . 16))"
-    );
-
-    let _tty_extent = PosnExtentFixtureGuard::set(crate::window::PosnObjectExtentMode::On);
-    install_accepted_tty_fixture_rows(&mut eval, frame_id, &[(selected_window, 0, 7)]);
-    let before = builtin_posn_at_point(
-        &mut eval,
-        vec![Value::fixnum(5), Value::make_window(selected_window.0)],
-    )
-    .expect("TTY before span");
-    let after = builtin_posn_at_point(
-        &mut eval,
-        vec![Value::fixnum(20), Value::make_window(selected_window.0)],
-    )
-    .expect("TTY after span");
-    let tty = builtin_posn_at_point(
-        &mut eval,
-        vec![Value::fixnum(12), Value::make_window(selected_window.0)],
-    )
-    .expect("TTY hidden-gap lookup");
-    assert!(before.is_nil());
-    assert!(after.is_nil());
-    assert_eq!(
-        super::super::print::print_value(&tty),
-        "(#<window 1> 14 (56 . 18) 0 nil 14 (6 . 0) nil (0 . 0) (1 . 0))"
     );
 }
 
@@ -7643,6 +7401,3 @@ fn window_text_pixel_size_reports_gnus_negative_width_for_a_retracted_from_row()
         "GNU: (-36 . 20)"
     );
 }
-
-#[cfg(test)]
-mod mode_line_min_width_boundary_test;

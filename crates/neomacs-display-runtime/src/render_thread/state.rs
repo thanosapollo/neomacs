@@ -889,6 +889,7 @@ pub(super) struct RenderApp {
     pub(super) gpu_startup_cancelled: Arc<std::sync::atomic::AtomicBool>,
     pub(super) startup_error: Option<String>,
     pub(super) startup_commands: std::collections::VecDeque<crate::thread_comm::RenderCommand>,
+    pub(super) frame_leases: HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
     pub(super) renderer: Option<WgpuRenderer>,
     /// Native decoder workers signal this callback after replacing a latest
     /// frame or publishing control state. Production installs a winit proxy;
@@ -937,6 +938,7 @@ pub(super) struct RenderApp {
     /// which winit's aggregate `ModifiersState` cannot express; updated
     /// from the physical modifier keys' own key events.
     pub(super) modifier_sides: super::modifier_sides::ModifierSides,
+    pub(super) key_repeats: super::key_repeat::KeyRepeats,
     pub(super) pending_file_drops: std::collections::HashSet<winit::event_loop::AsyncRequestSerial>,
 
     pub(super) image_metadata: SharedImageRenderState,
@@ -1091,27 +1093,31 @@ impl RenderApp {
         #[cfg(feature = "neo-term")] shared_terminals: crate::terminal::SharedTerminals,
     ) -> Self {
         let mut frame_windows = GuiFrameWindowManager::new();
-        frame_windows.set_primary_pending(GuiFrameWindowState {
-            pending_scale_factor: None,
-            lifecycle: FrameLifecycle::Pending {
-                width,
-                height,
-                scale_factor: 1.0,
-                mouse_hidden_for_typing: false,
-                ime_enabled: false,
-                last_ime_cursor_area: None,
-                chrome: WindowChrome {
-                    title,
-                    ..WindowChrome::default()
+        // A deferred connection is not a frame transaction. Only a consumed
+        // RealizeFrame may publish its primary identity and cancellation lease.
+        if !comms.keep_alive_without_frames {
+            frame_windows.set_primary_pending(GuiFrameWindowState {
+                pending_scale_factor: None,
+                lifecycle: FrameLifecycle::Pending {
+                    width,
+                    height,
+                    scale_factor: 1.0,
+                    mouse_hidden_for_typing: false,
+                    ime_enabled: false,
+                    last_ime_cursor_area: None,
+                    chrome: WindowChrome {
+                        title,
+                        ..WindowChrome::default()
+                    },
+                    geometry_hints: None,
                 },
-                geometry_hints: None,
-            },
-            render: GuiFrameRenderState::new_without_device(
-                0,
-                false,
-                neomacs_display_protocol::frame_time::observe_platform_now(),
-            ),
-        });
+                render: GuiFrameRenderState::new_without_device(
+                    0,
+                    false,
+                    neomacs_display_protocol::frame_time::observe_platform_now(),
+                ),
+            });
+        }
 
         let requested_visual_config = VisualConfig::default();
         let backend_profile = RenderBackendProfile::pending();
@@ -1129,6 +1135,7 @@ impl RenderApp {
             gpu_startup_cancelled: Default::default(),
             startup_error: None,
             startup_commands: Default::default(),
+            frame_leases: Default::default(),
             menus: crate::menus::MenuPresentation::default(),
             tooltips: crate::tooltips::Tooltips::default(),
             renderer: None,
@@ -1149,6 +1156,7 @@ impl RenderApp {
             modifier_policy: neomacs_display_protocol::ModifierPolicy::gnu_ns_default(),
             modifier_state: winit::keyboard::ModifiersState::empty(),
             modifier_sides: super::modifier_sides::ModifierSides::default(),
+            key_repeats: super::key_repeat::KeyRepeats::default(),
             pending_file_drops: Default::default(),
             image_metadata,
             cursor_defaults: CursorState::new(

@@ -17,14 +17,44 @@ impl RenderApp {
         self.frame_windows.mark_top_level_dirty();
     }
 
+    #[cfg(test)]
     pub(super) fn handle_terminal(&mut self, cmd: TerminalCommand) {
+        self.handle_terminal_with_waker(cmd, None);
+    }
+
+    pub(super) fn handle_terminal_with_waker(
+        &mut self,
+        cmd: TerminalCommand,
+        waker: Option<winit::event_loop::EventLoopProxy>,
+    ) {
         match cmd {
+            TerminalCommand::TerminalSetPalette { frame, palette } => {
+                let changed = match palette {
+                    Some(palette) => {
+                        self.terminal_manager.palettes.insert(frame, palette) != Some(palette)
+                    }
+                    None => self.terminal_manager.palettes.remove(&frame).is_some(),
+                };
+                if changed {
+                    // Reproject cached semantic cells; do not reread/reparse PTY
+                    // output or rebuild the grid just because a theme changed.
+                    self.invalidate_terminal_scene();
+                }
+            }
             TerminalCommand::TerminalCreate {
                 id,
                 size,
                 target,
                 shell,
-            } => match crate::terminal::TerminalView::new(id, size, target, shell.as_deref()) {
+                invocation,
+            } => match crate::terminal::TerminalView::new_invocation_with_waker(
+                id,
+                size,
+                target,
+                shell.as_deref(),
+                invocation.as_ref(),
+                waker,
+            ) {
                 Ok(view) => {
                     if let Err(error) = self.shared_terminals.mark_live(id, view.term.clone()) {
                         tracing::error!("Failed to publish terminal {id}: {error}");

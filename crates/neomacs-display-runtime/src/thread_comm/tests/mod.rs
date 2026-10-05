@@ -1,3 +1,7 @@
+mod personal_release;
+#[cfg(feature = "neo-term")]
+mod personal_release_eshell;
+
 use super::*;
 use crate::core::frame_glyphs::FrameGlyphBuffer;
 use neomacs_display_protocol::glyph_matrix::FrameDisplayState;
@@ -14,6 +18,93 @@ fn test_image_load(image: u32, attempt: u64) -> ImageLoadToken {
         ImageId::new(image),
         ImageLoadAttempt::new(attempt).expect("non-zero test load attempt"),
     )
+}
+
+#[test]
+fn native_repeat_tracking_does_not_fill_command_completion_ledger() {
+    let (emacs, render) = ThreadComms::new().split();
+    let mut progress = neomacs_display_protocol::input_progress::InputProgress::default();
+    let _command = progress.begin_command();
+    // A single interactive command may read held-key input indefinitely.
+    for _ in 0..1300 {
+        let (observer, _, _) = render.send_key_input_with_receipt(InputEvent::Key {
+            keysym: b'p' as u32,
+            modifiers: 0,
+            pressed: true,
+            emacs_frame_id: 1,
+        });
+        let observer = observer.expect("every native key needs a read receipt");
+        assert!(!observer.consumed_or_cancelled());
+        let InputEvent::Tracked { receipt, .. } = emacs.input_rx.try_recv().unwrap() else {
+            panic!("native key must retain read ownership through the bridge");
+        };
+        progress.consumed(receipt);
+        assert!(observer.consumed_or_cancelled());
+    }
+    assert!(progress.current_command_receipts().is_empty());
+}
+
+#[test]
+fn native_page_keys_keep_read_and_scroll_completion_receipts_separate() {
+    let (emacs, render) = ThreadComms::new().split();
+    let (read, completion, _) = render.send_key_input_with_receipt(InputEvent::Key {
+        keysym: 0xff55,
+        modifiers: 0,
+        pressed: true,
+        emacs_frame_id: 1,
+    });
+    let read = read.unwrap();
+    let completion = completion.unwrap();
+    assert!(!read.same_input(&completion));
+    let mut progress = neomacs_display_protocol::input_progress::InputProgress::default();
+    let command = progress.begin_command();
+    let InputEvent::Tracked { receipt, event } = emacs.input_rx.try_recv().unwrap() else {
+        panic!("missing native read receipt");
+    };
+    progress.consumed(receipt);
+    let InputEvent::Tracked { receipt, .. } = *event else {
+        panic!("missing scroll completion receipt");
+    };
+    progress.consumed(receipt);
+    assert!(read.consumed_or_cancelled());
+    assert!(!completion.acknowledged_by(&progress.checkpoint()));
+    assert_eq!(progress.current_command_receipts().len(), 1);
+    assert!(progress.current_command_receipts()[0].same_input(&completion));
+    drop(command);
+    assert!(completion.acknowledged_by(&progress.checkpoint()));
+    assert!(!read.acknowledged_by(&progress.checkpoint()));
+}
+
+#[test]
+fn accepted_opacity_is_independent_of_superseded_visual_mailbox() {
+    let (emacs, render) = ThreadComms::new().split();
+    emacs.frame_opacity.lock().unwrap().accept(1, [0.5; 2], 0.2);
+    let mut numeric = FrameDisplayState::new(12, 4, 8.0, 16.0);
+    numeric.frame_alpha = [0.5; 2];
+    assert!(
+        emacs
+            .frame_tx
+            .submit(sealed_test_state(numeric))
+            .unwrap()
+            .is_none()
+    );
+    emacs
+        .frame_opacity
+        .lock()
+        .unwrap()
+        .accept(1, [-1.0; 2], 0.2);
+    let mut nil = FrameDisplayState::new(12, 4, 8.0, 16.0);
+    nil.frame_alpha = [-1.0; 2];
+    assert!(
+        emacs
+            .frame_tx
+            .submit(sealed_test_state(nil))
+            .unwrap()
+            .is_some()
+    );
+    let latest = render.frame_rx.try_recv().unwrap();
+    assert_eq!(latest.frame_alpha, [-1.0; 2]);
+    assert_eq!(render.frame_opacity.lock().unwrap().applied(1), Some(0.5));
 }
 
 #[test]
@@ -152,7 +243,7 @@ fn thread_comms_input_channel_roundtrip() {
     let comms = ThreadComms::new();
 
     let event = InputEvent::Key {
-        key: neovm_core::keyboard::FrontendKey::Keysym(65), // 'A'
+        keysym: 65, // 'A'
         modifiers: 0,
         pressed: true,
         emacs_frame_id: 0,
@@ -163,12 +254,12 @@ fn thread_comms_input_channel_roundtrip() {
     let received = comms.input_rx.try_recv().unwrap();
     match received {
         InputEvent::Key {
-            key,
+            keysym,
             modifiers,
             pressed,
             emacs_frame_id,
         } => {
-            assert_eq!(key, neovm_core::keyboard::FrontendKey::Keysym(65));
+            assert_eq!(keysym, 65);
             assert_eq!(modifiers, 0);
             assert!(pressed);
             assert_eq!(emacs_frame_id, 0);
@@ -301,7 +392,7 @@ fn thread_comms_input_channel_bounded_capacity() {
     // Fill up the input channel to capacity
     for _ in 0..INPUT_CHANNEL_CAPACITY {
         let event = InputEvent::Key {
-            key: neovm_core::keyboard::FrontendKey::Keysym(0),
+            keysym: 0,
             modifiers: 0,
             pressed: false,
             emacs_frame_id: 0,
@@ -311,7 +402,7 @@ fn thread_comms_input_channel_bounded_capacity() {
 
     // Next try_send should fail (channel full)
     let result = comms.input_tx.try_send(InputEvent::Key {
-        key: neovm_core::keyboard::FrontendKey::Keysym(0),
+        keysym: 0,
         modifiers: 0,
         pressed: false,
         emacs_frame_id: 0,
@@ -434,19 +525,19 @@ fn render_comms_send_input_delivers_event() {
 #[test]
 fn input_event_key_construction() {
     let event = InputEvent::Key {
-        key: neovm_core::keyboard::FrontendKey::Keysym(0xFF0D), // Return
-        modifiers: 4,                                           // Ctrl
+        keysym: 0xFF0D, // Return
+        modifiers: 4,   // Ctrl
         pressed: true,
         emacs_frame_id: 0,
     };
     match event {
         InputEvent::Key {
-            key,
+            keysym,
             modifiers,
             pressed,
             emacs_frame_id,
         } => {
-            assert_eq!(key, neovm_core::keyboard::FrontendKey::Keysym(0xFF0D));
+            assert_eq!(keysym, 0xFF0D);
             assert_eq!(modifiers, 4);
             assert!(pressed);
             assert_eq!(emacs_frame_id, 0);
@@ -683,7 +774,7 @@ fn a_file_drop_reports_the_dropped_paths_and_nothing_that_stands_in_for_a_posn()
 #[test]
 fn input_event_clone() {
     let original = InputEvent::Key {
-        key: neovm_core::keyboard::FrontendKey::Keysym(42),
+        keysym: 42,
         modifiers: 8,
         pressed: false,
         emacs_frame_id: 0,
@@ -691,12 +782,12 @@ fn input_event_clone() {
     let cloned = original.clone();
     match cloned {
         InputEvent::Key {
-            key,
+            keysym,
             modifiers,
             pressed,
             emacs_frame_id,
         } => {
-            assert_eq!(key, neovm_core::keyboard::FrontendKey::Keysym(42));
+            assert_eq!(keysym, 42);
             assert_eq!(modifiers, 8);
             assert!(!pressed);
             assert_eq!(emacs_frame_id, 0);
@@ -708,7 +799,7 @@ fn input_event_clone() {
 #[test]
 fn input_event_debug() {
     let event = InputEvent::Key {
-        key: neovm_core::keyboard::FrontendKey::Keysym(65),
+        keysym: 65,
         modifiers: 0,
         pressed: true,
         emacs_frame_id: 0,
@@ -1539,19 +1630,19 @@ fn channel_sends_multiple_input_events_in_order() {
 
     let events = vec![
         InputEvent::Key {
-            key: neovm_core::keyboard::FrontendKey::Keysym(1),
+            keysym: 1,
             modifiers: 0,
             pressed: true,
             emacs_frame_id: 0,
         },
         InputEvent::Key {
-            key: neovm_core::keyboard::FrontendKey::Keysym(2),
+            keysym: 2,
             modifiers: 0,
             pressed: true,
             emacs_frame_id: 0,
         },
         InputEvent::Key {
-            key: neovm_core::keyboard::FrontendKey::Keysym(3),
+            keysym: 3,
             modifiers: 0,
             pressed: true,
             emacs_frame_id: 0,
@@ -1641,7 +1732,7 @@ fn cross_thread_input_event_delivery() {
 
     let handle = std::thread::spawn(move || {
         render.send_input(InputEvent::Key {
-            key: neovm_core::keyboard::FrontendKey::Keysym(0x61), // 'a'
+            keysym: 0x61, // 'a'
             modifiers: 0,
             pressed: true,
             emacs_frame_id: 0,
@@ -1659,9 +1750,7 @@ fn cross_thread_input_event_delivery() {
     // Both events should be receivable on the Emacs side
     let evt1 = emacs.input_rx.try_recv().unwrap();
     match evt1 {
-        InputEvent::Key { key, .. } => {
-            assert_eq!(key, neovm_core::keyboard::FrontendKey::Keysym(0x61))
-        }
+        InputEvent::Key { keysym, .. } => assert_eq!(keysym, 0x61),
         other => panic!("Expected Key, got {:?}", other),
     }
 

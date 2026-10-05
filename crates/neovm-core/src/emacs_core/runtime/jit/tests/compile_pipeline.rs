@@ -427,8 +427,6 @@ fn jit_pipeline_optional_shim_groups_follow_the_leaf_not_the_module() {
         call_census: true,
         direct_framed: true,
         hof: true,
-        collection_journal: true,
-        collection_observation_gate: true,
     };
     let ids = ShimIds::declare(&mut module, CallConv::SystemV, types::I64, every).expect("ids");
     let again = ShimIds::declare(&mut module, CallConv::SystemV, types::I64, every).expect("ids");
@@ -448,8 +446,6 @@ fn jit_pipeline_optional_shim_groups_follow_the_leaf_not_the_module() {
         call_census: false,
         direct_framed: false,
         hof: false,
-        collection_journal: false,
-        collection_observation_gate: false,
     };
     let refs = RtRefs::new(ids, base_only, &mut func, CallConv::SystemV, types::I64);
     assert_eq!(
@@ -464,19 +460,6 @@ fn jit_pipeline_optional_shim_groups_follow_the_leaf_not_the_module() {
     assert!(refs.try_get(&mut func, Shim::CallCensus).is_none());
     assert!(refs.try_get(&mut func, Shim::CallSpecCensus).is_none());
     assert!(refs.try_get(&mut func, Shim::DirectFramed).is_none());
-    assert!(
-        refs.try_get(&mut func, Shim::StringCollectionWrite)
-            .is_none()
-    );
-    assert!(
-        refs.try_get(&mut func, Shim::UnobservedCollectionOwner)
-            .is_none()
-    );
-    let gate_signature = Shim::UnobservedCollectionOwner.signature(CallConv::SystemV, types::I64);
-    assert_eq!(gate_signature.params.len(), 1);
-    assert_eq!(gate_signature.params[0].value_type, types::I64);
-    assert_eq!(gate_signature.returns.len(), 1);
-    assert_eq!(gate_signature.returns[0].value_type, types::I8);
     let cons = refs.get(&mut func, Shim::Cons);
     assert_eq!(refs.get(&mut func, Shim::Cons), cons, "imported once");
     assert_eq!(func.dfg.ext_funcs.len(), 1);
@@ -507,8 +490,6 @@ fn jit_pipeline_optional_shim_groups_follow_the_leaf_not_the_module() {
         Shim::CallCensus,
         Shim::CallSpecCensus,
         Shim::DirectFramed,
-        Shim::StringCollectionWrite,
-        Shim::UnobservedCollectionOwner,
     ] {
         let id = ids.get(shim).expect("backend declares every group");
         assert!(
@@ -571,9 +552,6 @@ fn throw_if() -> ByteCodeFunction {
 /// take its body, on the leaf it produced (`mir=` on `[neovm-jit-final-leaf]`).
 #[test]
 fn jit_pipeline_leaf_records_its_mir_verdict() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     force_deopt_for_test(false);
     observe_stats();
     let verdict = |f: &ByteCodeFunction| {

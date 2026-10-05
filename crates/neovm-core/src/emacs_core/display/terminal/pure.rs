@@ -170,15 +170,6 @@ pub trait TerminalHost {
     fn delete_terminal(&mut self) -> Result<(), String> {
         Ok(())
     }
-    /// GNU `Fsend_string_to_terminal`'s `fwrite`+`fflush` on the terminal's
-    /// output stream (src/dispnew.c:6838-6843).  The host owns the fd, so the
-    /// write and its flush belong behind this method.  A host that owns no
-    /// output stream rejects; the caller distinguishes GNU's "not a termcap
-    /// terminal device" from "Terminal is currently suspended" using the
-    /// terminal record, not this error.
-    fn write_bytes(&mut self, _bytes: &[u8]) -> Result<(), String> {
-        Err("terminal host has no output stream".to_owned())
-    }
 }
 
 /// Validated identity of a text terminal a frontend must open for one frame.
@@ -597,6 +588,20 @@ pub(crate) fn next_terminal_id() -> u64 {
     })
 }
 
+/// Register a native graphical connection without changing the daemon's
+/// initial terminal or any existing TTY frame.
+pub fn register_graphical_terminal(
+    identity: neomacs_display_protocol::GraphicalDisplayIdentity,
+) -> u64 {
+    let id = next_terminal_id();
+    ensure_terminal_runtime_owner(
+        id,
+        identity.terminal_name().to_owned(),
+        TerminalRuntimeConfig::window_system(identity),
+    );
+    id
+}
+
 /// GNU `get_named_terminal`: find an active termcap terminal already owning
 /// DEVICE so a second frame shares its renderer, input source, and kboard
 /// instead of opening the same tty twice.
@@ -815,10 +820,7 @@ fn selected_terminal_id(eval: &crate::emacs_core::eval::Context) -> Option<u64> 
         })
 }
 
-pub(crate) fn decode_terminal_id_eval(
-    eval: &crate::emacs_core::eval::Context,
-    value: &Value,
-) -> Option<u64> {
+fn decode_terminal_id_eval(eval: &crate::emacs_core::eval::Context, value: &Value) -> Option<u64> {
     if value.is_nil() {
         return selected_terminal_id(eval);
     }
@@ -1005,45 +1007,6 @@ fn terminal_runtime_for_id(id: u64) -> TerminalRuntime {
 /// GNU `t->type` for a terminal that still exists.
 fn terminal_output_method_for_id(id: u64) -> Option<TerminalOutputMethod> {
     with_terminal_manager(|slot| slot.borrow().get(id).map(|terminal| terminal.output_method))
-}
-
-/// GNU `Fsend_string_to_terminal`'s terminal dispatch
-/// (src/dispnew.c:6819-6843): route STRING's bytes to the terminal's output
-/// stream, unaltered.  The Lisp-visible argument decoding lives with the
-/// builtin; everything that reads the terminal record lives here.
-pub(crate) fn write_bytes_to_terminal(terminal_id: u64, bytes: &[u8]) -> Result<(), Flow> {
-    match terminal_output_method_for_id(terminal_id) {
-        // GNU: `out = stdout' for `output_initial' -- what batch, daemon and
-        // pre-tty sessions run on (src/dispnew.c:6823-6824).
-        Some(TerminalOutputMethod::Initial) => {
-            use std::io::Write as _;
-            // GNU ignores the fwrite result here; the tty has nowhere better
-            // to report a failed diagnostic write.
-            let _ = std::io::stdout().write_all(bytes);
-            let _ = std::io::stdout().flush();
-            Ok(())
-        }
-        // GNU: `error("Device %d is not a termcap terminal device", t->id)'
-        // (src/dispnew.c:6826-6827).  `None' cannot survive the caller's
-        // live-terminal decode; treat it with the same answer for totality.
-        Some(TerminalOutputMethod::WindowSystem) | None => Err(signal(
-            "error",
-            vec![Value::string(format!(
-                "Device {terminal_id} is not a termcap terminal device"
-            ))],
-        )),
-        Some(TerminalOutputMethod::Termcap) => {
-            // GNU: `!tty->output' means the terminal is suspended
-            // (src/dispnew.c:6833-6835).
-            if terminal_runtime_for_id(terminal_id).suspended {
-                return Err(signal(
-                    "error",
-                    vec![Value::string("Terminal is currently suspended")],
-                ));
-            }
-            with_terminal_host_for_id(terminal_id, |host| host.write_bytes(bytes))
-        }
-    }
 }
 
 /// Mark the selected terminal as having a controlling tty, so it can host a
@@ -1276,7 +1239,7 @@ pub(crate) fn builtin_frame_terminal(
     Ok(terminal_handle_value_for_id(terminal_id).unwrap_or_else(terminal_handle_value))
 }
 
-/// (terminal-live-p TERMINAL) -> t
+/// (terminal-live-p TERMINAL) -> output type or nil
 ///
 /// In GNU Emacs, terminal-live-p returns the terminal type symbol
 /// (e.g. 'x, 'w32) for GUI terminals, or t for TTY.  This is used
@@ -1289,30 +1252,15 @@ pub(crate) fn builtin_terminal_live_p(
     let Some(terminal_id) = decode_terminal_id_eval(eval, &args[0]) else {
         return Ok(Value::NIL);
     };
-    let runtime = terminal_runtime_for_id(terminal_id);
-    let mut terminal_has_frame = false;
-    let window_system = eval
-        .frames
-        .frame_list()
-        .into_iter()
-        .filter_map(|frame_id| eval.frames.get(frame_id))
-        .filter(|frame| frame.terminal_id == terminal_id)
-        .find_map(|frame| {
-            terminal_has_frame = true;
-            frame.effective_window_system()
-        });
-    // Return the window system type so framep-on-display works correctly.
-    if let Some(window_system) = window_system {
-        Ok(window_system)
-    } else if terminal_has_frame || runtime.controlling_tty || runtime.tty_type.is_some() {
-        Ok(Value::T)
-    } else if crate::emacs_core::display::x_window_system_active(eval) {
-        Ok(Value::symbol(
-            crate::emacs_core::display::gui_window_system_symbol(),
-        ))
-    } else {
-        Ok(Value::T)
-    }
+    // GNU Fterminal_live_p classifies the decoded terminal's output method,
+    // even when its last frame is gone or another terminal is selected.
+    Ok(match terminal_output_method_for_id(terminal_id) {
+        Some(TerminalOutputMethod::Initial | TerminalOutputMethod::Termcap) => Value::T,
+        Some(TerminalOutputMethod::WindowSystem) => {
+            Value::symbol(crate::emacs_core::display::gui_window_system_symbol())
+        }
+        None => Value::NIL,
+    })
 }
 
 /// (terminal-parameter TERMINAL PARAMETER) -> value
@@ -1597,6 +1545,23 @@ pub(crate) fn delete_terminal_owned(
             "error",
             vec![Value::string(
                 "Attempt to delete the sole active display terminal",
+            )],
+        ));
+    }
+    // The native display host retains this connection across frame deletion,
+    // but cannot retire/reconnect it independently. Reject public deletion
+    // before any Lisp hooks or ownership mutation; internal teardown is exempt.
+    if matches!(mode, DeleteTerminalMode::Public { .. })
+        && eval
+            .display_host
+            .as_ref()
+            .and_then(|host| host.gui_terminal())
+            .is_some_and(|(id, _)| id == terminal_id)
+    {
+        return Err(signal(
+            "error",
+            vec![Value::string(
+                "Deleting a retained graphical display terminal is not supported",
             )],
         ));
     }

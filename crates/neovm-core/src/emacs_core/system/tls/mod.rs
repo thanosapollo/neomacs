@@ -436,6 +436,22 @@ impl TlsStream {
         }
     }
 
+    /// Already-decrypted input or an immediately observable terminal read is
+    /// readiness even when TCP is empty. Borrow without consuming or doing I/O.
+    pub(crate) fn has_buffered_process_output(&mut self) -> bool {
+        match self {
+            Self::Rustls(stream) => rustls_has_buffered_process_output(&mut stream.inner.conn),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_connection(
+        connection: rustls::ClientConnection,
+        socket: TcpStream,
+    ) -> Self {
+        Self::rustls(rustls::StreamOwned::new(connection, socket), Vec::new())
+    }
+
     pub(crate) fn read_process_output(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Rustls(stream) => {
@@ -467,6 +483,18 @@ impl TlsStream {
                 rustls_complete_io_result(stream)
             }
         }
+    }
+}
+
+pub(crate) fn rustls_has_buffered_process_output(
+    connection: &mut rustls::ClientConnection,
+) -> bool {
+    // Ok(empty) is processed close_notify: the next read immediately returns
+    // EOF even if TCP stays open. UnexpectedEof likewise requires the normal
+    // read-failure/retirement path. Neither query consumes plaintext or does I/O.
+    match connection.reader().into_first_chunk() {
+        Ok(_) => true,
+        Err(err) => err.kind() == std::io::ErrorKind::UnexpectedEof,
     }
 }
 

@@ -10,6 +10,7 @@ use crate::emacs_core::value::Value;
 use super::BufferText;
 
 mod reverse_scan_test;
+mod interval_retention;
 
 fn implemented_kind(kind: BufferTextBackendKind) -> ImplementedBufferTextBackendKind {
     kind.implemented()

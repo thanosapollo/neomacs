@@ -1,8 +1,4 @@
 //! Buffer window source read bounds and text extraction.
-//!
-//! | Knob | Default | Values | Gate |
-//! | --- | --- | --- | --- |
-//! | `NEOMACS_EDIT_SYNC_SOURCE_BUDGET` | `on` | `off`, `on` | Copy through a known sync stop with real source lookahead, retrying locally if the walk cannot synchronize. |
 
 use crate::neovm_bridge::{ForwardScrollMeasurement, LayoutBufferView, RustBufferAccess};
 use crate::scroll_policy::{
@@ -16,116 +12,6 @@ use neovm_core::buffer::{CharPos0, EmacsBytePos, TextPositionAnchor};
 #[path = "tests/window_source_tests.rs"]
 mod bounded_read_tests;
 
-#[cfg(test)]
-#[path = "tests/property_keys_budget_support.rs"]
-pub(crate) mod property_keys_budget_support;
-
-/// Numeric source-copy policy. This carries no Lisp state and is owned by
-/// one immutable layout attempt; its limit is never the semantic accessible end.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum BufferWindowReadBudget {
-    #[default]
-    WindowRows,
-    SyncStop(crate::types::LayoutCharPos0),
-    AccessibleEnd,
-}
-
-/// Why the copied bytes end; the real accessible end remains independent.
-/// No shared runtime state is retained by this attempt-owned numeric witness.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum BufferWindowReadBoundary {
-    AccessibleEnd,
-    #[default]
-    WindowRows,
-    SyncHorizon,
-}
-
-impl BufferWindowReadBoundary {
-    #[inline]
-    pub(crate) fn exhausts_sync_horizon(
-        self,
-        byte_idx: usize,
-        bytes_read: usize,
-        charpos: i64,
-        accessible_end: i64,
-    ) -> bool {
-        matches!(self, Self::SyncHorizon) && byte_idx >= bytes_read && charpos < accessible_end
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static SYNC_SOURCE_BUDGET_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-    static SYNC_SOURCE_BUDGET_RETRIES: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(0) };
-    static SYNC_SOURCE_BUDGET_HORIZON_READS: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(0) };
-}
-
-/// Force the numeric source budget on this thread (tests only).
-#[cfg(test)]
-pub(crate) fn set_sync_source_budget_for_test(enabled: Option<bool>) {
-    SYNC_SOURCE_BUDGET_OVERRIDE.with(|cell| cell.set(enabled));
-}
-
-#[cfg(test)]
-pub(crate) fn reset_sync_source_budget_retries_for_test() {
-    SYNC_SOURCE_BUDGET_RETRIES.with(|cell| cell.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn sync_source_budget_retries_for_test() -> u64 {
-    SYNC_SOURCE_BUDGET_RETRIES.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
-pub(crate) fn record_sync_source_budget_retry_for_test() {
-    SYNC_SOURCE_BUDGET_RETRIES.with(|cell| cell.set(cell.get() + 1));
-}
-
-/// Test-only numeric witness: count actual artificial source copies, not
-/// merely request admissions or a process flag. Thread-local only for test
-/// isolation; no Lisp references or production state are retained.
-#[cfg(test)]
-pub(crate) fn reset_sync_source_budget_horizon_reads_for_test() {
-    SYNC_SOURCE_BUDGET_HORIZON_READS.with(|cell| cell.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn sync_source_budget_horizon_reads_for_test() -> u64 {
-    SYNC_SOURCE_BUDGET_HORIZON_READS.with(std::cell::Cell::get)
-}
-
-/// Pure numeric knob parser: absence alone selects the unset default.
-/// It retains no Lisp state, environment mutation or mutable cache. Independent
-/// mutators may call it concurrently; the existing OnceLock publishes policy.
-fn parse_sync_source_budget(value: Option<&std::ffi::OsStr>) -> bool {
-    let Some(value) = value else {
-        return true;
-    };
-    value.to_str().is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "on" | "1" | "true" | "yes"
-        )
-    })
-}
-
-/// Process-read flag with no Lisp or layout state. OnceLock publishes it for
-/// concurrent readers; every source bound and retry belongs to one attempt.
-#[inline]
-pub(crate) fn sync_source_budget_enabled() -> bool {
-    #[cfg(test)]
-    if let Some(enabled) = SYNC_SOURCE_BUDGET_OVERRIDE.with(std::cell::Cell::get) {
-        return enabled;
-    }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        parse_sync_source_budget(std::env::var_os("NEOMACS_EDIT_SYNC_SOURCE_BUDGET").as_deref())
-    })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BufferWindowSource {
     window_start: i64,
@@ -134,14 +20,9 @@ pub(crate) struct BufferWindowSource {
     point_charpos: i64,
     accessible_start: i64,
     accessible_end: TextPositionAnchor,
-    read_boundary: BufferWindowReadBoundary,
 }
 
 impl BufferWindowSource {
-    pub(crate) const fn read_boundary(self) -> BufferWindowReadBoundary {
-        self.read_boundary
-    }
-
     pub(crate) const fn window_start(self) -> i64 {
         self.window_start
     }
@@ -179,7 +60,6 @@ pub(crate) struct BufferWindowSourceRequest {
     accessible_start: i64,
     accessible_end: i64,
     max_rows: usize,
-    read_budget: BufferWindowReadBudget,
     kind: WindowKind,
     scroll_policy: ScrollPolicy,
     scroll_margin: i64,
@@ -230,7 +110,7 @@ enum PreviousViewportPointRelation {
 
 impl BufferWindowSourceRequest {
     pub(crate) fn from_window_params(params: &WindowParams, max_rows: usize) -> Self {
-        let mut request = Self::new(
+        Self::new(
             params.window_start_charpos().get(),
             params.previous_visible_end_charpos().map(|pos| pos.get()),
             params.point_charpos().get(),
@@ -240,11 +120,7 @@ impl BufferWindowSourceRequest {
             params.kind,
             ScrollPolicy::from_window_params(params),
             params.scroll_margin,
-        );
-        if params.mini_measurement == crate::types::MiniWindowMeasurement::ToEnd {
-            request.read_budget = BufferWindowReadBudget::AccessibleEnd;
-        }
-        request
+        )
     }
 
     /// Build a source request for an incremental partial walk without changing
@@ -284,18 +160,10 @@ impl BufferWindowSourceRequest {
             accessible_start,
             accessible_end,
             max_rows,
-            read_budget: BufferWindowReadBudget::WindowRows,
             kind,
             scroll_policy,
             scroll_margin,
         }
-    }
-
-    /// Limit only copied bytes for a previously admitted sync walk. Keep the
-    /// real point, accessible end, and display-row geometry untouched.
-    pub(crate) fn with_sync_stop(mut self, stop: crate::types::LayoutCharPos0) -> Self {
-        self.read_budget = BufferWindowReadBudget::SyncStop(stop);
-        self
     }
 
     fn previous_viewport_point_relation(self) -> PreviousViewportPointRelation {
@@ -395,7 +263,6 @@ impl BufferWindowSourceRequest {
     ) -> BufferWindowSource {
         let text_start_byte = access.charpos_to_bytepos(window_start) as usize;
         let read_chars = self.accessible_end - window_start + 1;
-        let mut read_boundary = BufferWindowReadBoundary::AccessibleEnd;
         let bytes_read = if read_chars <= 0 {
             out.clear();
             0
@@ -406,49 +273,17 @@ impl BufferWindowSourceRequest {
             // property can consume. Wrapping and inserted strings add rows;
             // face-only overlays do not force a full-buffer copy. Selective
             // display still needs the unrestricted source walk.
-            let bounded_to = if self.read_budget == BufferWindowReadBudget::AccessibleEnd {
-                byte_to
-            } else if crate::neovm_bridge::buffer_selective_display(access.view()) == 0 {
-                let (scan_from, newlines, boundary) = match self.read_budget {
-                    BufferWindowReadBudget::AccessibleEnd => {
-                        unreachable!("handled by full measurement")
-                    }
-                    BufferWindowReadBudget::WindowRows => (
-                        text_start_byte as i64,
-                        self.max_rows + 2,
-                        BufferWindowReadBoundary::WindowRows,
-                    ),
-                    BufferWindowReadBudget::SyncStop(stop) => (
-                        access.charpos_to_bytepos(
-                            (stop.get() as i64).clamp(window_start, self.accessible_end),
-                        ),
-                        2,
-                        BufferWindowReadBoundary::SyncHorizon,
-                    ),
-                };
-                // Keep two preserved physical newlines AFTER the stop, not
-                // just bytes through stop. Prefix/replacement/bidi lookahead
-                // still sees real source, and the exact row transition decides
-                // synchronization. Hazardous newlines are skipped by access.
-                let bounded_to = access
-                    .find_nth_preserved_newline_after(scan_from, newlines)
+            let bounded_to = if crate::neovm_bridge::buffer_selective_display(access.view()) == 0 {
+                access
+                    .find_nth_preserved_newline_after(text_start_byte as i64, self.max_rows + 2)
                     .unwrap_or(byte_to)
-                    .min(byte_to);
-                if bounded_to < byte_to {
-                    read_boundary = boundary;
-                }
-                bounded_to
+                    .min(byte_to)
             } else {
                 byte_to
             };
             access.copy_text(text_start_byte as i64, bounded_to, out);
             out.len()
         };
-
-        #[cfg(test)]
-        if read_boundary == BufferWindowReadBoundary::SyncHorizon {
-            SYNC_SOURCE_BUDGET_HORIZON_READS.with(|cell| cell.set(cell.get() + 1));
-        }
 
         BufferWindowSource {
             window_start,
@@ -460,7 +295,6 @@ impl BufferWindowSourceRequest {
                 CharPos0::new(self.accessible_end.max(0) as usize),
                 EmacsBytePos::new(access.zv().max(0) as usize),
             ),
-            read_boundary,
         }
     }
 
@@ -664,11 +498,3 @@ impl BufferWindowSourceRequest {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "tests/source_budget_policy_aliases.rs"]
-mod source_budget_policy_aliases_tests;
-
-#[cfg(test)]
-#[path = "tests/source_budget_default_policy.rs"]
-mod source_budget_default_policy_tests;

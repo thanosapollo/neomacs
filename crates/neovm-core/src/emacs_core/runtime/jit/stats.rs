@@ -523,18 +523,10 @@ pub(super) fn record_compile(
         Err(_) => "not_compilable",
     };
     // Phase-0 tier residency: which tier produced the leaf. "-" = no leaf.
-    let tier = if super::compile::jit_opt_mode() == super::compile::OptMode::Opt {
-        result
-            .as_ref()
-            .map(|leaf| leaf.selected_tier().name())
-            .unwrap_or("-")
-    } else {
-        let tier = result
-            .as_ref()
-            .map(|leaf| leaf.tier().name())
-            .unwrap_or("-");
-        tier
-    };
+    let tier = result
+        .as_ref()
+        .map(|leaf| leaf.tier().name())
+        .unwrap_or("-");
     let (clif_insts, clif_blocks, deopt_sites, deopt_slots) =
         super::compile::LAST_IR_STATS.with(|c| c.get());
     let flonums = super::compile::lowering::flonum_census();
@@ -1061,11 +1053,7 @@ fn leaf_report_rows(
             report::LeafReportRow {
                 id: row.id,
                 name,
-                tier: if row.opt.is_opt {
-                    row.opt.tier_name(row.tier)
-                } else {
-                    row.tier.name()
-                },
+                tier: row.tier.name(),
                 state: row.state.into(),
                 osr_pc: row.obs.osr_pc,
                 regalloc: row.regalloc.name(),
@@ -1082,14 +1070,6 @@ fn leaf_report_rows(
                 compile_us: row.obs.compile_us,
                 mir: row.obs.mir_verdict,
                 t2: row.obs.t2,
-                opt_fold: row.opt.opt_fold,
-                opt_bool: row.opt.opt_bool,
-                opt_reps: row.opt.opt_reps,
-                opt_gvn: row.opt.opt_gvn,
-                opt_range: row.opt.opt_range,
-                opt_licm: row.opt.opt_licm,
-                opt_sink: row.opt.opt_sink,
-                opt_arrays: row.opt.opt_arrays,
             }
         })
         .collect();

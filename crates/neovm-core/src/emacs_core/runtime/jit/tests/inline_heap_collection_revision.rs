@@ -111,7 +111,7 @@ fn generational_inline_aset_invalidates_vector_and_record_certificates() {
         } else {
             1
         });
-        // Perform an initial primitive store before capturing the revision.
+        // Arm aset's function epoch through its initial outlined call.
         native(&mut context, &leaf, &[owner, index, Value::make_int(1)]);
         let (_, reads) = capture(|| owner.veclike_type());
         let before = super::super::dispatch::ASET_SHIM_CALLS.with(|count| count.get());

@@ -272,11 +272,11 @@ fn heap_words_are_where_compiled_code_reads_them() {
         GcHeaderByte::TypeTag,
         GcHeaderByte::Flags,
         GcHeaderByte::Gen,
-        GcHeaderByte::CollectionObserved,
+        GcHeaderByte::SlotClass,
     ];
     for (i, byte) in bytes.iter().enumerate() {
         assert_eq!(byte.offset(), i);
-        assert_eq!(byte.is_reserved(), matches!(i, 4 | 5), "{byte:?}");
+        assert_eq!(byte.is_reserved(), matches!(i, 4 | 5 | 7), "{byte:?}");
     }
     // A fresh young object's generation byte is live and zero; the reserved
     // bytes are zero.
@@ -284,7 +284,7 @@ fn heap_words_are_where_compiled_code_reads_them() {
         GcHeaderByte::TypeTag,
         GcHeaderByte::Flags,
         GcHeaderByte::Gen,
-        GcHeaderByte::CollectionObserved,
+        GcHeaderByte::SlotClass,
     ] {
         // SAFETY: a live float object starts with its 16-byte header.
         let b = unsafe { object.add(byte.offset()).read() };

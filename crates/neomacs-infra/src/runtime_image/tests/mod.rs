@@ -103,6 +103,7 @@ fn plan_with_fresh_pair(root: &Path) -> BootstrapImagePlan {
         role_binary_name: "neomacs-temacs".to_string(),
         canonical_image_name: "bootstrap-neomacs.pdump".to_string(),
         loader_image: loader,
+        terminal_layer: None,
     }
 }
 
@@ -124,6 +125,76 @@ fn a_missing_loader_name_forces_provisioning() {
     // With the fingerprinted twin gone the daemon would not find the image at
     // all, so this must not take the reuse path.
     assert!(reuse_if_fresh(&plan, &root.path().join("bootstrap-neomacs.pdump")).is_none());
+}
+
+#[test]
+fn gui_terminal_bytecode_requires_matching_editor_source_and_image() {
+    let root = tempfile::tempdir().unwrap();
+    let mut plan = plan_with_fresh_pair(root.path());
+    let source = root.path().join("neo-win.el");
+    let bytecode = source.with_extension("elc");
+    let image = root.path().join("bootstrap-neomacs.pdump");
+    let now = SystemTime::now();
+    write_at(&source, "source", now);
+    plan.terminal_layer = Some(BootstrapTerminalLayer {
+        source: source.clone(),
+        bootstrap_role_binary_name: "bootstrap-neomacs".into(),
+    });
+    assert!(
+        !terminal_layer_is_fresh(&plan, &image),
+        "missing leaf must not reuse image-only preparation"
+    );
+    write_at(&bytecode, "bytecode", now + Duration::from_secs(10));
+    assert!(terminal_layer_is_fresh(&plan, &image));
+    for input in [&plan.editor, &source, &image] {
+        let previous = fs::metadata(input).unwrap().modified().unwrap();
+        set_mtime(input, now + Duration::from_secs(20));
+        assert!(
+            !terminal_layer_is_fresh(&plan, &image),
+            "changed input: {input:?}"
+        );
+        set_mtime(input, previous);
+    }
+    write_at(&bytecode, "", now + Duration::from_secs(10));
+    assert!(
+        !terminal_layer_is_fresh(&plan, &image),
+        "empty output is not prepared"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_terminal_compiler_cannot_leave_a_reusable_partial_leaf() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let mut plan = plan_with_fresh_pair(root.path());
+    let source = root.path().join("neo-win.el");
+    let bytecode = source.with_extension("elc");
+    write_file(&source, "source");
+    // An owned fake compiler exposes the partial-output failure boundary;
+    // it does not stand in for the separate matching-native preparation gate.
+    write_file(
+        &plan.editor,
+        &format!(
+            "#!/bin/sh\nprintf partial > '{}'\nexit 42\n",
+            bytecode.display()
+        ),
+    );
+    fs::set_permissions(&plan.editor, fs::Permissions::from_mode(0o755)).unwrap();
+    plan.terminal_layer = Some(BootstrapTerminalLayer {
+        source,
+        bootstrap_role_binary_name: "bootstrap-neomacs".into(),
+    });
+    let result = prepare_terminal_layer(
+        &plan,
+        &root.path().join("bootstrap-neomacs.pdump"),
+        root.path(),
+    );
+    assert!(result.is_err());
+    assert!(
+        !bytecode.exists(),
+        "failed compilation left a fresh-looking partial leaf"
+    );
 }
 
 #[test]

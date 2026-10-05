@@ -116,18 +116,7 @@ pub(crate) const ABI_TAG: u32 = compute_abi_tag();
 // v24: static closure and list-HOF chains add six gated mapping shims and activation metadata.
 // v25: AOT re-tier adds monotone shared-source exclusion and salts its runtime layout.
 // v26: generational JIT cons stores read the shared cons-block unlogged bitmap.
-// v27: deferred mode-line display exits add a Context field and change its layout.
-// v28: collection-aware stores add a string-journal shim and consume header byte 7
-// as a sticky observed mark; GEN0 JitHeapState windows also include observed owners.
-// v29: observed GEN0 string stores read the sticky high bit in owned capacity.
-// v30: GEN0 observed windows may wrap around a certificate-free interval; a
-// cold native refinement shim republishes it, and remembered BLV proofs read
-// a permanent atomic observation-bitmap word.
-// v31: retained redisplay state (GNU mode-line gate, edit Sync) adds Context fields;
-// existing AOT images are invalidated.
-// v32: primitive opcodes bypass function cells; `aset` has a signal-only
-// value-shim contract and no NamedBuiltin variant-2 fallback or epoch guard.
-const ABI_TAG_VERSION: u32 = 32;
+const ABI_TAG_VERSION: u32 = 26;
 
 /// Format version of the AOT descriptor spec-section + the runtime spec ABI
 /// (`SpecSlot`/`spec_expected` sidecar bases, the loader re-classify+arm protocol).
@@ -149,17 +138,9 @@ const SPEC_ENCODING_VERSION: u32 = 1;
 // MUST match the shim DEFINITIONS in `compile.rs` + the `JIT_SHIM_TABLE` array.
 include!("shim_names.rs");
 
-/// ABI26 AOT import and salt set: the original prefix of the single-source
-/// `NEOVM_JIT_SHIM_NAMES`. Additive selected-only exports remain JIT-only.
-pub(crate) const MIR_SHIM_NAMES: &[&str] = NEOVM_JIT_SHIM_NAMES
-    .split_at(NEOVM_JIT_AOT_ABI_SHIM_COUNT)
-    .0;
-
-/// Complete host-exported JIT shim set, including additive selected-only names.
-/// AOT continues to use the unchanged ABI26 MIR prefix above. This alias adds
-/// no runtime state and is immutable for every mutator/compiler worker.
-#[cfg(test)]
-pub(crate) const JIT_SHIM_NAMES: &[&str] = NEOVM_JIT_SHIM_NAMES;
+/// The exported `neovm_jit_*` shim name set (alias of the single-source
+/// `NEOVM_JIT_SHIM_NAMES` from `shim_names.rs`).
+pub(crate) const MIR_SHIM_NAMES: &[&str] = NEOVM_JIT_SHIM_NAMES;
 
 /// Compute [`ABI_TAG`] at compile time from the structural invariants. A `const`
 /// FNV-1a over the salient constants + the shim names, so any drift in the ABI

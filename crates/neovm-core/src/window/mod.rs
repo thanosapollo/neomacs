@@ -37,15 +37,10 @@ mod parameters;
 pub mod part;
 mod pixel_input;
 mod point_rows;
-mod posn_object_extent;
-mod tty_posn_current;
 pub use point_rows::{
     DisplayPointRow, DisplayPointRowIter, DisplayPointRows, DisplayPointRowsIter,
     DisplayPointRowsMode, PointCell, display_point_rows_mode,
 };
-#[cfg(test)]
-pub(crate) use posn_object_extent::force_posn_object_extent_for_test;
-pub use posn_object_extent::{PosnObjectExtentMode, posn_object_extent_mode, retained_posn_extent};
 mod scroll_bar;
 mod sibling_layout;
 pub mod split;
@@ -84,6 +79,8 @@ pub struct WindowId(pub u64);
 /// Opaque frame identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameId(pub u64);
+
+pub mod frame_alpha;
 
 /// Whether a logical frame selection may retarget existing focus redirections.
 /// GNU `do_switch_frame` tracks explicit selections, but not input events.
@@ -2376,7 +2373,15 @@ fn collect_leaf_window_paths(
 /// and `posn-at-point` answers `(0 . 1)` -- the glyph. So the marker slot
 /// answers a COORDINATE, and stands in for a POSITION only when nothing drew
 /// one.
-pub use neomacs_display_protocol::posn_object_extent::PosnPointRole as DisplayPointRole;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DisplayPointRole {
+    /// The glyph the row drew for this position.
+    #[default]
+    Glyph,
+    /// A column a special glyph covered, standing in for the position the
+    /// display walk was at when it reached that column.
+    OverlaidMarker,
+}
 
 /// Authoritative display geometry for a single visible buffer position.
 ///
@@ -2752,74 +2757,8 @@ pub struct WindowDisplaySnapshot {
     /// cannot leave query-visible layout stale. `None` is reserved for
     /// synthetic test fixtures that intentionally install trusted rows.
     pub layout_freshness: Option<WindowDisplaySnapshotFreshness>,
-    /// Numeric matrix facts produced with this snapshot. Only the retained
-    /// accepted output is current-matrix state; a query snapshot has no
-    /// publication authority. Immutable Arc data is safe for concurrent readers.
-    pub posn_matrix:
-        Option<std::sync::Arc<neomacs_display_protocol::posn_object_extent::PosnMatrixSnapshot>>,
-    /// Test-only numeric policy captured by the snapshot's exclusive producer.
-    /// Published snapshots retain immutable copies; independent mutators share
-    /// no selector, Lisp value, or TLS state. Absent from shipping layouts.
-    #[cfg(any(test, feature = "redisplay-test-policy"))]
-    #[doc(hidden)]
-    pub test_posn_object_extent_mode: Option<PosnObjectExtentMode>,
     /// Exact end record produced by the same row walk as this snapshot.
     pub window_end_record: Option<WindowEndRecord>,
-}
-
-/// Which window bodies an explicit `force-window-update` invalidated.
-///
-/// Mirrors the three branches of GNU `Fforce_window_update`
-/// (`src/window.c:4492`):
-///
-/// - `AllWindows` — nil OBJECT: `windows_or_buffers_changed = 29`.
-/// - `Window(W)` — a live window: W is marked inaccurate and W's buffer gets
-///   `prevent_redisplay_optimizations_p`, so every window showing that buffer
-///   also loses reuse.
-/// - `Buffer(B)` — a displayed buffer (or its name): every window displaying B
-///   is forced.
-///
-/// The target is a closed sum type so a call site cannot smuggle an unrelated
-/// boolean (or a naked counter) into a decision about *which* bodies must be
-/// rebuilt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ForcedBodyRedisplay {
-    AllWindows,
-    Window(WindowId),
-    Buffer(BufferId),
-}
-
-/// Monotonic body-redisplay revisions consulted when a window may reuse
-/// retained body rows.
-///
-/// This is deliberately separate from `Context::redisplay_generation`: that
-/// counter also moves for presentation-only work (mode-line/chrome/menu
-/// updates) which must NOT relayout body text. Only an explicit body
-/// invalidation — today GNU `force-window-update` — moves these counters, and
-/// the three scopes below keep a targeted request from escalating unrelated
-/// windows:
-///
-/// - `all`    — every window (nil OBJECT),
-/// - `window` — one live window (and, through `buffer`, its displayed buffer),
-/// - `buffer` — every window displaying that buffer.
-///
-/// Equality is the reuse predicate: any move for this window/buffer pair makes
-/// the retained key differ, which escalates to a full rebuild.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BodyRedisplayRevision {
-    all: u64,
-    window: u64,
-    buffer: u64,
-}
-
-impl BodyRedisplayRevision {
-    pub(crate) const fn new(all: u64, window: u64, buffer: u64) -> Self {
-        Self {
-            all,
-            window,
-            buffer,
-        }
-    }
 }
 
 /// Opaque identity of every mutable input used to lay out one live window.
@@ -2838,10 +2777,6 @@ pub struct WindowDisplaySnapshotFreshness {
     pub(crate) face_change_count: u64,
     pub(crate) display_var_change_count: u64,
     pub(crate) redisplay_generation: u64,
-    /// Body-only invalidation; see [`BodyRedisplayRevision`]. Unlike
-    /// `redisplay_generation` this is NOT aligned away by scroll-surface
-    /// compatibility, so a forced body redisplay also refuses scroll reuse.
-    pub(crate) body_redisplay: BodyRedisplayRevision,
     pub(crate) media_generation: u64,
     pub(crate) function_epoch: u64,
     pub(crate) symbol_property_revision: crate::emacs_core::symbol::SymbolPropertyRevision,
@@ -2907,12 +2842,6 @@ pub struct WindowLayoutAttemptFreshness {
     selection: WindowLayoutSelectionState,
     face_change_count: u64,
     media_generation: u64,
-    /// Body-only invalidation for this window and its displayed buffer; see
-    /// [`BodyRedisplayRevision`]. A `force-window-update` issued while body
-    /// Lisp is running must not let that attempt publish rows produced from
-    /// the pre-invalidation inputs, and unlike `media_generation` it does not
-    /// depend on `image-flush` having actually changed a catalog entry.
-    body_redisplay: BodyRedisplayRevision,
     function_epoch: u64,
 }
 
@@ -3173,7 +3102,7 @@ impl WindowDisplaySnapshot {
             let run = &self.points[idx..];
             let run = &run[..run.partition_point(|point| point.buffer_pos == pos)];
             run.iter()
-                .find(|point| point.role.is_position())
+                .find(|point| point.role == DisplayPointRole::Glyph)
                 .or_else(|| run.first())
                 .cloned()
         };
@@ -3256,11 +3185,7 @@ impl WindowDisplaySnapshot {
             return Some(point);
         }
         Some(DisplayPointSnapshot {
-            role: if self.posn_object_extent_mode().enabled() {
-                DisplayPointRole::SyntheticBoundary
-            } else {
-                DisplayPointRole::Glyph
-            },
+            role: DisplayPointRole::Glyph,
             buffer_pos: end,
             x: row.end_x,
             y: row.y,
@@ -3305,11 +3230,7 @@ impl WindowDisplaySnapshot {
         });
         let Some(mut last) = row_points.next() else {
             return row.start_buffer_pos.map(|buffer_pos| DisplayPointSnapshot {
-                role: if self.posn_object_extent_mode().enabled() {
-                    DisplayPointRole::SyntheticBoundary
-                } else {
-                    DisplayPointRole::Glyph
-                },
+                role: DisplayPointRole::Glyph,
                 buffer_pos,
                 x: row.start_x,
                 y: row.y,
@@ -3467,10 +3388,6 @@ pub struct ChromeLineHit {
 
 impl PartialEq for WindowDisplaySnapshot {
     fn eq(&self, other: &Self) -> bool {
-        #[cfg(any(test, feature = "redisplay-test-policy"))]
-        if self.posn_object_extent_mode() != other.posn_object_extent_mode() {
-            return false;
-        }
         self.window_id == other.window_id
             && self.cell_origin == other.cell_origin
             && self.regions == other.regions
@@ -3487,7 +3404,6 @@ impl PartialEq for WindowDisplaySnapshot {
             && self.buffer_modiff == other.buffer_modiff
             && self.layout_freshness == other.layout_freshness
             && self.window_end_record == other.window_end_record
-            && self.posn_matrix == other.posn_matrix
             && self.iter_points().eq(other.iter_points())
     }
 }
@@ -3512,9 +3428,6 @@ impl Default for WindowDisplaySnapshot {
             rows: Vec::new(),
             buffer_modiff: None,
             layout_freshness: None,
-            posn_matrix: None,
-            #[cfg(any(test, feature = "redisplay-test-policy"))]
-            test_posn_object_extent_mode: None,
             window_end_record: None,
         }
     }
@@ -4072,6 +3985,10 @@ pub struct Frame {
     /// active display backend. Wiring the dispatch is tracked as
     /// audit Phase 6.
     pub parameters: HashMap<Value, Value>,
+    /// Accepted GUI opacity, independent of the raw Lisp parameter alist.
+    /// GNU stores a new raw value before its handler can signal an error.
+    pub background_alpha: f32,
+    pub frame_alpha: [f32; 2],
     /// Whether the frame is visible, iconified, or invisible.
     pub visibility: FrameVisibility,
     /// Whether the menu / tab / tool bars are actually displayed and therefore
@@ -4135,20 +4052,6 @@ pub struct Frame {
     /// Latest completed layout output used for incremental redisplay and GNU
     /// output bookkeeping. This cache is not renderer-active geometry.
     redisplay_cache: HashMap<WindowId, std::sync::Arc<WindowDisplaySnapshot>>,
-    /// Exact accepted TTY frame-pool numeric cells, independent of a leaf's
-    /// surviving redisplay cache. One frame mutator replaces a fully initialized
-    /// Arc only at validated presentation prepare; concurrent readers retain
-    /// immutable numeric views through the existing publication transport.
-    /// Query-only layouts never publish new pool observations. Typed allocation
-    /// adjustments update only TEXT current-row admission, preserving physical cells.
-    tty_posn_pool: Option<Arc<tty_posn_current::TtyPosnCurrentOwner>>,
-    /// GNU preserves pool-backed topology only when the accepted tree has no margins.
-    tty_posn_pool_can_repartition: bool,
-    /// Test-only numeric policy owned by this Frame's exclusive mutator.
-    /// Independent contexts and frames never share mutable selectors; readers
-    /// borrow immutable state. No Lisp values, TLS, or shipping fields exist.
-    #[cfg(any(test, feature = "redisplay-test-policy"))]
-    test_posn_object_extent_mode: Option<PosnObjectExtentMode>,
     /// Last recorded redisplay state for GNU window change hooks.
     pub(crate) window_hook_record: FrameWindowHookRecord,
     /// GNU `frame-window-state-change` flag.
@@ -4279,6 +4182,8 @@ impl Frame {
                 params.insert(Value::symbol("minibuffer"), Value::T);
                 params
             },
+            background_alpha: 1.0,
+            frame_alpha: [-1.0; 2],
             visibility: FrameVisibility::Visible,
             // Set true only once an interactive frontend displays this frame.
             displays_chrome: false,
@@ -4299,10 +4204,6 @@ impl Frame {
             pending_gui_resize: None,
             presentation_state: FramePresentationState::default(),
             redisplay_cache: HashMap::default(),
-            tty_posn_pool: None,
-            tty_posn_pool_can_repartition: false,
-            #[cfg(any(test, feature = "redisplay-test-policy"))]
-            test_posn_object_extent_mode: None,
             window_hook_record: FrameWindowHookRecord::default(),
             window_state_change: false,
             face_hash_table: Value::hash_table(HashTableTest::Eq),
@@ -4603,6 +4504,21 @@ impl Frame {
     }
 
     pub fn set_parameter(&mut self, key: Value, value: Value) -> Option<Value> {
+        // Only successful decoding changes the backend state. The raw value
+        // remains observable even when the GUI parameter handler later errors.
+        match key.as_symbol_id().and_then(FrameParam::from_symbol_id) {
+            Some(FrameParam::Alpha) => {
+                if let Ok(alpha) = frame_alpha::pair(value) {
+                    self.frame_alpha = alpha;
+                }
+            }
+            Some(FrameParam::AlphaBackground) => {
+                if let Ok(alpha) = frame_alpha::component(value, 1.0) {
+                    self.background_alpha = alpha;
+                }
+            }
+            _ => {}
+        }
         self.parameters.insert(key, value)
     }
 
@@ -4838,13 +4754,6 @@ impl Frame {
         let top_margin = self.frame_top_margin();
         let minibuffer_lines = i64::from(self.minibuffer_leaf.is_some());
         let root_lines = (text_lines - minibuffer_lines).max(1);
-        if self.posn_object_extent_mode().enabled()
-            && ((self.root_window().bounds().width / char_width).round() as i64 != cols.max(1)
-                || (self.root_window().bounds().height / char_height).round() as i64 != root_lines)
-        {
-            self.tty_posn_pool = None;
-            self.tty_posn_pool_can_repartition = false;
-        }
         let root_bounds = Rect::new(
             0.0,
             top_margin as f32 * char_height,
@@ -5248,18 +5157,6 @@ impl Frame {
         presentation: geometry::PresentationId,
         publications: Vec<WindowPresentationSnapshot>,
     ) -> Result<(), geometry::PresentationPrepareError> {
-        self.prepare_display_presentation_with_tty_posn_pool(presentation, publications, None)
-    }
-
-    /// Admit a completed producer's pool with the same validated publication.
-    /// Numeric state is owned by this exclusive Frame mutator; readers never
-    /// mutate the Arc, and rejected/reused presentations cannot replace it.
-    pub fn prepare_display_presentation_with_tty_posn_pool(
-        &mut self,
-        presentation: geometry::PresentationId,
-        publications: Vec<WindowPresentationSnapshot>,
-        pool: Option<Arc<neomacs_display_protocol::posn_frame_pool::PosnFramePool>>,
-    ) -> Result<(), geometry::PresentationPrepareError> {
         let publications: Vec<_> = publications
             .into_iter()
             .filter(|publication| self.find_window(publication.window_id()).is_some())
@@ -5297,9 +5194,6 @@ impl Frame {
             return Err(geometry::PresentationPrepareError::ReusedPresentation(
                 presentation,
             ));
-        }
-        if self.posn_object_extent_mode().enabled() && self.effective_window_system().is_none() {
-            self.note_tty_current_matrix_publication(&prepared.publications, pool);
         }
         self.commit_completed_window_output(presentation, &prepared.publications);
         let geometry_only_windows: HashSet<_> = prepared
@@ -5513,92 +5407,6 @@ impl Frame {
         self.redisplay_cache.get(&id).map(|snapshot| &**snapshot)
     }
 
-    /// GNU checks the entire live tree, including the minibuffer, before
-    /// preserving a pool through topology changes. This borrowed walk allocates
-    /// no leaf list and does not treat detached windows as live partitions.
-    fn tty_posn_live_margins_clear(&self) -> bool {
-        fn clear(tree: &WindowTree, id: WindowId) -> bool {
-            match tree.find(id) {
-                Some(Window::Leaf { margins, .. }) => *margins == WindowMargins::ZERO,
-                Some(Window::Internal { children, .. }) => {
-                    children.iter().all(|id| clear(tree, *id))
-                }
-                _ => false,
-            }
-        }
-        clear(&self.tree, self.tree.root_id()) && self.minibuffer_leaf.as_ref().is_none_or(|leaf| {
-            matches!(leaf, Window::Leaf { margins, .. } if *margins == WindowMargins::ZERO)
-        })
-    }
-
-    /// Accepted numeric producer input for the next speculative TTY capture.
-    /// Callers must already have the process policy ON; this read is inert.
-    pub fn tty_posn_pool(
-        &self,
-    ) -> Option<&Arc<neomacs_display_protocol::posn_frame_pool::PosnFramePool>> {
-        self.tty_posn_pool.as_ref()?.pool.as_ref()
-    }
-
-    /// GNU current-matrix lookup before after-EOL iterator column advancement.
-    /// A local accepted matrix stays authoritative. Without one, a new leaf
-    /// can still slice the unchanged accepted frame pool (fake_current_matrices).
-    /// Pure numeric read: no allocation, Arc cloning, or source-row publication.
-    pub(crate) fn retained_tty_posn_extent(
-        &self,
-        id: WindowId,
-        row: i64,
-        column: i64,
-    ) -> neomacs_display_protocol::posn_object_extent::PosnObjectExtent {
-        use neomacs_display_protocol::glyph_matrix::GlyphArea;
-        use neomacs_display_protocol::posn_object_extent::PosnObjectExtent;
-        use tty_posn_current::TtyCurrentMatrixAuthority;
-        let authority = self.tty_posn_current_matrix_authority(id);
-        if authority == Some(TtyCurrentMatrixAuthority::Undrawn) {
-            return PosnObjectExtent::Undrawn;
-        }
-        if authority != Some(TtyCurrentMatrixAuthority::FramePoolPartition)
-            && let Some(snapshot) = self
-                .redisplay_snapshot(id)
-                .filter(|snapshot| snapshot.posn_matrix.is_some())
-        {
-            return retained_posn_extent(Some(snapshot), row, column, GlyphArea::Text);
-        }
-        if !self.tty_posn_pool_can_repartition || !self.tty_posn_live_margins_clear() {
-            return PosnObjectExtent::Undrawn;
-        }
-        let Some(pool) = self.tty_posn_pool() else {
-            return PosnObjectExtent::Undrawn;
-        };
-        if pool.columns as i64 != (self.width as f32 / self.char_width.max(1.0)).round() as i64
-            || pool.lines as i64 != (self.height as f32 / self.char_height.max(1.0)).round() as i64
-        {
-            return PosnObjectExtent::Undrawn;
-        }
-        let Some(window) = self.find_window(id) else {
-            return PosnObjectExtent::Undrawn;
-        };
-        let Window::Leaf { margins, .. } = window else {
-            return PosnObjectExtent::Undrawn;
-        };
-        // GNU's unchanged-pool topology preservation is disabled for margins.
-        // A local accepted margin matrix above is still exact; no such matrix
-        // means this path must not infer its current rows from painted pixels.
-        if *margins != WindowMargins::ZERO {
-            return PosnObjectExtent::Undrawn;
-        }
-        let width = usize::try_from(window.total_columns(self.char_width)).unwrap_or(0);
-        let height = usize::try_from(window.total_lines(self.char_height)).unwrap_or(0);
-        pool.at_partition(
-            window.top_line(),
-            height,
-            [window.left_col(); GlyphArea::COUNT],
-            [0, width, 0],
-            row,
-            column,
-            GlyphArea::Text,
-        )
-    }
-
     /// GNU `coordinates_in_window`'s inputs for one live window of this frame
     /// (src/window.c:1348-1489).
     ///
@@ -5706,12 +5514,6 @@ impl Frame {
 
     /// Resize the frame and window tree to new pixel dimensions.
     pub fn resize_pixelwise(&mut self, width: u32, height: u32) {
-        if self.posn_object_extent_mode().enabled()
-            && (self.width != width || self.height != height)
-        {
-            self.tty_posn_pool = None;
-            self.tty_posn_pool_can_repartition = false;
-        }
         let horizontal_geometry_changed = self.width != width;
         self.clear_pending_gui_resize();
         self.width = width;
@@ -6571,53 +6373,6 @@ impl FrameManager {
             .sum()
     }
 
-    /// GNU's `bset_redisplay` observes ordinary windows on every frame.
-    /// Read only the live tree and completed display identities; detached
-    /// windows and the inactive minibuffer cannot raise this predicate.
-    /// The owning Context's mutator borrows these inputs; no state is cached
-    /// or shared between mutators, and the walk allocates no window list.
-    pub fn other_window_buffer_changed(&self, buffers: &BufferManager) -> bool {
-        fn changed(
-            frame: &Frame,
-            id: WindowId,
-            selected: Option<WindowId>,
-            buffers: &BufferManager,
-        ) -> bool {
-            let Some(window) = frame.tree.find(id) else {
-                return false;
-            };
-            if !window.children().is_empty() {
-                return window
-                    .children()
-                    .iter()
-                    .any(|id| changed(frame, *id, selected, buffers));
-            }
-            if Some(id) == selected {
-                return false;
-            }
-            let Some(buffer) = window.buffer_id().and_then(|id| buffers.get(id)) else {
-                return false;
-            };
-            if buffer.changed_char_range().is_some() {
-                return true;
-            }
-            frame.redisplay_snapshot(id).is_some_and(|snapshot| {
-                snapshot
-                    .buffer_modiff
-                    .is_some_and(|tick| tick != buffer.modified_tick())
-                    || snapshot.layout_freshness.as_ref().is_some_and(|freshness| {
-                        freshness.buffer.id != buffer.id()
-                            || freshness.buffer.overlay_modified_tick
-                                != buffer.overlay_modified_tick()
-                    })
-            })
-        }
-        let selected = self.selected_frame().map(|frame| frame.selected_window);
-        self.frames
-            .values()
-            .any(|frame| changed(frame, frame.tree.root_id(), selected, buffers))
-    }
-
     /// Get the selected frame.
     pub fn selected_frame(&self) -> Option<&Frame> {
         self.selected.and_then(|id| self.frames.get(&id))
@@ -7217,7 +6972,6 @@ impl FrameManager {
         // about `sync_window_area_bounds` was describing, and a
         // character-edge-only sync does it just the same.
         frame.recalculate_minibuffer_bounds();
-        frame.tty_posn_adjust_current_matrices();
         self.mark_window_topology_changed();
         Some(new_id)
     }
@@ -7264,7 +7018,6 @@ impl FrameManager {
         let parent_id = frame.tree().parent_of(new_window_id)?;
         let horflag = matches!(direction, SplitDirection::Horizontal);
         window_resize_apply(frame.tree_mut(), parent_id, horflag, 1.0, 1.0);
-        frame.tty_posn_adjust_current_matrices();
         Some(())
     }
 
@@ -7314,7 +7067,6 @@ impl FrameManager {
             // `window-resize-apply-total` runs -- which is what `window.el`
             // does on the paths GNU allows into this code at all.
             frame.recalculate_minibuffer_bounds();
-            frame.tty_posn_adjust_current_matrices();
         }
 
         // Deleting an INTERNAL window takes its whole subtree with it, so the
@@ -7453,7 +7205,6 @@ impl FrameManager {
             frame.selected_window = *first;
         }
         frame.recalculate_minibuffer_bounds();
-        frame.tty_posn_adjust_current_matrices();
 
         for (id, parameters) in removed_windows {
             self.deleted_windows.insert(
@@ -7491,17 +7242,6 @@ impl FrameManager {
         self.frames.iter().find_map(|(frame_id, frame)| {
             frame.find_window(window_id)?.is_leaf().then_some(*frame_id)
         })
-    }
-
-    /// Buffer displayed by WINDOW_ID, if it is a live leaf window.
-    ///
-    /// Mirrors reading `XWINDOW (w)->contents`: GNU's `Fforce_window_update`
-    /// uses it to mark the displayed buffer (`prevent_redisplay_optimizations_p`)
-    /// in addition to the window itself.
-    pub fn window_buffer_id(&self, window_id: WindowId) -> Option<BufferId> {
-        self.frames
-            .values()
-            .find_map(|frame| frame.find_window(window_id).and_then(Window::buffer_id))
     }
 
     /// Return true if WINDOW_ID is the minibuffer window of any live frame.
@@ -7584,19 +7324,6 @@ impl FrameManager {
             Some(buffer) if stamp == frame_stamp => WindowOldBuffer::Recorded(buffer),
             Some(_) => WindowOldBuffer::StaleEpoch,
         }
-    }
-
-    /// Numeric object state used by GNU window-configuration restoration.
-    /// A live leaf supplies its outgoing buffer and epoch; a resurrected leaf
-    /// retains its deletion record. Reads require an immutable FrameManager
-    /// borrow within the owning Context and add no shared or thread-local state.
-    pub(crate) fn window_restore_change_record(
-        &self,
-        window_id: WindowId,
-    ) -> Option<DeletedWindowRecord> {
-        self.lookup_window(window_id)
-            .map(|window| Self::deletion_record(Some(window)))
-            .or_else(|| self.deleted_windows.get(&window_id).copied())
     }
 
     /// What a window should remember once it is deleted.
@@ -7775,8 +7502,6 @@ fn make_split_sibling(
         old_point,
         vscroll,
         preserve_vscroll_p,
-        old_buffer,
-        change_stamp,
         ..
     } = &mut sibling
     {
@@ -7796,15 +7521,6 @@ fn make_split_sibling(
         *history = WindowHistoryState::default();
         *position_markers = WindowPositionMarkerState::Detached;
         *window_end = WindowEndState::Unrecorded;
-        if crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
-            // GNU make_window starts old_buffer NIL and change_stamp zero.
-            // A cloned decoration is not a recorded redisplay epoch: the new
-            // leaf must run its first buffer-change callback even when it
-            // shows the reference's buffer. Each frame's exclusive mutator
-            // owns these numeric IDs/stamps; no shared Lisp state is added.
-            *old_buffer = None;
-            *change_stamp = None;
-        }
         if !same_buffer {
             *window_start = LispCharPos1::ONE;
             *point = LispCharPos1::ONE;

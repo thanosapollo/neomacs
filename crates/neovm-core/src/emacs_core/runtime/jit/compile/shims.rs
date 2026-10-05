@@ -807,15 +807,7 @@ pub(crate) struct ShimAddr(*const ());
 unsafe impl Sync for ShimAddr {}
 
 #[used]
-pub(crate) static JIT_SHIM_TABLE: [(&str, ShimAddr); 74] = [
-    (
-        "neovm_jit_unobserved_collection_owner",
-        ShimAddr(crate::tagged::gc::neovm_jit_unobserved_collection_owner as *const ()),
-    ),
-    (
-        "neovm_jit_string_collection_write",
-        ShimAddr(super::collection_journal::neovm_jit_string_collection_write as *const ()),
-    ),
+pub(crate) static JIT_SHIM_TABLE: [(&str, ShimAddr); 70] = [
     (
         "neovm_jit_hof_length",
         ShimAddr(super::hof_runtime::neovm_jit_hof_length as *const ()),
@@ -1051,14 +1043,6 @@ pub(crate) static JIT_SHIM_TABLE: [(&str, ShimAddr); 74] = [
         "neovm_jit_direct_framed",
         ShimAddr(super::direct_call::neovm_jit_direct_framed as *const ()),
     ),
-    (
-        "neovm_jit_t2_record_array_use",
-        ShimAddr(neovm_jit_t2_record_array_use as *const ()),
-    ),
-    (
-        "neovm_jit_sqrt_binding_valid",
-        ShimAddr(neovm_jit_sqrt_binding_valid as *const ()),
-    ),
 ];
 
 /// Register every shim in [`JIT_SHIM_TABLE`] with a JIT module builder. Both
@@ -1220,7 +1204,7 @@ pub extern "C" fn neovm_jit_varset(ctx: *mut u8, sym: i64, val: i64) -> i64 {
             // no `Vm` (see `Context::try_set_plain_variable`); likewise a
             // cached buffer-local or forwarded store (P1.4 A2).
             if ctx.try_set_plain_variable(SymId(sym as u32), value)
-                || ctx.try_set_var_cached_compiled(SymId(sym as u32), value)
+                || ctx.try_set_var_cached(SymId(sym as u32), value)
             {
                 return STATUS_OK;
             }
@@ -1264,7 +1248,7 @@ pub extern "C" fn neovm_jit_varbind(ctx: *mut u8, sym: i64, val: i64) -> i64 {
         // load, where nearly every `let` is of a plain global.
         // Likewise a cached buffer-local or forwarded bind (P1.4 A3).
         if ctx.specbind_plain_untrapped_fast(SymId(sym as u32), value)
-            || ctx.specbind_cached_compiled(SymId(sym as u32), value)
+            || ctx.specbind_cached(SymId(sym as u32), value)
         {
             ctx.jit_bind_stack.push(bind_depth);
             return STATUS_OK;
@@ -1321,7 +1305,7 @@ pub extern "C" fn neovm_jit_unbind(ctx: *mut u8, n: i64) -> i64 {
     // general unwinder with its quit-flag bracket and debugger check. The
     // general path did this same pop, after ~80 instructions of its own on
     // every unbind of a source load's `let`s.
-    ctx.pop_compiled_specpdl_suffix(target);
+    ctx.pop_simple_specpdl_suffix(target);
     if ctx.specpdl.len() <= target {
         return STATUS_OK;
     }
@@ -1333,7 +1317,3 @@ pub extern "C" fn neovm_jit_unbind(ctx: *mut u8, n: i64) -> i64 {
         }
     }
 }
-
-// Selected array observer; no change to main exports or registration order.
-pub use super::array_profile::neovm_jit_t2_record_array_use;
-pub use super::sqrt_binding::neovm_jit_sqrt_binding_valid;

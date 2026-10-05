@@ -4,17 +4,8 @@
 //! character position, computes line breaks, positions glyphs on a fixed-width
 //! grid, and publishes `FrameDisplayState` snapshots for render backends.
 
-mod mini_eob_scroll;
-mod mini_source_start;
-mod mini_source_stop;
-mod posn_object_extent;
 mod prepared_viewports;
-
 mod query_cache;
-mod retained_face_gather;
-#[cfg(test)]
-#[path = "engine/tests/retained_face_gather_support.rs"]
-pub(crate) mod retained_face_gather_test_support;
 mod scroll_coverage;
 pub use scroll_coverage::ScrollCoverageProgress;
 mod scroll_preview;
@@ -182,9 +173,6 @@ impl EditReplayStructureProperty {
 pub(crate) enum LayoutPurpose {
     Redisplay,
     Snapshot,
-    MiniPreparation {
-        window_id: neovm_core::window::WindowId,
-    },
     SynchronousQuery {
         window_id: neovm_core::window::WindowId,
         scope: neovm_core::window::WindowLayoutQueryScope,
@@ -195,9 +183,7 @@ impl LayoutPurpose {
     const fn query_window(self) -> Option<neovm_core::window::WindowId> {
         match self {
             Self::Redisplay | Self::Snapshot => None,
-            Self::SynchronousQuery { window_id, .. } | Self::MiniPreparation { window_id } => {
-                Some(window_id)
-            }
+            Self::SynchronousQuery { window_id, .. } => Some(window_id),
         }
     }
 }
@@ -320,11 +306,6 @@ fn uses_adhoc_minibuffer_resize_scroll(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WindowLayoutWalkPurpose {
     Redisplay,
-    /// GNU renderer-inert snapshot. This numeric purpose belongs to one
-    /// exclusively borrowed engine/Context; independent mutators share no
-    /// Lisp values or mutable cache through it.
-    Snapshot,
-    MiniPreparation,
     SynchronousQuery(neovm_core::window::WindowLayoutQueryScope),
 }
 
@@ -345,25 +326,11 @@ fn window_position_publication(
     purpose: WindowLayoutWalkPurpose,
     source: WindowDisplaySource,
 ) -> WindowPositionPublication {
-    if matches!(
-        purpose,
-        WindowLayoutWalkPurpose::SynchronousQuery(_) | WindowLayoutWalkPurpose::MiniPreparation
-    ) {
+    if matches!(purpose, WindowLayoutWalkPurpose::SynchronousQuery(_)) {
         return WindowPositionPublication::SynchronousQueryEnd;
     }
     if source == WindowDisplaySource::InactiveEchoArea {
         return WindowPositionPublication::InactiveEchoArea;
-    }
-    if purpose == WindowLayoutWalkPurpose::Snapshot {
-        return WindowPositionPublication::Snapshot;
-    }
-    // A real GNU transaction already performed the pre-hook resize walk.
-    // Its presentation now enters redisplay_window. Standalone engine calls
-    // and the explicit legacy policy retain the original measurement route.
-    if evaluator.gnu_redisplay_hooks_policy_enabled()
-        && evaluator.gnu_redisplay_transaction_active()
-    {
-        return WindowPositionPublication::Redisplay;
     }
     if params.is_minibuffer() {
         let buffer_id = neovm_core::buffer::BufferId(params.buffer_id);
@@ -544,13 +511,6 @@ fn resolve_window_display_source_params(
     // (GNU resolves it inline with `lookup_image`). This is the single point
     // every window's params pass through that also holds the evaluator.
     let mut params = params.clone();
-    if purpose == WindowLayoutWalkPurpose::MiniPreparation {
-        params.window_start = params.buffer_begv;
-        params.vscroll = 0;
-        params.force_start = true;
-        params.previous_visible_end = None;
-        params.mini_measurement = crate::types::MiniWindowMeasurement::ToEnd;
-    }
     if let WindowLayoutWalkPurpose::SynchronousQuery(scope) = purpose {
         use neovm_core::window::WindowLayoutQueryScope;
         let start = match scope {
@@ -590,10 +550,8 @@ fn resolve_window_display_source_params(
         .map(crate::types::SharedImageCatalog);
     let params = &params;
 
-    if matches!(
-        purpose,
-        WindowLayoutWalkPurpose::SynchronousQuery(_) | WindowLayoutWalkPurpose::MiniPreparation
-    ) || !params.is_minibuffer()
+    if matches!(purpose, WindowLayoutWalkPurpose::SynchronousQuery(_))
+        || !params.is_minibuffer()
         || evaluator.minibuffer_window_is_active(window_id)
     {
         return ResolvedWindowDisplaySource {
@@ -730,12 +688,11 @@ fn collect_live_window_layout_inputs(
             .is_some_and(|selected| selected.id == frame_id);
         let is_selected = frame_is_selected && live_frame.selected_window == window_id;
         let cursor_role = match purpose {
-            WindowLayoutWalkPurpose::Redisplay | WindowLayoutWalkPurpose::Snapshot => {
+            WindowLayoutWalkPurpose::Redisplay => {
                 super::neovm_bridge::redisplay_cursor_target(evaluator, frame_id)
                     .role_for(window_id)
             }
-            WindowLayoutWalkPurpose::SynchronousQuery(_)
-            | WindowLayoutWalkPurpose::MiniPreparation => {
+            WindowLayoutWalkPurpose::SynchronousQuery(_) => {
                 WindowCursorRole::from_active(is_selected)
             }
         };
@@ -864,9 +821,6 @@ pub struct LayoutEngine {
     /// the frame converges.
     window_snapshots: Vec<WindowPresentationSnapshot>,
     query_restart_rows: Vec<(neovm_core::buffer::LispCharPos1, i64)>,
-    /// One renderer-inert full mini measurement. Owned numeric attempt result;
-    /// never shared with other Context mutators or retained presentations.
-    mini_preparation_height: Option<f32>,
     /// Granted only by the canonical walk's semantic reuse barrier. Geometry
     /// queries with evaluated Lisp conditions must never skip that walk.
     query_body_reuse_allowed: bool,
@@ -954,9 +908,9 @@ pub struct LayoutEngine {
     /// changes counted one char early (textprop.c:87). Only the mode-line
     /// gate (`NEOMACS_MODE_LINE_GATE=gnu`) reads it.
     pre_fontify_gnu_beg_unchanged: rustc_hash::FxHashMap<u64, i64>,
-    /// GNU `consider_all_windows_p` as `bset_redisplay` raises it across all
-    /// frames: a buffer changed that a non-selected window shows, or that two
-    /// windows show (xdisp.c:886-898). Computed before fontification in Phase A.
+    /// GNU `consider_all_windows_p` as `bset_redisplay` raises it for this
+    /// frame: a buffer changed that a non-selected window shows, or that two
+    /// windows show (xdisp.c:886-898). Computed in Phase A.
     frame_other_windows_changed: bool,
     /// Phase 3 below-reuse switch (default true). The localized edit fast path
     /// reuses the rows BELOW the dirty span too (charpos-shifted, same pixel_y),
@@ -1136,7 +1090,6 @@ impl FrameWindowEndAttempts {
 struct RedisplayLispLedger {
     acknowledged_scroll_hooks: rustc_hash::FxHashSet<WindowScrollHookSite>,
     exact_hook_resumes: rustc_hash::FxHashMap<neovm_core::window::WindowId, ResolvedWindowStart>,
-    mini_eob_scroll: mini_eob_scroll::MiniEobScrollLedger,
 }
 
 impl RedisplayLispLedger {
@@ -1155,9 +1108,8 @@ impl RedisplayLispLedger {
     }
 
     fn acknowledge_scroll_hook(&mut self, effect: &LayoutEffect) {
-        let site = effect.scroll_hook_site();
-        self.acknowledged_scroll_hooks.insert(site);
-        self.mini_eob_scroll.acknowledge(site);
+        self.acknowledged_scroll_hooks
+            .insert(effect.scroll_hook_site());
     }
 
     /// GNU resumes the same callback site from the start after Lisp has had a
@@ -1244,15 +1196,6 @@ impl IncrementalWindowPlan {
             .or_else(|| self.scroll.as_ref().map(|replay| replay.face_generation))
     }
 
-    #[inline]
-    fn extend_retained_face_ids(&self, ids: &mut std::collections::BTreeSet<FaceId>) {
-        if let Some(replay) = &self.cursor_only {
-            replay.extend_retained_face_ids(ids);
-        } else if let Some(replay) = &self.scroll {
-            replay.extend_retained_face_ids(ids);
-        }
-    }
-
     fn retained_face_ids(&self) -> Vec<FaceId> {
         self.cursor_only
             .as_ref()
@@ -1325,7 +1268,6 @@ fn admit_retained_frame_faces(
     committed_arena: &FrameFaceArena,
 ) -> Result<(), FrameFaceReuseError> {
     let current_generation = committed_arena.generation();
-    let gather_directly = retained_face_gather::enabled();
     let mut face_ids = std::collections::BTreeSet::new();
     for plan in plans {
         if let Some(source) = &plan.prepared_faces {
@@ -1347,15 +1289,11 @@ fn admit_retained_frame_faces(
                 current: current_generation,
             });
         }
-        if gather_directly {
-            plan.extend_retained_face_ids(&mut face_ids);
-        } else {
-            face_ids.extend(
-                plan.retained_face_ids()
-                    .into_iter()
-                    .filter(|face_id| *face_id != FaceId::new(0)),
-            );
-        }
+        face_ids.extend(
+            plan.retained_face_ids()
+                .into_iter()
+                .filter(|face_id| *face_id != FaceId::new(0)),
+        );
     }
     face_attempt.admit_retained(current_generation, face_ids, committed_arena)
 }
@@ -1393,7 +1331,6 @@ impl LayoutEngine {
         self.pending_tab_bar_pointer = None;
         self.window_snapshots.clear();
         self.query_restart_rows.clear();
-        self.mini_preparation_height = None;
         self.cursor_only_window_ids.clear();
         self.prepared_window_ids.clear();
         self.scroll_window_ids.clear();
@@ -1539,7 +1476,6 @@ impl LayoutEngine {
             text_buf: Vec::with_capacity(64 * 1024), // 64KB initial
             window_snapshots: Vec::new(),
             query_restart_rows: Vec::new(),
-            mini_preparation_height: None,
             query_body_reuse_allowed: false,
             query_cache: Default::default(),
             font_metrics: Some(FontMetricsService::new()),
@@ -1579,7 +1515,6 @@ impl LayoutEngine {
             text_buf: Vec::with_capacity(64 * 1024),
             window_snapshots: Vec::new(),
             query_restart_rows: Vec::new(),
-            mini_preparation_height: None,
             query_body_reuse_allowed: false,
             query_cache: Default::default(),
             font_metrics: None,
@@ -1699,14 +1634,7 @@ impl LayoutEngine {
         purpose: LayoutPurpose,
     ) -> FrameLayoutAttempt {
         debug_assert!(purpose.query_window().is_none());
-        if evaluator.redisplay_hook_flow_pending() {
-            return FrameLayoutAttempt::Aborted;
-        }
         self.layout_frame_rust_for_purpose_inner(evaluator, frame_id, purpose);
-        if evaluator.has_mode_line_display_flow() {
-            self.last_frame_display_state = None;
-            return FrameLayoutAttempt::Aborted;
-        }
         self.report_image_failures(evaluator);
         self.last_frame_display_state
             .take()
@@ -1929,23 +1857,16 @@ impl LayoutEngine {
             .get(&frame_id)
             .cloned()
             .unwrap_or_default();
+        let mut minibuffer_measurement_needs_begv = query_window.is_none();
         let mut frame_window_end_attempts = FrameWindowEndAttempts::default();
         let layout_walk_purpose = match purpose {
-            LayoutPurpose::MiniPreparation { .. } => WindowLayoutWalkPurpose::MiniPreparation,
             LayoutPurpose::SynchronousQuery { scope, .. } => {
                 WindowLayoutWalkPurpose::SynchronousQuery(scope)
-            }
-            LayoutPurpose::Snapshot if evaluator.gnu_redisplay_hooks_policy_enabled() => {
-                WindowLayoutWalkPurpose::Snapshot
             }
             LayoutPurpose::Redisplay | LayoutPurpose::Snapshot => {
                 WindowLayoutWalkPurpose::Redisplay
             }
         };
-        let mut minibuffer_measurement_needs_begv = query_window.is_none()
-            && layout_walk_purpose != WindowLayoutWalkPurpose::Snapshot
-            && !(evaluator.gnu_redisplay_hooks_policy_enabled()
-                && evaluator.gnu_redisplay_transaction_active());
 
         let (
             frame_params,
@@ -2111,9 +2032,24 @@ impl LayoutEngine {
             // `windows_or_buffers_changed`, which disables GNU's one-line
             // optimization for the whole redisplay. The mini-window is left
             // out: echo-area text reaches it through `echo_area_display`.
-            self.frame_other_windows_changed = evaluator
-                .frame_manager()
-                .other_window_buffer_changed(evaluator.buffer_manager());
+            self.frame_other_windows_changed = window_params_list
+                .iter()
+                .filter(|params| !params.is_minibuffer())
+                .any(|params| {
+                    let dirty = self
+                        .pre_fontify_dirty_spans
+                        .get(&params.buffer_id)
+                        .is_some_and(Option::is_some);
+                    dirty
+                        && (!params.selected
+                            || window_params_list
+                                .iter()
+                                .filter(|other| {
+                                    !other.is_minibuffer() && other.buffer_id == params.buffer_id
+                                })
+                                .count()
+                                > 1)
+                });
 
             self.reset_frame_attempt_state();
             let mut face_attempt = committed_face_arena.begin_attempt();
@@ -2149,7 +2085,23 @@ impl LayoutEngine {
                         .and_then(neovm_core::face::Color::parse)
                         .map(|color| Color::from_pixel(color.to_pixel()))
                         .unwrap_or(Color::BLACK),
-                    background_alpha: 1.0,
+                    background_alpha: frame.background_alpha,
+                    frame_alpha: {
+                        let mut alpha = frame.frame_alpha;
+                        let limit = neovm_core::window::frame_alpha::lower_limit(
+                            evaluator
+                                .obarray()
+                                .symbol_value("frame-alpha-lower-limit")
+                                .copied()
+                                .unwrap_or(Value::fixnum(20)),
+                        );
+                        for value in &mut alpha {
+                            if *value >= 0.0 && (0.0..=1.0).contains(&limit) {
+                                *value = value.max(limit);
+                            }
+                        }
+                        alpha
+                    },
                     no_accept_focus: frame.no_accept_focus,
                 })
             } else {
@@ -2217,11 +2169,7 @@ impl LayoutEngine {
                 .zip(&window_layout_inputs)
                 .zip(&retained_keys)
                 .map(|((params, (_, layout_box)), (_, key))| {
-                    if query_window.is_some()
-                        || layout_walk_purpose == WindowLayoutWalkPurpose::Snapshot
-                    {
-                        // Snapshot/query rows must start at the live marker;
-                        // historical viewport replay belongs to redisplay.
+                    if query_window.is_some() {
                         return IncrementalWindowPlan {
                             prepared_faces: None,
                             cursor_only: None,
@@ -2584,9 +2532,7 @@ impl LayoutEngine {
                 let mut cursor_only_replay = plan.cursor_only.take();
                 let mut scroll_replay = plan.scroll.take();
                 let mut is_edit = plan.is_edit;
-                let mut visibility_retry_budget = if query_window.is_some()
-                    || layout_walk_purpose == WindowLayoutWalkPurpose::Snapshot
-                {
+                let mut visibility_retry_budget = if query_window.is_some() {
                     0
                 } else {
                     MAX_WINDOW_VISIBILITY_RETRIES
@@ -2633,14 +2579,7 @@ impl LayoutEngine {
                         }
                         LeafLayoutAttempt::Effect(effect) => {
                             lisp_ledger.acknowledge_scroll_hook(&effect);
-                            if let Err(flow) = effect.execute_inline(evaluator) {
-                                evaluator.defer_redisplay_hook_flow(flow);
-                                frame_window_end_attempts.reject_all(evaluator);
-                                evaluator.retire_interaction_presentation(presentation_id);
-                                self.last_frame_display_state = None;
-                                self.reset_frame_attempt_state();
-                                return None;
-                            }
+                            effect.execute_inline(evaluator);
                             lisp_ledger
                                 .acknowledge_live_hook_resume(evaluator, frame_id, window_id);
                             let current_topology_generation =
@@ -2712,9 +2651,7 @@ impl LayoutEngine {
                             // A hook effect re-enters this leaf from its live
                             // inputs, which is the same fresh attempt the old
                             // recursion performed by unwinding to this loop.
-                            visibility_retry_budget = if query_window.is_some()
-                                || layout_walk_purpose == WindowLayoutWalkPurpose::Snapshot
-                            {
+                            visibility_retry_budget = if query_window.is_some() {
                                 0
                             } else {
                                 MAX_WINDOW_VISIBILITY_RETRIES
@@ -2722,11 +2659,6 @@ impl LayoutEngine {
                             viewport_retry_phase = ViewportResolutionPhase::Resolve;
                         }
                         LeafLayoutAttempt::LogicalInputsChanged => {
-                            if evaluator.has_mode_line_display_flow() {
-                                frame_window_end_attempts.reject_all(evaluator);
-                                evaluator.retire_interaction_presentation(presentation_id);
-                                return None;
-                            }
                             let request = FrameRelayoutRequest::LogicalInputsChanged {
                                 window_id: DisplayWindowId::new(live_inputs.window.window_id),
                             };
@@ -2925,18 +2857,7 @@ impl LayoutEngine {
                             .any(|row| row.row == *index && row.start_buffer_pos == Some(*anchor))
                     })
                 });
-                let mini_height = if matches!(purpose, LayoutPurpose::MiniPreparation { .. }) {
-                    self.frame_output.mini_measurement_height_px(
-                        target.0 as i64,
-                        window_params_list
-                            .first()
-                            .map_or(1.0, |params| params.char_height.max(1.0)),
-                    )
-                } else {
-                    None
-                };
                 self.reset_frame_attempt_state();
-                self.mini_preparation_height = mini_height;
                 // The completed query owns these small certificates until
                 // `query_window_layout` transfers them into its cache entry.
                 self.query_restart_rows = query_restart_rows;
@@ -2948,9 +2869,7 @@ impl LayoutEngine {
             // this speculative frame, then apply it and retry within the
             // shared convergence budget. Resize policy controls which planned
             // growth or shrink is permitted; the frame owns its geometry.
-            if !(evaluator.gnu_redisplay_hooks_policy_enabled()
-                && evaluator.gnu_redisplay_transaction_active())
-                && let Some(mini_params) = window_params_list.last()
+            if let Some(mini_params) = window_params_list.last()
                 && mini_params.is_minibuffer()
                 && let Some(mini_content_height_px) = self.output_window_content_height_px(
                     mini_params.window_id,
@@ -3238,18 +3157,6 @@ impl LayoutEngine {
                     period: bitmap.period,
                     align: bitmap.align.as_u8(),
                 },
-            );
-        }
-
-        if window_system.is_none()
-            && evaluator
-                .frame_manager()
-                .posn_object_extent_mode(frame_id)
-                .enabled()
-        {
-            posn_object_extent::capture_terminal_object_extents(
-                &frame_display_state,
-                &mut self.window_snapshots,
             );
         }
 
@@ -3684,14 +3591,6 @@ impl LayoutEngine {
             }
         }
 
-        if layout_walk_purpose == WindowLayoutWalkPurpose::Snapshot {
-            // Frame preparation also commits live output and window ends.
-            // A renderer-inert snapshot owns only its fresh geometry.
-            for snapshot in &mut self.window_snapshots {
-                snapshot.retain_as_geometry_only();
-            }
-        }
-
         // Fringe bitmaps are stamped onto matrix rows after the row walk has
         // pushed their snapshot rows, so pair the two up now that both are
         // final — this is what makes `fringe-bitmaps-at-pos` readable from the
@@ -3703,232 +3602,20 @@ impl LayoutEngine {
             );
         }
 
-        // The sealed producer contains final New/Reused/Shifted row operations,
-        // including the final chrome adjustments. Queries never reach this seam.
-        let accepted_tty_posn_pool = if window_system.is_none()
-            && evaluator
-                .frame_manager()
-                .posn_object_extent_mode(frame_id)
-                .enabled()
-        {
-            let previous = evaluator
-                .frame_manager()
-                .get(frame_id)
-                .and_then(|frame| frame.tty_posn_pool());
-            let captured =
-                neomacs_display_protocol::posn_frame_pool::PosnFramePool::from_terminal_frame(
-                    self.last_frame_display_state
-                        .as_ref()
-                        .expect("accepted sealed state")
-                        .state(),
-                    previous.map(|pool| &**pool),
-                    neovm_core::encoding::char_width,
-                );
-            Some(
-                match previous.filter(|pool| captured.retains_same_observations(pool)) {
-                    Some(pool) => std::sync::Arc::clone(pool),
-                    None => std::sync::Arc::new(captured),
-                },
-            )
-        } else {
-            None
-        };
         let snapshots = std::mem::take(&mut self.window_snapshots);
         if let Some(frame) = evaluator.frame_manager_mut().get_mut(frame_id) {
             frame
-                .prepare_display_presentation_with_tty_posn_pool(
+                .prepare_display_presentation(
                     neovm_core::window::geometry::PresentationId::new(presentation_id),
                     snapshots,
-                    accepted_tty_posn_pool,
                 )
                 .expect("layout presentation identity is fresh");
-            // Body dimensions are now authoritative before renderer activation.
-            // Failed prepare and missing-frame paths cannot acknowledge output.
-            evaluator.note_gnu_frame_display_accepted(
-                frame_id,
-                self.retained_window_matrices
-                    .keys()
-                    .map(|window| neovm_core::window::WindowId(window.get() as u64)),
-            );
         }
         frame_window_end_attempts.accept_all();
         for face_name in face_resolver.take_invalid_face_references() {
             evaluator.add_to_log(&format!("Invalid face reference: {face_name}"));
         }
         None
-    }
-
-    /// GNU resize_mini_window's full, renderer-inert BEGV-to-ZV walk. The
-    /// exclusive presentation engine is idle before window-change hooks; this
-    /// query retires speculative rows and never seals or paints a frame.
-    pub fn prepare_minibuffer_geometry(
-        &mut self,
-        evaluator: &mut neovm_core::emacs_core::Context,
-        request: neovm_core::emacs_core::eval::RedisplayMiniGeometryRequest,
-    ) -> Result<neovm_core::emacs_core::value::Value, neovm_core::emacs_core::error::Flow> {
-        use neovm_core::buffer::LispCharPos1;
-        let Some(frame) = evaluator.frame_manager().get(request.frame) else {
-            return Ok(Value::NIL);
-        };
-        let Some(_window) = frame.find_window(request.window) else {
-            return Ok(Value::NIL);
-        };
-        if frame.minibuffer_window != Some(request.window) {
-            return Ok(Value::NIL);
-        }
-        let mini_only = frame.root_window().id() == request.window;
-        let char_height = frame.char_height.max(1.0);
-        let old_height = _window.bounds().height;
-        let inner_height = frame.root_window().bounds().height
-            + if mini_only {
-                0.0
-            } else {
-                _window.bounds().height
-            };
-        let frame_rows = inner_height / char_height;
-        let begv = evaluator
-            .buffer_manager()
-            .get(request.buffer)
-            .map(|buffer| {
-                LispCharPos1::from_one_based_usize(
-                    buffer.point_min_char_pos().get().saturating_add(1),
-                )
-            })
-            .unwrap_or(LispCharPos1::ONE);
-        let adhoc = uses_adhoc_minibuffer_resize_scroll(evaluator, request.buffer);
-        // GNU resets the default start before the nil-policy early return.
-        if adhoc {
-            evaluator.gnu_set_prepared_minibuffer_start(request.frame, request.window, begv, false);
-        }
-        if mini_only {
-            return evaluator.gnu_resize_prepared_mini_frame(request.frame);
-        }
-        let mode = resize_mini_windows_mode_for_buffer(evaluator, request.buffer);
-        if !mode.should_grow() {
-            return Ok(Value::NIL);
-        }
-        let raw_maximum = evaluator
-            .buffer_manager()
-            .get(request.buffer)
-            .and_then(|buffer| buffer.buffer_local_value("max-mini-window-height"))
-            .or_else(|| {
-                evaluator
-                    .obarray()
-                    .symbol_value("max-mini-window-height")
-                    .copied()
-            })
-            .unwrap_or_else(|| Value::make_float(0.25));
-        let max_lines = max_mini_window_lines_from_value(raw_maximum, frame_rows);
-        self.mini_preparation_height = None;
-        self.query_body_reuse_allowed = false;
-        evaluator.sync_runtime_faces_for_frame(request.frame);
-        let query = self.layout_frame_rust_for_purpose_inner(
-            evaluator,
-            request.frame,
-            LayoutPurpose::MiniPreparation {
-                window_id: request.window,
-            },
-        );
-        self.report_image_failures(evaluator);
-        let query = query.ok_or_else(|| {
-            evaluator.failed_redisplay_mini_preparation(
-                neovm_core::emacs_core::eval::RedisplayMiniPreparationFailure::DidNotConverge,
-            )
-        })?;
-        let height = self
-            .mini_preparation_height
-            .take()
-            .unwrap_or(char_height)
-            .max(char_height);
-        let empty = evaluator
-            .buffer_manager()
-            .get(request.buffer)
-            .is_none_or(|buffer| buffer.accessible_emacs_byte_range().is_empty());
-        // GNU grow-only's allowed shrink is shrink_mini_window(unit), even
-        // when a nonempty shorter message requests more than one line.
-        let desired_height = if mode == ResizeMiniWindowsMode::GrowOnly && height < old_height {
-            if mode.should_shrink(request.exact, empty) {
-                char_height
-            } else {
-                old_height
-            }
-        } else {
-            height
-        };
-        let resize = evaluator
-            .frame_manager()
-            .get(request.frame)
-            .and_then(|frame| frame.plan_mini_window_resize(desired_height, max_lines))
-            .filter(|resize| {
-                if resize.is_growth() {
-                    mode.should_grow()
-                } else {
-                    mode.should_shrink(request.exact, empty)
-                }
-            });
-        // The display-row producer supplies exact source anchors, including
-        // overlay/display-string rows. Choose the last screenful from these
-        // rows, rather than counting physical newlines or measuring a prefix.
-        let max_height = (max_lines * char_height).max(char_height).min(inner_height);
-        let start = if height > max_height && adhoc {
-            query
-                .geometry()
-                .and_then(|snapshot| {
-                    let target_y = snapshot
-                        .rows
-                        .last()?
-                        .y
-                        .saturating_sub((max_height - char_height).round() as i64);
-                    if evaluator.gnu_redisplay_hooks_policy_enabled() {
-                        let end = evaluator
-                            .buffer_manager()
-                            .get(request.buffer)
-                            .map(|buffer| {
-                                LispCharPos1::from_one_based_usize(
-                                    buffer.point_max_char_pos().get().saturating_add(1),
-                                )
-                            })?;
-                        mini_source_start::aligned_after_string_start(snapshot, target_y, end)
-                    } else {
-                        snapshot
-                            .rows
-                            .iter()
-                            .rev()
-                            .find(|row| row.y <= target_y)
-                            .and_then(|row| row.start_buffer_pos)
-                    }
-                })
-                .unwrap_or(begv)
-        } else if height <= max_height {
-            begv
-        } else {
-            evaluator
-                .frame_manager()
-                .get(request.frame)
-                .and_then(|frame| frame.find_window(request.window))
-                .and_then(|window| {
-                    if let neovm_core::window::Window::Leaf { window_start, .. } = window {
-                        Some(*window_start)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(begv)
-        };
-        evaluator.gnu_set_prepared_minibuffer_start(
-            request.frame,
-            request.window,
-            start,
-            height > max_height && adhoc,
-        );
-        if let Some(resize) = resize {
-            evaluator.gnu_apply_prepared_minibuffer_resize(
-                request.frame,
-                request.window,
-                resize.height_px(),
-            )?;
-        }
-        Ok(Value::NIL)
     }
 
     /// Answer a live window query from validated geometry or the canonical row
@@ -3955,7 +3642,6 @@ impl LayoutEngine {
         }
         self.query_body_reuse_allowed = true;
         self.query_restart_rows.clear();
-        self.mini_preparation_height = None;
         let (query, collections) = neovm_core::tagged::collection_reads::capture_normalized(
             evaluator,
             |evaluator| {
@@ -4206,168 +3892,74 @@ impl LayoutEngine {
             return None;
         };
         let delta = curr_key.buffer_size - prev.key.buffer_size;
-        use crate::incremental_layout::edit_sync::{self, BelowReuse, EditSyncMode};
-        use crate::incremental_layout::{EditReplayPositions, EditReplaySourceProof};
-        let positions = EditReplayPositions::new(dirty_start, dirty_end, delta);
-        let (replay, span_newlines, span_structure_safe) = if edit_sync::lazy_proof_enabled()
-            && self.allow_below_reuse
-            && edit_sync::edit_sync_mode() == EditSyncMode::Sync
-            && !edit_sync::prove_first_enabled()
-            && edit_sync::sync_allowed(&curr_key, params.scroll_margin, buffer)
-        {
-            #[cfg(test)]
-            crate::incremental_layout::lazy_proof_test_support::note_lazy_entry();
-            let mut observed_newlines = None;
-            let mut observed_safe = None;
-            let replay = prev.edit_replay_sync_lazy(&curr_key, positions, || {
-                #[cfg(test)]
-                crate::incremental_layout::lazy_proof_test_support::note_source_proof();
-                let mut newlines = 0usize;
-                let simple = (dirty_start..dirty_end).all(|cp| {
-                    #[cfg(test)]
-                    crate::incremental_layout::lazy_proof_test_support::note_char_query();
-                    let byte = buffer.char_pos_to_emacs_byte_pos_clamped(
-                        neovm_core::buffer::CharPos0::new(cp as usize),
-                    );
-                    match buffer.char_at_emacs_byte_pos(byte) {
-                        Some('\n') => {
-                            newlines += 1;
-                            true
-                        }
-                        Some(c) => c.is_ascii_graphic() || c == ' ',
-                        None => false,
-                    }
-                });
-                let structure_range = neovm_core::buffer::CharRange::new(
-                    neovm_core::buffer::CharPos0::new(dirty_start.max(0) as usize),
-                    neovm_core::buffer::CharPos0::new(dirty_end.max(0) as usize),
+        // Below-reuse SAFETY GATE, part 1: every char in the dirty span is
+        // printable ASCII (graphic or space) or a newline — combined with
+        // edit_replay's monospace + width check this proves each span line
+        // still occupies exactly one row (no wrap), which is what makes the
+        // rows-below reuse (shift charpos, keep pixel_y) sound. Newlines are
+        // allowed because the span relays WHOLE rows: an existing newline is
+        // a row boundary inside the span (jit-lock's line region includes the
+        // trailing newline), and an INSERTED newline — which does change the
+        // row structure — makes the bounded walk miss its expected_walk
+        // end-charpos contract and bail, the same runtime backstop deletes
+        // rely on. A tab or wide char escalates to above-only (the
+        // cols-times-char_width fit arithmetic would lie about them). With
+        // property changes feeding the accumulator, the span covers the
+        // jit-lock line region, so this also vets the line's existing content.
+        // A pure delete has an empty NEW span (its old extent is the deleted
+        // range) — vacuously ASCII-safe; edit_replay + the post-walk
+        // validation own the delete-specific safety.
+        let mut span_newlines = 0usize;
+        let simple_span = self.allow_below_reuse
+            && (dirty_start..dirty_end).all(|cp| {
+                let byte = buffer.char_pos_to_emacs_byte_pos_clamped(
+                    neovm_core::buffer::CharPos0::new(cp as usize),
                 );
-                let safe = simple && {
-                    #[cfg(test)]
-                    crate::incremental_layout::lazy_proof_test_support::note_property_query();
-                    !buffer.has_any_non_nil_property_in_char_range(
-                        structure_range,
-                        EditReplayStructureProperty::symbols(),
-                    )
-                };
-                observed_newlines = Some(newlines);
-                observed_safe = Some(safe);
-                if safe {
-                    EditReplaySourceProof::Simple { newlines }
-                } else {
-                    EditReplaySourceProof::Rejected
+                match buffer.char_at_emacs_byte_pos(byte) {
+                    Some('\n') => {
+                        span_newlines += 1;
+                        true
+                    }
+                    Some(c) => c.is_ascii_graphic() || c == ' ',
+                    None => false,
                 }
             });
-            (replay, observed_newlines, observed_safe)
-        } else {
-            // Below-reuse SAFETY GATE, part 1: every char in the dirty span is
-            // printable ASCII (graphic or space) or a newline — combined with
-            // edit_replay's monospace + width check this proves each span line
-            // still occupies exactly one row (no wrap), which is what makes the
-            // rows-below reuse (shift charpos, keep pixel_y) sound. Newlines are
-            // allowed because the span relays WHOLE rows: an existing newline is
-            // a row boundary inside the span (jit-lock's line region includes the
-            // trailing newline), and an INSERTED newline — which does change the
-            // row structure — makes the bounded walk miss its expected_walk
-            // end-charpos contract and bail, the same runtime backstop deletes
-            // rely on. A tab or wide char escalates to above-only (the
-            // cols-times-char_width fit arithmetic would lie about them). With
-            // property changes feeding the accumulator, the span covers the
-            // jit-lock line region, so this also vets the line's existing content.
-            // A pure delete has an empty NEW span (its old extent is the deleted
-            // range) — vacuously ASCII-safe; edit_replay + the post-walk
-            // validation own the delete-specific safety.
-            #[cfg(test)]
-            if self.allow_below_reuse {
-                crate::incremental_layout::lazy_proof_test_support::note_source_proof();
-            }
-            let mut span_newlines = 0usize;
-            let simple_span = self.allow_below_reuse
-                && (dirty_start..dirty_end).all(|cp| {
-                    #[cfg(test)]
-                    crate::incremental_layout::lazy_proof_test_support::note_char_query();
-                    let byte = buffer.char_pos_to_emacs_byte_pos_clamped(
-                        neovm_core::buffer::CharPos0::new(cp as usize),
-                    );
-                    match buffer.char_at_emacs_byte_pos(byte) {
-                        Some('\n') => {
-                            span_newlines += 1;
-                            true
-                        }
-                        Some(c) => c.is_ascii_graphic() || c == ' ',
-                        None => false,
-                    }
-                });
-            // Part 2: no structure-affecting text property may cover the span.
-            // Face-class props (`face`, `font-lock-face`, `fontified`) only recolor
-            // glyphs; these change what the chars BECOME (replacement, hiding,
-            // prefixes, composition), which invalidates the one-line-one-row proof.
-            // GNU's try_window_id needs no such scan because its regenerated region
-            // re-syncs against the old matrix post-walk; here the post-walk
-            // `expected_walk` validation is the backstop and this scan keeps the
-            // replay from being built (and bailed) pointlessly.
-            let structure_range = neovm_core::buffer::CharRange::new(
-                neovm_core::buffer::CharPos0::new(dirty_start.max(0) as usize),
-                neovm_core::buffer::CharPos0::new(dirty_end.max(0) as usize),
+        // Part 2: no structure-affecting text property may cover the span.
+        // Face-class props (`face`, `font-lock-face`, `fontified`) only recolor
+        // glyphs; these change what the chars BECOME (replacement, hiding,
+        // prefixes, composition), which invalidates the one-line-one-row proof.
+        // GNU's try_window_id needs no such scan because its regenerated region
+        // re-syncs against the old matrix post-walk; here the post-walk
+        // `expected_walk` validation is the backstop and this scan keeps the
+        // replay from being built (and bailed) pointlessly.
+        let structure_range = neovm_core::buffer::CharRange::new(
+            neovm_core::buffer::CharPos0::new(dirty_start.max(0) as usize),
+            neovm_core::buffer::CharPos0::new(dirty_end.max(0) as usize),
+        );
+        let span_structure_safe = simple_span
+            && !buffer.has_any_non_nil_property_in_char_range(
+                structure_range,
+                EditReplayStructureProperty::symbols(),
             );
-            let span_structure_safe = simple_span && {
-                #[cfg(test)]
-                crate::incremental_layout::lazy_proof_test_support::note_property_query();
-                !buffer.has_any_non_nil_property_in_char_range(
-                    structure_range,
-                    EditReplayStructureProperty::symbols(),
-                )
-            };
-            let damage = EditDamage::new(dirty_start, dirty_end, delta, span_newlines);
-            // P3.5 G2: under NEOMACS_LAYOUT_EDIT_SYNC=sync the rows below the edit
-            // are reused by synchronizing the walk with them (GNU try_window_id),
-            // which needs none of the span proofs above; they remain the fallback
-            // when no row below can be synchronized with.
-            let below = if self.allow_below_reuse
-                && edit_sync::edit_sync_mode() == EditSyncMode::Sync
-                && edit_sync::sync_allowed(&curr_key, params.scroll_margin, buffer)
-            {
-                BelowReuse::Sync {
-                    prove_fallback: span_structure_safe,
-                }
-            } else if span_structure_safe {
-                BelowReuse::Prove
-            } else {
-                BelowReuse::Off
-            };
-            // GNU sync remains the semantic policy. Its general producer need
-            // not replace the already certified single-row producer: both are
-            // sealed by the existing post-walk contracts. A prove call may also
-            // return an ABOVE-ONLY replay; that is a rejected proof, never a win.
-            let replay = if matches!(
-                below,
-                BelowReuse::Sync {
-                    prove_fallback: true
-                }
-            ) && edit_sync::prove_first_enabled()
-            {
-                match prev.edit_replay_with(&curr_key, damage, BelowReuse::Prove) {
-                    Some(proved)
-                        if proved.bound_walk
-                            && proved.expected_walk.is_some()
-                            && prev.prove_span_matches_sync(damage, &proved) =>
-                    {
-                        #[cfg(test)]
-                        edit_sync::note_prove_first_for_test(true);
-                        Some(proved)
-                    }
-                    _ => {
-                        #[cfg(test)]
-                        edit_sync::note_prove_first_for_test(false);
-                        prev.edit_replay_with(&curr_key, damage, below)
-                    }
-                }
-            } else {
-                prev.edit_replay_with(&curr_key, damage, below)
-            };
-            (replay, Some(span_newlines), Some(span_structure_safe))
+        let damage = EditDamage::new(dirty_start, dirty_end, delta, span_newlines);
+        // P3.5 G2: under NEOMACS_LAYOUT_EDIT_SYNC=sync the rows below the edit
+        // are reused by synchronizing the walk with them (GNU try_window_id),
+        // which needs none of the span proofs above; they remain the fallback
+        // when no row below can be synchronized with.
+        use crate::incremental_layout::edit_sync::{self, BelowReuse, EditSyncMode};
+        let below = if self.allow_below_reuse
+            && edit_sync::edit_sync_mode() == EditSyncMode::Sync
+            && edit_sync::sync_allowed(&curr_key, params.scroll_margin, buffer)
+        {
+            BelowReuse::Sync {
+                prove_fallback: span_structure_safe,
+            }
+        } else if span_structure_safe {
+            BelowReuse::Prove
+        } else {
+            BelowReuse::Off
         };
-        let Some(mut replay) = replay else {
+        let Some(mut replay) = prev.edit_replay_with(&curr_key, damage, below) else {
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let body: Vec<&neomacs_display_protocol::glyph_matrix::GlyphRow> = prev
                     .matrix
@@ -4384,8 +3976,8 @@ impl LayoutEngine {
                     dirty_start,
                     dirty_end,
                     delta,
-                    span_newlines = ?span_newlines,
-                    span_structure_safe = ?span_structure_safe,
+                    span_newlines,
+                    span_structure_safe,
                     body_rows = body.len(),
                     margin_rows = body
                         .iter()
@@ -4414,9 +4006,9 @@ impl LayoutEngine {
         };
         let keep_chrome = match crate::incremental_layout::mode_line_gate::mode_line_gate() {
             crate::incremental_layout::mode_line_gate::ModeLineGate::Legacy => prev
-                .chrome_reusable_after_edit_positions(
+                .chrome_reusable_after_edit(
                     &replay,
-                    positions,
+                    damage,
                     chrome_reuse_context(params, evaluator),
                     |from, to| {
                         (from.max(0)..to.max(0)).any(|cp| {
@@ -4463,19 +4055,8 @@ impl LayoutEngine {
         evaluator: &neovm_core::emacs_core::Context,
     ) -> bool {
         use crate::incremental_layout::mode_line_gate::{
-            EditFrameFacts, ModeLineDecision, ModeLineEvaluateReason, decide_edit_chrome,
-            line_numbers_require_mode_line,
+            EditFrameFacts, ModeLineDecision, decide_edit_chrome,
         };
-        // GNU cannot keep optimization 1 with nonvisual line numbers. This
-        // refusal is independent of every other clause, so do not gather
-        // buffer facts or search the retained cursor row to rediscover it.
-        // Only the GNU arm calls this function; the explicit legacy path is
-        // unchanged. The diagnostic names this sufficient refusal clause.
-        if line_numbers_require_mode_line(curr_key.display_line_numbers) {
-            let decision = ModeLineDecision::Evaluate(ModeLineEvaluateReason::LineNumbersDisplayed);
-            tracing::debug!(window = params.window_id, ?decision, "mode-line gate (gnu)");
-            return false;
-        }
         let Some(buffer) = evaluator
             .buffer_manager()
             .get(neovm_core::buffer::BufferId(params.buffer_id))
@@ -4582,18 +4163,8 @@ impl LayoutEngine {
             &resolved_params
         };
         let scroll_hook_site = WindowScrollHookSite::new(window_id, resolved_window_start);
-        let site_publication = if params.is_minibuffer()
-            && matches!(position_publication, WindowPositionPublication::Redisplay)
-            && evaluator.gnu_redisplay_hooks_policy_enabled()
-            && evaluator.gnu_redisplay_transaction_active()
-            && lisp_ledger
-                .mini_eob_scroll
-                .completed(window_id, neovm_core::buffer::BufferId(params.buffer_id))
-        {
-            WindowPositionPublication::RedisplayMiniEobFallback
-        } else {
-            lisp_ledger.publication_for_site(position_publication, scroll_hook_site)
-        };
+        let site_publication =
+            lisp_ledger.publication_for_site(position_publication, scroll_hook_site);
         if !matches!(&viewport_resolution, ViewportResolutionPhase::Measure(_))
             && let Some(effect) = site_publication.publish_window_start(
                 evaluator,
@@ -4632,30 +4203,14 @@ impl LayoutEngine {
         let display_target = crate::display_property::DisplayPropertyTarget::for_window_system(
             face_resolver.is_window_system(),
         );
-        let display_when = if params.mini_measurement == MiniWindowMeasurement::ToEnd
-            && evaluator.gnu_redisplay_hooks_policy_enabled()
-        {
-            let condition_end =
-                mini_source_stop::condition_end_boundary(evaluator, params, fontify_end);
-            crate::display_when::evaluate_window_display_when_forms_at_end(
-                evaluator,
-                buf_id,
-                Some(window_id.0),
-                neovm_core::buffer::CharPos0::new(window_start.max(0) as usize),
-                neovm_core::buffer::CharPos0::new(fontify_end.max(0) as usize),
-                display_target,
-                condition_end,
-            )
-        } else {
-            crate::display_when::evaluate_window_display_when_forms(
-                evaluator,
-                buf_id,
-                Some(window_id.0),
-                neovm_core::buffer::CharPos0::new(window_start.max(0) as usize),
-                neovm_core::buffer::CharPos0::new(fontify_end.max(0) as usize),
-                display_target,
-            )
-        };
+        let display_when = crate::display_when::evaluate_window_display_when_forms(
+            evaluator,
+            buf_id,
+            Some(window_id.0),
+            neovm_core::buffer::CharPos0::new(window_start.max(0) as usize),
+            neovm_core::buffer::CharPos0::new(fontify_end.max(0) as usize),
+            display_target,
+        );
         // The retained key tracks buffer/face changes, not arbitrary Lisp
         // dependencies. A newly evaluated condition can change glyphs without
         // moving any of those ticks. This applies to cursor, scroll, and edit
@@ -4756,12 +4311,6 @@ impl LayoutEngine {
         let buffer_name = buffer.name().to_owned();
         let mut window_end_attempt =
             evaluator.begin_redisplay_window_end_attempt(frame_id, window_id, buf_id);
-        // Pure attempt-local admission captured after conditional replay refusal.
-        // No plan, snapshot or Lisp owner is retained by this numeric decision.
-        let admitted_edit_sync_fontify_attempt = is_edit
-            && scroll_replay
-                .as_ref()
-                .is_some_and(|replay| replay.edit && replay.sync.is_some());
         let render_outcome = BufferWindowRenderRequest::new(
             frame_id,
             window_id,
@@ -4849,11 +4398,10 @@ impl LayoutEngine {
                 .map(WindowPresentationSnapshot::display_snapshot)
                 .find(|snapshot| snapshot.window_id == window_id)
                 .map(|snapshot| {
-                    VisibleFontificationCoverage::inspect_for_edit_sync(
+                    VisibleFontificationCoverage::inspect(
                         buffer,
                         snapshot,
                         neovm_core::buffer::CharPos0::new(fontify_end.max(0) as usize),
-                        admitted_edit_sync_fontify_attempt,
                     )
                 })
                 .unwrap_or(VisibleFontificationCoverage::Complete);
@@ -4885,46 +4433,6 @@ impl LayoutEngine {
                 }
                 return LeafLayoutAttempt::LogicalInputsChanged;
             }
-            BufferSourceRenderAttemptOutcome::GnuMiniEobCursorUnavailable { boundary } => {
-                if let Some(attempt) = window_end_attempt.take() {
-                    evaluator.reject_redisplay_window_end_attempt(attempt);
-                }
-                let Ok(site) = lisp_ledger.mini_eob_scroll.next_site(
-                    evaluator,
-                    frame_id,
-                    window_id,
-                    buf_id,
-                    resolved_window_start,
-                    params,
-                    layout_box.body().height,
-                    topology_generation,
-                    boundary,
-                ) else {
-                    return LeafLayoutAttempt::LogicalInputsChanged;
-                };
-                // Commit the independently resolved decision marker, even
-                // when the producer proved the prepared source line is stable.
-                let _ = evaluator.publish_redisplay_window_start(
-                    frame_id,
-                    window_id,
-                    crate::coords::layout_i64_char_pos_to_lisp_char_pos(site.window_start().get()),
-                );
-                let effect = LayoutEffect::RunWindowScrollFunctions(
-                    crate::layout_effect::WindowScrollEffect::new(site),
-                );
-                if evaluator.window_scroll_functions_may_run(window_id) {
-                    return LeafLayoutAttempt::Effect(effect);
-                }
-                // With no Lisp hook, acknowledge the same semantic decision
-                // and re-enter the real producer instead of manufacturing a
-                // second callback or treating a missing hook as convergence.
-                lisp_ledger.acknowledge_scroll_hook(&effect);
-                return LeafLayoutAttempt::Retry(Box::new(WindowLayoutRetry {
-                    params: params.clone(),
-                    remaining_visibility_retries,
-                    viewport_resolution: ViewportResolutionPhase::Commit(site.window_start()),
-                }));
-            }
             BufferSourceRenderAttemptOutcome::Skipped => {
                 self.frame_output
                     .render_window_info(WindowFrameInfoRenderRequest::new(
@@ -4952,8 +4460,7 @@ impl LayoutEngine {
                     window_end_attempt,
                 };
             }
-            BufferSourceRenderAttemptOutcome::ReplayMispredicted
-            | BufferSourceRenderAttemptOutcome::SyncSourceHorizonExhausted { .. } => {
+            BufferSourceRenderAttemptOutcome::ReplayMispredicted => {
                 if let Some(attempt) = window_end_attempt.take() {
                     evaluator.reject_redisplay_window_end_attempt(attempt);
                 }
@@ -5375,7 +4882,3 @@ impl LayoutEngine {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "engine/tests/mode_line_flow_test.rs"]
-mod mode_line_flow_test;

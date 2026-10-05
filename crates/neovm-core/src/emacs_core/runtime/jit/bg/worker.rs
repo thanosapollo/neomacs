@@ -133,7 +133,7 @@ fn serve(backend: &mut WorkerBackend, job: BackendJob) {
         if super::take_forced_panic() {
             panic!("backend panic forced by a test");
         }
-        backend.define_with_groups(payload)
+        backend.define(payload)
     }));
     let result = match outcome {
         Ok(result) => result,

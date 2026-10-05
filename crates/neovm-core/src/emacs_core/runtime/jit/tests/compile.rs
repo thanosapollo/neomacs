@@ -1070,9 +1070,6 @@ fn inline_pure_callee_lowers_and_runs() {
 
 #[test]
 fn inlined_callee_redefinition_rejits() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::Context;
     use crate::emacs_core::intern::SymId;
     // C = (lambda (x) (* x x)); F = (lambda (a) (C a)). Compiling F inlines C
@@ -1176,9 +1173,6 @@ fn mir_call_lowering_runs_a_non_inlined_call() {
 
 #[test]
 fn inline_plus_residual_call_keeps_shared_speculation_in_mir() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::Context;
     use crate::emacs_core::intern::SymId;
     // F = (g (sq a)): sq inlines, while the multi-block g remains a call.
@@ -1264,9 +1258,6 @@ fn inline_plus_residual_call_keeps_shared_speculation_in_mir() {
 
 #[test]
 fn precise_eviction_only_evicts_inlined_dependents() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::Context;
     use crate::emacs_core::intern::SymId;
     // F = (C a) inlines C = (* x x), so INLINE_DEPS records C -> {F}. Redefining
@@ -1405,9 +1396,6 @@ fn mir_allocates_escaping_cons() {
 /// picks the tier.
 #[test]
 fn a_compiled_loop_polls_quit_whichever_tier_compiles_it() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::Context;
     // `(while (> n 0) (setq n (1- n)))`: no shim-lowered op at all, so the
     // MIR tier's `has_adapter_site` is false and its gate used to admit it.
@@ -1493,9 +1481,6 @@ fn a_compiled_loop_polls_quit_whichever_tier_compiles_it() {
 /// and ElsePop must carry the condition in that edge's root/argument stack.
 #[test]
 fn mir_conditional_loops_preserve_poll_cadence_and_quit() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::{
         Context, bytecode_branch_poll_count, reset_bytecode_branch_poll_count,
     };
@@ -1555,9 +1540,6 @@ fn mir_conditional_loops_preserve_poll_cadence_and_quit() {
 /// Exact GC must see the edge's live stack and preserve every earlier cons.
 #[test]
 fn mir_loop_keeps_native_list_alive_across_exact_gc() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::Context;
     use crate::emacs_core::intern::SymId;
 
@@ -1611,9 +1593,6 @@ fn mir_loop_keeps_native_list_alive_across_exact_gc() {
 /// An overflow must retain the loop's progress in its interpreter framestate.
 #[test]
 fn mir_loop_overflow_after_a_poll_deopts_at_the_current_iteration() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::{
         Context, bytecode_branch_poll_count, reset_bytecode_branch_poll_count,
     };
@@ -1670,9 +1649,6 @@ fn mir_loop_overflow_after_a_poll_deopts_at_the_current_iteration() {
 /// deopt to its original boundary, preserving iterations already completed.
 #[test]
 fn mir_loop_does_not_keep_an_inlined_callee_across_a_gc_hook() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::Context;
     use crate::emacs_core::intern::SymId;
 
@@ -3040,9 +3016,6 @@ fn baseline_reg_args_fallback_stores_do_not_leak_into_the_next_site() {
 ///     (lambda (a b) (setq v v) (let ((c (cons a a))) (setq a c) (point) (setq v v) b))
 #[test]
 fn baseline_fallback_meet_keeps_only_the_slots_both_paths_agree_on() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::Context;
     use crate::emacs_core::intern::{SymId, intern};
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
@@ -3439,12 +3412,14 @@ fn compiled_aset_matches_the_builtin() {
     }
 }
 
-/// Baset cannot call an aset replacement that collects and reallocates. The
-/// primitive writes the vector and leaves the residual h intact.
+/// A REDEFINED `aset` still runs from compiled code, through the rooted
+/// fallback: the fast shim bounces it, and the fallback roots the residual
+/// across a redefinition that collects exactly and reallocates. `h` lives
+/// only in the residual.
 ///
 ///     (lambda (v) (let ((h (cons 1 2))) (aset v 0 9) h))
 #[test]
-fn redefined_aset_cannot_reenter_through_an_opcode() {
+fn redefined_aset_takes_the_rooted_fallback() {
     use crate::emacs_core::eval::Context;
     let mut ev = Context::new();
     let ctx = &mut ev as *mut Context as *mut u8;
@@ -3474,31 +3449,28 @@ fn redefined_aset_cannot_reenter_through_an_opcode() {
     let h = Value::from_bits(bits);
     assert_eq!(h.cons_car(), Value::make_int(1));
     assert_eq!(crate::emacs_core::print::print_value(&v), "[9 0]");
-    // The collecting replacement must never run from this opcode.
-    ev.eval_str("(progn (defvar opcode-aset-calls 0) (fset 'aset (lambda (a i x) (setq opcode-aset-calls (1+ opcode-aset-calls)) (garbage-collect) (make-list 4096 0) 'redefined)))")
+    // Redefined: it collects and reallocates; `h` must survive, the vector
+    // is untouched.
+    ev.eval_str("(fset 'aset (lambda (a i x) (garbage-collect) (make-list 4096 0) 'redefined))")
         .expect("fset");
     for _ in 0..3 {
         let v = ev.eval_str("(vector 0 0)").expect("v");
         let NativeRun::Ok(bits) = leaf.call(ctx, &[v]) else {
-            panic!("Baset must still run");
+            panic!("redefined aset must still run");
         };
         let h = Value::from_bits(bits);
         assert!(
             h.is_cons(),
-            "h remains intact across the primitive (got {h:?})"
+            "h survived the redefinition's collection (got {h:?})"
         );
         assert_eq!(h.cons_car(), Value::make_int(1), "car intact");
         assert_eq!(h.cons_cdr(), Value::make_int(2), "cdr intact");
         assert_eq!(
             crate::emacs_core::print::print_value(&v),
-            "[9 0]",
-            "the opcode ran the primitive"
+            "[0 0]",
+            "the redefinition ran instead of the builtin"
         );
     }
-    assert_eq!(
-        ev.eval_str("opcode-aset-calls").expect("calls"),
-        Value::make_int(0)
-    );
 }
 
 /// The tier gate, through the production compile path. A loop with a
@@ -3507,9 +3479,6 @@ fn redefined_aset_cannot_reenter_through_an_opcode() {
 /// outside a loop takes the MIR tier.
 #[test]
 fn tier_gate_sends_a_loop_with_a_shim_op_to_the_baseline() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::Context;
     use crate::emacs_core::intern::SymId;
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
@@ -3617,9 +3586,6 @@ fn tier_gate_sends_a_loop_with_a_shim_op_to_the_baseline() {
 /// Called with new = (lambda (y) (1- y)): GNU and the interpreter give 4.
 #[test]
 fn mir_inline_call_revalidates_after_fset_and_allows_state_reads() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::Context;
     use crate::emacs_core::intern::SymId;
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
@@ -3897,9 +3863,6 @@ fn mir_adapter_keeps_conses_real_across_a_shim() {
 /// Through the production compile path (the inliner + the tier gate).
 #[test]
 fn mir_adapter_inlined_predicate_reads_its_own_operand() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::Context;
     use crate::emacs_core::intern::SymId;
     let mut ev = Context::new();
@@ -4365,9 +4328,6 @@ fn a_cross_block_call_site_speculates_behind_a_callee_check() {
 ///     (lambda (a b) (setq v v) (let ((c (cons a a))) (setq a c) (callee (if c 5 7)) b))
 #[test]
 fn a_missed_callee_check_does_not_elide_the_speculated_path_stores() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     let (mut ev, sym_val) = harness_with_inc_callee("spec-cross-block-carry");
     let mut f = ByteCodeFunction::new(LambdaParams {
@@ -8200,9 +8160,6 @@ fn unreachable_block_after_an_exit_lowers_without_panicking() {
 /// `gate:float-site`.
 #[test]
 fn a_pure_body_with_a_float_feedback_site_is_rejected_from_the_mir_tier() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     // (lambda (a b) (+ a b)) — pure, required-only: MIR-eligible.
     fn adder() -> ByteCodeFunction {
         let mut f = nullary();
@@ -8578,9 +8535,6 @@ fn a_generic_site_result_is_not_a_known_fixnum_across_a_block_edge() {
 /// guards fixnum and would rerun-from-start on every miss.
 #[test]
 fn a_body_with_a_generic_arith_site_is_rejected_from_the_mir_tier() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::jit::NumericFeedback as NF;
     let control = generic_arith_fn(Op::Add, 2, NF::FixnumOnly);
     let before = crate::emacs_core::jit::stats::compile_stats_snapshot();
@@ -9379,9 +9333,6 @@ fn type_of_call_sites_answer_as_the_builtin_on_the_fast_path() {
 
 #[test]
 fn an_unrelated_redefinition_keeps_an_inlining_leaf_compiled() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::Context;
     use crate::emacs_core::intern::SymId;
     // F = (C a) inlines C = (* x x). Redefining an UNRELATED D moves the
@@ -9449,9 +9400,6 @@ fn an_unrelated_redefinition_keeps_an_inlining_leaf_compiled() {
 
 #[test]
 fn refsetting_the_same_function_and_repeated_redefinitions_stop_recompiling() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     use crate::emacs_core::eval::Context;
     use crate::emacs_core::intern::SymId;
     // F = (C a) inlines C. Storing C's own value again redefines nothing, so F

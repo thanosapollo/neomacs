@@ -14,7 +14,7 @@ pub use neomacs_display_runtime::tty_input::TtyInputReader;
 /// `suspend-tty`, `resume-tty`, and `delete-terminal` functions can
 /// send commands to the render thread.
 pub struct TtyTerminalHost {
-    pub cmd_tx: crossbeam_channel::Sender<RenderCommand>,
+    pub cmd_tx: neomacs_display_runtime::thread_comm::CommandSender,
 }
 
 pub struct TtyPopupDisplayHost {
@@ -114,18 +114,5 @@ impl neovm_core::emacs_core::terminal::pure::TerminalHost for TtyTerminalHost {
         self.cmd_tx
             .send(RenderCommand::Lifecycle(LifecycleCommand::Shutdown))
             .map_err(|err| format!("failed to delete tty terminal frontend: {err}"))
-    }
-
-    // GNU writes `tty->output' directly (src/dispnew.c:6838-6843); here that
-    // stream is stdout, and this builtin already runs on the same evaluator
-    // thread that performs every other TtyRif stdout write, so ordering with
-    // redisplay output is inherent.  Same precedent as the popup-menu path.
-    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
-        use std::io::Write as _;
-        let mut stdout = io::stdout();
-        stdout
-            .write_all(bytes)
-            .and_then(|()| stdout.flush())
-            .map_err(|err| format!("failed to write to the terminal: {err}"))
     }
 }

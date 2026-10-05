@@ -89,6 +89,15 @@ pub struct BootstrapImagePlan {
     /// The file the loader will actually pick beside the editor (the
     /// fingerprinted twin of the canonical name).
     pub loader_image: PathBuf,
+    /// Optional GUI terminal layer required before deferred daemon startup.
+    pub terminal_layer: Option<BootstrapTerminalLayer>,
+}
+
+/// Caller-selected source and compiler role; provisioning retains the image lock.
+#[derive(Clone, Debug)]
+pub struct BootstrapTerminalLayer {
+    pub source: PathBuf,
+    pub bootstrap_role_binary_name: String,
 }
 
 /// What a provision did.
@@ -128,7 +137,9 @@ pub fn provision_bootstrap_image(
         )
     })?;
     let canonical = bin_dir.join(&plan.canonical_image_name);
-    if let Some(image) = reuse_if_fresh(plan, &canonical) {
+    if let Some(image) = reuse_if_fresh(plan, &canonical)
+        && terminal_layer_is_fresh(plan, &canonical)
+    {
         return Ok(image);
     }
 
@@ -146,6 +157,7 @@ pub fn provision_bootstrap_image(
 
     let _lock = lock_beside(&canonical)?;
     if let Some(image) = reuse_if_fresh(plan, &canonical) {
+        prepare_terminal_layer(plan, &canonical, bin_dir)?;
         return Ok(image);
     }
     provision_locked(plan, &canonical, bin_dir)
@@ -216,6 +228,8 @@ fn provision_locked(
         }
     }
 
+    prepare_terminal_layer(plan, canonical, bin_dir)?;
+
     let smoke_output = scratch.path().join("smoke.out");
     let mut smoke = Command::new(&plan.editor);
     smoke
@@ -247,6 +261,83 @@ fn provision_locked(
         loader: plan.loader_image.clone(),
         outcome: BootstrapImageOutcome::Rebuilt,
     })
+}
+
+fn terminal_layer_is_fresh(plan: &BootstrapImagePlan, image: &Path) -> bool {
+    let Some(layer) = &plan.terminal_layer else {
+        return true;
+    };
+    let bytecode = layer.source.with_extension("elc");
+    [&plan.editor, &layer.source, image]
+        .into_iter()
+        .all(|input| freshness(&bytecode, input) == Freshness::Fresh)
+}
+
+fn prepare_terminal_layer(
+    plan: &BootstrapImagePlan,
+    image: &Path,
+    bin_dir: &Path,
+) -> Result<(), String> {
+    let Some(layer) = &plan.terminal_layer else {
+        return Ok(());
+    };
+    if terminal_layer_is_fresh(plan, image) {
+        return Ok(());
+    }
+    let role = bin_dir.join(&layer.bootstrap_role_binary_name);
+    ensure_role_binary(&plan.editor, &role)?;
+    let scratch = tempfile::Builder::new()
+        .prefix("neomacs-terminal-layer-")
+        .tempdir()
+        .map_err(|error| format!("failed to prepare GUI terminal scratch: {error}"))?;
+    let environment = isolated_environment(scratch.path(), &plan.runtime_root)?;
+    let bytecode = layer.source.with_extension("elc");
+    if bytecode.exists() {
+        fs::remove_file(&bytecode)
+            .map_err(|error| format!("removing stale GUI bytecode: {error}"))?;
+    }
+    // argv[0] selects BootstrapUse; the final editor role would discard the
+    // compiler's interpreted construction environment from this same image.
+    let mut compile = Command::new(&role);
+    compile
+        .args(["--batch", "-Q", "--dump-file"])
+        .arg(image)
+        .args(["--eval", "(provide 'neomacs)", "-f", "batch-byte-compile"])
+        .arg(&layer.source)
+        .current_dir(&plan.runtime_root);
+    apply_environment(&mut compile, &environment);
+    if let Err(error) = run_bounded(
+        &mut compile,
+        &scratch.path().join("terminal-layer.out"),
+        BOOTSTRAP_DEADLINE,
+        "compiling the deferred GUI terminal layer did not complete",
+    ) {
+        // A failed compiler may already have emitted a nonempty leaf whose
+        // timestamps satisfy reuse. Never admit that partial output later.
+        let _ = fs::remove_file(&bytecode);
+        return Err(error);
+    }
+    if !is_nonempty_file(&bytecode) {
+        return Err(format!(
+            "native compiler did not produce {}",
+            bytecode.display()
+        ));
+    }
+    let mut smoke = Command::new(&plan.editor);
+    smoke.args(["--batch", "-Q", "--dump-file"]).arg(image)
+        .args(["--eval", "(progn (provide 'neomacs) (load \"term/neo-win\") (unless (featurep 'neo-win) (kill-emacs 1)))"])
+        .current_dir(&plan.runtime_root);
+    apply_environment(&mut smoke, &environment);
+    if let Err(error) = run_bounded(
+        &mut smoke,
+        &scratch.path().join("terminal-smoke.out"),
+        SMOKE_DEADLINE,
+        "loading the prepared GUI terminal layer failed",
+    ) {
+        let _ = fs::remove_file(&bytecode);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

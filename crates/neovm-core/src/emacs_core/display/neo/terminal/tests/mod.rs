@@ -6,9 +6,16 @@ use crate::emacs_core::eval::{Context, GuiFrameHostRequest};
 use crate::emacs_core::value::{Value, list_to_vec};
 use std::sync::{Arc, Mutex};
 
+mod invocation_test;
+mod palette_test;
+
 #[derive(Clone, Debug, PartialEq)]
 enum TerminalHostEvent {
     Create(TerminalCreateRequest),
+    Palette {
+        frame: crate::window::FrameId,
+        palette: Option<neomacs_display_protocol::neo_term_palette::NeoTermPalette>,
+    },
     Write {
         id: TerminalId,
         data: Vec<u8>,
@@ -46,6 +53,18 @@ impl DisplayHost for RecordingTerminalDisplayHost {
             .expect("terminal host events")
             .push(TerminalHostEvent::Create(request));
         Ok(TerminalId::new(41).expect("nonzero terminal id"))
+    }
+
+    fn set_terminal_palette(
+        &self,
+        frame: crate::window::FrameId,
+        palette: Option<neomacs_display_protocol::neo_term_palette::NeoTermPalette>,
+    ) -> Result<(), String> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(TerminalHostEvent::Palette { frame, palette });
+        Ok(())
     }
 
     fn write_terminal(&self, id: TerminalId, data: Vec<u8>) -> Result<(), String> {
@@ -147,6 +166,7 @@ fn public_terminal_builtins_route_typed_requests_through_the_display_host() {
                 },
                 target: TerminalDisplayTarget::Floating,
                 shell: Some("/bin/sh".to_owned()),
+                invocation: None,
             }),
             TerminalHostEvent::Write {
                 id: TerminalId::new(41).unwrap(),

@@ -14,27 +14,8 @@
 //! - `tab-bar-height` — get tab bar height
 //! - `line-number-display-width` — get line number display width
 //! - `long-line-optimizations-p` — check if long-line optimizations are enabled
-//!
-//! Redisplay and formatting controls (read once per process):
-//!
-//! | Knob | Unset default | Values | Effect |
-//! | --- | --- | --- | --- |
-//! | `NEOMACS_POSN_BOUNDED_TEXT` | `on` | `off`; `on`/`1`/`true`/`yes` | Bound text copied by approximate window-position fallbacks |
-//! | `NEOMACS_MODE_LINE_PROP_SLICE` | `off` | `off`; `on`/`1`/`true`/`yes` | Clip and graft literal source intervals with one plist copy |
-//! | `NEOMACS_MODE_LINE_PROP_BORROW` | `off` | `off`; `on`/`1`/`true`/`yes` | Borrow source string intervals during synchronous mode-line property reads |
-//! | `NEOMACS_MODE_LINE_PLAIN_FIELD` | `off` | `off`; `on`/`1`/`true`/`yes` | Append property-free percent text directly to the mode-line output |
-//! | `NEOMACS_MODE_LINE_NUMERIC_PADDING` | `on` | `off`; `on`/`1`/`true`/`yes` | Keep numeric-wrapper padding independent of inherited mode-line properties |
-//! | `NEOMACS_REDISPLAY_GNU_HOOKS` | `off` | `off`; `on`/`1`/`true`/`yes` | GNU redisplay transaction, owned pre targets, live hook order and core configuration-hook default; selected-mini preparation; renderer-inert snapshot positions |
 
-#[path = "mode_line_flow.rs"]
-mod mode_line_flow_policy;
-
-#[inline]
-pub fn mode_line_flow_enabled() -> bool {
-    mode_line_flow_policy::enabled()
-}
 mod mode_line_gc;
-mod mode_line_numeric_padding;
 pub(crate) mod motion;
 
 use self::motion::MotionEngine;
@@ -164,20 +145,7 @@ impl super::eval::Context {
     /// because this remains part of the same logical redisplay even though the
     /// physical layout attempt has released its borrow. Errors are demoted,
     /// mirroring GNU's `safe_run_hooks_2`.
-    pub fn run_window_scroll_functions_for_committed_start(
-        &mut self,
-        window_id: WindowId,
-    ) -> EvalResult {
-        if crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
-            return crate::emacs_core::builtins::run_gnu_committed_scroll_functions(
-                self, window_id,
-            );
-        }
-        self.run_window_scroll_functions_for_committed_start_legacy(window_id);
-        Ok(Value::NIL)
-    }
-
-    fn run_window_scroll_functions_for_committed_start_legacy(&mut self, window_id: WindowId) {
+    pub fn run_window_scroll_functions_for_committed_start(&mut self, window_id: WindowId) {
         // No global-value early-out: `window-scroll-functions` may be
         // buffer-local, and the builtin enters the displayed buffer before it
         // reads the hook (GNU `run_window_scroll_functions` runs with the
@@ -2013,9 +1981,9 @@ pub(crate) fn builtin_format_mode_line_ctx(
 /// - `buffer`: target buffer (for buffer-local percent specs).
 /// - `target_cols`: the row width in character cells. `%-` fills to this width.
 ///
-/// Returns the rendered string. The compatibility entry defers nonlocal exits
-/// to Context's redisplay driver and returns an empty string for this row.
-/// Use [`try_format_mode_line_for_display_with_sources`] to handle Flow directly.
+/// Returns the fully rendered mode-line as a propertized string. On
+/// any evaluator error the function returns an empty string; callers
+/// that need to distinguish failure from empty should check `as_str`.
 pub fn format_mode_line_for_display(
     eval: &mut super::eval::Context,
     format_val: Value,
@@ -2036,122 +2004,25 @@ pub fn format_mode_line_for_display_with_sources(
     buffer: Value,
     target_cols: usize,
 ) -> ModeLineDisplayOutput {
-    if eval.has_mode_line_display_flow() {
-        return ModeLineDisplayOutput::from_root_string(Value::string(""));
-    }
-    // GNU's enclosing window handler covers the safe evaluator's bindings
-    // and unwind as well as its body. Register it before dispatch, so an
-    // ordinary error cannot reach outer handler-bind callbacks or debugger.
-    let condition_stack_base = mode_line_flow_policy::enabled().then(|| {
-        let base = eval.condition_stack_len();
-        eval.push_condition_frame(super::eval::ConditionFrame::ConditionCase {
-            conditions: Value::symbol("error"),
-            resume: super::eval::ResumeTarget::InterpreterConditionCase {
-                handler_index: 0,
-                condition_stack_base: base,
-            },
-        });
-        base
-    });
-    let result = try_format_mode_line_for_display_with_sources(
-        eval,
-        format_val,
-        window,
-        buffer,
-        target_cols,
-    );
-    if let Some(base) = condition_stack_base {
-        eval.truncate_condition_stack(base);
-    }
-    match result {
-        Ok(output) => output,
-        Err(flow) => {
-            mode_line_flow_policy::handle_display_error(eval, flow);
-            ModeLineDisplayOutput::from_root_string(Value::string(""))
-        }
-    }
-}
-
-/// Fallible redisplay seam. Signals in `:eval` are logged and contribute nil;
-/// throws and other nonlocal exits return only after all display scopes restore.
-/// The compatibility adapter defers these exits to Context's redisplay driver.
-pub fn try_format_mode_line_for_display_with_sources(
-    eval: &mut super::eval::Context,
-    format_val: Value,
-    window: Value,
-    buffer: Value,
-    target_cols: usize,
-) -> Result<ModeLineDisplayOutput, Flow> {
-    try_format_mode_line_display(eval, format_val, window, buffer, target_cols, true)
-}
-
-/// Frame-title evaluation uses the same safe evaluator, but unlike actual
-/// mode/header/tab lines GNU does not save match data around the title walker.
-pub fn try_format_frame_title_for_display(
-    eval: &mut super::eval::Context,
-    format_val: Value,
-    window: Value,
-    buffer: Value,
-    target_cols: usize,
-) -> EvalResult {
-    if !mode_line_flow_policy::enabled() {
-        return Ok(format_mode_line_for_display(
-            eval,
-            format_val,
-            window,
-            buffer,
-            target_cols,
-        ));
-    }
-    try_format_mode_line_display(eval, format_val, window, buffer, target_cols, false)
-        .map(ModeLineDisplayOutput::into_value)
-}
-
-fn try_format_mode_line_display(
-    eval: &mut super::eval::Context,
-    format_val: Value,
-    window: Value,
-    buffer: Value,
-    target_cols: usize,
-    save_match_data: bool,
-) -> Result<ModeLineDisplayOutput, Flow> {
     let args = [format_val, Value::NIL, window, buffer];
-    validate_optional_window_designator(
+    if validate_optional_window_designator(
         eval,
         args.get(2),
         crate::emacs_core::window_cmds::WindowDomain::Any,
-    )?;
-    validate_optional_buffer_designator(eval, args.get(3))?;
-    let saved_buffer = eval.buffers.current_buffer_id();
-    let mut title_selection = if !save_match_data && mode_line_flow_policy::enabled() {
-        Some(mode_line_flow_policy::FormatSelection::enter(
-            eval,
-            Some(&window),
-        )?)
-    } else {
-        None
-    };
-    let target_buffer = resolve_mode_line_buffer(eval, args.get(2), args.get(3));
-    if let Some(buffer_id) = target_buffer {
-        if let Err(flow) = eval.set_current_buffer_unrecorded(buffer_id) {
-            if let Some(selection) = title_selection {
-                selection.restore(eval);
-            }
-            if let Some(buffer_id) = saved_buffer {
-                eval.restore_current_buffer_if_live(buffer_id);
-            }
-            return Err(flow);
-        }
-    }
-    let saved_match_data =
-        (save_match_data && mode_line_flow_policy::enabled()).then(|| eval.match_data.clone());
-    let match_roots = mode_line_gc::ScratchRoots::new();
-    if let Some(crate::emacs_core::regex::SearchedString::Heap(searched)) = saved_match_data
-        .as_ref()
-        .and_then(Option::as_ref)
-        .and_then(crate::emacs_core::regex::MatchData::searched_string)
+    )
+    .is_err()
     {
-        match_roots.pin(*searched);
+        return ModeLineDisplayOutput::from_root_string(Value::string(""));
+    }
+    if validate_optional_buffer_designator(eval, args.get(3)).is_err() {
+        return ModeLineDisplayOutput::from_root_string(Value::string(""));
+    }
+    let target_buffer = resolve_mode_line_buffer(eval, args.get(2), args.get(3));
+    let saved_buffer = eval.buffers.current_buffer_id();
+    if let Some(buffer_id) = target_buffer
+        && eval.set_current_buffer_unrecorded(buffer_id).is_err()
+    {
+        return ModeLineDisplayOutput::from_root_string(Value::string(""));
     }
 
     // GNU `display_mode_lines` (xdisp.c) makes the window being redisplayed the
@@ -2192,7 +2063,7 @@ fn try_format_mode_line_display(
     });
 
     let result_value = if format_val.is_nil() {
-        Ok(ModeLineDisplayOutput::from_root_string(Value::string("")))
+        ModeLineDisplayOutput::from_root_string(Value::string(""))
     } else {
         let face_spec = resolve_mode_line_face_spec(&args);
         let mut pctx = build_mode_line_percent_context(
@@ -2218,16 +2089,8 @@ fn try_format_mode_line_display(
             {
                 eval.push_specpdl_root(value);
             }
-            let output = format_mode_line_recursive(
-                eval,
-                &pctx,
-                &format_val,
-                &mut rendered,
-                0,
-                false,
-                title_selection.as_mut(),
-            )
-            .map(|()| rendered.into_display_output(face_spec));
+            format_mode_line_recursive(eval, &pctx, &format_val, &mut rendered, 0, false);
+            let output = rendered.into_display_output(face_spec);
             eval.restore_specpdl_roots(pctx_root_scope);
             output
         }
@@ -2241,14 +2104,8 @@ fn try_format_mode_line_display(
     if let Some(saved) = saved_window_selection {
         eval.frames.restore_selected_window_for_mode_line(saved);
     }
-    if let Some(selection) = title_selection {
-        selection.restore(eval);
-    }
     if let Some(buffer_id) = saved_buffer {
         eval.restore_current_buffer_if_live(buffer_id);
-    }
-    if let Some(match_data) = saved_match_data {
-        eval.match_data = match_data;
     }
     result_value
 }
@@ -2265,70 +2122,48 @@ pub(crate) fn finish_format_mode_line_in_eval(
     )?;
     validate_optional_buffer_designator(eval, args.get(3))?;
 
+    let target_buffer = resolve_mode_line_buffer(eval, args.get(2), args.get(3));
     let saved_buffer = eval.buffers.current_buffer_id();
-    let mut selection =
-        if mode_line_flow_policy::enabled() && !args[0].is_nil() && !eval.noninteractive() {
-            Some(mode_line_flow_policy::FormatSelection::enter(
-                eval,
-                args.get(2),
-            )?)
-        } else {
-            None
-        };
-    let result = (|| {
-        let target_buffer = resolve_mode_line_buffer(eval, args.get(2), args.get(3));
-        if let Some(buffer_id) = target_buffer {
-            eval.set_current_buffer_unrecorded(buffer_id)?;
-        }
-        let result = if args[0].is_nil() || eval.noninteractive() {
-            Ok(Value::string(""))
-        } else {
-            let format_val = args[0];
-            let face_spec = resolve_mode_line_face_spec(args);
-            let pctx = build_mode_line_percent_context(
-                &eval.frames,
-                &eval.buffers,
-                Some(&eval.coding_systems),
-                &eval.obarray,
-                args.get(2),
-            );
-            let mut result = ModeLineRendered::default();
-            {
-                // pctx caches heap Values (frame name, eol indicator) captured
-                // before the walk; an :eval that renames the frame would orphan
-                // them mid-walk. Root them for the walk's span.
-                let _accumulator_roots = mode_line_gc::ScratchRoots::new();
-                let pctx_root_scope = eval.save_specpdl_roots();
-                for value in [pctx.frame_name, pctx.eol_indicator, face_spec.face]
-                    .into_iter()
-                    .flatten()
-                {
-                    eval.push_specpdl_root(value);
-                }
-                let output = format_mode_line_recursive(
-                    eval,
-                    &pctx,
-                    &format_val,
-                    &mut result,
-                    0,
-                    false,
-                    selection.as_mut(),
-                )
-                .map(|()| result.into_value(face_spec));
-                eval.restore_specpdl_roots(pctx_root_scope);
-                output
-            }
-        };
-
-        result
-    })();
-    if let Some(selection) = selection {
-        selection.restore(eval);
+    if let Some(buffer_id) = target_buffer {
+        eval.set_current_buffer_unrecorded(buffer_id)?;
     }
+
+    let result = if args[0].is_nil() || eval.noninteractive() {
+        Value::string("")
+    } else {
+        let format_val = args[0];
+        let face_spec = resolve_mode_line_face_spec(args);
+        let pctx = build_mode_line_percent_context(
+            &eval.frames,
+            &eval.buffers,
+            Some(&eval.coding_systems),
+            &eval.obarray,
+            args.get(2),
+        );
+        let mut result = ModeLineRendered::default();
+        {
+            // pctx caches heap Values (frame name, eol indicator) captured
+            // before the walk; an :eval that renames the frame would orphan
+            // them mid-walk. Root them for the walk's span.
+            let _accumulator_roots = mode_line_gc::ScratchRoots::new();
+            let pctx_root_scope = eval.save_specpdl_roots();
+            for value in [pctx.frame_name, pctx.eol_indicator, face_spec.face]
+                .into_iter()
+                .flatten()
+            {
+                eval.push_specpdl_root(value);
+            }
+            format_mode_line_recursive(eval, &pctx, &format_val, &mut result, 0, false);
+            let output = result.into_value(face_spec);
+            eval.restore_specpdl_roots(pctx_root_scope);
+            output
+        }
+    };
+
     if let Some(buffer_id) = saved_buffer {
         eval.restore_current_buffer_if_live(buffer_id);
     }
-    result
+    Ok(result)
 }
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
@@ -2343,8 +2178,6 @@ pub(crate) fn finish_format_mode_line_in_state_with_eval(
 ) -> EvalResult {
     // The compatibility callback must collect from the same active heap as
     // these split-state Values; the scratch registry carries its identity.
-    // Its evaluator owns GNU's inhibit bindings and internal condition
-    // barrier; this split seam applies the returned signal/nonlocal policy.
     let roots = mode_line_gc::ScratchRoots::new();
     for &arg in args {
         roots.pin(arg);
@@ -2364,7 +2197,7 @@ pub(crate) fn finish_format_mode_line_in_state_with_eval(
     }
 
     let result = if args[0].is_nil() {
-        Ok(Value::string(""))
+        Value::string("")
     } else {
         let format_val = args[0];
         let face_spec = resolve_mode_line_face_spec(args);
@@ -2388,18 +2221,14 @@ pub(crate) fn finish_format_mode_line_in_state_with_eval(
             false,
             &mut eval_form,
             &roots,
-        )
-        .map(|()| result.into_value(face_spec))
+        )?;
+        result.into_value(face_spec)
     };
 
-    if result.is_err() && !mode_line_flow_policy::enabled() {
-        // Preserve the legacy callback's error exit while the fix is off.
-        return result;
-    }
     if let Some(buffer_id) = saved_buffer {
         buffers.switch_current_unrecorded(buffer_id);
     }
-    result
+    Ok(result)
 }
 
 fn mode_line_symbol_value_in_state(
@@ -2894,15 +2723,6 @@ pub struct ModeLineDisplaySourceSpan {
     output_end: usize,
     source: Value,
     source_start: usize,
-    boundary: ModeLineStringBoundary,
-}
-
-/// Property-stop provenance owned by one formatter accumulator. Mutators keep
-/// independent accumulators; this metadata is immutable in published output.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ModeLineStringBoundary {
-    Literal,
-    DecodedPercent,
 }
 
 impl ModeLineDisplaySourceSpan {
@@ -2912,7 +2732,6 @@ impl ModeLineDisplaySourceSpan {
             output_end,
             source,
             source_start,
-            boundary: ModeLineStringBoundary::Literal,
         }
     }
 
@@ -2943,11 +2762,12 @@ impl ModeLineDisplaySourceSpan {
     }
 
     fn shifted_output(self, offset: usize) -> Self {
-        Self {
-            output_start: self.output_start.saturating_add(offset),
-            output_end: self.output_end.saturating_add(offset),
-            ..self
-        }
+        Self::new(
+            self.output_start.saturating_add(offset),
+            self.output_end.saturating_add(offset),
+            self.source,
+            self.source_start,
+        )
     }
 }
 
@@ -2984,118 +2804,6 @@ impl ModeLineDisplayOutput {
     }
 }
 
-/// Read once per process. The production selector is immutable plain data;
-/// there is no retained Lisp state or per-mutator cache. A formatter uses a
-/// source interval borrow only in its own synchronous, no-Lisp read span.
-#[inline]
-fn mode_line_prop_borrow_enabled() -> bool {
-    #[cfg(test)]
-    if let Some(enabled) = MODE_LINE_PROP_BORROW_OVERRIDE.with(std::cell::Cell::get) {
-        return enabled;
-    }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("NEOMACS_MODE_LINE_PROP_BORROW")
-                .ok()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .as_deref(),
-            Some("on" | "1" | "true" | "yes")
-        )
-    })
-}
-
-#[cfg(test)]
-thread_local! {
-    static MODE_LINE_PROP_BORROW_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-fn set_mode_line_prop_borrow_for_test(enabled: Option<bool>) {
-    MODE_LINE_PROP_BORROW_OVERRIDE.with(|cell| cell.set(enabled));
-}
-
-/// Read a source's properties at the same point in the formatter walk as the
-/// copied baseline. `read` never runs Lisp or keeps an interval-table borrow;
-/// later `:eval` elements may therefore mutate the source normally. Appending
-/// to the destination still copies the source plists through the existing
-/// interval graft, so already-produced output never aliases the source.
-#[inline]
-fn with_mode_line_string_properties<R>(
-    value: Value,
-    read: impl FnOnce(&TextPropertyTable) -> R,
-) -> Option<R> {
-    if mode_line_prop_borrow_enabled() {
-        borrow_string_text_properties_table_for_value(value).map(read)
-    } else {
-        get_string_text_properties_table_for_value(value)
-            .as_ref()
-            .map(read)
-    }
-}
-
-/// Immutable process selector, published by OnceLock. A source-slice graft
-/// uses only a synchronous immutable source borrow and an exclusive destination;
-/// no source Lisp state is retained between formatter elements or mutators.
-#[inline]
-fn mode_line_prop_slice_enabled() -> bool {
-    #[cfg(test)]
-    if let Some(enabled) = MODE_LINE_PROP_SLICE_OVERRIDE.with(std::cell::Cell::get) {
-        return enabled;
-    }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("NEOMACS_MODE_LINE_PROP_SLICE")
-                .ok()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .as_deref(),
-            Some("on" | "1" | "true" | "yes")
-        )
-    })
-}
-
-#[cfg(test)]
-thread_local! {
-    static MODE_LINE_PROP_SLICE_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-fn set_mode_line_prop_slice_for_test(enabled: Option<bool>) {
-    MODE_LINE_PROP_SLICE_OVERRIDE.with(|cell| cell.set(enabled));
-}
-
-/// Preserve the legacy capture point and interval partition while removing
-/// the intermediate sliced table and its plist spine copies when selected.
-#[inline]
-fn append_mode_line_source_slice(
-    target: &mut ModeLineRendered,
-    source: &TextPropertyTable,
-    start: usize,
-    end: usize,
-    offset: usize,
-) {
-    let range = display_char_range(start, end);
-    let offset = CharLen::new(offset);
-    if mode_line_prop_slice_enabled() {
-        if let Some(roots) = &mut target.gc_roots {
-            target
-                .text_props
-                .append_source_slice_at_char_offset_with_roots(source, range, offset, |value| {
-                    mode_line_gc::pin_accumulator_value(roots, value)
-                });
-        } else {
-            target
-                .text_props
-                .append_source_slice_at_char_offset(source, range, offset);
-        }
-    } else {
-        target.append_properties(&source.slice_char_range(range), offset.get());
-    }
-}
-
 #[derive(Clone, Default)]
 struct ModeLineRendered {
     /// Accumulated Emacs character codes (one entry per character). Storing
@@ -3104,19 +2812,12 @@ struct ModeLineRendered {
     /// them, and the legacy storage-String round-trip that used to bridge the
     /// gap has been retired (issue #131).
     text: Vec<u32>,
-    /// GNU string identity: multibyte iff any FORMAT INPUT was multibyte (the
-    /// `concat' rule), never derived from the accumulated content.  Deriving
-    /// it from the codes instead re-encoded every U+0080..U+00FF character
-    /// whose code fits in a byte as a unibyte raw byte, which then displays
-    /// as the octal escape `\NNN` -- issue #470's "dot turns into `\267`".
-    multibyte: bool,
     text_props: TextPropertyTable,
     source_spans: Vec<ModeLineDisplaySourceSpan>,
     min_width_transitions: Vec<ModeLineMinWidthTransition>,
     /// The enclosing walk owns the scratch-root scope. Mutations publish new
     /// Lisp values there before any later element can evaluate Lisp.
     gc_roots: Option<mode_line_gc::AccumulatorRoots>,
-    numeric_padding: mode_line_numeric_padding::PaddingRanges,
 }
 
 /// One `display (min-width WIDTH-SPEC)` run in GNU's direct mode-line
@@ -3135,20 +2836,9 @@ struct ModeLineMinWidthTransition {
     run: ModeLineMinWidthRun,
 }
 
-/// Temporary iterator events owned by the current formatter call, not a cache
-/// of Lisp state shared by mutators. Source values retain the existing roots.
-enum ModeLineMinWidthEvent {
-    Run(ModeLineMinWidthRun),
-    StringBoundary(ModeLineDisplaySourceSpan),
-}
-
 /// Decode a `LispString` into its sequence of Emacs character codes. Multibyte
 /// strings are scanned one Emacs character at a time (eight-bit characters
-/// surface as `0x3FFF00+`); a unibyte string's high byte IS a raw byte, so it
-/// surfaces as its byte8 character (`0x3FFF00+`), never as a plain Unicode
-/// code -- GNU's `BYTE8_TO_CHAR` (src/character.h).  Byte identity then
-/// survives any later multibyte promotion, exactly as GNU's `concat` keeps a
-/// unibyte operand's raw bytes raw (`str_to_multibyte`).
+/// surface as `0x3FFF00+`); unibyte strings yield one code per raw byte.
 fn mode_line_string_char_codes(string: &crate::heap_types::LispString) -> Vec<u32> {
     let bytes = string.as_bytes();
     if string.is_multibyte() {
@@ -3161,18 +2851,13 @@ fn mode_line_string_char_codes(string: &crate::heap_types::LispString) -> Vec<u3
         }
         codes
     } else {
-        bytes
-            .iter()
-            .map(|&b| crate::emacs_core::emacs_char::unibyte_to_char(b))
-            .collect()
+        bytes.iter().map(|&b| u32::from(b)).collect()
     }
 }
 
 /// Build the final mode-line `LispString` from accumulated character codes: a
-/// multibyte result encodes each code via `char_string` (byte8 characters take
-/// GNU's overlong raw-byte form), a unibyte result maps each code straight to
-/// a byte -- the low byte of a byte8 code IS its raw byte, so the `as u8` is
-/// GNU's `CHAR_TO_BYTE8`.
+/// multibyte result encodes each code via `char_string`, a unibyte result maps
+/// each code straight to a byte.
 fn mode_line_lisp_string_from_codes(
     codes: &[u32],
     multibyte: bool,
@@ -3239,24 +2924,17 @@ impl ModeLineRendered {
     }
 
     fn plain(text: impl Into<String>) -> Self {
-        let text = text.into();
-        let multibyte = text.chars().any(|c| !c.is_ascii());
         Self {
-            text: text.chars().map(|c| c as u32).collect(),
-            multibyte,
+            text: text.into().chars().map(|c| c as u32).collect(),
             text_props: TextPropertyTable::new(),
             source_spans: Vec::new(),
             min_width_transitions: Vec::new(),
             gc_roots: None,
-            numeric_padding: Default::default(),
         }
     }
 
     fn append_rendered(&mut self, other: &Self) {
         let char_offset = self.char_len();
-        self.multibyte |= other.multibyte;
-        self.numeric_padding
-            .append_shifted(&other.numeric_padding, char_offset);
         self.text.extend_from_slice(&other.text);
         self.append_properties(&other.text_props, char_offset);
         for span in &other.source_spans {
@@ -3301,7 +2979,6 @@ impl ModeLineRendered {
         }
         if let Some(previous) = self.source_spans.last_mut()
             && previous.source == source
-            && previous.boundary == ModeLineStringBoundary::Literal
             && previous.output_end == output_start
             && previous
                 .source_start
@@ -3324,19 +3001,17 @@ impl ModeLineRendered {
         match value.as_lisp_string() {
             Some(string) => {
                 let char_offset = self.char_len();
-                self.multibyte |= string.is_multibyte();
                 self.text.extend(mode_line_string_char_codes(string));
                 self.record_source_span(char_offset, self.char_len(), *value, 0);
-                with_mode_line_string_properties(*value, |props| {
-                    self.append_properties(props, char_offset);
-                });
+                if let Some(props) = get_string_text_properties_table_for_value(*value) {
+                    self.append_properties(&props, char_offset);
+                }
             }
             None => {
                 let Some(text) = value.as_utf8_str() else {
                     return;
                 };
                 let char_offset = self.char_len();
-                self.multibyte |= text.chars().any(|c| !c.is_ascii());
                 self.text.extend(text.chars().map(|c| c as u32));
                 self.record_source_span(char_offset, self.char_len(), *value, 0);
             }
@@ -3347,19 +3022,7 @@ impl ModeLineRendered {
         if value.is_string() {
             self.append_string_value_preserving_props(value);
         } else if let Some(ch) = value.as_char() {
-            self.multibyte |= !ch.is_ascii();
             self.text.push(ch as u32);
-        }
-    }
-
-    fn append_decoded_string_or_char_value_preserving_props(&mut self, value: &Value) {
-        let first_span = self.source_spans.len();
-        self.append_string_or_char_value_preserving_props(value);
-        // GNU display_string bypasses property stops for a decoded Lisp string
-        // (%m). Decoded C strings (%F/%Z) also do not reseat a Lisp-string stop;
-        // retain their source identity without inventing such a boundary.
-        for span in &mut self.source_spans[first_span..] {
-            span.boundary = ModeLineStringBoundary::DecodedPercent;
         }
     }
 
@@ -3375,10 +3038,6 @@ impl ModeLineRendered {
         match value.as_lisp_string() {
             Some(string) => {
                 let char_offset = self.char_len();
-                // GNU `substring' semantics: the slice keeps the SOURCE
-                // string's multibyte flag even when the taken range is pure
-                // ASCII.
-                self.multibyte |= string.is_multibyte();
                 self.text.extend(
                     mode_line_string_char_codes(string)
                         .into_iter()
@@ -3386,16 +3045,18 @@ impl ModeLineRendered {
                         .take(end_char - start_char),
                 );
                 self.record_source_span(char_offset, self.char_len(), *value, start_char);
-                with_mode_line_string_properties(*value, |props| {
-                    append_mode_line_source_slice(self, props, start_char, end_char, char_offset);
-                });
+                if let Some(props) = get_string_text_properties_table_for_value(*value) {
+                    self.append_properties(
+                        &props.slice_char_range(display_char_range(start_char, end_char)),
+                        char_offset,
+                    );
+                }
             }
             None => {
                 let Some(text) = value.as_utf8_str() else {
                     return;
                 };
                 let char_offset = self.char_len();
-                self.multibyte |= text.chars().any(|c| !c.is_ascii());
                 self.text.extend(
                     text.chars()
                         .skip(start_char)
@@ -3403,23 +3064,19 @@ impl ModeLineRendered {
                         .map(|c| c as u32),
                 );
                 self.record_source_span(char_offset, self.char_len(), *value, start_char);
-                if value.is_string() {
-                    with_mode_line_string_properties(*value, |props| {
-                        append_mode_line_source_slice(
-                            self,
-                            props,
-                            start_char,
-                            end_char,
-                            char_offset,
-                        );
-                    });
+                if value.is_string()
+                    && let Some(props) = get_string_text_properties_table_for_value(*value)
+                {
+                    self.append_properties(
+                        &props.slice_char_range(display_char_range(start_char, end_char)),
+                        char_offset,
+                    );
                 }
             }
         }
     }
 
     fn push_plain_char(&mut self, ch: char) {
-        self.multibyte |= !ch.is_ascii();
         self.text.push(ch as u32);
     }
 
@@ -3430,10 +3087,6 @@ impl ModeLineRendered {
     fn slice_chars(&self, precision: usize) -> Self {
         Self {
             gc_roots: None,
-            // A truncation, not a re-derivation: keep the source identity,
-            // like GNU `substring'.
-            multibyte: self.multibyte,
-            numeric_padding: self.numeric_padding.clipped(precision),
             text: self.text.iter().take(precision).copied().collect(),
             text_props: self
                 .text_props
@@ -3483,31 +3136,6 @@ impl ModeLineRendered {
             return;
         }
 
-        if mode_line_numeric_padding::enabled() {
-            self.min_width_transitions.clear();
-            let text_props = &self.text_props;
-            let transitions = &mut self.min_width_transitions;
-            let roots = &mut self.gc_roots;
-            self.numeric_padding
-                .for_each_unmarked_range(self.text.len(), |range| {
-                    let mut next_run = run.clone();
-                    next_run.padding_properties =
-                        text_props.get_properties_at_char_pos(CharPos0::new(range.start));
-                    if let Some(roots) = roots.as_mut() {
-                        mode_line_gc::pin_accumulator_value(roots, next_run.width_spec);
-                        for (&name, &value) in &next_run.padding_properties {
-                            mode_line_gc::pin_accumulator_value(roots, name);
-                            mode_line_gc::pin_accumulator_value(roots, value);
-                        }
-                    }
-                    transitions.push(ModeLineMinWidthTransition {
-                        output_start: range.start,
-                        run: next_run,
-                    });
-                });
-            return;
-        }
-
         // The outer :propertize owns the resulting display property over this
         // entire subtree, so any nested min-width markers it overwrote are no
         // longer observable by GNU's iterator.
@@ -3537,20 +3165,14 @@ impl ModeLineRendered {
         }
     }
 
-    /// Reproduce GNU `display_min_width`: changing min-width identity closes
-    /// an active run. With numeric provenance enabled, ordinary Lisp-string
-    /// stops follow the source-position/EQ closing rule; decoded percent text,
-    /// synthetic numeric padding and end of stream do not invent a stop.
+    /// Reproduce GNU `display_min_width`: an active run is closed only when a
+    /// different min-width identity starts.  Ordinary following strings and
+    /// the end of the flattened mode line do not themselves flush it.
     fn realize_display_min_width_transitions(&mut self) {
         let transitions = std::mem::take(&mut self.min_width_transitions);
         let Some(first) = transitions.first().cloned() else {
             return;
         };
-
-        if mode_line_numeric_padding::enabled() {
-            self.realize_display_min_width_string_boundaries(transitions);
-            return;
-        }
 
         let mut active = first;
         let mut inserted = 0usize;
@@ -3574,93 +3196,6 @@ impl ModeLineRendered {
         }
     }
 
-    fn realize_display_min_width_string_boundaries(
-        &mut self,
-        transitions: Vec<ModeLineMinWidthTransition>,
-    ) {
-        // Source spans identify actual display_string Lisp-string boundaries.
-        // Numeric field-width spaces have no source span, so they must keep an
-        // inherited min-width run active until the next string is encountered.
-        let mut events: Vec<(usize, ModeLineMinWidthEvent)> = transitions
-            .into_iter()
-            .map(|transition| {
-                (
-                    transition.output_start,
-                    ModeLineMinWidthEvent::Run(transition.run),
-                )
-            })
-            .collect();
-        for span in &self.source_spans {
-            if span.boundary == ModeLineStringBoundary::DecodedPercent {
-                continue;
-            }
-            let has_min_width = self
-                .text_props
-                .get_property_at_char_pos(
-                    CharPos0::new(span.output_start),
-                    Value::symbol("display"),
-                )
-                .and_then(mode_line_display_spec_min_width)
-                .is_some();
-            if !has_min_width {
-                events.push((
-                    span.output_start,
-                    ModeLineMinWidthEvent::StringBoundary(*span),
-                ));
-            }
-        }
-        events.sort_by_key(|(start, _)| *start);
-
-        let mut active: Option<ModeLineMinWidthTransition> = None;
-        let mut inserted = 0usize;
-        for (start, event) in events {
-            let run = match event {
-                ModeLineMinWidthEvent::Run(run) => Some(run),
-                ModeLineMinWidthEvent::StringBoundary(span) => {
-                    if span.source_start > 0 {
-                        let predecessor = with_mode_line_string_properties(span.source, |props| {
-                            props.get_property_at_char_pos(
-                                CharPos0::new(span.source_start - 1),
-                                Value::symbol("display"),
-                            )
-                        })
-                        .flatten()
-                        .and_then(mode_line_display_spec_min_width);
-                        if !matches!((&active, predecessor), (Some(previous), Some(width))
-                            if previous.run.width_spec.bits() == width.width_spec.bits())
-                        {
-                            continue;
-                        }
-                    }
-                    None
-                }
-            };
-            if let (Some(previous), Some(next)) = (&active, &run)
-                && previous.run.width_spec.bits() == next.width_spec.bits()
-            {
-                continue;
-            }
-            let mut next_start = start.saturating_add(inserted);
-            if let Some(previous) = active.take() {
-                let run_width = next_start.saturating_sub(previous.output_start);
-                if run_width < previous.run.columns {
-                    let padding = previous.run.columns - run_width;
-                    self.insert_min_width_padding(
-                        next_start,
-                        padding,
-                        &previous.run.padding_properties,
-                    );
-                    inserted = inserted.saturating_add(padding);
-                    next_start = next_start.saturating_add(padding);
-                }
-            }
-            active = run.map(|run| ModeLineMinWidthTransition {
-                output_start: next_start,
-                run,
-            });
-        }
-    }
-
     fn insert_min_width_padding(
         &mut self,
         at: usize,
@@ -3671,7 +3206,6 @@ impl ModeLineRendered {
             return;
         }
         let at = at.min(self.text.len());
-        self.numeric_padding.insert_unmarked(at, columns);
         self.text
             .splice(at..at, std::iter::repeat_n(' ' as u32, columns));
         self.text_props
@@ -3725,14 +3259,11 @@ impl ModeLineRendered {
             if chunk.len() != 2 {
                 continue;
             }
-            let end = self.char_len();
-            self.numeric_padding.for_each_unmarked_range(end, |range| {
-                self.text_props.put_property_in_char_range(
-                    display_char_range(range.start, range.end),
-                    chunk[0],
-                    chunk[1],
-                );
-            });
+            self.text_props.put_property_in_char_range(
+                display_char_range(0, self.char_len()),
+                chunk[0],
+                chunk[1],
+            );
         }
         self.pin_properties();
     }
@@ -3803,14 +3334,10 @@ impl ModeLineRendered {
 
     fn into_display_output(mut self, face_spec: ModeLineFaceSpec) -> ModeLineDisplayOutput {
         self.realize_display_min_width_transitions();
-        // GNU string identity follows the format INPUTS (the `concat' rule:
-        // multibyte iff any argument is multibyte), never the content.  The
-        // old content heuristic (`any(code > 0xFF)`) re-encoded every
-        // U+0080..U+00FF character -- whose code fits in one byte -- as a
-        // unibyte raw byte, and a raw byte displays as the octal escape
-        // `\NNN' (src/xdisp.c:8649-8662): issue #470's "dot turns into
-        // `\267`" between mode-line re-evaluations.
-        let multibyte = self.multibyte;
+        // A multibyte result iff any accumulated character exceeds a single
+        // byte; otherwise every code fits in a unibyte byte. Mirrors the old
+        // storage path's `decode_storage_char_codes_auto(..).any(> 0xFF)`.
+        let multibyte = self.text.iter().any(|&code| code > 0xFF);
         if face_spec.no_props {
             return ModeLineDisplayOutput {
                 value: Value::heap_string(mode_line_lisp_string_from_codes(&self.text, multibyte)),
@@ -3884,32 +3411,6 @@ fn resolve_mode_line_face_spec(args: &[Value]) -> ModeLineFaceSpec {
     ModeLineFaceSpec { no_props, face }
 }
 
-/// GNU xdisp.c display_mode_element's final field-width padding has no
-/// inherited :propertize properties. Percent fields still use the original
-/// helper because their store_mode_line_string padding inherits source props.
-fn append_mode_line_numeric_segment(
-    result: &mut ModeLineRendered,
-    rendered: &ModeLineRendered,
-    field_width: i64,
-    precision: i64,
-) {
-    if !mode_line_numeric_padding::enabled() {
-        append_mode_line_rendered_segment(result, rendered, field_width, precision);
-        return;
-    }
-    let mut segment = if precision > 0 {
-        rendered.slice_chars(precision as usize)
-    } else {
-        rendered.clone()
-    };
-    let start = segment.char_len();
-    if field_width > 0 && (start as i64) < field_width {
-        segment.pad_plain_spaces((field_width - start as i64) as usize);
-        segment.numeric_padding.mark(start..segment.char_len());
-    }
-    result.append_rendered(&segment);
-}
-
 fn append_mode_line_rendered_segment(
     result: &mut ModeLineRendered,
     rendered: &ModeLineRendered,
@@ -3928,63 +3429,12 @@ fn append_mode_line_rendered_segment(
     result.append_rendered(&segment);
 }
 
-/// Immutable process selector published by OnceLock. The direct field append
-/// uses only its caller's exclusive rendered output and retains no Lisp state;
-/// independent mutators never share formatter data through this selector.
-#[inline]
-fn mode_line_plain_field_enabled() -> bool {
-    #[cfg(test)]
-    if let Some(enabled) = MODE_LINE_PLAIN_FIELD_OVERRIDE.with(std::cell::Cell::get) {
-        return enabled;
-    }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("NEOMACS_MODE_LINE_PLAIN_FIELD")
-                .ok()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .as_deref(),
-            Some("on" | "1" | "true" | "yes")
-        )
-    })
-}
-
-#[cfg(test)]
-thread_local! {
-    static MODE_LINE_PLAIN_FIELD_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-fn set_mode_line_plain_field_for_test(enabled: Option<bool>) {
-    MODE_LINE_PLAIN_FIELD_OVERRIDE.with(|cell| cell.set(enabled));
-}
-
 fn append_mode_line_percent_string_spec(
     result: &mut ModeLineRendered,
     spec: &str,
     props_at_percent: &std::collections::HashMap<Value, Value>,
     field_width: i64,
 ) {
-    if props_at_percent.is_empty() && mode_line_plain_field_enabled() {
-        let char_offset = result.char_len();
-        // ModeLineRendered::plain decodes UTF-8 chars to these same codes.
-        // Extend the final buffer directly, avoiding its temporary String,
-        // character-code Vec, and second copy. This field has no source or
-        // min-width sidecar to append.
-        result.multibyte |= spec.chars().any(|ch| !ch.is_ascii());
-        result.text.extend(spec.chars().map(|ch| ch as u32));
-        let rendered_len = (result.char_len() - char_offset) as i64;
-        if field_width > 0 && rendered_len < field_width {
-            result.pad_plain_spaces((field_width - rendered_len) as usize);
-        }
-        // Preserve the empty segment's property mutation/syntax ticks and
-        // cache revalidation. Its empty graft changes no interval boundaries.
-        result
-            .text_props
-            .append_shifted_at_char_offset(&TextPropertyTable::new(), CharLen::new(char_offset));
-        return;
-    }
     append_mode_line_percent_segment(
         result,
         ModeLineRendered::plain(spec),
@@ -4017,7 +3467,7 @@ fn append_mode_line_percent_lisp_text_spec(
     field_width: i64,
 ) {
     let mut segment = ModeLineRendered::default();
-    segment.append_decoded_string_or_char_value_preserving_props(value);
+    segment.append_string_or_char_value_preserving_props(value);
     append_mode_line_percent_segment(result, segment, props_at_percent, field_width);
 }
 
@@ -4107,10 +3557,9 @@ fn format_mode_line_recursive(
     result: &mut ModeLineRendered,
     depth: usize,
     risky: bool,
-    selection: Option<&mut mode_line_flow_policy::FormatSelection>,
-) -> Result<(), Flow> {
+) {
     if depth > 20 {
-        return Ok(()); // Guard against infinite recursion
+        return; // Guard against infinite recursion
     }
 
     // Formats have a per-element scope; accumulator mutations publish roots
@@ -4118,10 +3567,8 @@ fn format_mode_line_recursive(
     let root_scope = eval.save_specpdl_roots();
     eval.push_specpdl_root(*format);
     result.root_for_walk();
-    let output =
-        format_mode_line_recursive_rooted(eval, pctx, format, result, depth, risky, selection);
+    format_mode_line_recursive_rooted(eval, pctx, format, result, depth, risky);
     eval.restore_specpdl_roots(root_scope);
-    output
 }
 
 fn format_mode_line_recursive_rooted(
@@ -4131,8 +3578,7 @@ fn format_mode_line_recursive_rooted(
     result: &mut ModeLineRendered,
     depth: usize,
     risky: bool,
-    mut selection: Option<&mut mode_line_flow_policy::FormatSelection>,
-) -> Result<(), Flow> {
+) {
     match format.kind() {
         ValueKind::Nil => {}
 
@@ -4186,8 +3632,7 @@ fn format_mode_line_recursive_rooted(
                         result,
                         depth + 1,
                         risky || !mode_line_symbol_is_risky(&eval.obarray, name),
-                        selection.as_deref_mut(),
-                    )?;
+                    );
                 }
             }
         }
@@ -4201,70 +3646,44 @@ fn format_mode_line_recursive_rooted(
 
             if car.is_symbol_named(":eval") {
                 if risky {
-                    return Ok(());
+                    return;
                 }
                 if cdr.is_cons() {
                     let form_val = cdr.cons_car();
                     eval.push_specpdl_root(form_val);
-                    if let Some(selection) = selection.as_deref_mut() {
-                        selection.before_eval(eval);
+                    if let Ok(val) = eval.eval_value(&form_val) {
+                        // The recursive entry roots the fresh return value
+                        // before a nested element can run Lisp again.
+                        format_mode_line_recursive(eval, pctx, &val, result, depth + 1, risky);
                     }
-                    let val = mode_line_flow_policy::eval_form(eval, &form_val)?;
-                    // The recursive entry roots the fresh return value before
-                    // a nested element can run Lisp again.
-                    format_mode_line_recursive(
-                        eval,
-                        pctx,
-                        &val,
-                        result,
-                        depth + 1,
-                        risky,
-                        selection.as_deref_mut(),
-                    )?;
                 }
-                return Ok(());
+                return;
             }
 
             if car.is_symbol_named(":propertize") {
                 if risky {
-                    return Ok(());
+                    return;
                 }
                 if cdr.is_cons() {
                     let elt = cdr.cons_car();
                     let mut nested = ModeLineRendered::default();
-                    format_mode_line_recursive(
-                        eval,
-                        pctx,
-                        &elt,
-                        &mut nested,
-                        depth + 1,
-                        risky,
-                        selection.as_deref_mut(),
-                    )?;
+                    format_mode_line_recursive(eval, pctx, &elt, &mut nested, depth + 1, risky);
                     nested.apply_propertize_properties(cdr.cons_cdr(), pctx.target);
                     result.append_rendered(&nested);
                 }
-                return Ok(());
+                return;
             }
 
             if let Some(lim) = car.as_fixnum() {
                 let mut nested = ModeLineRendered::default();
-                format_mode_line_recursive(
-                    eval,
-                    pctx,
-                    &cdr,
-                    &mut nested,
-                    depth + 1,
-                    risky,
-                    selection.as_deref_mut(),
-                )?;
-                append_mode_line_numeric_segment(
+                format_mode_line_recursive(eval, pctx, &cdr, &mut nested, depth + 1, risky);
+                append_mode_line_rendered_segment(
                     result,
                     &nested,
                     if lim > 0 { lim } else { 0 },
                     if lim < 0 { -lim } else { 0 },
                 );
-                return Ok(());
+                return;
             }
 
             if car.is_symbol() && !car.is_symbol_named("t") {
@@ -4273,27 +3692,11 @@ fn format_mode_line_recursive_rooted(
                         .is_some_and(|value| value.is_truthy())
                     && let Some(branch) = mode_line_conditional_branch(cdr, true)
                 {
-                    format_mode_line_recursive(
-                        eval,
-                        pctx,
-                        &branch,
-                        result,
-                        depth + 1,
-                        risky,
-                        selection.as_deref_mut(),
-                    )?;
+                    format_mode_line_recursive(eval, pctx, &branch, result, depth + 1, risky);
                 } else if let Some(branch) = mode_line_conditional_branch(cdr, false) {
-                    format_mode_line_recursive(
-                        eval,
-                        pctx,
-                        &branch,
-                        result,
-                        depth + 1,
-                        risky,
-                        selection.as_deref_mut(),
-                    )?;
+                    format_mode_line_recursive(eval, pctx, &branch, result, depth + 1, risky);
                 }
-                return Ok(());
+                return;
             }
 
             // GNU FOR_EACH_TAIL_SAFE reads XCDR after rendering each element:
@@ -4304,15 +3707,7 @@ fn format_mode_line_recursive_rooted(
             let mut cycle = ModeLineTailCycle::new(tail);
             while tail.is_cons() {
                 let element = tail.cons_car();
-                format_mode_line_recursive(
-                    eval,
-                    pctx,
-                    &element,
-                    result,
-                    depth + 1,
-                    risky,
-                    selection.as_deref_mut(),
-                )?;
+                format_mode_line_recursive(eval, pctx, &element, result, depth + 1, risky);
                 tail = tail.cons_cdr();
                 eval.set_specpdl_root_slot(&tail_root, tail);
                 if cycle.step(tail, |checkpoint| {
@@ -4327,7 +3722,6 @@ fn format_mode_line_recursive_rooted(
             result.append_string_value_preserving_props(format);
         }
     }
-    Ok(())
 }
 
 #[allow(dead_code, clippy::too_many_arguments)] // split-state mode-line compatibility seam
@@ -4433,7 +3827,7 @@ fn format_mode_line_recursive_in_state(
                     depth + 1,
                     risky,
                 );
-                append_mode_line_numeric_segment(
+                append_mode_line_rendered_segment(
                     result,
                     &nested,
                     if lim > 0 { lim } else { 0 },
@@ -4572,10 +3966,7 @@ fn format_mode_line_recursive_in_state_with_eval_rooted(
                 if cdr.is_cons() {
                     let form_val = cdr.cons_car();
                     roots.pin(form_val);
-                    let val = mode_line_flow_policy::split_eval_result(
-                        &form_val,
-                        eval_form(&form_val, buffers),
-                    )?;
+                    let val = eval_form(&form_val, buffers)?;
                     format_mode_line_recursive_in_state_with_eval_rooted(
                         obarray,
                         dynamic,
@@ -4634,7 +4025,7 @@ fn format_mode_line_recursive_in_state_with_eval_rooted(
                     eval_form,
                     roots,
                 )?;
-                append_mode_line_numeric_segment(
+                append_mode_line_rendered_segment(
                     result,
                     &nested,
                     if lim > 0 { lim } else { 0 },
@@ -4786,10 +4177,9 @@ fn expand_mode_line_percent_in_state(
         }
 
         let props_at_percent = if value.is_string() {
-            with_mode_line_string_properties(*value, |table| {
-                table.get_properties_at_char_pos(CharPos0::new(percent_char_pos))
-            })
-            .unwrap_or_default()
+            get_string_text_properties_table_for_value(*value)
+                .map(|table| table.get_properties_at_char_pos(CharPos0::new(percent_char_pos)))
+                .unwrap_or_default()
         } else {
             Default::default()
         };
@@ -5163,7 +4553,7 @@ fn expand_mode_line_percent_in_state(
                     pctx.buffer_coding.with_frame(pctx.frame_coding_mnemonics),
                 );
                 if let Some(eol_indicator) = pctx.eol_indicator {
-                    segment.append_decoded_string_or_char_value_preserving_props(&eol_indicator);
+                    segment.append_string_or_char_value_preserving_props(&eol_indicator);
                 } else {
                     segment.push_plain_char(':');
                 }
@@ -7432,11 +6822,9 @@ pub(crate) fn set_bounded_window_text_for_test(enabled: Option<bool>) {
 }
 
 /// `NEOMACS_POSN_BOUNDED_TEXT=on` (P3.5 H): the approximate window geometry
-/// behind `pos-visible-in-window-p` and `posn-at-x-y` when canonical
-/// geometry is unavailable reads only the text the window can show.
-/// `posn-at-point` and `window-text-pixel-size` use separate exact paths.
-/// Off, the fallback copies to the buffer end, O(Z) per call. Read once;
-/// unset defaults on; explicit empty/unknown settings retain the old path.
+/// behind `posn-at-point`, `pos-visible-in-window-p` and `posn-at-x-y` reads
+/// only the text the window can show. Off, it reads to the end of the
+/// buffer, which is O(Z) per call. Read once; default off.
 fn bounded_window_text_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = BOUNDED_WINDOW_TEXT_OVERRIDE.with(std::cell::Cell::get) {
@@ -7444,29 +6832,14 @@ fn bounded_window_text_enabled() -> bool {
     }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        parse_bounded_window_text_os_knob(std::env::var_os("NEOMACS_POSN_BOUNDED_TEXT").as_deref())
+        matches!(
+            std::env::var("NEOMACS_POSN_BOUNDED_TEXT")
+                .ok()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("on" | "1" | "true" | "yes")
+        )
     })
-}
-
-fn parse_bounded_window_text_knob(value: Option<&str>) -> bool {
-    match value.map(str::trim) {
-        None => true,
-        Some(value) => matches!(
-            value.to_ascii_lowercase().as_str(),
-            "on" | "1" | "true" | "yes"
-        ),
-    }
-}
-
-/// Only an absent setting selects the default. A present non-Unicode value
-/// is unknown and keeps the baseline, like any other unrecognized setting.
-fn parse_bounded_window_text_os_knob(value: Option<&std::ffi::OsStr>) -> bool {
-    match value {
-        None => parse_bounded_window_text_knob(None),
-        Some(value) => value
-            .to_str()
-            .is_some_and(|value| parse_bounded_window_text_knob(Some(value))),
-    }
 }
 
 /// [`live_window_display_context_for`] holding the rest of the buffer from
@@ -7908,7 +7281,6 @@ fn live_position_visibility(
 
 #[derive(Clone, Copy)]
 struct ExactVisibleMetrics {
-    object_extent: Option<neomacs_display_protocol::posn_object_extent::PosnObjectExtent>,
     point: LispCharPos1,
     x: i64,
     y: i64,
@@ -7920,51 +7292,11 @@ struct ExactVisibleMetrics {
     col: i64,
 }
 
-impl ExactVisibleMetrics {
-    fn object_dimensions(&self) -> (i64, i64) {
-        self.object_extent.map_or(
-            (self.width, self.height),
-            neomacs_display_protocol::posn_object_extent::PosnObjectExtent::dimensions,
-        )
-    }
-}
-
-fn with_tty_posn_extent(
-    mut metrics: ExactVisibleMetrics,
-    terminal: bool,
-    frame: Option<&crate::window::Frame>,
-    window: WindowId,
-    point: &crate::window::DisplayPointSnapshot,
-) -> ExactVisibleMetrics {
-    if terminal && {
-        #[cfg(any(test, feature = "redisplay-test-policy"))]
-        {
-            frame.map_or_else(
-                crate::window::posn_object_extent_mode,
-                crate::window::Frame::posn_object_extent_mode,
-            )
-        }
-        #[cfg(not(any(test, feature = "redisplay-test-policy")))]
-        {
-            crate::window::posn_object_extent_mode()
-        }
-    }
-    .enabled()
-    {
-        metrics.object_extent = Some(frame.map_or(
-            neomacs_display_protocol::posn_object_extent::PosnObjectExtent::Undrawn,
-            |frame| frame.retained_tty_posn_extent(window, point.row, point.col),
-        ));
-    }
-    metrics
-}
-
 fn exact_metrics_from_point(
     point: crate::window::geometry::SnapshotPointGeometry,
 ) -> ExactVisibleMetrics {
     let body_point = point.in_text_body();
     ExactVisibleMetrics {
-        object_extent: None,
         point: point.buffer_pos(),
         x: body_point.x().get().round() as i64,
         y: body_point.y().get().round() as i64,
@@ -7983,7 +7315,6 @@ fn exact_metrics_from_redisplay_point(
 ) -> ExactVisibleMetrics {
     let (body_row, body_y) = snapshot.text_body_position(point.row, point.y);
     ExactVisibleMetrics {
-        object_extent: None,
         point: point.buffer_pos,
         x: point.x,
         y: body_y,
@@ -7996,20 +7327,9 @@ fn exact_metrics_from_redisplay_point(
     }
 }
 
-/// Numeric source coordinates resolved by the approximate walk, before
-/// report-only after-EOL columns or clicked rows. GNU reads the current matrix
-/// with iterator hpos/vpos, not the separately reported click geometry.
-/// Each query mutator owns these numeric values; copied observations are
-/// immutable and contain no shared mutable state or Lisp-state cache.
-#[derive(Clone, Copy)]
-struct ApproxMatrixPosition {
-    row: i64,
-    column: i64,
-}
-
 /// What `approximate_point_at_coords` found.
 enum ApproxPointAtCoords {
-    Point(ExactVisibleMetrics, ApproxMatrixPosition),
+    Point(ExactVisibleMetrics),
     /// The coordinates lie below the rows the context's text covers: only the
     /// whole buffer's text answers them (`live_window_display_context_with_all_text`).
     NeedsAllText,
@@ -8036,7 +7356,6 @@ fn approximate_point_at_coords(
 
     let mut row = 0_i64;
     let mut line_start = start;
-    let matrix_position;
     loop {
         let line_end = match ctx.text.find_newline(line_start) {
             Some(line_end) => line_end,
@@ -8058,24 +7377,17 @@ fn approximate_point_at_coords(
                         .saturating_add(usize::try_from(chosen_col).ok()?)
                         .saturating_add(1)
                         .min(total.saturating_add(1));
-                    return Some(ApproxPointAtCoords::Point(
-                        ExactVisibleMetrics {
-                            object_extent: None,
-                            point: LispCharPos1::from_one_based_usize(point),
-                            x,
-                            y,
-                            dx: x - chosen_col.saturating_mul(char_width),
-                            dy: y - query_row.saturating_mul(char_height),
-                            width: 0,
-                            height: 0,
-                            row: query_row,
-                            col: query_col,
-                        },
-                        ApproxMatrixPosition {
-                            row: query_row,
-                            column: chosen_col,
-                        },
-                    ));
+                    return Some(ApproxPointAtCoords::Point(ExactVisibleMetrics {
+                        point: LispCharPos1::from_one_based_usize(point),
+                        x,
+                        y,
+                        dx: x - chosen_col.saturating_mul(char_width),
+                        dy: y - query_row.saturating_mul(char_height),
+                        width: 0,
+                        height: 0,
+                        row: query_row,
+                        col: query_col,
+                    }));
                 }
                 return Some(ApproxPointAtCoords::NeedsAllText);
             }
@@ -8094,56 +7406,37 @@ fn approximate_point_at_coords(
                 .saturating_add(1)
                 .min(total.saturating_add(1));
 
-            return Some(ApproxPointAtCoords::Point(
-                ExactVisibleMetrics {
-                    object_extent: None,
-                    point: LispCharPos1::from_one_based_usize(point),
-                    x,
-                    y,
-                    dx: x - chosen_col.saturating_mul(char_width),
-                    dy: y - query_row.saturating_mul(char_height),
-                    width: 0,
-                    height: 0,
-                    row: query_row,
-                    col: query_col,
-                },
-                ApproxMatrixPosition {
-                    row: query_row,
-                    column: chosen_col,
-                },
-            ));
+            return Some(ApproxPointAtCoords::Point(ExactVisibleMetrics {
+                point: LispCharPos1::from_one_based_usize(point),
+                x,
+                y,
+                dx: x - chosen_col.saturating_mul(char_width),
+                dy: y - query_row.saturating_mul(char_height),
+                width: 0,
+                height: 0,
+                row: query_row,
+                col: query_col,
+            }));
         }
 
         if line_end >= total {
-            // A click below ZV stops at the final source segment. Keep that
-            // numeric matrix row/column separate from main's clicked-row
-            // reporting and offset behavior below.
-            let final_segment = visual_rows.saturating_sub(1);
-            matrix_position = ApproxMatrixPosition {
-                row: row.saturating_add(final_segment),
-                column: line_len.saturating_sub(final_segment.saturating_mul(wrap_cols)),
-            };
             break;
         }
         row += visual_rows;
         line_start = line_end + 1;
     }
 
-    Some(ApproxPointAtCoords::Point(
-        ExactVisibleMetrics {
-            object_extent: None,
-            point: LispCharPos1::from_one_based_usize(total.saturating_add(1)),
-            x,
-            y,
-            dx: x,
-            dy: y - query_row.saturating_mul(char_height),
-            width: 0,
-            height: 0,
-            row: query_row,
-            col: query_col,
-        },
-        matrix_position,
-    ))
+    Some(ApproxPointAtCoords::Point(ExactVisibleMetrics {
+        point: LispCharPos1::from_one_based_usize(total.saturating_add(1)),
+        x,
+        y,
+        dx: x,
+        dy: y - query_row.saturating_mul(char_height),
+        width: 0,
+        height: 0,
+        row: query_row,
+        col: query_col,
+    }))
 }
 
 /// Lisp motion queries use current redisplay rows, recomputed when stale.
@@ -8249,20 +7542,9 @@ fn resolve_exact_visible_metrics_with_layout(
         else {
             return Ok(None);
         };
-        return Ok(geometry.point_for_buffer_pos(pos_lisp).map(|point| {
-            (
-                wid,
-                with_tty_posn_extent(
-                    exact_metrics_from_redisplay_point(&geometry, &point),
-                    eval.frames
-                        .get(fid)
-                        .is_some_and(|frame| frame.effective_window_system().is_none()),
-                    eval.frames.get(fid),
-                    wid,
-                    &point,
-                ),
-            )
-        }));
+        return Ok(geometry
+            .point_for_buffer_pos(pos_lisp)
+            .map(|point| (wid, exact_metrics_from_redisplay_point(&geometry, &point))));
     }
     if retained_rows_valid {
         return Ok(None);
@@ -8328,18 +7610,9 @@ fn resolve_exact_visible_metrics(
         let Some(snapshot) = frame.redisplay_snapshot(wid) else {
             return Ok(None);
         };
-        return Ok(snapshot.point_for_buffer_pos(pos_lisp).map(|point| {
-            (
-                wid,
-                with_tty_posn_extent(
-                    exact_metrics_from_redisplay_point(snapshot, &point),
-                    true,
-                    Some(frame),
-                    wid,
-                    &point,
-                ),
-            )
-        }));
+        return Ok(snapshot
+            .point_for_buffer_pos(pos_lisp)
+            .map(|point| (wid, exact_metrics_from_redisplay_point(snapshot, &point))));
     }
     let publication = match source {
         PositionGeometrySource::Redisplay => frame.completed_presentation_geometry(),
@@ -8369,7 +7642,6 @@ fn geometry_query_flow(error: crate::window::geometry::GeometryQueryError) -> Fl
 }
 
 fn make_text_area_position(window_id: WindowId, metrics: ExactVisibleMetrics) -> Value {
-    let (object_width, object_height) = metrics.object_dimensions();
     Value::list(vec![
         Value::make_window(window_id.0),
         Value::fixnum(metrics.point.as_i64()),
@@ -8380,7 +7652,7 @@ fn make_text_area_position(window_id: WindowId, metrics: ExactVisibleMetrics) ->
         Value::cons(Value::fixnum(metrics.col), Value::fixnum(metrics.row)),
         Value::NIL,
         Value::cons(Value::fixnum(metrics.dx), Value::fixnum(metrics.dy)),
-        Value::cons(Value::fixnum(object_width), Value::fixnum(object_height)),
+        Value::cons(Value::fixnum(metrics.width), Value::fixnum(metrics.height)),
     ])
 }
 
@@ -8943,47 +8215,6 @@ impl TextAreaClick {
         }
     }
 
-    /// GNU dispnew.c buffer_posn_from_coords records click minus the
-    /// iterator's current x/y, before reading current-matrix object extents.
-    /// Insertion/synthetic tails retain that canonical iterator origin even
-    /// when their physical hit box extends across terminal default fill.
-    /// Ordinary glyphs keep their existing path: a tab/wide source rectangle
-    /// alone does not record GNU's per-terminal-cell iterator advancement.
-    /// This helper owns only numbers/local immutable row state, no Lisp cache.
-    fn apply_tty_boundary_offsets(
-        self,
-        mut metrics: ExactVisibleMetrics,
-        snapshot: &WindowDisplaySnapshot,
-        point: &crate::window::DisplayPointSnapshot,
-        first_visible_x: i64,
-    ) -> ExactVisibleMetrics {
-        if matches!(
-            point.role,
-            crate::window::DisplayPointRole::InsertionBoundary
-                | crate::window::DisplayPointRole::SyntheticBoundary
-        ) {
-            let (_, iterator_y) = snapshot.text_body_position(point.row, point.y);
-            // An empty hscrolled row has no emitted source glyph to move the
-            // physical output pen. GNU's live iterator still measures TO_X
-            // from first_visible_x, before its current-matrix extent read.
-            // Keep this origin query-local: cursor, columns and visibility
-            // continue to use the producer's physical geometry.
-            let empty_row = snapshot.row_metrics(point.row).is_some_and(|row| {
-                row.start_buffer_pos == Some(point.buffer_pos)
-                    && row.end_buffer_pos == Some(point.buffer_pos)
-                    && row.start_x == row.end_x
-            });
-            let iterator_x = if empty_row {
-                point.x.saturating_sub(first_visible_x)
-            } else {
-                point.x
-            };
-            metrics.dx = self.x.saturating_sub(iterator_x);
-            metrics.dy = self.y.saturating_sub(iterator_y);
-        }
-        metrics
-    }
-
     /// Rewrite a posn this port derived without a display point of its own --
     /// the approximate scanner ledger 201 named as residual 4. Same two cells
     /// and the same rule, with the metrics' own column standing in for the
@@ -9024,7 +8255,6 @@ fn make_window_part_position(
         crate::window::WindowPart::LeftFringe | crate::window::WindowPart::RightFringe => 0,
         _ => metrics.col,
     };
-    let (object_width, object_height) = metrics.object_dimensions();
     Value::list(vec![
         Value::make_window(window_id.0),
         Value::symbol(area),
@@ -9035,7 +8265,7 @@ fn make_window_part_position(
         Value::cons(Value::fixnum(col), Value::fixnum(metrics.row)),
         Value::NIL,
         Value::cons(Value::fixnum(metrics.dx), Value::fixnum(metrics.dy)),
-        Value::cons(Value::fixnum(object_width), Value::fixnum(object_height)),
+        Value::cons(Value::fixnum(metrics.width), Value::fixnum(metrics.height)),
     ])
 }
 
@@ -9255,37 +8485,11 @@ fn posn_at_x_y_impl(
             if let Some(snapshot) = snapshot {
                 let click = TextAreaClick::new(report_x, report_y, column_width);
                 if let Some(point) = snapshot.point_at_coords(at) {
-                    let mut metrics =
-                        click.apply(exact_metrics_from_redisplay_point(snapshot, &point), &point);
-                    if part == crate::window::WindowPart::Text
-                        && frame.effective_window_system().is_none()
-                        && frame.posn_object_extent_mode().enabled()
-                    {
-                        let first_visible_x = frame.find_window(hit.window).map_or(0, |window| {
-                            let at_eob = window
-                                .buffer_id()
-                                .and_then(|buffer| buffers.get(buffer))
-                                .is_some_and(|buffer| {
-                                    point.buffer_pos == buffer.point_max_lisp_char_pos()
-                                });
-                            if at_eob {
-                                i64::try_from(window.hscroll())
-                                    .unwrap_or(i64::MAX)
-                                    .saturating_mul(column_width)
-                            } else {
-                                0
-                            }
-                        });
-                        metrics = click.apply_tty_boundary_offsets(
-                            metrics,
-                            snapshot,
-                            &point,
-                            first_visible_x,
-                        );
-                        metrics.object_extent =
-                            Some(frame.retained_tty_posn_extent(hit.window, point.row, point.col));
-                    }
-                    return Ok(make_window_part_position(hit.window, part, metrics));
+                    return Ok(make_window_part_position(
+                        hit.window,
+                        part,
+                        click.apply(exact_metrics_from_redisplay_point(snapshot, &point), &point),
+                    ));
                 }
                 return Ok(Value::NIL);
             }
@@ -9301,42 +8505,26 @@ fn posn_at_x_y_impl(
             let Some(ctx) = live_window_display_context_for(frames, buffers, fid, wid)? else {
                 return Ok(Value::NIL);
             };
-            let (metrics, matrix_position) =
-                match approximate_point_at_coords(&ctx, at.text_area_x(), at.window_y()) {
-                    Some(ApproxPointAtCoords::Point(metrics, matrix_position)) => {
-                        (metrics, matrix_position)
+            let metrics = match approximate_point_at_coords(&ctx, at.text_area_x(), at.window_y()) {
+                Some(ApproxPointAtCoords::Point(metrics)) => metrics,
+                Some(ApproxPointAtCoords::NeedsAllText) => {
+                    let Some(ctx) =
+                        live_window_display_context_with_all_text(frames, buffers, fid, wid)?
+                    else {
+                        return Ok(Value::NIL);
+                    };
+                    match approximate_point_at_coords(&ctx, at.text_area_x(), at.window_y()) {
+                        Some(ApproxPointAtCoords::Point(metrics)) => metrics,
+                        _ => return Ok(Value::NIL),
                     }
-                    Some(ApproxPointAtCoords::NeedsAllText) => {
-                        let Some(ctx) =
-                            live_window_display_context_with_all_text(frames, buffers, fid, wid)?
-                        else {
-                            return Ok(Value::NIL);
-                        };
-                        match approximate_point_at_coords(&ctx, at.text_area_x(), at.window_y()) {
-                            Some(ApproxPointAtCoords::Point(metrics, matrix_position)) => {
-                                (metrics, matrix_position)
-                            }
-                            _ => return Ok(Value::NIL),
-                        }
-                    }
-                    None => return Ok(Value::NIL),
-                };
-            // The fallback reports clicked rows/columns, while GNU reads
-            // current-matrix extents at the walk's resolved source coordinates
-            // before after-EOL advancement (dispnew.c buffer_posn_from_coords).
-            // A cold child can still own an accepted frame-pool slice.
-            let matrix_row = matrix_position.row;
-            let matrix_column = matrix_position.column;
-            let mut metrics =
-                TextAreaClick::new(report_x, report_y, column_width).apply_to_metrics(metrics);
-            if part == crate::window::WindowPart::Text
-                && frame.effective_window_system().is_none()
-                && frame.posn_object_extent_mode().enabled()
-            {
-                metrics.object_extent =
-                    Some(frame.retained_tty_posn_extent(hit.window, matrix_row, matrix_column));
-            }
-            Ok(make_window_part_position(hit.window, part, metrics))
+                }
+                None => return Ok(Value::NIL),
+            };
+            Ok(make_window_part_position(
+                hit.window,
+                part,
+                TextAreaClick::new(report_x, report_y, column_width).apply_to_metrics(metrics),
+            ))
         }
     }
 }
@@ -9767,7 +8955,7 @@ fn run_frame_snapshot(
     eval: &mut super::eval::Context,
     request: &SnapshotRequest,
 ) -> Result<String, Flow> {
-    eval.redisplay_with_force(true)?;
+    eval.redisplay_with_force(true);
     let Some(mut hook) = eval.frame_snapshot_fn.take() else {
         return Err(signal(
             "error",
@@ -9778,9 +8966,6 @@ fn run_frame_snapshot(
     };
     let result = hook(eval, request);
     eval.frame_snapshot_fn = Some(hook);
-    if let Some(flow) = eval.take_mode_line_display_flow() {
-        return Err(flow);
-    }
     result.map_err(|message| signal("error", vec![Value::string(message)]))
 }
 
@@ -9997,25 +9182,9 @@ mod tests;
 mod mode_line_gc_roots;
 
 #[cfg(test)]
-#[path = "tests/mode_line_multibyte_identity.rs"]
-mod mode_line_multibyte_identity;
-
-#[cfg(test)]
 #[path = "tests/mode_line_incremental_roots.rs"]
 mod mode_line_incremental_roots;
 
 #[cfg(test)]
 #[path = "tests/mode_line_live_spine.rs"]
 mod mode_line_live_spine;
-
-#[cfg(test)]
-#[path = "tests/mode_line_flow.rs"]
-mod mode_line_flow;
-
-#[cfg(test)]
-#[path = "tests/mode_line_outer_flow.rs"]
-mod mode_line_outer_flow;
-
-#[cfg(test)]
-#[path = "tests/mode_line_outer_handlers.rs"]
-mod mode_line_outer_handlers;

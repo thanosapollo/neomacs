@@ -105,7 +105,6 @@ fn assert_tty_popup_teardown_repaints(exit: PopupExit) {
             .current_buffer()
             .unwrap()
             .reset_unchanged_region();
-        crate::test_utils::mock_redisplay::accept_all_frames(ctx);
     }));
     eval.eval_str("(redisplay t)").unwrap();
     let before = layouts.get();

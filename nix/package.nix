@@ -9,7 +9,18 @@
 let
   inherit (pkgs) lib;
   craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-  cargoSrc = craneLib.cleanCargoSource source;
+  # Preserve the COMPLETE authenticated local provider, not only *.rs/*.toml.
+  providerSource = source + "/local-deps/rio-vt-0.5.5";
+  providerPrefix = toString providerSource;
+  cargoSrc = lib.cleanSourceWith {
+    src = source;
+    name = "neomacs-cargo-source";
+    filter = path: type:
+      let p = toString path; in
+      p == providerPrefix
+      || lib.hasPrefix (providerPrefix + "/") p
+      || craneLib.filterCargoSources path type;
+  };
   productionCapabilities = import ./production-capabilities.nix {
     inherit lib pkgs source;
   };
@@ -19,13 +30,15 @@ let
   cargoPackages = [
     "-p"
     "neomacs"
+    "-p"
+    "neomacs-mcp"
   ];
   cargoFeatures = map (feature: "neomacs/${feature}") productionCapabilities.cargoFeatures;
   cargoFeatureArgs = lib.optionals (cargoFeatures != [ ]) [
     "--features"
     (lib.concatStringsSep "," cargoFeatures)
   ];
-  cargoBuildArgs = lib.concatStringsSep " " (cargoPackages ++ cargoFeatureArgs);
+  cargoBuildArgs = lib.concatStringsSep " " ([ "--locked" ] ++ cargoPackages ++ cargoFeatureArgs);
   runtimeLibs = dependencies.productionBuildInputs productionCapabilities;
   videoEnabled = builtins.elem "video" productionCapabilities.cargoFeatures;
   gstreamerRuntime = import ./gstreamer-runtime.nix {
@@ -52,6 +65,21 @@ let
     ];
     buildInputs = runtimeLibs;
     doCheck = false;
+    # Task-local CPU budget: applies inside BOTH daemon-owned builders.
+    CARGO_BUILD_JOBS = "2";
+    RAYON_NUM_THREADS = "2";
+    preConfigure = ''
+      ${pkgs.util-linux}/bin/taskset -apc 0,1 "$$"
+      allowed=""
+      while read -r key value; do
+        if [ "$key" = "Cpus_allowed_list:" ]; then allowed="$value"; fi
+      done < /proc/$$/status
+      test "$allowed" = "0-1" || { echo "builder affinity refused: $allowed" >&2; exit 1; }
+      export CARGO_BUILD_JOBS=2 RAYON_NUM_THREADS=2 NIX_BUILD_CORES=2
+      echo "neo-term cwd builder: pid=$$ cpus=$allowed cargo-jobs=$CARGO_BUILD_JOBS"
+      # Compare exact manifests, Rust/test sources, lock, assets and member set.
+      diff -r ${providerSource} local-deps/rio-vt-0.5.5
+    '';
   };
   cargoArtifacts = craneLib.buildDepsOnly (
     commonArgs
@@ -59,6 +87,13 @@ let
       # Keep dependency artifacts stable across commits. Let buildDepsOnly
       # synthesize its dummy source to avoid import-from-derivation.
       version = "0.0.0";
+      # Crane stubs local path crates. Restore ONLY this provider after stubbing;
+      # workspace crates stay dummy so dependency preparation remains narrow.
+      extraDummyScript = ''
+        rm -rf "$out/local-deps/rio-vt-0.5.5"
+        mkdir -p "$out/local-deps"
+        cp -r ${providerSource} "$out/local-deps/rio-vt-0.5.5"
+      '';
     }
   );
   hostEmulator = pkgs.stdenv.hostPlatform.emulator pkgs.buildPackages;
@@ -108,10 +143,13 @@ craneLib.buildPackage (
     inherit cargoArtifacts;
 
     postBuild = ''
-      cargo xtask fresh-build --release --skip-build
+      cargo run --locked -p xtask -- fresh-build --release --skip-build
     '';
 
     postInstall = ''
+      # The protocol-blind relay is independent of editor wrappers/runtime state.
+      install -m 0755 target/release/neomacs-mcp "$out/bin/neomacs-mcp"
+
       mkdir -p "$out/share/neomacs"
       cp -r lisp "$out/share/neomacs/"
       cp -r etc "$out/share/neomacs/"
@@ -165,7 +203,9 @@ craneLib.buildPackage (
     '';
 
     passthru = {
-      inherit gstreamerRuntime productionCapabilities;
+      inherit gstreamerRuntime productionCapabilities cargoArtifacts;
+      cargoSource = cargoSrc;
+      fullSource = source;
     };
 
     meta = {

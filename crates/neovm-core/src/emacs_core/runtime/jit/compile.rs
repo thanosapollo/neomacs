@@ -484,12 +484,7 @@ fn jit_profile_emit(
         .jit_runtime()
         .compiled_id()
         .map_or_else(|| "-".to_string(), |id| id.to_string());
-    let tier = if jit_opt_mode() == OptMode::Opt {
-        result.map_or("-", |l| l.selected_tier().name())
-    } else {
-        let tier = result.map_or("-", |l| l.tier().name());
-        tier
-    };
+    let tier = result.map_or("-", |l| l.tier().name());
     let name = super::stats::perf_map::active_label_name()
         .map_or_else(|| "-".to_string(), |n| n.replace(',', ";"));
     let mut line = format!(
@@ -843,12 +838,7 @@ pub fn compile_bytecode_function_requested(
     let gate_phase = super::stats::enter_phase(super::stats::CompilePhase::Gate);
     // Publish this body's per-site operand types and no-inline call sites
     // for the whole compile, before anything below reads them.
-    let _numeric = if array_snapshot::selected() {
-        snapshot::publish_numeric_feedback_with_arrays(f)
-    } else {
-        let _numeric = publish_numeric_feedback(f);
-        snapshot::FrontFeedbackScope::Main { _scope: _numeric }
-    };
+    let _numeric = publish_numeric_feedback(f);
     let call_heavy = body_is_call_heavy(f.executable_ops(), &f.constants);
     let self_recursive = body_calls_itself(f, obarray);
     let _scope = lowering::RegallocScope::enter(regalloc_for_shape(
@@ -866,7 +856,7 @@ pub fn compile_bytecode_function_requested(
     );
     // The self policy scopes only an immutable compiler-source token; its
     // selected site maps below provide the actual self-call proof.
-    let _self_source = direct_call::SelfSourceScope::enter_for(f, self_recursive, call_heavy);
+    let _self_source = direct_call::SelfSourceScope::enter_for(f, self_recursive);
     let outer = (
         BYPASS_PROFIT_GATE.with(|b| b.replace(request.bypass_profit_gate)),
         ACTIVE_CALL_HEAVY.with(|b| b.replace(call_heavy)),
@@ -889,14 +879,8 @@ pub fn compile_bytecode_function_requested(
     let started = std::time::Instant::now();
     super::stats::verdict::begin();
     let named_t2 = inline_planning::named_tier_eligible(f, request, self_recursive);
-    let opt_request = (jit_opt_mode() == OptMode::Opt).then_some(request);
-    let mut result =
-        compile_bytecode_function_inner(f, obarray, named_t2, request.tier, opt_request);
-    if jit_opt_mode() == OptMode::Opt {
-        super::stats::inline_census::note_selected_compile_outcome(f, &result);
-    } else {
-        super::stats::inline_census::note_compile_outcome(f, &result);
-    }
+    let mut result = compile_bytecode_function_inner(f, obarray, named_t2);
+    super::stats::inline_census::note_compile_outcome(f, &result);
     let mir_verdict = super::stats::verdict::take();
     if let Ok(leaf) = &mut result {
         leaf.obs.mir_verdict = mir_verdict.clone();
@@ -1064,8 +1048,6 @@ fn compile_bytecode_function_inner(
     f: &ByteCodeFunction,
     obarray: Option<&Obarray>,
     named_t2: bool,
-    tier: super::tier2::CompileTier,
-    opt_request: Option<CompileRequest>,
 ) -> Result<CompiledLeaf, CompileError> {
     use super::stats::{CompilePhase, enter_phase};
     let gate_phase = enter_phase(CompilePhase::Gate);
@@ -1105,7 +1087,6 @@ fn compile_bytecode_function_inner(
     // the original MIR-first, late-fuser path below.
     let inline2 = jit_inline2_mode();
     let early_fused = inline_planning::early_fused(f, constants, obarray, native_arity, named_t2);
-    opt_backend::build_census(f, early_fused.as_deref());
     let fused_v2 = early_fused.as_ref().is_some_and(|body| body.is_v2());
     let (ops, constants) = early_fused.as_ref().map_or((ops, constants), |body| {
         (body.ops.as_slice(), body.constants.as_slice())
@@ -1137,8 +1118,7 @@ fn compile_bytecode_function_inner(
     }
     drop(gate_phase);
     let mir_phase = enter_phase(CompilePhase::MirBuild);
-    let mir_built = (jit_opt_mode() == OptMode::Legacy
-        && !has_rest
+    let mir_built = (!has_rest
         && f.params.optional.is_empty()
         && dynamic_prefix == 0
         && !reopt_gate
@@ -1312,47 +1292,17 @@ fn compile_bytecode_function_inner(
     let _fused_feedback = fused
         .as_ref()
         .map(|fused| publish_numeric_feedback_vec(fused.feedback.clone()));
-    let opt_params = (jit_opt_mode() == OptMode::Opt
-        && matches!(
-            tier,
-            super::tier2::CompileTier::Upgrade(super::tier2::T2Upgrade::Feedback)
-        )
-        && !reopt_gate)
-        .then_some(super::opt::ir::ParamShape {
-            required,
-            optional: nonrest - required,
-            has_rest,
-        });
-    let mut leaf = if let Some(request) = opt_request {
-        opt_backend::lower_best_requested(
-            ops,
-            constants,
-            native_arity,
-            match &fused {
-                Some(fused) => fused.offset_map.as_deref(),
-                None => f.executable_gnu_byte_offset_map(),
-            },
-            obarray,
-            None,
-            dynamic_prefix,
-            opt_params,
-            Some(request),
-        )?
-    } else {
-        opt_backend::lower_best(
-            ops,
-            constants,
-            native_arity,
-            match &fused {
-                Some(fused) => fused.offset_map.as_deref(),
-                None => f.executable_gnu_byte_offset_map(),
-            },
-            obarray,
-            None,
-            dynamic_prefix,
-            opt_params,
-        )?
-    };
+    let mut leaf = lower_leaf_full(
+        ops,
+        constants,
+        native_arity,
+        match &fused {
+            Some(fused) => fused.offset_map.as_deref(),
+            None => f.executable_gnu_byte_offset_map(),
+        },
+        obarray,
+        dynamic_prefix,
+    )?;
     leaf.required = required;
     leaf.has_rest = has_rest;
     inline_frames::retain_inline_dependencies(&mut leaf, fused.as_deref());
@@ -3156,125 +3106,6 @@ fn emit_backedge_jump_with_args(
     cold.end(fb, Some(cold_exits::ColdExit::Poll));
 }
 
-/// Opt-only Boolean poll views; original counter/protocol path is unchanged.
-#[allow(clippy::too_many_arguments)]
-fn emit_backedge_jump_with_representations(
-    fb: &mut FunctionBuilder,
-    rt: &RtCtx,
-    counter_slot: StackSlot,
-    signal_exit: &mut Option<Block>,
-    vals: &[ClifValue],
-    raw_slots: Option<&[bool]>,
-    bool_slots: Option<&[bool]>,
-    target_block: Block,
-    target_args: &[BlockArg],
-    handlers: &[HandlerStatic],
-    pending: &mut Vec<PendingDispatch>,
-    physical: Option<inline_physical::PollAdmission<'_>>,
-) {
-    if bool_slots.is_none() {
-        emit_backedge_jump_with_args(
-            fb,
-            rt,
-            counter_slot,
-            signal_exit,
-            vals,
-            raw_slots,
-            target_block,
-            target_args,
-            handlers,
-            pending,
-            physical,
-        );
-        return;
-    }
-    let c = fb.ins().stack_load(rt.ptr_ty, types::I64, counter_slot, 0);
-    let c1 = lowering::iadd_imm_p(fb, c, 1);
-    let c1m = lowering::band_imm_p(fb, c1, 0xFF);
-    fb.ins().stack_store(rt.ptr_ty, c1m, counter_slot, 0);
-    let wrapped = lowering::icmp_imm_p(fb, IntCC::Equal, c1m, 0);
-    let cold = cold_exits::ColdSpan::begin(fb);
-    let poll = fb.create_block();
-    fb.ins().brif(wrapped, poll, &[], target_block, target_args);
-
-    fb.switch_to_block(poll);
-    fb.seal_block(poll);
-    // A poll block is a store history of its own: a Switch compare chain
-    // emits one per backward target, as SIBLING paths that the compile-time
-    // record would otherwise thread through one another (rule 3 on
-    // `lowering::RootWinCarry`). It runs once per 255 backward jumps, so storing
-    // afresh costs nothing measurable.
-    lowering::rootwin_carry_reset();
-    let one = fb.ins().iconst(types::I64, 1);
-    fb.ins().stack_store(rt.ptr_ty, one, counter_slot, 0);
-    // The tick counter and the tier spine's loop credit, when asked for at
-    // compile time; the poll below runs either way.
-    t2_profile::emit_poll_extras(fb, rt);
-    // Materialize tagged roots only after entering the rare poll path.
-    // The successor variables and MIR edge arguments keep their representations.
-    let tagged_vals;
-    let vals = if raw_slots.is_some() || bool_slots.is_some() {
-        if let Some(raw) = raw_slots {
-            debug_assert_eq!(raw.len(), vals.len());
-        }
-        if let Some(bools) = bool_slots {
-            debug_assert_eq!(bools.len(), vals.len());
-        }
-        tagged_vals = vals
-            .iter()
-            .enumerate()
-            .map(|(i, &value)| {
-                if bool_slots.is_some_and(|bools| bools[i]) {
-                    boolean::tagged_bool_view(fb, value)
-                } else if raw_slots.is_some_and(|raw| raw[i]) {
-                    retag_fixnum(fb, value)
-                } else {
-                    value
-                }
-            })
-            .collect::<Vec<_>>();
-        &tagged_vals[..]
-    } else {
-        vals
-    };
-    // Root the target stack across the poll, including a handler-entry
-    // snapshot when a baseline loop is inside a protected extent.
-    let saved = if vals.is_empty() {
-        CondRoots::NONE
-    } else {
-        emit_cond_residual_roots_pre(fb, rt, vals)
-    };
-    let vmctx = fb.use_var(rt.vmctx_var);
-    let backedge = rt.refs.get(fb.func, Shim::Backedge);
-    let call = fb.ins().call(backedge, &[vmctx]);
-    let status = fb.inst_results(call)[0];
-    emit_cond_residual_roots_post(fb, rt, saved);
-    let tagged_reps = vec![SlotRep::Tagged; vals.len()];
-    let se = signal_target_for_site(fb, signal_exit, handlers, pending, vals, &tagged_reps);
-    let ok = lowering::icmp_imm_p(fb, IntCC::Equal, status, STATUS_OK);
-    if let Some(cache) = &rt.inline_entry_cache {
-        let refreshed = fb.create_block();
-        fb.ins().brif(ok, refreshed, &[], se, &[]);
-        fb.switch_to_block(refreshed);
-        fb.seal_block(refreshed);
-        cache.invalidate(fb);
-        if let Some(admission) = physical {
-            inline_physical::emit(
-                fb,
-                rt,
-                admission.frames,
-                admission.pc,
-                vals,
-                admission.pending,
-            );
-        }
-        fb.ins().jump(target_block, target_args);
-    } else {
-        fb.ins().brif(ok, target_block, target_args, se, &[]);
-    }
-    cold.end(fb, Some(cold_exits::ColdExit::Poll));
-}
-
 /// Lower a leaf bytecode body taking `arity` fixed arguments to native code.
 ///
 /// Whether the body has a BACKWARD jump (a loop) — needs the back-edge poll
@@ -3474,79 +3305,6 @@ pub fn lower_leaf_full_osr(
     osr_pc: Option<usize>,
     dynamic_prefix: usize,
 ) -> Result<CompiledLeaf, CompileError> {
-    lower_leaf_full_osr_with_opt(
-        ops,
-        constants,
-        arity,
-        offset_map,
-        obarray,
-        osr_pc,
-        dynamic_prefix,
-        None,
-    )
-}
-
-pub(crate) fn lower_leaf_full_osr_with_opt(
-    ops: &[Op],
-    constants: &[Value],
-    arity: usize,
-    offset_map: Option<&[GnuByteOffsetMapEntry]>,
-    obarray: Option<&Obarray>,
-    osr_pc: Option<usize>,
-    dynamic_prefix: usize,
-    opt_params: Option<super::opt::ir::ParamShape>,
-) -> Result<CompiledLeaf, CompileError> {
-    lower_leaf_full_osr_with_plan_impl(
-        ops,
-        constants,
-        arity,
-        offset_map,
-        obarray,
-        osr_pc,
-        dynamic_prefix,
-        opt_params,
-        None,
-        None,
-    )
-}
-
-/// Direct IR harness: only test-owned verified plans, with source-derived
-/// guard facts disabled so mutations cannot reuse an obsolete source proof.
-#[cfg(test)]
-pub(crate) fn lower_opt_ir_for_test(
-    ops: &[Op],
-    constants: &[Value],
-    arity: usize,
-    offset_map: Option<&[GnuByteOffsetMapEntry]>,
-    plan: &super::opt::ir::Func,
-) -> Result<CompiledLeaf, CompileError> {
-    lower_leaf_full_osr_with_plan_impl(
-        ops,
-        constants,
-        arity,
-        offset_map,
-        None,
-        plan.osr.as_ref().map(|osr| osr.entry_pc as usize),
-        plan.dynamic_prefix,
-        Some(plan.arity),
-        Some(plan),
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn lower_leaf_full_osr_with_plan_impl(
-    ops: &[Op],
-    constants: &[Value],
-    arity: usize,
-    offset_map: Option<&[GnuByteOffsetMapEntry]>,
-    obarray: Option<&Obarray>,
-    osr_pc: Option<usize>,
-    dynamic_prefix: usize,
-    opt_params: Option<super::opt::ir::ParamShape>,
-    opt_override: Option<&super::opt::ir::Func>,
-    opt_request: Option<CompileRequest>,
-) -> Result<CompiledLeaf, CompileError> {
     // Every analysis and the reloc collection below see the MASKED view; only
     // the emitter's `Op::Constant` arm knows the prefix (it loads those slots
     // through the callee at run time).
@@ -3558,49 +3316,12 @@ fn lower_leaf_full_osr_with_plan_impl(
         constants
     };
     let cfg = analyze_cfg(ops, constants, offset_map, arity)?;
-    let sqrt_witnesses = if (opt_params.is_some() || opt_override.is_some())
-        && jit_opt_passes().sink
-        && jit_opt_mode() == OptMode::Opt
-    {
-        obarray.map_or_else(HashMap::new, |ob| {
-            let sites = find_spec_sites(ops, constants, &cfg.leaders, ob, true);
-            sqrt_snapshot::capture(ops, &sites, ob)
-        })
-    } else {
-        HashMap::new()
-    };
-    let sqrt_sites = sqrt_witnesses.keys().map(|&pc| pc as u32).collect();
-    let opt = match opt_override {
-        Some(plan) => {
-            plan.verify()
-                .map_err(|_| CompileError::UnsupportedOp("opt-build:verify"))?;
-            Some(plan.clone())
-        }
-        None => opt_params
-            .map(|params| {
-                opt_backend::build_plan_with_sqrt_sites(
-                    ops,
-                    constants,
-                    &cfg,
-                    params,
-                    dynamic_prefix,
-                    osr_pc,
-                    &sqrt_sites,
-                )
-            })
-            .transpose()?,
-    };
-
     // Cross-block redundant-guard elimination: per-block-entry known-fixnum slots
     // (empty if the function has an op the analysis doesn't model -> no elision).
     // OSR adds an entry predecessor that guards the header's proven slots.
     // Once those checks pass, the same must-analysis facts remain valid on
     // every reachable edge; untyped slots still retain their per-op guards.
-    let known_fixnum_slots = if opt_override.is_some() {
-        HashMap::new()
-    } else {
-        compute_known_fixnum_slots(ops, constants, &cfg)
-    };
+    let known_fixnum_slots = compute_known_fixnum_slots(ops, constants, &cfg);
     let n = ops.len();
     // What the lowering bakes addresses inside goes into the leaf (see
     // `call_feedback::FeedbackHolds`).
@@ -3709,7 +3430,6 @@ fn lower_leaf_full_osr_with_plan_impl(
     // A declaration-table string only; the code is the same either way.
     let label = super::stats::perf_map::active_label(match osr_pc {
         Some(pc) => super::stats::perf_map::LabelTier::Osr(pc),
-        None if opt.is_some() => super::stats::perf_map::LabelTier::Opt,
         None => super::stats::perf_map::LabelTier::Baseline,
     });
     let entry_name = label.as_deref().unwrap_or("__neovm_jit_leaf");
@@ -3719,14 +3439,8 @@ fn lower_leaf_full_osr_with_plan_impl(
     // the address of `obs.entries`, and a profiling leaf's code the address
     // of its countdown (`tier2`; an OSR leaf never profiles).
     let mut obs = LeafObs::new(super::stats::entry_counting_enabled());
-    if let Some(func) = opt.as_ref() {
-        opt_census::attach(&obs, &func.census);
-    }
     if osr_pc.is_none() {
         obs.t2 = super::tier2::cells_for_build();
-    }
-    if array_snapshot::selected() && obs.t2.profiling() && ops.iter().any(|op| *op == Op::Aref) {
-        super::tier2::array_stability::attach(&obs);
     }
 
     // Baseline tier runs Cranelift at the default opt_level="none": its job is
@@ -3757,79 +3471,33 @@ fn lower_leaf_full_osr_with_plan_impl(
         direct_call::has_exact_self_site(ops, &spec_sites, arity),
     );
     let mut chains = Vec::new();
-    let _opt_quality = opt
-        .as_ref()
-        .zip(opt_request)
-        .and_then(|(plan, request)| opt_backend::quality_scope(plan, osr_pc, request));
-    // BEGIN T35 SELECTED CALLER
-    let selection = leaf_builder_selected::requirements(false, obs.emit().t2, ops, opt.as_ref());
-    let defined = if selection.is_selected() {
-        shared::define_jit_leaf_selected(
-            /*per_leaf_shims=*/ true,
-            selection.array_profile,
-            selection.sink_versions,
-            |sink| {
-                leaf_builder_selected::build_selected_leaf_fn(
-                    sink,
-                    ops,
-                    constants,
-                    arity,
-                    &cfg,
-                    &known_fixnum_slots,
-                    &spec_sites,
-                    &spec_slots,
-                    n,
-                    &deopt_spill,
-                    &deopt_meta,
-                    &reloc_data,
-                    &reloc_index,
-                    has_backedge,
-                    needs_rt,
-                    /*aot=*/ false,
-                    entry_name,
-                    Linkage::Local,
-                    osr_pc,
-                    dynamic_prefix,
-                    obs.emit(),
-                    abi,
-                    opt.as_ref(),
-                    &sqrt_witnesses,
-                    &mut chains,
-                )
-            },
-        )?
-    } else {
-        let defined = shared::define_jit_leaf(/*per_leaf_shims=*/ true, |sink| {
-            build_leaf_fn(
-                sink,
-                ops,
-                constants,
-                arity,
-                &cfg,
-                &known_fixnum_slots,
-                &spec_sites,
-                &spec_slots,
-                n,
-                &deopt_spill,
-                &deopt_meta,
-                &reloc_data,
-                &reloc_index,
-                has_backedge,
-                needs_rt,
-                /*aot=*/ false,
-                entry_name,
-                Linkage::Local,
-                osr_pc,
-                dynamic_prefix,
-                obs.emit(),
-                abi,
-                opt.as_ref(),
-                &mut chains,
-            )
-        })?;
-        defined
-    };
-    // END T35 SELECTED CALLER
+    let defined = shared::define_jit_leaf(/*per_leaf_shims=*/ true, |sink| {
+        build_leaf_fn(
+            sink,
+            ops,
+            constants,
+            arity,
+            &cfg,
+            &known_fixnum_slots,
+            &spec_sites,
+            &spec_slots,
+            n,
+            &deopt_spill,
+            &deopt_meta,
+            &reloc_data,
+            &reloc_index,
+            has_backedge,
+            needs_rt,
+            /*aot=*/ false,
+            entry_name,
+            Linkage::Local,
+            osr_pc,
+            dynamic_prefix,
+            obs.emit(),
+            abi,
+            &mut chains,
+        )
+    })?;
     let entry = defined.entry;
     if entry.is_null() {
         // A deferred backend (`jit::bg`): its install may re-stamp a slot
@@ -3847,7 +3515,6 @@ fn lower_leaf_full_osr_with_plan_impl(
     super::stats::asm_dump::flush(&super::stats::asm_dump::AsmLeafInfo {
         tier: match osr_pc {
             Some(pc) => super::stats::perf_map::LabelTier::Osr(pc),
-            None if opt.is_some() => super::stats::perf_map::LabelTier::Opt,
             None => super::stats::perf_map::LabelTier::Baseline,
         },
         entry_name,
@@ -4004,7 +3671,6 @@ pub(crate) fn build_baseline_leaf_object<S: LeafSink>(
         /*dynamic_prefix=*/ 0,               // AOT never targets a patched source
         LeafEmit::NONE,  // AOT code never counts or profiles
         LeafAbi::Memory, // AOT keeps the memory ABI
-        None,            // AOT retains the original backend
         &mut Vec::new(),
     )?;
     Ok(BaselineAotMeta {
@@ -4016,17 +3682,1123 @@ pub(crate) fn build_baseline_leaf_object<S: LeafSink>(
     })
 }
 
-mod boolean;
-mod leaf_builder;
-mod leaf_builder_selected;
-mod numeric_carrier;
-pub(crate) mod opt_backend;
-pub(crate) mod opt_census;
-mod opt_emission;
-mod sink_cold_snapshot;
-mod sqrt_binding;
-mod sqrt_snapshot;
-use leaf_builder::build_leaf_fn;
+/// Module-generic build seam for [`lower_leaf_full`]: sets up the leaf ABI
+/// signature, lowers the bytecode `ops` through a `FunctionBuilder`, then
+/// hands the function to `sink` ([`LeafSink::define_leaf`]), returning its
+/// `FuncId`. CLIF output is byte-identical to the previous in-line lowering
+/// (pure extraction).
+///
+/// Generic over the sink so the same lowering drives the JIT (a per-leaf
+/// `JITModule` or the persistent per-thread backend) and the `ObjectModule`
+/// AOT path, unchanged. The
+/// address-stable buffers (`spec_slots`/`deopt_spill`/`deopt_meta`/`reloc_data`)
+/// are borrowed: their addresses are baked into the generated code, and the
+/// caller retains ownership to move them into the `CompiledLeaf`.
+///
+/// This fn deliberately contains NONE of the three ObjectModule-incompatible
+/// JIT seams, which stay in the [`lower_leaf_full`] wrapper:
+///   * `builder.symbol(...)`    — AOT: `Linkage::Import` resolved via dlopen.
+///   * `finalize_definitions()` — AOT: `ObjectModule::finish()`.
+///   * `get_finalized_function` — AOT: `dlsym` of the exported entry symbol.
+#[allow(clippy::too_many_arguments)]
+fn build_leaf_fn<S: LeafSink>(
+    sink: &mut S,
+    ops: &[Op],
+    constants: &[Value],
+    arity: usize,
+    cfg: &Cfg,
+    known_fixnum_slots: &HashMap<usize, Vec<bool>>,
+    spec_sites: &HashMap<usize, SpecSite>,
+    spec_slots: &[SpecSlot],
+    n: usize,
+    deopt_spill: &[core::cell::Cell<i64>],
+    deopt_meta: &DeoptCells,
+    reloc_data: &[Value],
+    reloc_index: &std::collections::HashMap<usize, u32>,
+    has_backedge: bool,
+    needs_rt: bool,
+    // R2-E (baseline-tier AOT): false → JIT (bases baked as `iconst`, byte-identical
+    // to before); true → AOT (reloc-base + deopt bases loaded from the per-thread
+    // `LeafSidecar` 4th entry arg, since the addresses are session-specific). Mirrors
+    // `build_mir_leaf_fn`'s `aot` flag. Same RESULTS either way.
+    aot: bool,
+    // The exported entry symbol + its linkage. JIT: `("__neovm_jit_leaf", Local)`.
+    // AOT: the content-hash entry name + `Export` so the loader can `dlsym` it.
+    entry_name: &str,
+    entry_linkage: Linkage,
+    // OSR (on-stack replacement, JIT-only): when `Some(osr_pc)`, the function
+    // entry does NOT seed args + jump to block 0; instead it seeds the operand
+    // stack (`entry_depth[osr_pc]` tagged Values read from the `args` pointer)
+    // and jumps STRAIGHT to the loop-header block at `osr_pc`, so the interpreter
+    // can transfer a hot loop into native code mid-execution. Blocks unreachable
+    // from `osr_pc` (the pre-loop prologue) are pruned so no dangling SSA survives.
+    osr_pc: Option<usize>,
+    // `make-closure` patched prefix of the source (JIT only): those leading
+    // constant slots load through the callee constant base in the 4th entry
+    // param instead of baking. 0 = plain function / AOT.
+    dynamic_prefix: usize,
+    // JIT only: what the code writes into the leaf's `LeafObs` -- the entry
+    // counter (incremented first thing in the entry block,
+    // `lowering::emit_entry_count`) and the poll tick counter when entry
+    // counting was on at compile time, and a profiling leaf's countdown
+    // (`t2_profile`). `LeafEmit::NONE` = none of them.
+    emit: LeafEmit<'_>,
+    // The entry's shape (`reg_abi`): the memory ABI for AOT and OSR, the
+    // register ABI for an eligible JIT body when the knob is on.
+    abi: LeafAbi,
+    chains: &mut Vec<super::vframe::DeoptChain>,
+) -> Result<cranelift_module::FuncId, CompileError> {
+    debug_assert!(
+        abi == LeafAbi::Memory || (!aot && osr_pc.is_none()),
+        "AOT and OSR entries keep the memory ABI"
+    );
+    let variable_raw = uniform_raw_osr_slots(cfg, known_fixnum_slots, osr_pc);
+    let has_raw_slots = variable_raw.iter().any(|&raw| raw);
+    lowering::imm_pool_reset();
+    cold_exits::begin_function();
+    LAST_IR_STATS.with(|c| c.set((0, 0, 0, 0)));
+    lowering::flonum_census_reset();
+    heap_inline::inline_heap_sites_reset();
+    inline_vars::begin_function(ops, constants, cfg, aot);
+    let frontend_config = sink.module().target_config();
+    let call_conv = frontend_config.default_call_conv;
+    let ptr_ty = frontend_config.pointer_type();
+
+    // ABI: fn(vmctx: *mut Context, args: *const i64, out: *mut i64) -> i64.
+    // Reads `arity` argument words from `args`; returns STATUS_OK + writes the
+    // result bits via `out` on success, STATUS_DEOPT on a failed guard, or
+    // STATUS_SIGNAL when a runtime call raised a Flow (stashed for
+    // `take_pending_flow`). `vmctx` is only used by runtime-call shims.
+    // Unified 4-param entry ABI: fn(vmctx, args, out, sidecar) -> status (see
+    // build_mir_leaf_fn). JIT (`aot=false`) declares but ignores `sidecar` (bases
+    // stay `iconst`); AOT (`aot=true`) reads its reloc/deopt bases from it. The
+    // register ABI (`reg_abi`) takes the arguments as parameters instead and
+    // returns (value, status).
+    let sig = abi.signature(call_conv, ptr_ty);
+
+    let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
+    let mut fbctx = sink.take_builder_context();
+    let frames = inline_frames::Frames::new(deopt_meta);
+    {
+        let mut fb = FunctionBuilder::new(&mut func, &mut fbctx);
+
+        // Declare the runtime-call machinery into this function if the body
+        // re-enters the runtime (`Cons` / `Call`).
+        let mut rt = if needs_rt {
+            // Declare the JIT-only round-1 subr-speculation shims iff the body has
+            // round-1 subr-kind spec sites. The AOT baseline emit classifies ONLY
+            // CBSym sites (`find_cbsym_spec_sites`; the `Op::Call` subr pass is
+            // increment B), so this is always false for AOT — an ObjectModule
+            // never declares the round-1 subr import names. CBSym-kind sites are
+            // deliberately NOT counted here: they get their own R2 shims, so a
+            // CBSym-only body never imports the `Op::Call` spec shims.
+            let subr_spec = spec_sites.values().any(|site| site.kind.is_round1_subr());
+            // The R2 CallBuiltinSym intrinsic shims (Tier-A read / Tier-B
+            // dispatch-skip), declared when a CBSym-kind site exists. UNLIKE the
+            // round-1 shims these are NOW emitted by AOT too (increment A): CBSym
+            // classification is obarray-free, so `find_cbsym_spec_sites` populates
+            // this for the baseline `ObjectModule` and the two shims become imports
+            // resolved against the host at `dlopen`.
+            let cbsym_spec = spec_sites.values().any(|site| site.kind.is_cbsym());
+            let shapes = jit_direct_shapes();
+            let groups = ShimGroups {
+                subr_spec,
+                cbsym_spec,
+                tier2_profile: emit.t2.is_some(),
+                direct_shapes: !aot && (shapes.optional || shapes.rest),
+                call_census: !aot && jit_call_census_on(),
+                direct_framed: !aot && shapes.framed,
+                hof: inline::active_fused().is_some_and(|body| {
+                    body.v2.as_ref().is_some_and(|side| !side.hof_at.is_empty())
+                }),
+            };
+            let refs = RtRefs::new(
+                sink.shim_ids(call_conv, ptr_ty, groups)?,
+                groups,
+                fb.func,
+                call_conv,
+                ptr_ty,
+            );
+            let vmctx_var = fb.declare_var(ptr_ty);
+            let max_call_args = ops
+                .iter()
+                .filter_map(|o| match o {
+                    Op::Call(n) | Op::Apply(n) | Op::List(n) | Op::Concat(n) => Some(*n as usize),
+                    Op::CallBuiltin(_, n) | Op::CallBuiltinSym(_, n) => Some(*n as usize),
+                    Op::Nconc => Some(2),
+                    Op::Substring | Op::Aset => Some(3),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            let call_args_slot = fb.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                (max_call_args.max(1) * 8) as u32,
+                3,
+            ));
+            let call_result_slot =
+                fb.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+            Some(RtCtx {
+                refs,
+                vmctx_var,
+                ptr_ty,
+                call_args_slot,
+                call_result_slot,
+                rootwin: None,
+                heap: None,
+                inline_alloc: !aot && jit_inline_alloc_on(),
+                generational: std::cell::Cell::new(aot.then_some(false)),
+                direct_sites: std::cell::Cell::new(0),
+                self_direct_source: direct_call::source_for_abi(abi),
+                poll: emit.poll(),
+                inline_entry_cache: None,
+            })
+        } else {
+            None
+        };
+
+        // A pure profiling leaf needs only the tier-request import. Keeping
+        // this separate preserves its existing runtime-free shape when off.
+        let t2_refs = if emit.t2.is_some() && rt.is_none() {
+            Some(t2_profile::pure_entry_refs(
+                sink, fb.func, call_conv, ptr_ty,
+            )?)
+        } else {
+            None
+        };
+
+        // SSA variables: one I64 slot per operand-stack position (carries the
+        // stack across block edges), plus one for the out pointer (used by
+        // `Return` in any block).
+        let vars: Vec<Variable> = (0..cfg.max_depth)
+            .map(|_| fb.declare_var(types::I64))
+            .collect();
+        let out_var = fb.declare_var(ptr_ty);
+
+        // One CLIF block per bytecode basic block.
+        let block_for: HashMap<usize, Block> = cfg
+            .leaders
+            .iter()
+            .map(|&l| (l, fb.create_block()))
+            .collect();
+        // Deopt-buffer base addresses (for the JIT `iconst` path). The CLIF
+        // `DeoptRefs` is materialized in the entry block below (the baseline tier
+        // has no AOT path yet, so always the `iconst` form).
+        let spill_base_addr = deopt_spill.as_ptr() as i64;
+        let meta_pc_addr = &deopt_meta.pc as *const core::cell::Cell<i64> as i64;
+        let meta_depth_addr = &deopt_meta.depth as *const core::cell::Cell<i64> as i64;
+        let meta_handlers_addr = &deopt_meta.handlers as *const core::cell::Cell<i64> as i64;
+        // Shared signal-propagation block (returns STATUS_SIGNAL), created
+        // lazily by the first `Call` lowering.
+        let mut signal_exit: Option<Block> = None;
+        // Backward-jump quit counter (the interpreter's u8 `quitcounter`), kept
+        // in a stack slot so every block can bump it.
+        let backedge_counter: Option<StackSlot> = has_backedge.then(|| {
+            fb.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3))
+        });
+
+        // Function-entry block: stash vmctx + the out pointer, load args into
+        // the slot variables, then jump into bytecode block 0.
+        let entry = fb.create_block();
+        fb.append_block_params_for_function_params(entry);
+        fb.switch_to_block(entry);
+        if let Some(counter) = emit.entry_counter {
+            debug_assert!(!aot, "AOT code never counts entries");
+            lowering::emit_entry_count(&mut fb, ptr_ty, counter);
+        }
+        let entry_params = fb.block_params(entry).to_vec();
+        if let Some(t2) = emit.t2 {
+            debug_assert!(!aot && osr_pc.is_none(), "only a JIT entry leaf profiles");
+            let refs = rt
+                .as_ref()
+                .map(|rt| &rt.refs)
+                .or(t2_refs.as_ref())
+                .expect("profiling refs");
+            t2_profile::emit_entry_countdown(&mut fb, ptr_ty, refs, t2);
+        }
+        // A function entry that can re-enter Lisp signals "Bytecode stack
+        // overflow" before the native stack runs out (`stack_guard`); the
+        // rest of the entry code then runs in the block after the guard, on
+        // its parameters. An OSR entry is not a recursion level: the
+        // interpreter frame it continues was entered through a probed path.
+        let entry_params = match rt.as_ref() {
+            Some(rt) if osr_pc.is_none() && stack_guard::body_may_reenter_lisp(ops) => {
+                stack_guard::emit_entry_stack_guard(&mut fb, rt, abi, &entry_params)
+            }
+            _ => entry_params,
+        };
+        // Memory: `[vmctx, args, out, sidecar]`. Register: `[vmctx, aux,
+        // a0..]`, `aux` taking the sidecar word's place (a JIT body reads it
+        // only as its callee constant base) and no `args`/`out` at all.
+        let (vmctx_param, args_ptr, out_ptr, fourth_param) = match abi {
+            LeafAbi::Memory => (
+                entry_params[0],
+                Some(entry_params[1]),
+                Some(entry_params[2]),
+                entry_params[3],
+            ),
+            LeafAbi::Register { .. } => (entry_params[0], None, None, entry_params[1]),
+        };
+        // R2-E: the 4th entry param (the per-thread `*const LeafSidecar`). Read only
+        // in AOT mode; JIT ignores it. The entry block dominates every block, so a
+        // base materialized here is valid in any (incl. cold deopt) block.
+        let sidecar_param = aot.then_some(fourth_param);
+        // JIT leaf of a `make-closure`-patched source: the same 4th entry param is
+        // the EXECUTING CALLEE's constant base (`CompiledLeaf::call_consts`); the
+        // patched slots load off it (`lower_simple_op` `Op::Constant`). Bound in
+        // the entry block so it dominates every block.
+        debug_assert!(
+            !(aot && dynamic_prefix > 0),
+            "AOT never targets a patched source"
+        );
+        let consts_base = (!aot && dynamic_prefix > 0).then_some(fourth_param);
+        // R1a: base address of the heap-constant reloc vector, materialized once in
+        // entry (dominates all blocks); the baseline Op::Constant loads off it by
+        // index. JIT bakes the Box address as `iconst`; AOT loads it from the
+        // sidecar (session-specific). `None` when the body references no heap consts.
+        let reloc_base = if reloc_data.is_empty() {
+            None
+        } else if aot {
+            let sc = sidecar_param.expect("AOT sets sidecar_param");
+            Some(fb.ins().load(
+                ptr_ty,
+                MemFlagsData::trusted(),
+                sc,
+                LeafSidecar::OFF_RELOC_BASE,
+            ))
+        } else {
+            Some(fb.ins().iconst(ptr_ty, reloc_data.as_ptr() as i64))
+        };
+        // R2 increment B2: the AOT sidecar's spec-slot / spec-expected array bases,
+        // loaded ONCE here (the entry block dominates every block, incl. cold deopt)
+        // iff this is an AOT body with at least one `Op::Call` subr/bytecode spec
+        // site (CBSym sites are slotless — they read neither base). JIT
+        // (`aot=false`) emits NOTHING here (bases stay `None`; each site bakes its
+        // slot/expected as `iconst`), so the JIT lowering is byte-identical to
+        // pre-B2. `None` when the leaf has no such site, so a null sidecar base is
+        // never loaded/indexed.
+        let has_op_call_spec = spec_sites.values().any(|s| s.kind.to_spec_disc().is_some());
+        let (spec_slot_base, spec_expected_base) = if aot && has_op_call_spec {
+            let sc = sidecar_param.expect("AOT sets sidecar_param");
+            (
+                Some(fb.ins().load(
+                    ptr_ty,
+                    MemFlagsData::trusted(),
+                    sc,
+                    LeafSidecar::OFF_SPEC_SLOT_BASE,
+                )),
+                Some(fb.ins().load(
+                    ptr_ty,
+                    MemFlagsData::trusted(),
+                    sc,
+                    LeafSidecar::OFF_SPEC_EXPECTED_BASE,
+                )),
+            )
+        } else {
+            (None, None)
+        };
+        // Deopt-buffer bases as entry-block values: JIT (`aot=false`) → the `iconst`
+        // form (deferred to the cold deopt blocks, byte-identical to pre-R2-E); AOT
+        // (`aot=true`) → loaded from the sidecar. The baseline's precise deopt spills
+        // operand-stack + pc/depth/handlers — exactly the sidecar's carried bases (at
+        // D0 there are no spec slots, so no per-spec-slot state beyond these).
+        let deopt_refs = materialize_deopt_refs(
+            &mut fb,
+            ptr_ty,
+            aot,
+            /*has_precise_deopt=*/ true,
+            sidecar_param,
+            spill_base_addr,
+            meta_pc_addr,
+            meta_depth_addr,
+            meta_handlers_addr,
+        );
+        // Pool the common immediates once per function (see
+        // `lowering::imm_pool_define`); `imm_pool_reset` ran at function start.
+        lowering::imm_pool_define(&mut fb, lowering::POOLED_IMMEDIATES);
+        if let Some(rt) = rt.as_mut() {
+            fb.def_var(rt.vmctx_var, vmctx_param);
+            // The heap pointer every inline heap site reads, loaded once here
+            // (the entry block dominates every block, the OSR jump included)
+            // when the body has two such sites or one in a loop; else each
+            // site loads its own. Only a body with inline sites loads it, and
+            // such a body dereferences its vmctx anyway.
+            if !aot
+                && (inline_hof::hoist_callback_heap_ptr()
+                    || heap_inline::hoist_heap_ptr(
+                        ops,
+                        has_back_edge(ops),
+                        rt.inline_alloc,
+                        |pc| {
+                            matches!(
+                                active_numeric_feedback(pc),
+                                crate::emacs_core::jit::NumericFeedback::Float
+                            )
+                        },
+                    ))
+            {
+                rt.heap = Some(heap_inline::load_heap_ptr(&mut fb, vmctx_param));
+            }
+            // Root-window base + capacity check once per activation instead
+            // of once per site (`lowering::HoistedRootWin`). Only for a body
+            // with rooting sites: those dereference the vmctx anyway, so it is
+            // a real Context; a site-free body may be entered with a null one.
+            // Two sites, or one inside a loop: a single straight-line site
+            // executes once per activation, like the prologue, and its inline
+            // form costs about the same, but a site in a loop runs its check
+            // on every iteration (the 3M-call benchmark: −2.4% hoisted).
+            let sites = count_rooting_sites(ops);
+            if cfg.max_depth > 0 && (sites >= 2 || (sites == 1 && has_back_edge(ops))) {
+                lowering::emit_hoisted_root_window_prologue(
+                    &mut fb,
+                    rt,
+                    vmctx_param,
+                    cfg.max_depth,
+                );
+            }
+        }
+        if !aot && let Some(rt) = rt.as_mut() {
+            rt.inline_entry_cache =
+                inline::active_fused()
+                    .filter(|body| body.is_v2())
+                    .and_then(|body| {
+                        inline_entry_cache::EntryCache::build(
+                            &mut fb,
+                            &body,
+                            cfg,
+                            arity,
+                            osr_pc,
+                            dynamic_prefix,
+                        )
+                    });
+        }
+        if let Some(out_ptr) = out_ptr {
+            fb.def_var(out_var, out_ptr);
+        }
+        if let Some(slot) = backedge_counter {
+            // The interpreter starts quitcounter at 1.
+            let one = fb.ins().iconst(types::I64, 1);
+            fb.ins().stack_store(ptr_ty, one, slot, 0);
+        }
+        // Entry seeding + jump target. Normal: seed the `arity` args into the
+        // bottom slots and jump to bytecode block 0. OSR: the `args` pointer holds
+        // the live OPERAND STACK snapshot (`entry_depth[osr_pc]` tagged Values), so
+        // seed those slots and jump STRAIGHT to the loop-header block at `osr_pc`.
+        let (seed_count, jump_target) = match osr_pc {
+            Some(p) => (cfg.entry_depth[&p], block_for[&p]),
+            None => (arity, block_for[&0]),
+        };
+        for (i, var) in vars.iter().take(seed_count).enumerate() {
+            let v = match args_ptr {
+                Some(args_ptr) => fb.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    args_ptr,
+                    (i * 8) as i32,
+                ),
+                // Register ABI: the arguments are the entry's parameters.
+                None => entry_params[2 + i],
+            };
+            fb.def_var(*var, v);
+        }
+        // A live OSR snapshot is an additional predecessor of the header.
+        // Check exactly the type facts that normal entry established before
+        // using them to elide guards in the body. Rejection captures the whole
+        // unchanged tagged snapshot at the header, before any bytecode effect.
+        let mut entry_deopts = Vec::new();
+        if let Some(rt) = rt.as_ref()
+            && rt
+                .inline_entry_cache
+                .as_ref()
+                .is_some_and(|cache| cache.physical_protocol_admitted())
+        {
+            let values = vars[..seed_count]
+                .iter()
+                .map(|&var| fb.use_var(var))
+                .collect::<Vec<_>>();
+            inline_physical::emit(
+                &mut fb,
+                rt,
+                &frames,
+                osr_pc.unwrap_or(0),
+                &values,
+                &mut entry_deopts,
+            );
+        }
+        if let Some(pc) = osr_pc
+            && let Some(slots) = known_fixnum_slots.get(&pc)
+            && slots.iter().any(|&known| known)
+        {
+            let stack: Vec<ClifValue> = vars[..seed_count]
+                .iter()
+                .map(|&var| fb.use_var(var))
+                .collect();
+            let reps = vec![SlotRep::Tagged; seed_count];
+            let deopt = deopt_site(&mut fb, pc, 0, &stack, &reps, &mut entry_deopts);
+            let unknown = HashSet::new();
+            for (&value, &known) in stack.iter().zip(slots) {
+                if known {
+                    guard_fixnum(&mut fb, deopt, value, &unknown);
+                }
+            }
+        }
+        for (slot, &var) in vars.iter().take(seed_count).enumerate() {
+            if variable_raw[slot] {
+                let tagged = fb.use_var(var);
+                let raw = lowering::sshr_imm_p(&mut fb, tagged, FIXNUM_SHIFT as i64);
+                fb.def_var(var, raw);
+            }
+        }
+        fb.ins().jump(jump_target, &[]);
+        if has_raw_slots {
+            for site in &entry_deopts {
+                fb.set_cold_block(site.block);
+            }
+        }
+        // An OSR entry snapshot is all tagged: no flonum crosses an edge.
+        emit_pending_deopts(&mut fb, deopt_refs, &mut entry_deopts, None, abi);
+
+        for (leader_index, &l) in cfg.leaders.iter().enumerate() {
+            let blk = block_for[&l];
+            fb.switch_to_block(blk);
+            // A leader may be reached from any store history: drop the
+            // root-window record (see `lowering::RootWinCarry`).
+            lowering::rootwin_carry_reset();
+            // An unreachable block — no path from the entry, so the dataflow
+            // gave it no entry depth: the byte-compiler emits code after an
+            // unconditional exit that nothing targets (ebrowse, eglot, wdired,
+            // texinfo, ns-win all have one) — lowers to a trap. Nothing it
+            // does can run, and anything reachable only through it is
+            // unreachable too, so skipping it leaves every jump target with
+            // a depth. Indexing here panicked ("no entry found for key") the
+            // moment the profitability gate stopped vetoing such bodies.
+            let Some(&depth) = cfg.entry_depth.get(&l) else {
+                fb.ins()
+                    .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                continue;
+            };
+            let mut stack: Vec<ClifValue> = (0..depth).map(|k| fb.use_var(vars[k])).collect();
+            // OSR slot representations are uniform at all reachable leaders.
+            let mut reps: Vec<SlotRep> = variable_raw[..depth]
+                .iter()
+                .map(|&raw| SlotRep::raw_if(raw))
+                .collect();
+            // Cross-block known-fixnum operands at this block's entry: each slot
+            // the dataflow analysis proved fixnum maps to its just-materialized
+            // ClifValue. StackRef/Dup keep the same ClifValue, so the set stays
+            // valid as the block runs; `guard_fixnum` elides guards for members.
+            let known_fixnum: HashSet<ClifValue> = known_fixnum_slots
+                .get(&l)
+                .map(|slots| {
+                    slots
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, &is_fix)| {
+                            (is_fix && !variable_raw[k])
+                                .then(|| stack.get(k).copied())
+                                .flatten()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Active handler frames at block entry (static), kept in sync as
+            // PopHandler ops run; signal sites inside a protected extent queue
+            // a dispatch block here, filled after the block's terminator.
+            let mut physical_binds = cfg.entry_binds.get(&l).copied().unwrap_or(0);
+            let mut handlers: Vec<HandlerStatic> =
+                cfg.entry_handlers.get(&l).cloned().unwrap_or_default();
+            let mut pending: Vec<PendingDispatch> = Vec::new();
+            let mut pending_deopt: Vec<PendingDeopt> = Vec::new();
+
+            let end = cfg.leaders.get(leader_index + 1).copied().unwrap_or(n);
+            let mut terminated = false;
+            for (off, op) in ops[l..end].iter().enumerate() {
+                let i = l + off;
+                // An inlined region's ops deopt to the CALL they replaced,
+                // with the caller's pre-call stack — captured here, at the
+                // region's first op, where the stack still holds
+                // `[...residual, callee, args]`.
+                if let Some(fused) = inline::active_fused().filter(|f| !f.is_v2()) {
+                    match fused.region_at(i) {
+                        Some(region) if i == region.start => {
+                            let region = region.clone();
+                            // Regions stay allocation-free (`inline.rs`: a
+                            // collection inside one would strand its
+                            // framestate), so box any flonum BEFORE the
+                            // snapshot: the region's deopt replays the call
+                            // with boxed arguments.
+                            box_all_flonums(&mut fb, rt.as_ref(), &mut stack, &mut reps);
+                            lowering::set_active_region(Some(lowering::RegionDeopt {
+                                call_site_pc: region.call_site_pc,
+                                stack: stack.clone(),
+                                reps: reps.clone(),
+                                chain: None,
+                            }));
+                            // ...and the splice is a speculation, so check the
+                            // slot still holds the callee whose body is next.
+                            lowering::emit_region_entry_guard(
+                                &mut fb,
+                                &region,
+                                handlers.len(),
+                                &stack,
+                                &reps,
+                                &mut pending_deopt,
+                            )?;
+                        }
+                        None => lowering::set_active_region(None),
+                        // A region is single-entry and the walk ascends, so
+                        // its snapshot was taken at its start and is still
+                        // the active one. Check it instead of trusting it: a
+                        // deopt under someone else's framestate replays the
+                        // wrong call.
+                        Some(region) => {
+                            if lowering::active_region_call_site() != Some(region.call_site_pc) {
+                                return Err(CompileError::UnsupportedOp("inline-region-entry"));
+                            }
+                        }
+                    }
+                }
+                if let Some(site) =
+                    inline::active_fused().and_then(|f| f.admitted_hof_at(i).copied())
+                {
+                    inline_hof::emit(
+                        &frames,
+                        &mut fb,
+                        i,
+                        site,
+                        rt.as_ref().expect("HOF runtime"),
+                        physical_binds,
+                        &mut stack,
+                        &mut reps,
+                        &mut pending_deopt,
+                        &mut signal_exit,
+                        reloc_base,
+                        reloc_index,
+                    )?;
+                    continue;
+                }
+                if frames.before_op(
+                    &mut fb,
+                    i,
+                    op,
+                    rt.as_ref(),
+                    physical_binds,
+                    handlers.len(),
+                    &mut stack,
+                    &mut reps,
+                    &mut pending_deopt,
+                    reloc_index,
+                )? {
+                    continue;
+                }
+                match op {
+                    Op::VarBind(_)
+                    | Op::SaveCurrentBuffer
+                    | Op::SaveExcursion
+                    | Op::SaveRestriction
+                    | Op::UnwindProtectPop => physical_binds += 1,
+                    Op::Unbind(n) => physical_binds -= *n as usize,
+                    _ => {}
+                }
+                // Terminators consume / snapshot / spill the operand stack as tagged
+                // Values; force-tag any raw slots and box any flonums first (the
+                // block's slot state is discarded after the terminator, so no
+                // per-pop lockstep is needed past this point).
+                if matches!(
+                    op,
+                    Op::Throw
+                        | Op::Switch
+                        | Op::PushConditionCase(_)
+                        | Op::PushConditionCaseRaw(_)
+                        | Op::PushCatch(_)
+                ) {
+                    materialize_model_stack(&mut fb, rt.as_ref(), &mut stack, &mut reps);
+                } else if matches!(op, Op::Return) {
+                    // Only the returned value escapes: box it if it is a
+                    // flonum. The slots below it die here, so a flonum among
+                    // them is never boxed.
+                    if let Some(top) = stack.len().checked_sub(1)
+                        && reps[top].is_flonum()
+                    {
+                        let rt = rt.as_ref().expect("a flonum implies the runtime refs");
+                        box_flonum_slot(&mut fb, rt, &mut stack, &mut reps, top);
+                    }
+                    retag_raw_fixnums(&mut fb, &mut stack, &mut reps);
+                }
+                match op {
+                    Op::Return => {
+                        let result = stack.pop().ok_or(CompileError::StackUnderflow)?;
+                        let out = out_ptr.map(|_| fb.use_var(out_var));
+                        reg_abi::emit_leaf_return(&mut fb, abi, out, Some(result), STATUS_OK);
+                        terminated = true;
+                        break;
+                    }
+                    Op::Throw => {
+                        // Stash Flow::Throw{tag, value} and exit via the signal
+                        // path; inside a protected extent that path is the
+                        // handler dispatch (a same-function `catch` is caught
+                        // natively via the match shim).
+                        let value = stack.pop().ok_or(CompileError::StackUnderflow)?;
+                        let tag = stack.pop().ok_or(CompileError::StackUnderflow)?;
+                        let rt = rt.as_ref().ok_or(CompileError::UnsupportedOp("throw"))?;
+                        let throw_flow = rt.refs.get(fb.func, Shim::ThrowFlow);
+                        fb.ins().call(throw_flow, &[tag, value]);
+                        let se = signal_target_for_site(
+                            &mut fb,
+                            &mut signal_exit,
+                            &handlers,
+                            &mut pending,
+                            &stack,
+                            &reps,
+                        );
+                        fb.ins().jump(se, &[]);
+                        terminated = true;
+                        break;
+                    }
+                    Op::Goto(t) => {
+                        write_edge_stack_to_vars(
+                            &mut fb,
+                            rt.as_ref(),
+                            &vars,
+                            &mut stack,
+                            &mut reps,
+                            &variable_raw,
+                        );
+                        let tu = *t as usize;
+                        if tu <= i {
+                            // Backward jump: bump the quit counter and poll on
+                            // wrap, exactly like the interpreter's branch_to!.
+                            let (rt, slot) = (
+                                rt.as_ref().expect("backedge implies rt"),
+                                backedge_counter.expect("backedge implies counter"),
+                            );
+                            emit_backedge_jump(
+                                &mut fb,
+                                rt,
+                                slot,
+                                &mut signal_exit,
+                                &vars,
+                                &variable_raw,
+                                cfg.entry_depth[&tu],
+                                block_for[&tu],
+                                &handlers,
+                                &mut pending,
+                                inline_physical::poll_admission(
+                                    rt,
+                                    &frames,
+                                    tu,
+                                    &mut pending_deopt,
+                                ),
+                            );
+                        } else {
+                            fb.ins().jump(block_for[&tu], &[]);
+                        }
+                        terminated = true;
+                        break;
+                    }
+                    Op::GotoIfNil(t) | Op::GotoIfNotNil(t) => {
+                        let cond = stack.pop().ok_or(CompileError::StackUnderflow)?;
+                        let rep = reps.pop().ok_or(CompileError::StackUnderflow)?;
+                        let cond = if rep == SlotRep::RawFixnum {
+                            retag_fixnum(&mut fb, cond)
+                        } else {
+                            cond
+                        };
+                        write_edge_stack_to_vars(
+                            &mut fb,
+                            rt.as_ref(),
+                            &vars,
+                            &mut stack,
+                            &mut reps,
+                            &variable_raw,
+                        );
+                        let is_nil =
+                            fb.ins()
+                                .icmp_imm_u(IntCC::Equal, cond, Value::NIL.bits() as i64);
+                        let tu = *t as usize;
+                        let mut target = block_for[&tu];
+                        let fallthrough = block_for[&(i + 1)];
+                        let backedge = (tu <= i).then(|| fb.create_block());
+                        if let Some(tramp) = backedge {
+                            target = tramp;
+                        }
+                        // brif takes the `then` block when the condition is true.
+                        if matches!(op, Op::GotoIfNil(_)) {
+                            fb.ins().brif(is_nil, target, &[], fallthrough, &[]);
+                        } else {
+                            fb.ins().brif(is_nil, fallthrough, &[], target, &[]);
+                        }
+                        if let Some(tramp) = backedge {
+                            // Taken-edge trampoline carrying the back-edge poll.
+                            fb.switch_to_block(tramp);
+                            fb.seal_block(tramp);
+                            let (rt, slot) = (
+                                rt.as_ref().expect("backedge implies rt"),
+                                backedge_counter.expect("backedge implies counter"),
+                            );
+                            emit_backedge_jump(
+                                &mut fb,
+                                rt,
+                                slot,
+                                &mut signal_exit,
+                                &vars,
+                                &variable_raw,
+                                cfg.entry_depth[&tu],
+                                block_for[&tu],
+                                &handlers,
+                                &mut pending,
+                                inline_physical::poll_admission(
+                                    rt,
+                                    &frames,
+                                    tu,
+                                    &mut pending_deopt,
+                                ),
+                            );
+                        }
+                        terminated = true;
+                        break;
+                    }
+                    Op::GotoIfNilElsePop(t) | Op::GotoIfNotNilElsePop(t) => {
+                        // Peek the condition without popping; write the FULL stack
+                        // (cond on top) to vars. The jump-taken successor reads it
+                        // all (depth D); the fall-through (depth D-1) ignores the
+                        // top slot — implementing the "ElsePop".
+                        let cond = *stack.last().ok_or(CompileError::StackUnderflow)?;
+                        let rep = *reps.last().ok_or(CompileError::StackUnderflow)?;
+                        let cond = if rep == SlotRep::RawFixnum {
+                            retag_fixnum(&mut fb, cond)
+                        } else {
+                            cond
+                        };
+                        write_edge_stack_to_vars(
+                            &mut fb,
+                            rt.as_ref(),
+                            &vars,
+                            &mut stack,
+                            &mut reps,
+                            &variable_raw,
+                        );
+                        let is_nil =
+                            fb.ins()
+                                .icmp_imm_u(IntCC::Equal, cond, Value::NIL.bits() as i64);
+                        let tu = *t as usize;
+                        let mut target = block_for[&tu];
+                        let fallthrough = block_for[&(i + 1)];
+                        let backedge = (tu <= i).then(|| fb.create_block());
+                        if let Some(tramp) = backedge {
+                            target = tramp;
+                        }
+                        if matches!(op, Op::GotoIfNilElsePop(_)) {
+                            fb.ins().brif(is_nil, target, &[], fallthrough, &[]);
+                        } else {
+                            fb.ins().brif(is_nil, fallthrough, &[], target, &[]);
+                        }
+                        if let Some(tramp) = backedge {
+                            fb.switch_to_block(tramp);
+                            fb.seal_block(tramp);
+                            let (rt, slot) = (
+                                rt.as_ref().expect("backedge implies rt"),
+                                backedge_counter.expect("backedge implies counter"),
+                            );
+                            emit_backedge_jump(
+                                &mut fb,
+                                rt,
+                                slot,
+                                &mut signal_exit,
+                                &vars,
+                                &variable_raw,
+                                cfg.entry_depth[&tu],
+                                block_for[&tu],
+                                &handlers,
+                                &mut pending,
+                                inline_physical::poll_admission(
+                                    rt,
+                                    &frames,
+                                    tu,
+                                    &mut pending_deopt,
+                                ),
+                            );
+                        }
+                        terminated = true;
+                        break;
+                    }
+                    Op::Switch => {
+                        // [dispatch table] -> a static target, or fall
+                        // through on a miss (`switch_dispatch`).
+                        let rt_ref = rt.as_ref().ok_or(CompileError::UnsupportedOp("switch"))?;
+                        let table = stack.pop().ok_or(CompileError::StackUnderflow)?;
+                        let dispatch = stack.pop().ok_or(CompileError::StackUnderflow)?;
+                        reps.truncate(stack.len());
+                        write_edge_stack_to_vars(
+                            &mut fb,
+                            rt.as_ref(),
+                            &vars,
+                            &mut stack,
+                            &mut reps,
+                            &variable_raw,
+                        );
+                        let targets = cfg.switch_targets.get(&i).expect("resolved in analyze");
+                        let sig = signal_target_for_site(
+                            &mut fb,
+                            &mut signal_exit,
+                            &handlers,
+                            &mut pending,
+                            &stack,
+                            &reps,
+                        );
+                        let fall = block_for[&(i + 1)];
+                        let inline = if !aot && jit_inline_switch_on() {
+                            switch_dispatch::inline_switch_for_site(
+                                ops,
+                                constants,
+                                dynamic_prefix,
+                                &cfg.leaders,
+                                i,
+                                targets,
+                            )
+                        } else {
+                            None
+                        };
+                        let mut landings = switch_dispatch::BaselineSwitchLandings {
+                            site: i,
+                            targets,
+                            block_for: &block_for,
+                            entry_depth: &cfg.entry_depth,
+                            rt: rt_ref,
+                            backedge_counter,
+                            signal_exit: &mut signal_exit,
+                            vars: &vars,
+                            variable_raw: &variable_raw,
+                            handlers: &handlers,
+                            pending: &mut pending,
+                            trampolines: Vec::new(),
+                            unfilled: Vec::new(),
+                        };
+                        switch_dispatch::emit_switch_dispatch(
+                            &mut fb,
+                            rt_ref,
+                            dispatch,
+                            table,
+                            targets,
+                            fall,
+                            sig,
+                            &mut landings,
+                            inline.as_ref(),
+                        );
+                        terminated = true;
+                        break;
+                    }
+                    Op::PushConditionCase(t) | Op::PushConditionCaseRaw(t) | Op::PushCatch(t) => {
+                        // Register the handler frame via the shim (interpreter
+                        // arm parity), then end the block with an "anchor"
+                        // edge: a never-taken branch to the handler target
+                        // that (a) guarantees the target block always has a
+                        // Cranelift predecessor with every entry var defined
+                        // (its real entries are the runtime match dispatches)
+                        // and (b) falls through to the protected body.
+                        let rt_ref = rt.as_ref().ok_or(CompileError::UnsupportedOp("handler"))?;
+                        let tu = *t as usize;
+                        let vmctx = fb.use_var(rt_ref.vmctx_var);
+                        // The target serves two consumers that need DIFFERENT
+                        // numbering. The compiled dispatch below reaches its
+                        // handler through `block_for`, keyed by the pc of the
+                        // ops being lowered — fused. But the shim stores this
+                        // operand in a `ResumeTarget`, and the only code that
+                        // reads it back is a RESUMED INTERPRETER frame, which
+                        // jumps to it in the UNFUSED ops. So the runtime gets
+                        // the original pc and `block_for` keeps the fused one.
+                        let runtime_target = inline::active_fused()
+                            .and_then(|f| f.caller_pc(tu))
+                            .unwrap_or(tu);
+                        let t_v = fb.ins().iconst(types::I64, runtime_target as i64);
+                        match op {
+                            Op::PushConditionCase(_) => {
+                                let d_v = fb.ins().iconst(types::I64, stack.len() as i64);
+                                let push_cc = rt_ref.refs.get(fb.func, Shim::PushCc);
+                                fb.ins().call(push_cc, &[vmctx, t_v, d_v]);
+                            }
+                            Op::PushConditionCaseRaw(_) => {
+                                let conditions = stack.pop().ok_or(CompileError::StackUnderflow)?;
+                                let d_v = fb.ins().iconst(types::I64, stack.len() as i64);
+                                let push_cc_raw = rt_ref.refs.get(fb.func, Shim::PushCcRaw);
+                                fb.ins().call(push_cc_raw, &[vmctx, t_v, d_v, conditions]);
+                            }
+                            Op::PushCatch(_) => {
+                                let tag = stack.pop().ok_or(CompileError::StackUnderflow)?;
+                                let d_v = fb.ins().iconst(types::I64, stack.len() as i64);
+                                let push_catch = rt_ref.refs.get(fb.func, Shim::PushCatch);
+                                fb.ins().call(push_catch, &[vmctx, t_v, d_v, tag]);
+                            }
+                            _ => unreachable!("matched Push* above"),
+                        }
+                        reps.truncate(stack.len());
+                        write_edge_stack_to_vars(
+                            &mut fb,
+                            rt.as_ref(),
+                            &vars,
+                            &mut stack,
+                            &mut reps,
+                            &variable_raw,
+                        );
+                        // Placeholder error-value slot for the never-taken
+                        // anchor edge (real entries define it from the shim).
+                        let nil = fb.ins().iconst(types::I64, Value::NIL.bits() as i64);
+                        fb.def_var(vars[stack.len()], nil);
+                        let never = fb.ins().iconst(types::I8, 0);
+                        fb.ins()
+                            .brif(never, block_for[&tu], &[], block_for[&(i + 1)], &[]);
+                        terminated = true;
+                        break;
+                    }
+                    Op::PopHandler => {
+                        // Normal exit from the protected extent: drop the
+                        // runtime frame and the static tracking entry.
+                        let rt_ref = rt.as_ref().ok_or(CompileError::UnsupportedOp("handler"))?;
+                        let vmctx = fb.use_var(rt_ref.vmctx_var);
+                        let pop_handler = rt_ref.refs.get(fb.func, Shim::PopHandler);
+                        fb.ins().call(pop_handler, &[vmctx]);
+                        handlers
+                            .pop()
+                            .ok_or(CompileError::UnsupportedOp("unbalanced-pophandler"))?;
+                    }
+                    other => {
+                        let spec = spec_sites.get(&i).map(|site| {
+                            (
+                                site.sym,
+                                site.expected_bits,
+                                &spec_slots[site.slot] as *const SpecSlot as i64,
+                                // R2 increment B2: the slot index the AOT sidecar's
+                                // spec-slot / spec-expected arrays are keyed by.
+                                site.slot,
+                                site.kind,
+                            )
+                        });
+                        // A tail call's residual is dead: the emitter sees
+                        // the call's own operands only, so it roots nothing.
+                        let dead = lowering::tail_call_dead_residuals(
+                            other,
+                            ops.get(i + 1),
+                            !handlers.is_empty(),
+                            spec.map(|(_, _, _, _, kind)| kind),
+                            stack.len(),
+                        )
+                        .unwrap_or(0);
+                        let residual: Vec<ClifValue> = stack.drain(..dead).collect();
+                        let residual_reps: Vec<SlotRep> = reps.drain(..dead).collect();
+                        lower_simple_op(
+                            &mut fb,
+                            i,
+                            &mut pending_deopt,
+                            &mut signal_exit,
+                            constants,
+                            &mut stack,
+                            &mut reps,
+                            rt.as_ref(),
+                            &handlers,
+                            &mut pending,
+                            spec,
+                            other,
+                            &known_fixnum,
+                            reloc_base,
+                            reloc_index,
+                            aot,
+                            spec_slot_base,
+                            spec_expected_base,
+                            dynamic_prefix,
+                            consts_base,
+                        )?;
+                        stack.splice(0..0, residual);
+                        reps.splice(0..0, residual_reps);
+                        // `lower_simple_op` keeps `reps` in lockstep with `stack`
+                        // (it re-syncs after a non-unboxing op itself).
+                    }
+                }
+            }
+            if !terminated {
+                // Fall through with the uniform variable representations.
+                write_edge_stack_to_vars(
+                    &mut fb,
+                    rt.as_ref(),
+                    &vars,
+                    &mut stack,
+                    &mut reps,
+                    &variable_raw,
+                );
+                fb.ins().jump(block_for[&end], &[]);
+            }
+            // Keep failed-guard reconstruction out of the ordinary emitted
+            // path. Cranelift sinks cold blocks during final code emission;
+            // this is a layout hint, not a register-allocation weight.
+            // A snapshot holding a flonum boxes it there: cold too.
+            for site in &pending_deopt {
+                if has_raw_slots || site.holds_flonum() {
+                    fb.set_cold_block(site.block);
+                }
+            }
+            // Fill the precise-deopt exit blocks queued by this block's guards.
+            emit_pending_deopts(
+                &mut fb,
+                deopt_refs,
+                &mut pending_deopt,
+                rt.as_ref().map(|rt| &rt.refs),
+                abi,
+            );
+            // Fill the handler-dispatch blocks queued by this block's signal
+            // sites (the builder can switch blocks now that it's terminated).
+            if !pending.is_empty() {
+                let rt_ref = rt.as_ref().expect("pending dispatches imply rt");
+                emit_pending_dispatches(
+                    &mut fb,
+                    rt_ref,
+                    &mut signal_exit,
+                    &vars,
+                    &block_for,
+                    &mut pending,
+                )?;
+            }
+        }
+
+        // Terminate the shared signal block (return STATUS_SIGNAL) iff used.
+        if let Some(sb) = signal_exit {
+            fb.switch_to_block(sb);
+            cold_exits::mark_exit_cold(&mut fb, sb, cold_exits::ColdExit::Signal);
+            reg_abi::emit_leaf_return(&mut fb, abi, None, None, STATUS_SIGNAL);
+        }
+
+        fb.seal_all_blocks();
+        fb.finalize(frontend_config);
+    }
+    chains.extend(frames.finish());
+    sink.return_builder_context(fbctx);
+    LAST_IR_STATS.with(|c| {
+        let (_, _, sites, slots) = c.get();
+        c.set((
+            func.dfg.num_insts() as u32,
+            func.layout.blocks().count() as u32,
+            sites,
+            slots,
+        ));
+    });
+
+    note_clif_size(&func);
+    let (rw_emitted, rw_elided) = lowering::rootwin_counters();
+    lowering::dump_clif(
+        &func,
+        &format!(
+            "baseline ops={} rw_stores={rw_emitted} rw_elided={rw_elided} entry={entry_name}",
+            ops.len()
+        ),
+    );
+    sink.define_leaf(
+        LeafEntry {
+            name: entry_name,
+            linkage: entry_linkage,
+            signature: &sig,
+        },
+        func,
+        super::stats::asm_dump::want_disasm(aot),
+    )
+}
 
 mod knobs;
 pub(crate) use knobs::*;
@@ -4039,10 +4811,6 @@ use calls::{cbsym_spec_kind, named_builtin_call};
 pub(crate) mod intrinsics;
 pub(crate) mod leaf_abi;
 
-// The cold Opt ownership reader uses feedback_holds. Keep main's leaf model
-// and its field attributes exact; its sole dead-code expectation predates
-// this legitimate reader and no longer applies.
-#[cfg_attr(not(test), allow(unfulfilled_lint_expectations))]
 mod leaf;
 pub use leaf::*;
 
@@ -4069,8 +4837,6 @@ pub(crate) mod direct_call;
 pub(crate) mod jit_layout;
 pub(crate) mod reg_abi;
 pub(crate) use reg_abi::LeafAbi;
-pub(crate) mod array_profile;
-pub(crate) mod array_snapshot;
 pub(crate) mod chain_framestate;
 pub(crate) mod hof_runtime;
 pub(crate) mod inline_entry_cache;
@@ -4105,7 +4871,6 @@ mod array_shim_tests;
 #[cfg(test)]
 #[path = "tests/call_feedback.rs"]
 mod call_feedback_tests;
-mod collection_journal;
 #[cfg(test)]
 #[path = "tests/compile_pipeline.rs"]
 pub(crate) mod compile_pipeline_tests;
@@ -4114,9 +4879,6 @@ pub(crate) mod heap_inline;
 #[path = "tests/inline_heap_ops.rs"]
 mod inline_heap_ops_tests;
 
-#[cfg(test)]
-#[path = "tests/gen0_tracked_collection_revision.rs"]
-mod gen0_tracked_collection_revision_tests;
 #[cfg(test)]
 #[path = "tests/inline_heap_generational.rs"]
 mod inline_heap_generational_tests;
@@ -4223,107 +4985,3 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/varref_inline.rs"]
 mod varref_inline_tests;
-
-#[cfg(test)]
-#[path = "tests/opt_lower.rs"]
-mod opt_lower_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_admission.rs"]
-mod opt_admission_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_ir_lower.rs"]
-mod opt_ir_lower_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_fold_select.rs"]
-mod opt_fold_select_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_passes.rs"]
-mod opt_passes_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_regalloc.rs"]
-mod opt_regalloc_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_bool.rs"]
-mod opt_bool_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_bool_numeric.rs"]
-mod opt_bool_numeric_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_reps.rs"]
-mod opt_reps_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_gvn_test.rs"]
-mod opt_gvn_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_array_profile.rs"]
-mod opt_array_profile_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_arrays.rs"]
-mod opt_array_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_sink_alloc_probe.rs"]
-mod opt_sink_alloc_probe_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_sink_identity.rs"]
-mod opt_sink_identity_tests;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_sink_sqrt.rs"]
-mod opt_sink_sqrt;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_sink_numeric_ready.rs"]
-mod opt_sink_numeric_ready;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_sink_numeric_sqrt_contagion.rs"]
-mod opt_sink_numeric_sqrt_contagion;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_sink_numeric_static_contagion.rs"]
-mod opt_sink_numeric_static_contagion;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_sink_numeric_cold.rs"]
-mod opt_sink_numeric_cold;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_sink_numeric_infallible.rs"]
-mod opt_sink_numeric_infallible;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_sink_cold_demand.rs"]
-mod opt_sink_cold_demand;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_sqrt_binding.rs"]
-mod opt_sqrt_binding;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_sqrt_snapshot.rs"]
-mod opt_sqrt_snapshot;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_sink_numeric_resolved.rs"]
-mod opt_sink_numeric_resolved;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_sink_native_verification.rs"]
-mod opt_sink_native_verification;
-
-#[cfg(test)]
-#[path = "compile/tests/opt_rootwin_counts.rs"]
-mod opt_rootwin_count_tests;

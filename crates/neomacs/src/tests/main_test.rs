@@ -88,10 +88,6 @@ use std::time::{Duration, Instant};
 #[path = "../tests/platform_startup_test.rs"]
 mod platform_fonts;
 
-#[cfg(test)]
-#[path = "frame_snapshot_policy.rs"]
-mod frame_snapshot_policy;
-
 fn gui_display() -> BootstrapDisplayConfig {
     let observation = neomacs_display_protocol::DisplayObservation::X11(
         neomacs_display_protocol::X11DisplayObservation::new(
@@ -1620,7 +1616,7 @@ fn synchronous_window_end_uses_the_final_source_buffer_identity() {
 }
 
 fn test_image_catalog(
-    cmd_tx: &crossbeam_channel::Sender<RenderCommand>,
+    cmd_tx: &neomacs_display_runtime::thread_comm::CommandSender,
     image_metadata: SharedImageRenderState,
 ) -> Rc<AsyncImageCatalog> {
     Rc::new(AsyncImageCatalog::new(
@@ -1633,7 +1629,7 @@ fn test_image_catalog(
 
 #[test]
 fn image_catalog_reports_renderer_owned_cache_bytes() {
-    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, _cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let image_state = Arc::new(neomacs_display_runtime::render_thread::ImageRenderState::default());
     let catalog = test_image_catalog(&cmd_tx, Arc::clone(&image_state));
 
@@ -2317,8 +2313,10 @@ fn assert_selected_frame_matches_materialized_default_metrics(eval: &Context) {
 
 #[test]
 fn opening_gui_frame_adoption_does_not_push_stale_window_size() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let mut host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -2341,6 +2339,7 @@ fn opening_gui_frame_adoption_does_not_push_stale_window_size() {
         terminal_state: super::super::TerminalHostState::new(new_shared_terminals()),
     };
 
+    assert!(neovm_core::emacs_core::DisplayHost::opening_gui_frame_pending(&host));
     neovm_core::emacs_core::DisplayHost::realize_gui_frame(
         &mut host,
         GuiFrameHostRequest {
@@ -2395,8 +2394,10 @@ fn opening_gui_frame_adoption_does_not_push_stale_window_size() {
 
 #[test]
 fn opening_gui_frame_adoption_applies_fullscreen_mode() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let mut host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -2419,6 +2420,7 @@ fn opening_gui_frame_adoption_applies_fullscreen_mode() {
         terminal_state: super::super::TerminalHostState::new(new_shared_terminals()),
     };
 
+    assert!(neovm_core::emacs_core::DisplayHost::opening_gui_frame_pending(&host));
     neovm_core::emacs_core::DisplayHost::realize_gui_frame(
         &mut host,
         GuiFrameHostRequest {
@@ -2451,8 +2453,10 @@ fn opening_gui_frame_adoption_applies_fullscreen_mode() {
 
 #[test]
 fn primary_display_host_destroy_gui_frame_routes_primary_and_secondary_windows() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let mut host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -2504,8 +2508,10 @@ fn primary_display_host_destroy_gui_frame_routes_primary_and_secondary_windows()
 
 #[test]
 fn primary_display_host_popup_menu_routes_primary_and_secondary_frames() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let mut host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -2587,9 +2593,11 @@ fn unbounded_lookup(catalog: &AsyncImageCatalog, request: ImageResolveRequest) -
 
 #[test]
 fn primary_image_catalog_lookup_returns_pending_without_waiting_for_render_thread() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let image_metadata = Arc::new(ImageRenderState::default());
     let host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -2688,7 +2696,7 @@ fn primary_image_catalog_lookup_returns_pending_without_waiting_for_render_threa
 
 #[test]
 fn animation_frames_share_sequence_identity_and_retirement_advances_generation() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::new(ImageRenderState::default()), None);
     let source = ImageResolveSource::Data(ImageDataSource::Isolated(EncodedBytes::new(vec![
         b'G', b'I', b'F',
@@ -2735,7 +2743,7 @@ fn animation_frames_share_sequence_identity_and_retirement_advances_generation()
 
 #[test]
 fn primary_image_catalog_does_not_block_on_render_command_backpressure() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(1);
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(1);
     cmd_tx
         .send(RenderCommand::Asset(AssetCommand::ImageRetire {
             image: ImageId::new(1),
@@ -2758,6 +2766,8 @@ fn primary_image_catalog_does_not_block_on_render_command_backpressure() {
     let worker_cmd_tx = cmd_tx.clone();
     let worker = std::thread::spawn(move || {
         let host = PrimaryWindowDisplayHost {
+            deferred_frame: None,
+            frame_opacity: Default::default(),
             resources: Default::default(),
             system_fonts: Default::default(),
             tooltip_client: Default::default(),
@@ -2817,9 +2827,11 @@ fn primary_image_catalog_does_not_block_on_render_command_backpressure() {
 
 #[test]
 fn primary_image_catalog_does_not_wait_for_renderer_metadata_lock() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let image_metadata = Arc::new(ImageRenderState::default());
     let host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -2884,8 +2896,10 @@ fn primary_image_catalog_does_not_wait_for_renderer_metadata_lock() {
 
 #[test]
 fn primary_display_host_expands_tilde_in_image_file_before_render_command() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -2973,9 +2987,11 @@ fn failed_image_decode_wakes_waiter_and_is_negative_cached() {
 
 #[test]
 fn primary_display_host_resolve_image_sync_returns_cached_decode_failure_promptly() {
-    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, _cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let image_metadata: SharedImageRenderState = Arc::new(ImageRenderState::default());
     let host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -3066,8 +3082,10 @@ fn primary_display_host_resolve_image_sync_returns_cached_decode_failure_promptl
 
 #[test]
 fn primary_display_host_request_video_queues_create_once_with_stable_id() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -3152,8 +3170,10 @@ fn resolved_video_registry_never_evicts_a_still_referenceable_identity() {
 
 #[test]
 fn primary_display_host_request_video_preserves_uri_source() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -3201,8 +3221,10 @@ fn primary_display_host_request_video_preserves_uri_source() {
 
 #[test]
 fn primary_display_host_routes_one_typed_video_session_lifecycle() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -3260,8 +3282,10 @@ fn primary_display_host_routes_one_typed_video_session_lifecycle() {
 
 #[test]
 fn primary_display_host_request_webkit_queues_create_and_load_once_with_stable_id() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -3314,8 +3338,10 @@ fn primary_display_host_request_webkit_queues_create_and_load_once_with_stable_i
 
 #[test]
 fn primary_display_host_preserves_file_navigation_as_a_typed_path() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -3358,8 +3384,10 @@ fn primary_display_host_preserves_file_navigation_as_a_typed_path() {
 
 #[test]
 fn primary_display_host_xwidget_lifecycle_uses_explicit_xwidget_id() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -3431,9 +3459,11 @@ fn bootstrap_gui_frame_adoption_routes_future_resizes_to_primary_window() {
     let mut eval = create_bootstrap_evaluator_cached_with_features(BOOTSTRAP_CORE_FEATURES)
         .expect("cached bootstrap evaluator");
     let _bootstrap = bootstrap_buffers(&mut eval, 843, 489, gui_display());
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
 
     eval.set_display_host(Box::new(PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -3499,9 +3529,11 @@ fn bootstrap_gui_frame_adoption_routes_future_resizes_to_primary_window() {
 
 #[test]
 fn primary_window_resize_does_not_wait_for_host_acknowledgement() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let shared = shared_primary_window_size(843, 489);
     let mut host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -3567,8 +3599,10 @@ fn primary_window_resize_does_not_wait_for_host_acknowledgement() {
 
 #[test]
 fn primary_window_display_host_forwards_visual_config_to_renderer() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let mut host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -3609,7 +3643,7 @@ fn primary_window_display_host_forwards_visual_config_to_renderer() {
 
 #[test]
 fn primary_window_display_host_round_trips_clipboard_requests_through_renderer() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let worker = std::thread::spawn(move || {
         let RenderCommand::Clipboard(ClipboardCommand::SetText {
             selection,
@@ -3643,6 +3677,8 @@ fn primary_window_display_host_round_trips_clipboard_requests_through_renderer()
         reply.send(Ok(SelectionOwner::OtherProcess)).unwrap();
     });
     let mut host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -3712,9 +3748,11 @@ fn redisplay_title_sync_formats_frame_title_format_for_primary_window() {
     let mut eval = create_bootstrap_evaluator_cached_with_features(BOOTSTRAP_CORE_FEATURES)
         .expect("cached bootstrap evaluator");
     let _bootstrap = bootstrap_buffers(&mut eval, 843, 489, gui_display());
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
 
     eval.set_display_host(Box::new(PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -3762,8 +3800,10 @@ fn frame_host_title_formats_the_restored_runtime_system_name() {
     let mut eval = create_bootstrap_evaluator_cached_with_features(BOOTSTRAP_CORE_FEATURES)
         .expect("cached bootstrap evaluator");
     let _bootstrap = bootstrap_buffers(&mut eval, 843, 489, gui_display());
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     eval.set_display_host(Box::new(PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -3817,7 +3857,7 @@ fn frame_host_title_formats_the_restored_runtime_system_name() {
 
 #[test]
 fn tty_terminal_host_delete_terminal_sends_shutdown() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let mut host = TtyTerminalHost { cmd_tx };
 
     host.delete_terminal()
@@ -6715,8 +6755,10 @@ fn frame_snapshot_subr_end_to_end_json_and_text() {
 
 #[test]
 fn primary_display_host_reports_quality_policy_frame_shader_suppression() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let mut host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -6795,9 +6837,11 @@ fn primary_display_host_reports_quality_policy_frame_shader_suppression() {
 #[cfg(feature = "neo-term")]
 #[test]
 fn primary_display_host_routes_typed_terminal_requests_to_the_renderer() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let shared_terminals = new_shared_terminals();
     let host = PrimaryWindowDisplayHost {
+        deferred_frame: None,
+        frame_opacity: Default::default(),
         resources: Default::default(),
         system_fonts: Default::default(),
         tooltip_client: Default::default(),
@@ -6828,6 +6872,7 @@ fn primary_display_host_routes_typed_terminal_requests_to_the_renderer() {
             },
             target: CoreTerminalDisplayTarget::Floating,
             shell: Some("/bin/sh".to_owned()),
+            invocation: None,
         },
     )
     .expect("terminal create should queue");
@@ -6881,6 +6926,7 @@ fn primary_display_host_routes_typed_terminal_requests_to_the_renderer() {
             size,
             target: TerminalDisplayTarget::Floating,
             shell: Some(shell),
+            invocation: None,
         }) if *command_id == id
             && *size == TerminalGridSize::new(96, 31).unwrap()
             && shell == "/bin/sh"
@@ -6910,6 +6956,27 @@ fn primary_display_host_routes_typed_terminal_requests_to_the_renderer() {
         RenderCommand::Terminal(TerminalCommand::TerminalDestroy { id: command_id })
             if *command_id == id
     ));
+
+    // Same production host/channel, not a replacement spawn implementation.
+    let invocation = neovm_core::emacs_core::display_host::TerminalInvocation {
+        executable: "/bin/echo".into(),
+        argv: vec!["space λ".into(), "; $()".into()],
+        directory: "/".into(),
+        environment: vec!["SHELL=/bin/sh".into(), "A=literal".into()],
+    };
+    let exact_id = neovm_core::emacs_core::DisplayHost::create_terminal(
+        &host,
+        TerminalCreateRequest {
+            size: TerminalGridSize::new(80, 24).unwrap(),
+            target: CoreTerminalDisplayTarget::Floating,
+            shell: None,
+            invocation: Some(invocation.clone()),
+        },
+    )
+    .unwrap();
+    assert!(matches!(cmd_rx.try_recv().unwrap(),
+        RenderCommand::Terminal(TerminalCommand::TerminalCreate { id, shell: None, invocation: Some(received), .. })
+            if id == exact_id && received == invocation));
 }
 
 #[cfg(feature = "neo-term")]

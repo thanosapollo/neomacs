@@ -227,9 +227,3 @@ pub(crate) fn publish_numeric_feedback_vec(seen: Vec<NumericFeedback>) -> Numeri
 pub(crate) fn publish_numeric_feedback(f: &ByteCodeFunction) -> NumericFeedbackScope {
     FeedbackSnapshot::take(f).publish()
 }
-
-#[path = "snapshot/array_feedback.rs"]
-mod array_feedback;
-pub(crate) use array_feedback::{
-    FrontFeedbackScope, SelectedFeedbackSnapshot, publish_numeric_feedback_with_arrays,
-};

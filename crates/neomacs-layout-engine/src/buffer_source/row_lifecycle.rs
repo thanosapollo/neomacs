@@ -55,14 +55,6 @@ use neomacs_display_protocol::types::Color;
 use neovm_core::buffer::{EmacsBytePos, LispCharPos1};
 use neovm_core::emacs_core::value::{Value, list_to_vec};
 
-/// Typed numeric tail admission for one exclusive source walk. It carries
-/// no Lisp references or shared mutable state between mutator threads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BufferSourceEobOverlayPolicy {
-    Render,
-    SourcePositionReached,
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct BufferSourceEndOfBufferTailRenderContext<'a> {
     byte_idx: usize,
@@ -71,22 +63,10 @@ pub(crate) struct BufferSourceEndOfBufferTailRenderContext<'a> {
     point_charpos: i64,
     overlay_context: BufferOverlayStringTextRowRenderContext<'a>,
     active_face_state: &'a DisplayRowActiveFaceState,
-    overlay_policy: BufferSourceEobOverlayPolicy,
 }
 
-/// Actual producer stop, owned by this exclusive numeric row attempt.
-/// No Lisp state or mutable cache is retained across mutators.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BufferSourceEobTailProgress {
-    Complete,
-    SourceRowsExhausted,
-    OverlayRowsExhausted,
-}
-
-#[derive(Clone, Copy)]
 pub(crate) struct BufferSourceEndOfBufferTailRenderOutcome {
     point_is_visible_eob: bool,
-    pub(crate) progress: BufferSourceEobTailProgress,
 }
 
 impl BufferSourceEndOfBufferTailRenderOutcome {
@@ -483,13 +463,7 @@ impl<'a> BufferSourceEndOfBufferTailRenderContext<'a> {
             point_charpos,
             overlay_context,
             active_face_state,
-            overlay_policy: BufferSourceEobOverlayPolicy::Render,
         }
-    }
-
-    pub(crate) fn with_overlay_policy(mut self, policy: BufferSourceEobOverlayPolicy) -> Self {
-        self.overlay_policy = policy;
-        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -537,24 +511,13 @@ impl<'a> BufferSourceEndOfBufferTailRenderContext<'a> {
             );
         }
 
-        let mut progress = if point_is_visible_eob
-            && !self.overlay_context.should_render(row_geometry)
-            && !row_geometry.is_within_row_limit(self.overlay_context.row_limit_for_eob_proof())
-        {
-            BufferSourceEobTailProgress::SourceRowsExhausted
-        } else {
-            BufferSourceEobTailProgress::Complete
-        };
-
         // The END-OF-BUFFER anchor keeps its own call: the producer stops at
         // point-max, so an overlay string anchored there (the shape completion
         // UIs use) has no element to ride on. Folding it in needs the producer
         // to emit at its end position, which is P4.7/P4.8 territory.
-        if self.overlay_policy == BufferSourceEobOverlayPolicy::Render
-            && self.overlay_context.should_render(row_geometry)
-        {
+        if self.overlay_context.should_render(row_geometry) {
             let (x, col) = row_progress.coordinates_mut();
-            let continuation = self.overlay_context.render_eob_anchor_strings_at_text_row(
+            self.overlay_context.render_eob_anchor_strings_at_text_row(
                 buffer,
                 OverlayStringRenderPositions::from_layout_i64(self.charpos, self.point_charpos),
                 self.active_face_state.resolved_face().box_type != 0,
@@ -569,14 +532,10 @@ impl<'a> BufferSourceEndOfBufferTailRenderContext<'a> {
                 line_numbers,
                 face_scan,
             );
-            if point_is_visible_eob && continuation == DisplayRowTransitionContinuation::Exhausted {
-                progress = BufferSourceEobTailProgress::OverlayRowsExhausted;
-            }
         }
 
         BufferSourceEndOfBufferTailRenderOutcome {
             point_is_visible_eob,
-            progress,
         }
     }
 }

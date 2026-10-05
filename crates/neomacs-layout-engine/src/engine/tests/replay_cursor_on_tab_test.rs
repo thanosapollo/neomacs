@@ -10,7 +10,6 @@ use super::*;
 
 #[test]
 fn a_cursor_put_back_on_a_reused_tab_is_one_column_wide() {
-    crate::incremental_layout::edit_sync::set_prove_first_for_test(Some(false));
     crate::incremental_layout::edit_sync::set_edit_sync_mode_for_test(Some(
         crate::incremental_layout::edit_sync::EditSyncMode::Sync,
     ));
@@ -43,7 +42,6 @@ fn a_cursor_put_back_on_a_reused_tab_is_one_column_wide() {
     fresh.layout_frame_rust(&mut eval, frame_id);
     let reference = selected_window_layout_trace(&eval, &fresh, frame_id);
     crate::incremental_layout::edit_sync::set_edit_sync_mode_for_test(None);
-    crate::incremental_layout::edit_sync::set_prove_first_for_test(None);
     assert_eq!(incremental.phys_cursor, reference.phys_cursor);
     assert_eq!(incremental, reference);
 }

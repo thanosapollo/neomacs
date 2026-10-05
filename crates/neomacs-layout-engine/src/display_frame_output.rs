@@ -62,6 +62,7 @@ pub(crate) struct FrameOutputIdentity {
     pub(crate) outer_border_width: f32,
     pub(crate) outer_border_color: Color,
     pub(crate) background_alpha: f32,
+    pub(crate) frame_alpha: [f32; 2],
     pub(crate) no_accept_focus: bool,
 }
 
@@ -153,15 +154,6 @@ impl FrameOutputOwner {
             render_services,
             display_host,
         ))
-    }
-
-    pub(crate) fn mini_measurement_height_px(
-        &self,
-        window_id: i64,
-        fallback_row_height: f32,
-    ) -> Option<f32> {
-        self.builder
-            .mini_measurement_height_px(window_id, fallback_row_height)
     }
 
     pub(crate) fn latest_window_info(&self, window_id: i64) -> Option<WindowInfo> {
@@ -278,6 +270,7 @@ impl<'a> FrameOutputTarget<'a> {
             identity.outer_border_width,
             identity.outer_border_color,
             identity.background_alpha,
+            identity.frame_alpha,
             identity.no_accept_focus,
         );
     }

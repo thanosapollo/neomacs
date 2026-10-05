@@ -41,19 +41,11 @@ mod edit_line_numbers_test;
 mod edit_replay_point_visibility_test;
 mod edit_replay_row_extent_test;
 mod edit_sync_engine_test;
-#[cfg(test)]
-mod edit_sync_prove_first_engine_test;
 #[path = "../../tests/engine_layout_validity_test.rs"]
 mod layout_validity;
 mod lazy_text_hit_test;
 mod mini_window_still_test;
 mod mode_line_gate_engine_test;
-#[cfg(test)]
-mod posn_current_matrix_clear_engine_test;
-#[cfg(test)]
-mod posn_frame_pool_engine_test;
-#[cfg(test)]
-mod posn_frame_pool_guard_test;
 mod replay_cursor_on_tab_test;
 mod scroll_back_engine_test;
 mod scroll_input_policy_test;
@@ -1696,7 +1688,6 @@ fn test_window_params() -> WindowParams {
         top_line: 0,
         window_start: 1,
         measurement_rows: None,
-        mini_measurement: crate::types::MiniWindowMeasurement::Presentation,
         measurement_pixels: None,
         query_target: None,
         force_start: false,
@@ -35278,8 +35269,6 @@ fn p52_in_line_edit_reuses_chrome_only_after_the_modified_star_has_settled() {
     {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.set_buffer_local("mode-line-format", Value::string("ML"));
-        // GNU's one-line optimization requires a fixed paragraph direction.
-        buf.set_buffer_local("bidi-paragraph-direction", Value::symbol("left-to-right"));
         // Point must already sit on the row about to be edited BEFORE the
         // warm-up layout. Otherwise the first edit is refused by the
         // cursor-row clause rather than by the star, and the star precondition
@@ -37031,7 +37020,3 @@ fn unchanged_frame_layout_consults_the_image_catalog_once_per_pass() {
 
 #[cfg(test)]
 mod point_rows_test;
-
-#[cfg(test)]
-#[path = "mini_scroll_sites.rs"]
-mod mini_scroll_sites;

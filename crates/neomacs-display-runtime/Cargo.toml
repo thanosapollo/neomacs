@@ -62,6 +62,9 @@ neomacs-webview.workspace = true
 
 # Terminal emulation (neo-term)
 rio-vt = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+hostname = { workspace = true, optional = true }
+percent-encoding = { version = "2", optional = true }
 parking_lot = { workspace = true, optional = true }
 portable-pty = { workspace = true, optional = true }
 
@@ -69,6 +72,7 @@ portable-pty = { workspace = true, optional = true }
 neomacs-infra.workspace = true
 
 [features]
+gui-test-hooks = []
 # Native video remains opt-in at this crate boundary. Linux production builds
 # enable it through neomacs's `cargo xtask fresh-build` pipeline.
 default = ["neo-term"]
@@ -90,6 +94,9 @@ webview = [
 # GPU-accelerated terminal emulator
 neo-term = [
     "dep:rio-vt",
+    "dep:url",
+    "dep:hostname",
+    "dep:percent-encoding",
     "parking_lot",
     "portable-pty",
     "neomacs-display-protocol/neo-term",

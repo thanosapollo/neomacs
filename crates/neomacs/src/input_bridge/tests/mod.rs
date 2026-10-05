@@ -177,6 +177,46 @@ fn terminal_lifecycle_events_reach_the_evaluator_losslessly() {
     ));
 }
 
+#[cfg(feature = "neo-term")]
+#[test]
+fn native_terminal_settlement_crosses_existing_bridge_without_status_loss() {
+    let id = neovm_core::emacs_core::display_host::TerminalId::new(17).unwrap();
+    for completion in [
+        neovm_core::emacs_core::display_host::TerminalCompletion {
+            exit_code: Some(17),
+            signal: None,
+            wait_error: None,
+            output_drained: true,
+            read_error: None,
+        },
+        neovm_core::emacs_core::display_host::TerminalCompletion {
+            exit_code: None,
+            signal: Some("Terminated".into()),
+            wait_error: None,
+            output_drained: false,
+            read_error: Some("cancelled".into()),
+        },
+    ] {
+        assert!(matches!(
+            convert_display_event(&DisplayEvent::TerminalSettled { id, completion: completion.clone() }),
+            Some(KbInputEvent::TerminalSettled { id: actual, completion: received })
+                if actual == id && received == completion
+        ));
+    }
+}
+
+#[test]
+fn terminal_cwd_events_reach_the_evaluator_losslessly() {
+    let id = neovm_core::emacs_core::display_host::TerminalId::new(17).unwrap();
+    assert!(matches!(
+        convert_display_event(&DisplayEvent::TerminalDirectoryChanged {
+            id, directory: "/home/α b".to_owned(),
+        }),
+        Some(KbInputEvent::TerminalDirectoryChanged { id: actual, directory })
+            if actual == id && directory == "/home/α b"
+    ));
+}
+
 #[test]
 fn presentation_lifecycle_events_reach_the_evaluator_losslessly() {
     assert!(matches!(
@@ -204,7 +244,7 @@ fn presentation_lifecycle_events_reach_the_evaluator_losslessly() {
 #[test]
 fn key_release_is_dropped_by_core_transport_owner() {
     let display_event = DisplayEvent::Key {
-        key: keyboard::FrontendKey::Keysym(keyboard::XK_RETURN),
+        keysym: keyboard::XK_RETURN,
         modifiers: 0,
         pressed: false,
         emacs_frame_id: 0,
@@ -252,9 +292,44 @@ fn raw_tty_bytes_cross_the_bridge_without_interpretation() {
 }
 
 #[test]
+fn tracked_key_transport_preserves_immediate_quit_without_reading() {
+    use neomacs_display_protocol::input_progress::InputDelivery;
+    for (keysym, modifiers, expected) in [
+        ('g' as u32, keyboard::RENDER_CTRL_MASK, true),
+        ('g' as u32, 0, false),
+        ('p' as u32, keyboard::RENDER_CTRL_MASK, false),
+    ] {
+        let delivery = InputDelivery::for_read();
+        let receipt = delivery.receipt();
+        let display_event = DisplayEvent::Tracked {
+            receipt: delivery,
+            event: Box::new(DisplayEvent::Key {
+                keysym,
+                modifiers,
+                pressed: true,
+                emacs_frame_id: 42,
+            }),
+        };
+        let event = convert_display_event(&display_event).expect("tracked key event");
+        assert_eq!(event.requests_default_quit(), expected);
+        assert!(!receipt.consumed_or_cancelled());
+        let KbInputEvent::Tracked { event, .. } = &event else {
+            panic!("bridge discarded tracking");
+        };
+        assert!(matches!(
+            event.as_ref(),
+            KbInputEvent::KeyPress {
+                emacs_frame_id: 42,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
 fn key_transport_preserves_source_frame_identity() {
     let display_event = DisplayEvent::Key {
-        key: keyboard::FrontendKey::Character('a'),
+        keysym: 'a' as u32,
         modifiers: keyboard::RENDER_CTRL_MASK,
         pressed: true,
         emacs_frame_id: 42,

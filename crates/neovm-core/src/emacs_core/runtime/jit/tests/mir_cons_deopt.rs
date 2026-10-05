@@ -108,17 +108,11 @@ fn mir_cons_precise_frames_preserve_aliases_and_completed_effects() {
 
 #[test]
 fn mir_cons_block_local_loop_allocation_count() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     assert_block_local_loop_allocation_count(false);
 }
 
 #[test]
 fn mir_singleton_block_local_loop_allocation_count() {
-    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
-        crate::emacs_core::jit::compile::OptMode::Legacy,
-    );
     assert_block_local_loop_allocation_count(true);
 }
 

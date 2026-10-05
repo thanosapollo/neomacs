@@ -268,22 +268,13 @@ impl RowWindowText {
                     }
                     let bounds = FrameRect::new(left, top, right - left, bottom - top)
                         .map_err(|_| PresentedHitError::InvalidTextPositionGeometry)?;
-                    positions.push(
-                        PresentedTextPosition::new(
-                            self.window,
-                            bounds,
-                            point.buffer_pos.as_i64(),
-                            body.body_row,
-                            point.col,
-                        )
-                        .with_point_role(
-                            if self.snapshot.posn_object_extent_mode().enabled() {
-                                point.role
-                            } else {
-                                neomacs_display_protocol::posn_object_extent::PosnPointRole::Glyph
-                            },
-                        ),
-                    );
+                    positions.push(PresentedTextPosition::new(
+                        self.window,
+                        bounds,
+                        point.buffer_pos.as_i64(),
+                        body.body_row,
+                        point.col,
+                    ));
                     source_keys.push((point.buffer_pos.as_i64(), point.row, point.col, point.x));
                 }
             }
@@ -310,7 +301,3 @@ impl RowWindowText {
 #[cfg(test)]
 #[path = "../tests/spatial_row_text_test.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "../tests/spatial_row_role_test.rs"]
-mod canonical_role_tests;

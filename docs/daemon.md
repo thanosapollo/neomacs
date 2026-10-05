@@ -74,7 +74,11 @@ the way GNU's own `make` generates them. The suite's fixture then provisions the
 bootstrap runtime image beside the debug editor binary on first use: it copies
 the editor to its `neomacs-temacs` role name, dumps the image from Lisp sources,
 smoke-tests the result, and reuses it for every later case, regenerating it only
-when the editor binary is newer. The image is shared through an advisory lock,
+when the editor binary is newer. Under the same lock it compiles the deferred
+GUI terminal layer `lisp/term/neo-win.el` with the matching bootstrap-role editor
+and image. Its bytecode is refreshed when the editor, source, or image is newer;
+this keeps display-free initialization from repeatedly expanding GUI macros.
+The image is shared through an advisory lock,
 so concurrent test processes serialize the one bootstrap instead of repeating
 it. The whole target runs serially (a `.config/nextest.toml` override), because
 every case carries wall-clock deadlines against real daemon and client
@@ -164,19 +168,79 @@ startup locks are rejected.
 
 ## Current limitations
 
-- Headless daemons support ordinary evaluation and client TTY frames. Attaching
-  a native graphical frame is not implemented: it requires a separately hosted
-  GUI event loop. Graphical frame requests fail rather than creating an invisible
-  stand-in window. Start ordinary GUI Neomacs for graphical editing.
+- On Linux a display-free daemon can later attach native frames to one explicitly
+  selected Wayland socket. Lisp `make-frame` and native/GNU client `-c -d SOCKET`
+  use the original evaluator and an OS-main-owned native loop. Deleting the last
+  graphical frame retains that connection and evaluator for recreation. Unlike
+  GNU Emacs, explicit `delete-terminal` on this retained graphical connection is
+  rejected, even with FORCE, before hooks or frame/terminal changes: independent
+  connection retirement/reconnection is not supported. Ordinary frame deletion,
+  TTY terminal deletion and daemon shutdown remain available. Explicit
+  X11 and multiple independent display connections are rejected. Native attach
+  and frame readiness have a 15-second budget. If cancellation interrupts a
+  synchronous Wayland registry/configure wait, the exact owned connection is
+  closed and cannot be reused after a successful native-loop construction;
+  the daemon evaluator remains available, and restart establishes a fresh loop.
+  Ordinary GPU-start and evaluator/font/admission errors do not discard a healthy
+  native loop. Foreign driver, font and loader calls are not claimed to finish
+  within a deadline; cancelled foreign workers require bounded process exit
+  without library finalizers.
 - Automatic startup is for local Unix sockets. TCP clients continue to use the
   existing server-file/authentication path, but do not automatically start a
   local daemon for a missing or unreachable TCP endpoint.
-- A client startup-wait budget does not constrain init execution. An init which
-  never finishes keeps its background launcher and startup lock alive; explicitly
-  stop the daemon when cancellation of init is
+- A client startup-wait budget does not constrain init execution or native GUI
+  attachment. An init which never finishes keeps its background launcher and
+  startup lock alive; explicitly stop the daemon when cancellation of init is
   intended. Normal `kill-emacs` performs orderly cleanup.
 - Interrupted synchronous calls kill and reap their immediate child; shell
   descendants are not tracked independently. Integer/no-wait destinations
   deliberately detach their child and do not wait for its completion at exit.
 - Daemon mode is not available on Windows. Ordinary GUI, TTY and batch startup
   remain separate paths.
+
+## Strict in-process compositor and graphical-client acceptance
+
+This separate, opt-in Linux command prepares the same matching debug/bootstrap
+runtime as the native lifecycle command, then runs real mapped-frame and native/
+GNU graphical-client assertions. The ordinary lifecycle command never downloads
+or requires EWM. Missing selected fixtures or GNU oracles are errors.
+
+Prepare the GPL-3.0-or-later EWM fixture in an **absent disposable directory**:
+
+```sh
+CARGO_BUILD_JOBS=2 python3 scripts/test-daemon-gui.py --prepare-ewm "$TMPDIR/ewm-acceptance"
+NEOMACS_EWM_MODULE="$TMPDIR/ewm-acceptance/target/debug/libewm_core.so" \
+NEOMACS_GNU_EMACSCLIENT=/usr/bin/emacsclient \
+CARGO_TARGET_DIR=target/daemon-gui cargo xtask test-daemon-gui
+```
+
+EWM is fetched from `https://codeberg.org/ezemtsov/ewm.git`, exactly revision
+`d5bf1e0e8c6b3e7423b88c64db5c199442b7fdb3`, with its locked dependencies. The
+checked-in `test/daemon-gui/ewm-headless.patch` is a disclosed test adapter, not
+a vendored production dependency: it exposes upstream's HeadlessBackend fixture,
+production State/socket/event queues, and native committed-buffer instrumentation.
+Stock `ewm-start` opens DRM/libseat and is deliberately never called. This is not
+full EWM desktop Lisp compatibility. `--prepare-ewm DIR --reuse` verifies the
+complete tracked source against the exact pin plus adapter and reports the
+existing module hash without rebuilding; preserve its original build provenance.
+
+Prerequisites: Bubblewrap with user/PID/network namespaces, GNU emacsclient, a
+DRM **render node** (default `/dev/dri/renderD128`, selected by
+`NEOMACS_TEST_RENDER_NODE`), Vulkan/Wayland runtime libraries, and EWM's native
+build libraries (pkg-config: libinput, libseat, gbm, egl, libudev, libdisplay-info,
+wayland-server/client, xkbcommon, gio-2.0). Rust must meet both projects' MSRV.
+`VK_DRIVER_FILES` may select an ICD. The sandbox hides personal HOME and `/run`,
+uses a short private socket path, and binds only the selected render node, never
+a DRM card, input device, VT, seat or live display socket.
+
+Assertions start with DISPLAY/WAYLAND_DISPLAY/WAYLAND_SOCKET absent, then Lisp
+loads and starts actual in-process EWM. They require native mapped counts
+1→2→1→0→1, failed-display recovery, retained module debug/capture state through GC,
+evaluator/buffer identity, server selection/hooks, native and GNU `-c -n` and
+waiting `-c -d` ownership, and a client staying connected after its first frame
+is deleted while its second frame remains owned. The final frame is recreated
+after all client frames are deleted. Exit-zero or Lisp visibility alone is never
+graphical success. The runner prints exact module/editor hashes and assertions,
+reaps every owned client and sandbox wrapper, and removes its disposable fixture.
+This gate does not replace the ordinary native lifecycle gate, cross-platform
+tests, full GUI/VM/JIT/release matrices or independent code review.

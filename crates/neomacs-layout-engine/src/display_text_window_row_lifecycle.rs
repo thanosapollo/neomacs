@@ -263,7 +263,6 @@ pub(crate) struct TextWindowBeginRequest {
     text_clip_bounds: neomacs_display_protocol::types::Rect,
     selected: bool,
     first_row: DisplayTextRowBegin,
-    row_capacity: crate::output::window_request::OutputWindowRowCapacity,
 }
 
 pub(crate) struct TextWindowTailFinalizeRequest<'a> {
@@ -528,13 +527,7 @@ impl TextWindowBeginRequest {
             text_clip_bounds,
             selected,
             first_row,
-            row_capacity: crate::output::window_request::OutputWindowRowCapacity::Fixed,
         }
-    }
-
-    pub(crate) fn with_growing_rows(mut self) -> Self {
-        self.row_capacity = crate::output::window_request::OutputWindowRowCapacity::Growing;
-        self
     }
 
     pub(crate) fn begin_and_apply(
@@ -548,12 +541,6 @@ impl TextWindowBeginRequest {
             self.display_text_row_base,
             self.text_area_left,
             self.window_top,
-        );
-        #[cfg(any(test, feature = "redisplay-test-policy"))]
-        output_emitter.set_posn_object_extent_mode_for_test(
-            evaluator
-                .frame_manager()
-                .posn_object_extent_mode(self.frame_id),
         );
         output_emitter.begin_update(evaluator);
         begin_text_window_output_and_row(
@@ -569,7 +556,6 @@ impl TextWindowBeginRequest {
                 text_clip_bounds: self.text_clip_bounds,
                 selected: self.selected,
                 first_row: self.first_row,
-                row_capacity: self.row_capacity,
             },
         );
         output_emitter
