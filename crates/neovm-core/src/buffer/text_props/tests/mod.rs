@@ -1,6 +1,9 @@
 use super::*;
 
 #[cfg(test)]
+mod retention;
+
+#[cfg(test)]
 mod source_slice_graft;
 
 #[cfg(test)]
