@@ -48,6 +48,8 @@ limits list depth/length; a printed value exceeding 65536 bytes fails **after**
 evaluation. Arbitrary code can change the editor, load other libraries, perform
 I/O, enter a minibuffer, or exit the process. Such effects are not rolled back.
 Use this tool deliberately; it does not promise to preserve the study window.
+Setting `neomacs-mcp-full-access` to nil (default t) hides `neomacs_eval` from
+`tools/list` and refuses calls to it; other tools are unaffected.
 
 The optional tools operate only on uniquely claimed, undisplayed non-file
 companion buffers. They do not adopt a namesake, visit learner files, select a
@@ -146,11 +148,19 @@ The endpoint implements these two distinct eras:
   server identity, `resultType: "complete"`, `ttlMs: 0`, and private cache scope.
   Modern tool lists carry those cache fields; calls and ping carry `resultType`.
   Unsupported per-request versions receive `-32022` with `data.supported`
-  listing both implemented versions and `data.requested` echoing the request.
-- **2025-11-25 compatibility:** a fresh connection sends `initialize` with that
-  exact version, client information and capabilities, then
-  `notifications/initialized`. Tool requests use the legacy envelopes, without
-  modern required metadata. No other legacy versions are negotiated.
+  listing all three implemented versions and `data.requested` echoing the request.
+- **2025-11-25 and 2025-06-18 compatibility:** a fresh connection sends
+  `initialize` with a nonempty string `protocolVersion`, object client information
+  and object capabilities, then `notifications/initialized`. Supported offers
+  are echoed exactly, including the 2025-06-18 offer used by Codex 0.155.1.
+  Other string offers receive a 2025-11-25 counterproposal, the newest supported
+  handshake version; clients that cannot use it should disconnect, as specified
+  by [MCP version negotiation](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle#version-negotiation).
+  A malformed or repeated initialization is rejected without changing readiness.
+  Tool requests require the initialized notification and use the common legacy
+  envelopes, without `resultType` or modern required metadata. An `initialize`
+  offer of 2026-07-28 receives the same legacy counterproposal; modern semantics
+  remain exclusively per-request and do not use a handshake.
 
 Legacy `_meta.progressToken` and unrelated extension metadata do not switch eras;
 progress notifications are optional and are not emitted. Reserved modern
@@ -186,8 +196,10 @@ cancellation from being observed until it yields or returns.
 
 There are at most eight peers, 64 queued requests globally, and 16 queued
 requests/frames per peer/filter turn. Input accumulation and individual output
-are limited to 131072 bytes. Saturation closes the offending connection;
-responses are rejected after serialization, not by a memory-isolated evaluator.
+are limited to 131072 bytes. Saturation closes the offending connection. A
+response that exceeds the limit or cannot be encoded as JSON (for example raw
+bytes) is replaced by a `-32603` error for the same request after
+serialization, not by a memory-isolated evaluator; the connection stays open.
 A peer with an incomplete frame remains subject to the finite peer/input caps;
 there is no inactivity timer. Close unused clients rather than treating a long
 idle connection as an editor session lease.

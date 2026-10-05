@@ -134,22 +134,38 @@ def run(output):
         record("invalid-utf8-refusal", invalid_utf8["error"]["code"] == -32700, invalid_utf8)
         unsupported = w.request("tools/list", {"_meta": dict(META, **{"io.modelcontextprotocol/protocolVersion": "1900-01-01"})}, modern=False)
         record("unsupported-version-data", unsupported["error"]["code"] == -32022 and unsupported["error"]["data"] == {
-            "supported": ["2026-07-28", "2025-11-25"], "requested": "1900-01-01"}, unsupported)
-        legacy = connect()
-        initialized = legacy.request("initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
-                                                   "clientInfo": {"name": "native-regression", "version": "1"}}, modern=False)
-        assert initialized["result"]["protocolVersion"] == "2025-11-25", initialized
-        legacy.sock.sendall(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
-        for name, meta in [("progress", {"progressToken": "wire-progress"}),
-                           ("unrelated", {"example.com/context": "fixture"})]:
-            response = legacy.request("tools/call", {"name": "neomacs_eval", "arguments": {
-                "instance": instance, "code": "(+ 20 22)"}, "_meta": meta}, modern=False)
-            result = response.get("result", {})
-            record("legacy-" + name + "-metadata-eval", not result.get("isError", True)
-                   and result["content"][0]["text"] == "42" and "resultType" not in result, response)
-        record("legacy-ping-empty", legacy.request("ping", modern=False)["result"] == {})
-        record("dual-era-explicit-modern-ping", legacy.request("ping")["result"].get("resultType") == "complete")
-        legacy.close()
+            "supported": ["2026-07-28", "2025-11-25", "2025-06-18"], "requested": "1900-01-01"}, unsupported)
+        for version in ("2025-06-18", "2025-11-25", "1900-01-01", "2026-07-28"):
+            legacy = connect()
+            offer = {"protocolVersion": version, "capabilities": {},
+                     "clientInfo": {"name": "native-regression", "version": "1"}}
+            initialized = legacy.request("initialize", offer, modern=False)
+            expected = version if version in ("2025-06-18", "2025-11-25") else "2025-11-25"
+            record("legacy-" + version + "-negotiated-version",
+                   initialized["result"]["protocolVersion"] == expected, initialized)
+            incomplete = legacy.request("tools/list", modern=False)
+            record("legacy-" + version + "-not-ready",
+                   incomplete["error"]["code"] == -32600, incomplete)
+            repeated = legacy.request("initialize", offer, modern=False)
+            record("legacy-" + version + "-repeat-initialize-refused",
+                   repeated["error"]["code"] == -32602, repeated)
+            legacy.sock.sendall(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+            listed = legacy.request("tools/list", modern=False)["result"]
+            record("legacy-" + version + "-list-envelope",
+                   len(listed["tools"]) == 8 and "resultType" not in listed)
+            for name, meta in [("progress", {"progressToken": "wire-progress"}),
+                               ("unrelated", {"example.com/context": "fixture"})]:
+                response = legacy.request("tools/call", {"name": "neomacs_eval", "arguments": {
+                    "instance": instance, "code": "(+ 20 22)"}, "_meta": meta}, modern=False)
+                result = response.get("result", {})
+                record("legacy-" + version + "-" + name + "-metadata-eval",
+                       not result.get("isError", True) and result["content"][0]["text"] == "42"
+                       and "resultType" not in result, response)
+            record("legacy-" + version + "-ping-empty",
+                   legacy.request("ping", modern=False)["result"] == {})
+            record("legacy-" + version + "-explicit-modern-ping",
+                   legacy.request("ping")["result"].get("resultType") == "complete")
+            legacy.close()
         oversized = connect()
         oversized.sock.sendall(b"x" * 131073)
         try:

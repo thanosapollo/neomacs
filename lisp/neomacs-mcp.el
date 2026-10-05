@@ -23,6 +23,12 @@
   "Native owner-controlled MCP endpoint."
   :group 'external)
 
+(defcustom neomacs-mcp-full-access t
+  "Non-nil means MCP clients may evaluate arbitrary Lisp in this editor.
+When non-nil, the `neomacs_eval' tool is listed and callable.  When nil,
+that tool is neither listed nor callable.  Other tools are not affected."
+  :type 'boolean :group 'neomacs-mcp)
+
 (defcustom neomacs-mcp-send-timeout 0.25
   "Seconds before closing an owned peer whose response send has not returned."
   :type 'number :group 'neomacs-mcp)
@@ -35,6 +41,10 @@
 (defconst neomacs-mcp--scan-limit 8)
 (defconst neomacs-mcp--modern "2026-07-28")
 (defconst neomacs-mcp--legacy "2025-11-25")
+(defconst neomacs-mcp--full-access-tools '("neomacs_eval")
+  "Tools available only while `neomacs-mcp-full-access' is non-nil.")
+(defconst neomacs-mcp--legacy-versions '("2025-11-25" "2025-06-18")
+  "Supported handshake versions, newest first; both use legacy envelopes.")
 (defvar neomacs-mcp--boot nil)
 (defvar neomacs-mcp--generation 0)
 (defvar neomacs-mcp--listener nil)
@@ -145,6 +155,13 @@ Return a bounded printed value; effects are not rolled back on failure."
           (error "Eval result exceeds output limit; effects may have occurred")
         text))))
 
+(defun neomacs-mcp--available-tools ()
+  "Return the registered tools that clients may currently list and call."
+  (if neomacs-mcp-full-access
+      neomacs-mcp-tools
+    (cl-remove-if (lambda (entry) (member (car entry) neomacs-mcp--full-access-tools))
+                  neomacs-mcp-tools)))
+
 (defun neomacs-mcp--tool-list ()
   "Return deterministic descriptors for the registered tools."
   (vconcat
@@ -156,12 +173,13 @@ Return a bounded printed value; effects are not rolled back on failure."
                (when (plist-get tool :annotations)
                  (puthash "annotations" (plist-get tool :annotations) object))
                object))
-           (sort (copy-sequence neomacs-mcp-tools)
+           (sort (copy-sequence (neomacs-mcp--available-tools))
                  (lambda (a b) (string-lessp (car a) (car b)))))))
 
 (defun neomacs-mcp--call (params modern)
   "Call the tool named by PARAMS and return the MODERN or legacy envelope."
-  (let* ((tool (alist-get (gethash "name" params) neomacs-mcp-tools nil nil #'equal))
+  (let* ((tool (alist-get (gethash "name" params) (neomacs-mcp--available-tools)
+                          nil nil #'equal))
          (arguments (gethash "arguments" params (neomacs-mcp--object))))
     (unless tool (neomacs-mcp--fail -32602 "Unknown tool"))
     (neomacs-mcp--arguments (plist-get tool :schema) arguments)
@@ -191,7 +209,8 @@ Return a bounded printed value; effects are not rolled back on failure."
     (unless (equal version neomacs-mcp--modern)
       (neomacs-mcp--fail -32022 "Unsupported protocol version"
                          (neomacs-mcp--object
-                          "supported" (vector neomacs-mcp--modern neomacs-mcp--legacy)
+                          "supported" (vconcat (list neomacs-mcp--modern)
+                                              neomacs-mcp--legacy-versions)
                           "requested" version)))
     t))
 
@@ -212,15 +231,20 @@ Return a bounded printed value; effects are not rolled back on failure."
                       (neomacs-mcp--modern-p params))))
     (pcase method
       ("initialize"
-       (unless (and (equal (gethash "protocolVersion" params) neomacs-mcp--legacy)
-                    (hash-table-p (gethash "capabilities" params))
-                    (hash-table-p (gethash "clientInfo" params))
-                    (not (process-get peer 'legacy)))
-         (neomacs-mcp--fail -32602 "Expected fresh 2025-11-25 initialization"))
-       (process-put peer 'legacy 'initializing)
-       (neomacs-mcp--object "protocolVersion" neomacs-mcp--legacy
-                            "capabilities" (neomacs-mcp--object "tools" (neomacs-mcp--object))
-                            "serverInfo" (neomacs-mcp--object "name" "Neomacs" "version" "1")))
+       (let ((version (gethash "protocolVersion" params)))
+         (unless (and (stringp version) (> (length version) 0)
+                      (hash-table-p (gethash "capabilities" params))
+                      (hash-table-p (gethash "clientInfo" params))
+                      (not (process-get peer 'legacy)))
+           (neomacs-mcp--fail -32602 "Expected fresh legacy initialization"))
+         (process-put peer 'legacy 'initializing)
+         ;; Echo supported offers; otherwise propose the newest handshake era.
+         ;; Stateless modern requests never negotiate through initialize.
+         (neomacs-mcp--object
+          "protocolVersion" (if (member version neomacs-mcp--legacy-versions)
+                                version neomacs-mcp--legacy)
+          "capabilities" (neomacs-mcp--object "tools" (neomacs-mcp--object))
+          "serverInfo" (neomacs-mcp--object "name" "Neomacs" "version" "1"))))
       ("notifications/initialized"
        (unless (eq (process-get peer 'legacy) 'initializing)
          (neomacs-mcp--fail -32600 "Unexpected initialized notification"))
@@ -234,7 +258,8 @@ Return a bounded printed value; effects are not rolled back on failure."
          ("server/discover"
           (unless modern (neomacs-mcp--fail -32601 "Method not found"))
           (neomacs-mcp--object
-           "resultType" "complete" "supportedVersions" (vector neomacs-mcp--modern neomacs-mcp--legacy)
+           "resultType" "complete" "supportedVersions"
+           (vconcat (list neomacs-mcp--modern) neomacs-mcp--legacy-versions)
            "capabilities" (neomacs-mcp--object "tools" (neomacs-mcp--object))
            "_meta" (neomacs-mcp--object "io.modelcontextprotocol/serverInfo"
                                        (neomacs-mcp--object "name" "Neomacs" "version" "1"))
@@ -269,29 +294,47 @@ Return a bounded printed value; effects are not rolled back on failure."
   "Retire PEER when its native transport closes; ignore EVENT."
   (unless (process-live-p peer) (neomacs-mcp--close peer)))
 
+(defun neomacs-mcp--wire (response)
+  "Return RESPONSE as one line of JSON.
+If RESPONSE cannot be encoded, for example because it contains raw
+bytes, or exceeds the output limit, return an error for its ID instead."
+  (let* ((json (condition-case nil
+                   (json-serialize response :false-object :false :null-object :null)
+                 (error nil)))
+         (message (cond ((null json) "Response cannot be encoded as JSON")
+                        ((>= (string-bytes json) neomacs-mcp--output-limit)
+                         "Response exceeds the output limit"))))
+    (concat (if message
+                (json-serialize
+                 (neomacs-mcp--object
+                  "jsonrpc" "2.0" "id" (gethash "id" response :null)
+                  "error" (neomacs-mcp--object "code" -32603 "message" message)))
+              json)
+            "\n")))
+
 (defun neomacs-mcp--send (request response)
   "Bound serialization and sending RESPONSE for the exact REQUEST lifetime.
-Normal send return is not delivery acknowledgement.  Close an unread peer."
+A response that cannot be encoded or exceeds the output limit is replaced
+by an error for the same request.  Normal send return is not delivery
+acknowledgement.  Close an unread peer."
   (let* ((peer (plist-get request :peer))
          (generation (plist-get request :generation))
-         (wire (concat (json-serialize response :false-object :false :null-object :null) "\n")))
+         (wire (neomacs-mcp--wire response)))
     (when (and (not (plist-get request :cancelled)) (neomacs-mcp--live-p peer generation))
-      (if (> (string-bytes wire) neomacs-mcp--output-limit)
-          (neomacs-mcp--close peer)
-        (let ((timer (run-at-time
-                      neomacs-mcp-send-timeout nil
-                      (lambda ()
-                        (when (neomacs-mcp--live-p peer generation)
-                          (neomacs-mcp--close peer))))))
-          (process-put peer 'send-timer timer)
-          (unwind-protect
-              (condition-case nil
-                  (progn (process-send-string peer wire)
-                         (neomacs-mcp--live-p peer generation))
-                (error (neomacs-mcp--close peer)))
-            (cancel-timer timer)
-            (when (eq timer (process-get peer 'send-timer))
-              (process-put peer 'send-timer nil))))))))
+      (let ((timer (run-at-time
+                    neomacs-mcp-send-timeout nil
+                    (lambda ()
+                      (when (neomacs-mcp--live-p peer generation)
+                        (neomacs-mcp--close peer))))))
+        (process-put peer 'send-timer timer)
+        (unwind-protect
+            (condition-case nil
+                (progn (process-send-string peer wire)
+                       (neomacs-mcp--live-p peer generation))
+              (error (neomacs-mcp--close peer)))
+          (cancel-timer timer)
+          (when (eq timer (process-get peer 'send-timer))
+            (process-put peer 'send-timer nil)))))))
 
 (defun neomacs-mcp--schedule ()
   "Schedule a bounded drain unless another drain owns admission."
