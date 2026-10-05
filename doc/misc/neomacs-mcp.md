@@ -48,6 +48,8 @@ limits list depth/length; a printed value exceeding 65536 bytes fails **after**
 evaluation. Arbitrary code can change the editor, load other libraries, perform
 I/O, enter a minibuffer, or exit the process. Such effects are not rolled back.
 Use this tool deliberately; it does not promise to preserve the study window.
+Setting `neomacs-mcp-full-access` to nil (default t) hides `neomacs_eval` from
+`tools/list` and refuses calls to it; other tools are unaffected.
 
 The optional tools operate only on uniquely claimed, undisplayed non-file
 companion buffers. They do not adopt a namesake, visit learner files, select a
@@ -194,8 +196,10 @@ cancellation from being observed until it yields or returns.
 
 There are at most eight peers, 64 queued requests globally, and 16 queued
 requests/frames per peer/filter turn. Input accumulation and individual output
-are limited to 131072 bytes. Saturation closes the offending connection;
-responses are rejected after serialization, not by a memory-isolated evaluator.
+are limited to 131072 bytes. Saturation closes the offending connection. A
+response that exceeds the limit or cannot be encoded as JSON (for example raw
+bytes) is replaced by a `-32603` error for the same request after
+serialization, not by a memory-isolated evaluator; the connection stays open.
 A peer with an incomplete frame remains subject to the finite peer/input caps;
 there is no inactivity timer. Close unused clients rather than treating a long
 idle connection as an editor session lease.

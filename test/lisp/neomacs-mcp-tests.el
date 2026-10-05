@@ -210,6 +210,7 @@
 ;; Keep the established public ERT entry point inclusive of optional reads.
 (require 'neomacs-mcp-responsive-tests)
 (require 'neomacs-mcp-negotiation-tests)
+(require 'neomacs-mcp-reply-tests)
 
 (provide 'neomacs-mcp-tests)
 ;;; neomacs-mcp-tests.el ends here
