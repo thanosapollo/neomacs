@@ -356,7 +356,9 @@ impl Context {
                 }
                 let error_msg = self.command_error_message(&sig);
                 let data = self.signal_error_data_value(&sig);
-                self.report_command_error(data, "")?;
+                // GNU `top_level_1' reports through the same `cmd_error'.
+                self.report_command_error(data, "")
+                    .map_err(|failure| self.command_error_report_failure(failure))?;
                 // GNU cmd_error, not the shared cmd_error_internal reporter,
                 // releases reporting inhibition only after normal return.
                 self.set_quit_flag_value(Value::NIL);
@@ -496,7 +498,10 @@ impl Context {
                     self.cancel_key_echo_state();
 
                     let data = self.signal_error_data_value(&sig);
-                    self.report_command_error(data, "")?;
+                    if let Err(failure) = self.report_command_error(data, "") {
+                        diagnostic.emit();
+                        return Err(self.command_error_report_failure(failure));
+                    }
                     // GNU cmd_error, not the shared cmd_error_internal reporter,
                     // releases reporting inhibition only after normal return.
                     self.set_quit_flag_value(Value::NIL);
@@ -514,6 +519,25 @@ impl Context {
                 }
             }
         }
+    }
+
+    /// Reroute a signal raised while presenting a command error.
+    ///
+    /// GNU `cmd_error' runs after the condition-case of `command_loop_2' (or
+    /// `top_level_1') has unwound, so a signal from `command-error-function'
+    /// finds no handler and `signal_or_quit' throws to `top-level' (eval.c),
+    /// which `command_loop' catches and restarts.  Propagating the signal instead would end the
+    /// outermost command loop and with it the session.  Throws, shutdowns and
+    /// thread handoffs keep their own meaning.
+    pub(super) fn command_error_report_failure(&self, failure: Flow) -> Flow {
+        let Some(sig) = failure.as_signal() else {
+            return failure;
+        };
+        tracing::warn!(
+            signal = %super::super::error::format_signal_data_with_eval(self, sig),
+            "Reporting a command error signaled; returning to top level"
+        );
+        Flow::throw(Value::symbol("top-level"), Value::T)
     }
 
     /// Render a signal for diagnostics without choosing a presentation path.
