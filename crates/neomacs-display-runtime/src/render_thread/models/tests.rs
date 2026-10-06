@@ -139,18 +139,14 @@ pub(super) fn hit() -> GlyphHit {
     }
 }
 
-/// A frame of window `window` carrying the model glyph, presented with
-/// the model composited (a full render that drew it).
+/// Window `window` fully renders a frame whose glyph passes composite the
+/// model (as `render_pass` reports a full composition).
 pub(super) fn present(app: &mut RenderApp, window: u64) {
-    let mut frame = crate::core::frame_glyphs::FrameGlyphBuffer::with_size(800.0, 600.0);
-    frame.add_surface(
-        neomacs_display_protocol::SurfaceId::new(MODEL),
-        40.0,
-        20.0,
-        64.0,
-        32.0,
+    let picture = super::picture_of(
+        Some(std::collections::HashSet::from([MODEL])),
+        &app.model_picture(),
     );
-    app.note_models_composited(window, &std::collections::HashSet::from([MODEL]), &frame);
+    app.note_models_presented(window, &picture);
 }
 
 fn yaw(yaw: f64) -> ModelChange {
@@ -252,4 +248,142 @@ fn hiding_or_iconifying_a_frame_leaves_until_shown_and_presented() {
         });
         present(&mut app, B);
     }
+}
+
+// ----------------------------------------------------------------------
+// Review MUST 5/6: the presented picture, root and child, full and
+// retained, decides membership and pick provenance.
+
+/// A compositor-only frame of `window` through the retained-static
+/// strategy, with the bookkeeping `retained_static::draw` does: rebuild
+/// the retained raster when stale (the build composites `scene`, root and
+/// child), blit it, run a filled-box cursor mini-pass compositing
+/// `overlay`, and present. Answers whether the raster was rebuilt.
+fn present_retained(
+    app: &mut RenderApp,
+    window: u64,
+    retained: &mut Option<super::ModelPicture>,
+    scene: &[u32],
+    overlay: &[u32],
+) -> bool {
+    use crate::render_thread::render_pass::retained_static::{
+        retained_frame_picture, retained_scene_is_current,
+    };
+    let current = app.model_picture();
+    let size = neomacs_renderer_wgpu::SnapshotSize::new(800, 600).unwrap();
+    // No editor scene change between these frames: one generation.
+    let rebuild = !retained
+        .as_ref()
+        .is_some_and(|built| retained_scene_is_current((1, size, built), (1, size, &current)));
+    if rebuild {
+        *retained = Some(super::picture_of(
+            Some(scene.iter().copied().collect()),
+            &current,
+        ));
+    }
+    let picture = retained_frame_picture(
+        retained.as_ref(),
+        super::picture_of(Some(overlay.iter().copied().collect()), &current),
+    );
+    app.note_models_presented(window, &picture);
+    rebuild
+}
+
+/// A retained scene holding a child frame's model keeps showing it across
+/// a cursor-only frame whose filled-box overlay redraws no model.
+#[test]
+fn a_cursor_overlay_keeps_an_unchanged_retained_child_model() {
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    let mut retained = None;
+    // The child frame's model is composited into the retained raster.
+    assert!(present_retained(&mut app, A, &mut retained, &[MODEL], &[]));
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+    assert!(!present_retained(&mut app, A, &mut retained, &[MODEL], &[]));
+    assert!(
+        delivered(&emacs).is_empty(),
+        "the retained child model is still on screen"
+    );
+}
+
+/// Two windows: A shows the model in a retained child frame, B in its
+/// root. After a Lisp change only B fully renders; A's next frame is
+/// cursor-only. A's raster pictures the old camera, so it is rebuilt and
+/// A presents the new revision; A then still counts, so a later revision
+/// B presents alone does not raise the fence.
+#[test]
+fn two_windows_a_retained_child_member_still_counts_for_readiness() {
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    let mut retained = None;
+    present_retained(&mut app, A, &mut retained, &[MODEL], &[]);
+    present(&mut app, B);
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+    update(&mut app, &mut host, 1, yaw(30.0));
+    app.models.render_dirty(&mut host);
+    present(&mut app, B);
+    assert_eq!(delivered(&emacs), ["R{false,2,1}"], "A still pictures rev 1");
+    assert!(
+        present_retained(&mut app, A, &mut retained, &[MODEL], &[]),
+        "A's raster pictures the old camera"
+    );
+    assert_eq!(delivered(&emacs), ["R{true,2,1}"]);
+    update(&mut app, &mut host, 2, yaw(60.0));
+    app.models.render_dirty(&mut host);
+    present(&mut app, B);
+    assert_eq!(delivered(&emacs), ["R{false,3,2}"], "A still counts");
+    present_retained(&mut app, A, &mut retained, &[MODEL], &[]);
+    assert_eq!(delivered(&emacs), ["R{true,3,2}"]);
+}
+
+/// A full frame whose model glyph is fully clipped composites nothing of
+/// it: the window leaves even though the frame still carries the glyph.
+#[test]
+fn a_full_frame_with_the_model_fully_clipped_leaves() {
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    present(&mut app, A);
+    present(&mut app, B);
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+    app.note_models_presented(A, &super::ModelPicture::new());
+    assert!(delivered(&emacs).is_empty(), "B still shows it");
+    app.note_models_presented(B, &super::ModelPicture::new());
+    assert_eq!(delivered(&emacs), ["R{false,1,0}"]);
+}
+
+/// Review MUST 5: a Lisp change, a full presentation, then a cursor-only
+/// frame in the same native window with no redisplay in between. The
+/// retained raster built before the change must not come back, and a
+/// click picks the camera on screen.
+#[test]
+fn a_cursor_frame_after_a_model_change_shows_and_picks_the_new_camera() {
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    let mut retained = None;
+    assert!(present_retained(&mut app, A, &mut retained, &[MODEL], &[]));
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+    let before = app.models.rendered(MODEL).unwrap();
+
+    update(&mut app, &mut host, 1, yaw(30.0));
+    app.models.render_dirty(&mut host);
+    present(&mut app, A);
+    assert_eq!(delivered(&emacs), ["R{false,2,1}", "R{true,2,1}"]);
+
+    // A cursor blink: compositor-only, same generation and size.
+    assert!(
+        present_retained(&mut app, A, &mut retained, &[MODEL], &[]),
+        "the raster from before the change was blitted again"
+    );
+    assert!(delivered(&emacs).is_empty(), "A still shows rev 2");
+    assert_eq!(retained.as_ref().unwrap()[&MODEL].view.yaw, 30.0);
+
+    assert!(app.models.press(A, hit(), (10.0, 10.0)));
+    app.models.release(A, Some(hit()), Instant::now(), &mut host);
+    let pick = host.picks.last().expect("a click picks");
+    assert_eq!(pick.view.yaw, 30.0);
+    assert_ne!(pick.view, before.view);
 }

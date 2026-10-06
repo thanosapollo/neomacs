@@ -53,6 +53,9 @@ impl RenderApp {
         };
 
         let is_primary_frame = self.frame_windows.is_primary_frame_id(emacs_frame_id);
+        // Dirty models were drawn above; this is what their textures show
+        // while this frame composites them.
+        let model_picture = self.model_picture();
         let Some(renderer) = self.renderer.as_mut() else {
             return SubmissionResult::Timeout;
         };
@@ -95,11 +98,13 @@ impl RenderApp {
             compositor_only_hint,
             &self.render_policy,
             &mut self.device_lost,
+            &model_picture,
         );
         let RenderedFrameSurface {
             output,
             frame,
             projection,
+            models,
         } = match rendered {
             Ok(rendered) => rendered,
             Err(failure) => {
@@ -204,7 +209,7 @@ impl RenderApp {
         #[cfg(feature = "video")]
         renderer.finish_submitted_video_surface();
         frame_stats::note_submission(neomacs_display_protocol::frame_time::observe_platform_now());
-        self.note_models_presented(emacs_frame_id, &frame);
+        self.note_models_presented(emacs_frame_id, &models);
 
         if !child_frame_ids.is_empty() || !removed_child_frame_ids.is_empty() {
             tracing::debug!(

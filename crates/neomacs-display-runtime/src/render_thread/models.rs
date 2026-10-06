@@ -9,7 +9,6 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use neomacs_display_protocol::FrameGlyph;
 use neomacs_renderer_wgpu::model::store::ModelGpuHost;
 
 use super::RenderApp;
@@ -17,6 +16,16 @@ use super::RenderApp;
 /// The models a picture holds, each with the snapshot its pixels show.
 pub(super) type ModelPicture =
     std::collections::BTreeMap<u32, neomacs_renderer_wgpu::model::store::Snapshot>;
+
+/// The models among the composited surfaces `drawn`, each at the snapshot
+/// `current` says its texture shows (other surfaces are not models).
+pub(super) fn picture_of(drawn: Option<HashSet<u32>>, current: &ModelPicture) -> ModelPicture {
+    drawn
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|id| Some((id, *current.get(&id)?)))
+        .collect()
+}
 
 impl RenderApp {
     fn model_host(&mut self) -> Option<&mut dyn ModelGpuHost> {
@@ -74,42 +83,19 @@ impl RenderApp {
         self.flush_model_events();
     }
 
-    /// Top-level window `emacs_frame_id` presented `frame`: update the
-    /// showing sets from what the composite drew.
-    pub(super) fn note_models_presented(
-        &mut self,
-        emacs_frame_id: u64,
-        frame: &crate::core::frame_glyphs::FrameGlyphBuffer,
-    ) {
-        let Some(drawn) = self
-            .renderer
-            .as_mut()
-            .and_then(|renderer| renderer.take_drawn_surfaces())
-        else {
-            return;
-        };
-        self.note_models_composited(emacs_frame_id, &drawn, frame);
+    /// What every model's texture shows now: taken once a frame has drawn
+    /// its dirty models and before it composites them.
+    pub(super) fn model_picture(&self) -> ModelPicture {
+        self.models.rendered_snapshots()
     }
 
-    /// The composite of `frame` in window `emacs_frame_id` drew `drawn`.
-    pub(super) fn note_models_composited(
-        &mut self,
-        emacs_frame_id: u64,
-        drawn: &HashSet<u32>,
-        frame: &crate::core::frame_glyphs::FrameGlyphBuffer,
-    ) {
+    /// Top-level window `emacs_frame_id` presented a frame whose whole
+    /// picture (root and child frames, fresh or retained) holds `picture`.
+    pub(super) fn note_models_presented(&mut self, emacs_frame_id: u64, picture: &ModelPicture) {
         if self.models.is_empty() {
             return;
         }
-        let in_frame: HashSet<u32> = frame
-            .glyphs
-            .iter()
-            .filter_map(|glyph| match glyph {
-                FrameGlyph::Surface { surface_id, .. } => Some(surface_id.get()),
-                _ => None,
-            })
-            .collect();
-        self.models.presented(emacs_frame_id, drawn, &in_frame);
+        self.models.presented(emacs_frame_id, picture);
         self.flush_model_events();
     }
 

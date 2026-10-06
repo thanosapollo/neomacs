@@ -616,12 +616,30 @@ impl ModelStore {
         }
     }
 
-    /// `window` presented a frame. `drawn` are the surfaces composited in it
-    /// (root and child frames); `in_frame` the surface glyphs it carries.
-    /// A model drawn joins (or stays) at the rev its texture showed; one in
-    /// the frame but not composited (fully clipped, or a retained frame)
-    /// keeps its entry; one absent leaves.
-    pub fn presented(&mut self, window: WindowKey, drawn: &HashSet<u32>, in_frame: &HashSet<u32>) {
+    /// What model `id`'s texture shows now, if it can be composited.
+    pub fn rendered(&self, id: u32) -> Option<Snapshot> {
+        self.entries
+            .get(&id)
+            .filter(|e| e.status == ModelStatus::Ready && e.uploaded)
+            .and_then(|e| e.rendered)
+    }
+
+    /// [`Self::rendered`] for every model that has one: what a composite
+    /// drawing now would picture of each.
+    pub fn rendered_snapshots(&self) -> BTreeMap<u32, Snapshot> {
+        self.entries
+            .keys()
+            .filter_map(|id| Some((*id, self.rendered(*id)?)))
+            .collect()
+    }
+
+    /// `window` presented a frame whose whole picture (root and child
+    /// frames, freshly composited or retained) holds exactly the models in
+    /// `shown`, each at the snapshot its pixels came from. Those join (or
+    /// stay) at that snapshot's rev, which is also what a click there
+    /// picks; every other model leaves, including one whose glyph the
+    /// frame carries fully clipped.
+    pub fn presented(&mut self, window: WindowKey, shown: &BTreeMap<u32, Snapshot>) {
         if self.hidden.contains(&window) {
             return;
         }
@@ -631,14 +649,15 @@ impl ModelStore {
             if entry.status != ModelStatus::Ready {
                 continue;
             }
-            if drawn.contains(&id) {
-                if let Some(snapshot) = entry.rendered {
+            match shown.get(&id) {
+                Some(snapshot) => {
                     entry.readiness.presented(window, snapshot.rev);
-                    entry.presented.insert(window, snapshot);
+                    entry.presented.insert(window, *snapshot);
                 }
-            } else if !in_frame.contains(&id) {
-                entry.readiness.left(window);
-                entry.presented.remove(&window);
+                None => {
+                    entry.readiness.left(window);
+                    entry.presented.remove(&window);
+                }
             }
             self.evaluate(id);
         }
