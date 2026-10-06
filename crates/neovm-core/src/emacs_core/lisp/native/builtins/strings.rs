@@ -1333,8 +1333,8 @@ fn format_string_overflow_error() -> Flow {
 }
 
 /// GNU `styled_format`'s `max_bufsize`, `STRING_BYTES_BOUND + 1`: a field
-/// width or a conversion this many bytes long signals
-/// "Maximum string size exceeded".
+/// width, or a result with the field just converted, this many bytes long
+/// signals "Maximum string size exceeded".
 const FORMAT_MAX_BUFSIZE: usize = 1 << 61;
 
 /// GNU `styled_format`'s `USEFUL_PRECISION_MAX`: no float digit past this
@@ -1343,12 +1343,85 @@ const FORMAT_MAX_BUFSIZE: usize = 1 << 61;
 /// above `u16::MAX`).
 const USEFUL_PRECISION_MAX: usize = 1074;
 
-/// An empty String able to hold CAPACITY bytes, or GNU's `memory_full`.
-fn format_try_string(capacity: usize) -> Result<String, Flow> {
-    let mut s = String::new();
-    s.try_reserve_exact(capacity)
-        .map_err(|_| crate::emacs_core::alloc::memory_full())?;
-    Ok(s)
+/// One conversion's output, laid out as GNU `styled_format` assembles it
+/// (editfns.c:4145-4158): LEADING_SPACES spaces, HEAD (a sign and radix
+/// prefix), LEADING_ZEROS zeros, MID, TRAILING_ZEROS zeros, TAIL (an
+/// exponent), TRAILING_SPACES spaces.  The padding and the excess-precision
+/// zeros are sized by the user, so they are only counted here: `do_format`
+/// checks the whole field against `max_bufsize`, reserves it in the result,
+/// and writes them there.
+#[derive(Default)]
+struct FormatField {
+    leading_spaces: usize,
+    head: Vec<u8>,
+    leading_zeros: usize,
+    mid: Vec<u8>,
+    trailing_zeros: usize,
+    tail: Vec<u8>,
+    trailing_spaces: usize,
+}
+
+impl FormatField {
+    /// A field of MID alone.
+    fn text(mid: Vec<u8>) -> Self {
+        Self {
+            mid,
+            ..Self::default()
+        }
+    }
+
+    /// The field's length in bytes, or `None` past `usize::MAX`.
+    fn len(&self) -> Option<usize> {
+        [
+            self.leading_spaces,
+            self.head.len(),
+            self.leading_zeros,
+            self.mid.len(),
+            self.trailing_zeros,
+            self.tail.len(),
+            self.trailing_spaces,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+    }
+
+    /// The field's length in characters; the padding and zeros are ASCII.
+    fn chars(&self) -> usize {
+        self.leading_spaces
+            + emacs_chars_count(&self.head)
+            + self.leading_zeros
+            + emacs_chars_count(&self.mid)
+            + self.trailing_zeros
+            + emacs_chars_count(&self.tail)
+            + self.trailing_spaces
+    }
+
+    /// Append the field to OUT, which has room for it.
+    fn write_to(&self, out: &mut Vec<u8>) {
+        out.resize(out.len() + self.leading_spaces, b' ');
+        out.extend_from_slice(&self.head);
+        out.resize(out.len() + self.leading_zeros, b'0');
+        out.extend_from_slice(&self.mid);
+        out.resize(out.len() + self.trailing_zeros, b'0');
+        out.extend_from_slice(&self.tail);
+        out.resize(out.len() + self.trailing_spaces, b' ');
+    }
+
+    /// Pad the field, WIDTH columns so far, to the spec's width: spaces
+    /// after it for `-`, zeros after HEAD when ZERO_PAD, else spaces before.
+    fn pad(&mut self, width: usize, spec: &FormatSpec, zero_pad: bool) {
+        let padding = match spec.width {
+            Some(w) if w > width => w - width,
+            _ => return,
+        };
+        if spec.minus {
+            self.trailing_spaces = padding;
+        } else if zero_pad {
+            self.leading_zeros += padding;
+        } else {
+            self.leading_spaces = padding;
+        }
+    }
 }
 
 /// Parse a format spec from the format string's Emacs character codes, with
@@ -1471,48 +1544,24 @@ fn parse_format_spec(bytes: &[u8], pos: &mut usize) -> Result<ParsedFormatSpec, 
     })
 }
 
-/// Apply width/alignment padding to a formatted string.  Pads by hand:
-/// Rust's formatter refuses a width above `u16::MAX`.
-fn apply_width(s: String, spec: &FormatSpec) -> String {
-    let len = s.chars().count();
-    let padding = match spec.width {
-        Some(w) if w > len => w - len,
-        _ => return s,
+/// Lay out the formatted number S, with EXCESS zeros before any exponent,
+/// padded to the spec's width; zero padding goes after a sign.
+fn number_field(s: String, excess: usize, spec: &FormatSpec) -> FormatField {
+    let sign_len = usize::from(s.starts_with(['-', '+']));
+    let mark = s.find(['e', 'E']).unwrap_or(s.len());
+    let mut head = s.into_bytes();
+    let tail = head.split_off(mark);
+    let mid = head.split_off(sign_len);
+    let width = (head.len() + mid.len() + tail.len()).saturating_add(excess);
+    let mut field = FormatField {
+        head,
+        mid,
+        trailing_zeros: excess,
+        tail,
+        ..FormatField::default()
     };
-    let mut out = String::with_capacity(s.len() + padding);
-    if spec.minus {
-        out.push_str(&s);
-        out.extend(std::iter::repeat_n(' ', padding));
-    } else if spec.zero {
-        // For zero-padding, the zeros go after any sign
-        let sign_len = usize::from(s.starts_with(['-', '+']));
-        out.push_str(&s[..sign_len]);
-        out.extend(std::iter::repeat_n('0', padding));
-        out.push_str(&s[sign_len..]);
-    } else {
-        out.extend(std::iter::repeat_n(' ', padding));
-        out.push_str(&s);
-    }
-    out
-}
-
-fn apply_integer_width(sign: &str, prefix: &str, digits: &str, spec: &FormatSpec) -> String {
-    let content_len = sign.len() + prefix.len() + digits.len();
-    let width = spec.width.unwrap_or(0);
-    if width <= content_len {
-        return format!("{sign}{prefix}{digits}");
-    }
-
-    let padding = width - content_len;
-    if spec.minus {
-        return format!("{sign}{prefix}{digits}{}", " ".repeat(padding));
-    }
-
-    if spec.zero && spec.precision.is_none() {
-        return format!("{sign}{prefix}{}{digits}", "0".repeat(padding));
-    }
-
-    format!("{}{sign}{prefix}{digits}", " ".repeat(padding))
+    field.pad(width, spec, spec.zero);
+    field
 }
 
 fn format_integer_digits(
@@ -1520,7 +1569,7 @@ fn format_integer_digits(
     negative: bool,
     zero_value: bool,
     spec: &FormatSpec,
-) -> Result<String, Flow> {
+) -> FormatField {
     if spec.precision == Some(0) && zero_value {
         digits.clear();
     }
@@ -1547,29 +1596,29 @@ fn format_integer_digits(
         digits.push('0');
     }
 
+    // GNU adds excess precision as leading zeros.
+    let mut zeros = 0;
     if let Some(precision) = spec.precision {
         let desired = if spec.conversion == 'o' && spec.sharp && !digits.starts_with('0') {
             precision.max(digits.len() + 1)
         } else {
             precision
         };
-        if digits.len() < desired {
-            // GNU adds excess precision as leading zeros, and signals
-            // string_overflow for a conversion no string can hold.
-            let zeros = desired - digits.len();
-            if FORMAT_MAX_BUFSIZE - (sign.len() + prefix.len() + digits.len()) <= zeros {
-                return Err(format_string_overflow_error());
-            }
-            let mut padded = format_try_string(desired)?;
-            padded.extend(std::iter::repeat_n('0', zeros));
-            padded.push_str(&digits);
-            digits = padded;
-        }
+        zeros = desired.saturating_sub(digits.len());
     } else if spec.conversion == 'o' && spec.sharp && !digits.starts_with('0') {
-        digits = format!("0{digits}");
+        digits.insert(0, '0');
     }
 
-    Ok(apply_integer_width(sign, prefix, &digits, spec))
+    let head = format!("{sign}{prefix}").into_bytes();
+    let width = (head.len() + digits.len()).saturating_add(zeros);
+    let mut field = FormatField {
+        head,
+        leading_zeros: zeros,
+        mid: digits.into_bytes(),
+        ..FormatField::default()
+    };
+    field.pad(width, spec, spec.zero && spec.precision.is_none());
+    field
 }
 
 /// Render `n` as plain decimal digits appended to `out`, with no heap
@@ -1596,11 +1645,11 @@ fn push_i64_decimal(out: &mut Vec<u8>, n: i64) {
 }
 
 /// Format an integer with the given spec.
-fn format_int_spec(n: i64, spec: &FormatSpec) -> Result<String, Flow> {
+fn format_int_spec(n: i64, spec: &FormatSpec) -> FormatField {
     // Fast path for a plain `%d`/`%i`: one backward stack-buffer digit
     // pass and one allocation. The general path below runs 128-bit
-    // `core::fmt` digit rendering plus two more String-building passes
-    // (`format_integer_digits` → `apply_integer_width`) — several hundred
+    // `core::fmt` digit rendering plus more String building in
+    // `format_integer_digits` — several hundred
     // Ir per conversion, all avoidable when no flag/width/precision is set.
     if matches!(spec.conversion, 'd' | 'i')
         && spec.width.is_none()
@@ -1627,8 +1676,7 @@ fn format_int_spec(n: i64, spec: &FormatSpec) -> Result<String, Flow> {
             pos -= 1;
             buf[pos] = b'-';
         }
-        // Digits and '-' only — always valid UTF-8.
-        return Ok(unsafe { std::str::from_utf8_unchecked(&buf[pos..]) }.to_owned());
+        return FormatField::text(buf[pos..].to_vec());
     }
     let negative = n < 0;
     let abs_val = (n as i128).unsigned_abs();
@@ -1646,7 +1694,7 @@ fn format_int_spec(n: i64, spec: &FormatSpec) -> Result<String, Flow> {
 /// `format_int_spec` fixnum path but uses `malachite::Integer`'s
 /// `ToStringBase` trait for the underlying numeric conversion. The
 /// flag/width/precision handling is identical.
-fn format_bignum_spec(n: &Integer, spec: &FormatSpec) -> Result<String, Flow> {
+fn format_bignum_spec(n: &Integer, spec: &FormatSpec) -> FormatField {
     let negative = *n < 0;
     let abs = n.clone().abs();
     let mut digits = match spec.conversion {
@@ -1661,7 +1709,7 @@ fn format_bignum_spec(n: &Integer, spec: &FormatSpec) -> Result<String, Flow> {
     format_integer_digits(digits, negative, *n == Integer::ZERO, spec)
 }
 
-fn format_integer_float_spec(f: f64, spec: &FormatSpec) -> Result<String, Flow> {
+fn format_integer_float_spec(f: f64, spec: &FormatSpec) -> Result<FormatField, Flow> {
     if !f.is_finite() && matches!(spec.conversion, 'd' | 'i') {
         let text = if f.is_nan() {
             "nan"
@@ -1670,11 +1718,11 @@ fn format_integer_float_spec(f: f64, spec: &FormatSpec) -> Result<String, Flow> 
         } else {
             "inf"
         };
-        return Ok(apply_width(text.to_string(), spec));
+        return Ok(number_field(text.to_string(), 0, spec));
     }
 
     let big = Integer::rounding_from(f.trunc(), RoundingMode::Down).0;
-    format_bignum_spec(&big, spec)
+    Ok(format_bignum_spec(&big, spec))
 }
 
 /// Normalize Rust scientific notation to match C printf: sign always
@@ -1709,7 +1757,7 @@ fn ensure_float_alternate_decimal(mut s: String) -> String {
 }
 
 /// Format a float with the given spec.
-fn format_float_spec(f: f64, spec: &FormatSpec) -> Result<String, Flow> {
+fn format_float_spec(f: f64, spec: &FormatSpec) -> FormatField {
     // C printf spells non-finite values nan/inf (NAN/INF for the uppercase
     // conversions), with the sign bit preserved (e.g. 0.0/0.0 -> "-nan").
     if !f.is_finite() {
@@ -1722,7 +1770,7 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> Result<String, Flow> {
             "inf"
         };
         let sign = if f.is_sign_negative() { "-" } else { "" };
-        return Ok(apply_width(format!("{sign}{body}"), spec));
+        return number_field(format!("{sign}{body}"), 0, spec);
     }
     let precision = spec.precision.unwrap_or(6);
     // Like GNU, print at most USEFUL_PRECISION_MAX digits; the excess
@@ -1808,49 +1856,28 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> Result<String, Flow> {
     };
     // GNU `styled_format': the excess precision becomes zeros after the last
     // digit before any exponent -- for %g only with `#', whose trailing
-    // zeros are kept -- and a conversion that would reach max_bufsize bytes
-    // signals string_overflow before anything is allocated.
+    // zeros are kept.
     let excess = if matches!(spec.conversion, 'g' | 'G') && !(alternate && s.contains('.')) {
         0
     } else {
         precision - prec
     };
-    if excess == 0 {
-        return Ok(apply_width(s, spec));
-    }
-    if FORMAT_MAX_BUFSIZE - s.len() <= excess {
-        return Err(format_string_overflow_error());
-    }
-    let mark = s.find(['e', 'E']).unwrap_or(s.len());
-    let mut out = format_try_string(s.len() + excess)?;
-    out.push_str(&s[..mark]);
-    out.extend(std::iter::repeat_n('0', excess));
-    out.push_str(&s[mark..]);
-    Ok(apply_width(out, spec))
+    number_field(s, excess, spec)
 }
 
 /// Format a string (%s) with width and precision.
-fn format_string_spec(data: &[u8], is_multibyte: bool, spec: &FormatSpec) -> Vec<u8> {
-    format_string_spec_tracked(data, is_multibyte, spec).0
-}
-
-/// Like `format_string_spec` but also returns the byte range in the output bytes
-/// that corresponds to the source argument's content (excluding padding spaces
-/// added for width alignment). Used by `do_format` to track where each `%s`
-/// argument lands so text properties can be copied from the argument to the
-/// result. Mirrors the `info[i].start` / `info[i].end` tracking in GNU's
-/// `styled_format` (editfns.c:3651-3806).
+///
+/// The field's MID is the argument's content and its spaces are the
+/// padding, so `do_format` can tell where the argument lands and copy text
+/// properties from it to the result. Mirrors the `info[i].start` /
+/// `info[i].end` tracking in GNU's `styled_format` (editfns.c:3651-3806).
 ///
 /// Issue #131: `data` is the argument's Emacs internal-encoding bytes, measured
 /// with its own `is_multibyte` flag (a unibyte raw byte is one column, a
 /// multibyte eight-bit char is four, matching GNU). The returned content is
 /// canonical multibyte (unibyte content promoted), so the caller can splice it
 /// into the byte result; padding is always ASCII spaces.
-fn format_string_spec_tracked(
-    data: &[u8],
-    is_multibyte: bool,
-    spec: &FormatSpec,
-) -> (Vec<u8>, usize, usize) {
+fn format_string_spec(data: &[u8], is_multibyte: bool, spec: &FormatSpec) -> FormatField {
     let mut content_width = 0usize;
     let mut truncated_end = data.len();
     let mut saw_limit = spec.precision.is_none();
@@ -1882,27 +1909,12 @@ fn format_string_spec_tracked(
     } else {
         crate::emacs_core::emacs_char::str_to_multibyte(truncated)
     };
-    let content_bytes = content.len();
     if spec.width.is_none() && spec.precision.is_none() {
         content_width = emacs_chars_count(&content);
     }
-    let w = match spec.width {
-        Some(w) if w > content_width => w,
-        _ => return (content, 0, content_bytes),
-    };
-    let pad_chars = w - content_width;
-    // Padding is always ASCII spaces. Each padding char is one byte.
-    if spec.minus {
-        // Left-aligned: content first, then padding.
-        let mut padded = content;
-        padded.resize(content_bytes + pad_chars, b' ');
-        (padded, 0, content_bytes)
-    } else {
-        // Right-aligned (default): padding first, then content.
-        let mut padded = vec![b' '; pad_chars];
-        padded.extend_from_slice(&content);
-        (padded, pad_chars, pad_chars + content_bytes)
-    }
+    let mut field = FormatField::text(content);
+    field.pad(content_width, spec, false);
+    field
 }
 
 /// Core format implementation shared by both pure and eval variants.
@@ -2260,15 +2272,8 @@ fn do_format(
         if this_arg_idx >= args.len() {
             return Err(format_not_enough_args_error());
         }
-        // The result holds at least WIDTH more bytes; like GNU, signal
-        // memory_full when that cannot be allocated, before padding to it.
-        if let Some(width) = spec.width {
-            result
-                .try_reserve(width)
-                .map_err(|_| crate::emacs_core::alloc::memory_full())?;
-        }
 
-        let formatted: Vec<u8> = match spec.conversion {
+        let field: FormatField = match spec.conversion {
             's' => {
                 // Only `%s` on a string argument preserves text properties: the
                 // string's own bytes land verbatim, so we can map byte ranges in
@@ -2320,15 +2325,10 @@ fn do_format(
                 } else {
                     (princ_fn(&arg), true)
                 };
-                let (formatted, content_byte_start_in_formatted, content_byte_end_in_formatted) =
-                    format_string_spec_tracked(&s, src_multibyte, &spec);
-                if track_props
-                    && arg_is_string
-                    && content_byte_start_in_formatted < content_byte_end_in_formatted
-                {
-                    let formatted_chars = emacs_chars_count(&formatted);
-                    let content_char_start_in_formatted =
-                        emacs_chars_count(&formatted[..content_byte_start_in_formatted]);
+                let field = format_string_spec(&s, src_multibyte, &spec);
+                if track_props && arg_is_string && !field.mid.is_empty() {
+                    let formatted_chars = field.chars();
+                    let content_char_start_in_formatted = field.leading_spaces;
                     let field_char_start_in_formatted = if fmt_has_props {
                         0
                     } else {
@@ -2348,7 +2348,7 @@ fn do_format(
                         arg_char_len,
                     });
                 }
-                formatted
+                field
             }
             'S' => {
                 let s = prin1_fn(&args[this_arg_idx]);
@@ -2374,19 +2374,18 @@ fn do_format(
                     arg_idx = this_arg_idx + 1;
                     continue;
                 }
-                let formatted = match args[this_arg_idx].kind() {
-                    ValueKind::Fixnum(i) => format_int_spec(i, &spec)?,
+                match args[this_arg_idx].kind() {
+                    ValueKind::Fixnum(i) => format_int_spec(i, &spec),
                     ValueKind::Float => {
                         format_integer_float_spec(args[this_arg_idx].xfloat(), &spec)?
                     }
                     ValueKind::Veclike(VecLikeType::Bignum) => {
-                        format_bignum_spec(args[this_arg_idx].as_bignum().unwrap(), &spec)?
+                        format_bignum_spec(args[this_arg_idx].as_bignum().unwrap(), &spec)
                     }
                     _ => {
                         return Err(format_spec_type_mismatch_error());
                     }
-                };
-                formatted.into_bytes()
+                }
             }
             // GNU only treats lowercase e/f/g as float conversions; uppercase
             // E/G (like F/A) fall through to the "Invalid format operation"
@@ -2394,7 +2393,7 @@ fn do_format(
             'f' | 'e' | 'g' => {
                 let f = expect_number(&args[this_arg_idx])
                     .map_err(|_| format_spec_type_mismatch_error())?;
-                format_float_spec(f, &spec)?.into_bytes()
+                format_float_spec(f, &spec)
             }
             'c' => {
                 let n = expect_int(&args[this_arg_idx])
@@ -2414,8 +2413,19 @@ fn do_format(
             }
         };
         arg_idx = this_arg_idx + 1;
+        // GNU `styled_format' (editfns.c:4257-4264): the text emitted so far
+        // and this field must stay below max_bufsize, and the result must
+        // grow to hold them, before the field's padding and zeros are
+        // written into it.
+        let field_len = field
+            .len()
+            .filter(|&len| len < FORMAT_MAX_BUFSIZE.saturating_sub(result.len()))
+            .ok_or_else(format_string_overflow_error)?;
+        result
+            .try_reserve(field_len)
+            .map_err(|_| crate::emacs_core::alloc::memory_full())?;
         if track_props {
-            let formatted_chars = emacs_chars_count(&formatted);
+            let formatted_chars = field.chars();
             if formatted_chars > 0 {
                 source_spans.push(FormatSourceSpan {
                     source_char_start: source_start,
@@ -2427,10 +2437,7 @@ fn do_format(
             }
             result_char_pos += formatted_chars;
         }
-        result
-            .try_reserve(formatted.len())
-            .map_err(|_| crate::emacs_core::alloc::memory_full())?;
-        result.extend_from_slice(&formatted);
+        field.write_to(&mut result);
     }
 
     Ok((
