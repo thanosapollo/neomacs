@@ -2292,9 +2292,25 @@ pub(crate) fn builtin_mapbacktrace(args: Vec<Value>) -> EvalResult {
     Ok(Value::NIL)
 }
 
+/// GNU `allocate_record` (alloc.c): a record, its type slot included, has at
+/// most `PSEUDOVECTOR_SIZE_MASK' slots.
+fn check_record_slots(count: usize) -> Result<(), Flow> {
+    const PSEUDOVECTOR_SIZE_MASK: usize = 4095;
+    if count > PSEUDOVECTOR_SIZE_MASK {
+        return Err(signal(
+            "error",
+            vec![Value::string(format!(
+                "Attempt to allocate a record of {count} slots; max is {PSEUDOVECTOR_SIZE_MASK}"
+            ))],
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn builtin_make_record(args: Vec<Value>) -> EvalResult {
     expect_args("make-record", &args, 3)?;
     let length = expect_wholenump(&args[1])? as usize;
+    check_record_slots(length + 1)?;
     let mut items = Vec::with_capacity(length + 1);
     items.push(args[0]); // type tag
     for _ in 0..length {
@@ -2864,6 +2880,7 @@ pub(crate) fn builtin_record(args: Vec<Value>) -> EvalResult {
             vec![Value::symbol("record"), Value::fixnum(0)],
         ));
     }
+    check_record_slots(args.len())?;
     Ok(Value::make_record(args))
 }
 

@@ -1332,6 +1332,25 @@ fn format_string_overflow_error() -> Flow {
     signal("error", vec![Value::string("Maximum string size exceeded")])
 }
 
+/// GNU `styled_format`'s `max_bufsize`, `STRING_BYTES_BOUND + 1`: a field
+/// width or a conversion this many bytes long signals
+/// "Maximum string size exceeded".
+const FORMAT_MAX_BUFSIZE: usize = 1 << 61;
+
+/// GNU `styled_format`'s `USEFUL_PRECISION_MAX`: no float digit past this
+/// precision is nonzero.  GNU prints at most this many digits and adds any
+/// excess precision as zeros (Rust's formatter also refuses a precision
+/// above `u16::MAX`).
+const USEFUL_PRECISION_MAX: usize = 1074;
+
+/// An empty String able to hold CAPACITY bytes, or GNU's `memory_full`.
+fn format_try_string(capacity: usize) -> Result<String, Flow> {
+    let mut s = String::new();
+    s.try_reserve_exact(capacity)
+        .map_err(|_| crate::emacs_core::alloc::memory_full())?;
+    Ok(s)
+}
+
 /// Parse a format spec from the format string's Emacs character codes, with
 /// `*pos` positioned just after '%'. Advances `*pos` past the spec and returns
 /// the parsed spec plus the number of characters consumed after '%'. All format
@@ -1412,15 +1431,20 @@ fn parse_format_spec(bytes: &[u8], pos: &mut usize) -> Result<ParsedFormatSpec, 
     // Parse width
     let (has_width, width_value) = digits(bytes, pos);
     if has_width {
-        spec.width = Some(width_value.ok_or_else(format_string_overflow_error)?);
+        spec.width = Some(
+            width_value
+                .filter(|&width| width < FORMAT_MAX_BUFSIZE)
+                .ok_or_else(format_string_overflow_error)?,
+        );
     }
 
-    // Parse precision
+    // Parse precision.  Like GNU's `str2num`, an overflowing precision
+    // saturates: it only truncates `%s', and is too large for a number.
     if bytes.get(*pos) == Some(&b'.') {
         *pos += 1;
         let (has_prec, prec_value) = digits(bytes, pos);
         spec.precision = Some(if has_prec {
-            prec_value.ok_or_else(format_string_overflow_error)?
+            prec_value.unwrap_or(usize::MAX)
         } else {
             0
         });
@@ -1447,27 +1471,29 @@ fn parse_format_spec(bytes: &[u8], pos: &mut usize) -> Result<ParsedFormatSpec, 
     })
 }
 
-/// Apply width/alignment padding to a formatted string.
-fn apply_width(s: &str, spec: &FormatSpec) -> String {
-    let w = match spec.width {
-        Some(w) if w > s.chars().count() => w,
-        _ => return s.to_string(),
+/// Apply width/alignment padding to a formatted string.  Pads by hand:
+/// Rust's formatter refuses a width above `u16::MAX`.
+fn apply_width(s: String, spec: &FormatSpec) -> String {
+    let len = s.chars().count();
+    let padding = match spec.width {
+        Some(w) if w > len => w - len,
+        _ => return s,
     };
-    let _pad_char = if spec.zero && !spec.minus { '0' } else { ' ' };
+    let mut out = String::with_capacity(s.len() + padding);
     if spec.minus {
-        format!("{:<width$}", s, width = w)
-    } else if spec.zero && !spec.minus {
-        // For zero-padding, handle negative numbers specially
-        if let Some(unsigned) = s.strip_prefix('-') {
-            format!("-{unsigned:0>width$}", width = w - 1)
-        } else if let Some(unsigned) = s.strip_prefix('+') {
-            format!("+{unsigned:0>width$}", width = w - 1)
-        } else {
-            format!("{:0>width$}", s, width = w)
-        }
+        out.push_str(&s);
+        out.extend(std::iter::repeat_n(' ', padding));
+    } else if spec.zero {
+        // For zero-padding, the zeros go after any sign
+        let sign_len = usize::from(s.starts_with(['-', '+']));
+        out.push_str(&s[..sign_len]);
+        out.extend(std::iter::repeat_n('0', padding));
+        out.push_str(&s[sign_len..]);
     } else {
-        format!("{:>width$}", s, width = w)
+        out.extend(std::iter::repeat_n(' ', padding));
+        out.push_str(&s);
     }
+    out
 }
 
 fn apply_integer_width(sign: &str, prefix: &str, digits: &str, spec: &FormatSpec) -> String {
@@ -1494,7 +1520,7 @@ fn format_integer_digits(
     negative: bool,
     zero_value: bool,
     spec: &FormatSpec,
-) -> String {
+) -> Result<String, Flow> {
     if spec.precision == Some(0) && zero_value {
         digits.clear();
     }
@@ -1522,19 +1548,28 @@ fn format_integer_digits(
     }
 
     if let Some(precision) = spec.precision {
-        if spec.conversion == 'o' && spec.sharp && !digits.starts_with('0') {
-            let desired = precision.max(digits.len() + 1);
-            if desired > digits.len() {
-                digits = format!("{}{digits}", "0".repeat(desired - digits.len()));
+        let desired = if spec.conversion == 'o' && spec.sharp && !digits.starts_with('0') {
+            precision.max(digits.len() + 1)
+        } else {
+            precision
+        };
+        if digits.len() < desired {
+            // GNU adds excess precision as leading zeros, and signals
+            // string_overflow for a conversion no string can hold.
+            let zeros = desired - digits.len();
+            if FORMAT_MAX_BUFSIZE - (sign.len() + prefix.len() + digits.len()) <= zeros {
+                return Err(format_string_overflow_error());
             }
-        } else if digits.len() < precision {
-            digits = format!("{}{digits}", "0".repeat(precision - digits.len()));
+            let mut padded = format_try_string(desired)?;
+            padded.extend(std::iter::repeat_n('0', zeros));
+            padded.push_str(&digits);
+            digits = padded;
         }
     } else if spec.conversion == 'o' && spec.sharp && !digits.starts_with('0') {
         digits = format!("0{digits}");
     }
 
-    apply_integer_width(sign, prefix, &digits, spec)
+    Ok(apply_integer_width(sign, prefix, &digits, spec))
 }
 
 /// Render `n` as plain decimal digits appended to `out`, with no heap
@@ -1561,7 +1596,7 @@ fn push_i64_decimal(out: &mut Vec<u8>, n: i64) {
 }
 
 /// Format an integer with the given spec.
-fn format_int_spec(n: i64, spec: &FormatSpec) -> String {
+fn format_int_spec(n: i64, spec: &FormatSpec) -> Result<String, Flow> {
     // Fast path for a plain `%d`/`%i`: one backward stack-buffer digit
     // pass and one allocation. The general path below runs 128-bit
     // `core::fmt` digit rendering plus two more String-building passes
@@ -1593,7 +1628,7 @@ fn format_int_spec(n: i64, spec: &FormatSpec) -> String {
             buf[pos] = b'-';
         }
         // Digits and '-' only — always valid UTF-8.
-        return unsafe { std::str::from_utf8_unchecked(&buf[pos..]) }.to_owned();
+        return Ok(unsafe { std::str::from_utf8_unchecked(&buf[pos..]) }.to_owned());
     }
     let negative = n < 0;
     let abs_val = (n as i128).unsigned_abs();
@@ -1611,7 +1646,7 @@ fn format_int_spec(n: i64, spec: &FormatSpec) -> String {
 /// `format_int_spec` fixnum path but uses `malachite::Integer`'s
 /// `ToStringBase` trait for the underlying numeric conversion. The
 /// flag/width/precision handling is identical.
-fn format_bignum_spec(n: &Integer, spec: &FormatSpec) -> String {
+fn format_bignum_spec(n: &Integer, spec: &FormatSpec) -> Result<String, Flow> {
     let negative = *n < 0;
     let abs = n.clone().abs();
     let mut digits = match spec.conversion {
@@ -1635,11 +1670,11 @@ fn format_integer_float_spec(f: f64, spec: &FormatSpec) -> Result<String, Flow> 
         } else {
             "inf"
         };
-        return Ok(apply_width(text, spec));
+        return Ok(apply_width(text.to_string(), spec));
     }
 
     let big = Integer::rounding_from(f.trunc(), RoundingMode::Down).0;
-    Ok(format_bignum_spec(&big, spec))
+    format_bignum_spec(&big, spec)
 }
 
 /// Normalize Rust scientific notation to match C printf: sign always
@@ -1673,41 +1708,8 @@ fn ensure_float_alternate_decimal(mut s: String) -> String {
     s
 }
 
-/// Rust's formatter refuses a precision above `u16::MAX`; C's printf, which
-/// GNU uses, does not.  A double's exact decimal expansion has at most 1074
-/// fraction digits and 767 significant ones, so digits past this many are
-/// always zeros: print this many and append the rest.
-const EXACT_FLOAT_DIGITS: usize = 1100;
-
-/// `%.PRECf` for any PREC.
-fn float_fixed(f: f64, prec: usize) -> String {
-    let shown = prec.min(EXACT_FLOAT_DIGITS);
-    let mut s = format!("{:.shown$}", f);
-    s.extend(std::iter::repeat_n('0', prec - shown));
-    s
-}
-
-/// `%.PRECe` (or `E`) for any PREC, before exponent normalization.
-fn float_exponent(f: f64, prec: usize, upper: bool) -> String {
-    let shown = prec.min(EXACT_FLOAT_DIGITS);
-    let s = if upper {
-        format!("{:.shown$E}", f)
-    } else {
-        format!("{:.shown$e}", f)
-    };
-    if shown == prec {
-        return s;
-    }
-    let mark = s.rfind(['e', 'E']).unwrap_or(s.len());
-    let mut out = String::with_capacity(s.len() + (prec - shown));
-    out.push_str(&s[..mark]);
-    out.extend(std::iter::repeat_n('0', prec - shown));
-    out.push_str(&s[mark..]);
-    out
-}
-
 /// Format a float with the given spec.
-fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
+fn format_float_spec(f: f64, spec: &FormatSpec) -> Result<String, Flow> {
     // C printf spells non-finite values nan/inf (NAN/INF for the uppercase
     // conversions), with the sign bit preserved (e.g. 0.0/0.0 -> "-nan").
     if !f.is_finite() {
@@ -1720,13 +1722,16 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
             "inf"
         };
         let sign = if f.is_sign_negative() { "-" } else { "" };
-        return apply_width(&format!("{sign}{body}"), spec);
+        return Ok(apply_width(format!("{sign}{body}"), spec));
     }
-    let prec = spec.precision.unwrap_or(6);
+    let precision = spec.precision.unwrap_or(6);
+    // Like GNU, print at most USEFUL_PRECISION_MAX digits; the excess
+    // precision is added as zeros below.
+    let prec = precision.min(USEFUL_PRECISION_MAX);
     let alternate = spec.sharp && f.is_finite();
     let s = match spec.conversion {
         'f' => {
-            let s = float_fixed(f, prec);
+            let s = format!("{:.prec$}", f, prec = prec);
             if alternate {
                 ensure_float_alternate_decimal(s)
             } else {
@@ -1734,7 +1739,7 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
             }
         }
         'e' => {
-            let s = normalize_exp_notation(&float_exponent(f, prec, false));
+            let s = normalize_exp_notation(&format!("{:.prec$e}", f, prec = prec));
             if alternate {
                 ensure_float_alternate_decimal(s)
             } else {
@@ -1742,7 +1747,7 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
             }
         }
         'E' => {
-            let s = normalize_exp_notation(&float_exponent(f, prec, true));
+            let s = normalize_exp_notation(&format!("{:.prec$E}", f, prec = prec));
             if alternate {
                 ensure_float_alternate_decimal(s)
             } else {
@@ -1752,9 +1757,7 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
         'g' | 'G' => {
             let p = if prec == 0 { 1 } else { prec };
             // %g uses %e if exponent < -4 or >= precision, else %f
-            // Digits past EXACT_FLOAT_DIGITS are zeros, so they cannot carry
-            // into the exponent.
-            let exp_fmt = float_exponent(f, p.saturating_sub(1).min(EXACT_FLOAT_DIGITS), false);
+            let exp_fmt = format!("{:.prec$e}", f, prec = p.saturating_sub(1));
             // Parse the exponent
             let exp_val = exp_fmt
                 .rfind('e')
@@ -1762,7 +1765,7 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
                 .unwrap_or(0);
             if exp_val < -4 || exp_val >= p as i32 {
                 // Use %e style, strip trailing zeros
-                let mut s = float_exponent(f, p.saturating_sub(1), false);
+                let mut s = format!("{:.prec$e}", f, prec = p.saturating_sub(1));
                 // Strip trailing zeros before 'e'
                 if !alternate && let Some(e_pos) = s.rfind('e') {
                     let mantissa = &s[..e_pos];
@@ -1782,7 +1785,7 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
             } else {
                 // Use %f style with appropriate decimals
                 let decimal_places = (p as i32 - exp_val - 1).max(0) as usize;
-                let mut s = float_fixed(f, decimal_places);
+                let mut s = format!("{:.prec$}", f, prec = decimal_places);
                 // Strip trailing zeros after decimal point
                 if !alternate && s.contains('.') {
                     s = s.trim_end_matches('0').to_string();
@@ -1803,7 +1806,27 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
     } else {
         s
     };
-    apply_width(&s, spec)
+    // GNU `styled_format': the excess precision becomes zeros after the last
+    // digit before any exponent -- for %g only with `#', whose trailing
+    // zeros are kept -- and a conversion that would reach max_bufsize bytes
+    // signals string_overflow before anything is allocated.
+    let excess = if matches!(spec.conversion, 'g' | 'G') && !(alternate && s.contains('.')) {
+        0
+    } else {
+        precision - prec
+    };
+    if excess == 0 {
+        return Ok(apply_width(s, spec));
+    }
+    if FORMAT_MAX_BUFSIZE - s.len() <= excess {
+        return Err(format_string_overflow_error());
+    }
+    let mark = s.find(['e', 'E']).unwrap_or(s.len());
+    let mut out = format_try_string(s.len() + excess)?;
+    out.push_str(&s[..mark]);
+    out.extend(std::iter::repeat_n('0', excess));
+    out.push_str(&s[mark..]);
+    Ok(apply_width(out, spec))
 }
 
 /// Format a string (%s) with width and precision.
@@ -2237,6 +2260,13 @@ fn do_format(
         if this_arg_idx >= args.len() {
             return Err(format_not_enough_args_error());
         }
+        // The result holds at least WIDTH more bytes; like GNU, signal
+        // memory_full when that cannot be allocated, before padding to it.
+        if let Some(width) = spec.width {
+            result
+                .try_reserve(width)
+                .map_err(|_| crate::emacs_core::alloc::memory_full())?;
+        }
 
         let formatted: Vec<u8> = match spec.conversion {
             's' => {
@@ -2345,12 +2375,12 @@ fn do_format(
                     continue;
                 }
                 let formatted = match args[this_arg_idx].kind() {
-                    ValueKind::Fixnum(i) => format_int_spec(i, &spec),
+                    ValueKind::Fixnum(i) => format_int_spec(i, &spec)?,
                     ValueKind::Float => {
                         format_integer_float_spec(args[this_arg_idx].xfloat(), &spec)?
                     }
                     ValueKind::Veclike(VecLikeType::Bignum) => {
-                        format_bignum_spec(args[this_arg_idx].as_bignum().unwrap(), &spec)
+                        format_bignum_spec(args[this_arg_idx].as_bignum().unwrap(), &spec)?
                     }
                     _ => {
                         return Err(format_spec_type_mismatch_error());
@@ -2364,7 +2394,7 @@ fn do_format(
             'f' | 'e' | 'g' => {
                 let f = expect_number(&args[this_arg_idx])
                     .map_err(|_| format_spec_type_mismatch_error())?;
-                format_float_spec(f, &spec).into_bytes()
+                format_float_spec(f, &spec)?.into_bytes()
             }
             'c' => {
                 let n = expect_int(&args[this_arg_idx])
@@ -2397,6 +2427,9 @@ fn do_format(
             }
             result_char_pos += formatted_chars;
         }
+        result
+            .try_reserve(formatted.len())
+            .map_err(|_| crate::emacs_core::alloc::memory_full())?;
         result.extend_from_slice(&formatted);
     }
 

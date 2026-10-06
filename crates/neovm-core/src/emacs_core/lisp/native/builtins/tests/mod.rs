@@ -9885,6 +9885,127 @@ fn oversized_requests_signal_or_succeed_like_gnu() {
     }
 }
 
+/// GNU `styled_format` prints at most `USEFUL_PRECISION_MAX' float digits and
+/// adds any excess precision as zeros (none for `%g' without `#'), and pads
+/// to any width.  Huge precisions used to print the wrong `%g' text and
+/// widths above 65535 panicked.  Expected values are GNU Emacs output.
+#[test]
+fn huge_format_precision_and_width_print_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = crate::emacs_core::Context::new();
+    let mut eval = |src: &str| {
+        let value = ev.eval_str(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        crate::emacs_core::print_value_with_eval(&ev, &value)
+    };
+    let exact = "\"0.1000000000000000055511151231257827021181583404541015625\"";
+    for (src, expected) in [
+        ("(format \"%.4294967297g\" 0.1)", exact),
+        ("(format \"%.2147483648g\" 0.1)", exact),
+        ("(format \"%.2305843009213693951g\" 0.1)", exact),
+        ("(length (format \"%.2305843009213693951g\" 1e300))", "301"),
+        ("(length (format \"%.2305843009213693951g\" 5e-324))", "757"),
+        ("(format \"%.99999999999999999999s\" \"abc\")", "\"abc\""),
+        (
+            "(let ((s (format \"%70000f\" 1.0))) (list (length s) (substring s -8)))",
+            "(70000 \"1.000000\")",
+        ),
+        (
+            "(let ((s (format \"%-70000e\" 1.0))) (list (length s) (substring s 0 8)))",
+            "(70000 \"1.000000\")",
+        ),
+        (
+            "(let ((s (format \"%070000f\" -1.0))) (list (length s) (substring s 0 3)))",
+            "(70000 \"-00\")",
+        ),
+        (
+            "(let ((s (format \"%+070000.2f\" 1.0))) (list (length s) (substring s 0 3)))",
+            "(70000 \"+00\")",
+        ),
+        ("(length (format \"%70000d\" 1.0))", "70000"),
+    ] {
+        assert_eq!(eval(src), expected, "{src}");
+    }
+}
+
+/// GNU `styled_format` signals "Maximum string size exceeded" once a field
+/// width or conversion would reach `STRING_BYTES_BOUND + 1' bytes, and
+/// `memory_full' when the result cannot grow.  These used to abort.
+#[test]
+fn oversized_format_requests_signal_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = crate::emacs_core::Context::new();
+    let mut eval = |src: &str| {
+        let value = ev.eval_str(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        crate::emacs_core::print_value_with_eval(&ev, &value)
+    };
+    let overflow = "\"Maximum string size exceeded\"";
+    let full = "\"Memory exhausted\"";
+    for (src, expected) in [
+        ("(format \"%.2305843009213693951f\" 1.0)", overflow),
+        ("(format \"%.2305843009213693950f\" 1.0)", overflow),
+        ("(format \"%.2305843009213693949f\" 1.0)", full),
+        ("(format \"%.2305843009213693951e\" 0.1)", overflow),
+        ("(format \"%.2305843009213693946e\" 1.0)", overflow),
+        ("(format \"%.2305843009213693945e\" -1.0)", overflow),
+        ("(format \"%.2305843009213693945e\" 1.0)", full),
+        ("(format \"%#.2305843009213693951g\" 0.1)", overflow),
+        ("(format \"%#.2305843009213693950g\" 1.0)", full),
+        ("(format \"%2305843009213693952f\" 1.0)", overflow),
+        ("(format \"%2305843009213693951f\" 1.0)", full),
+        ("(format \"%2305843009213693951s\" \"a\")", full),
+        ("(format \"%.2305843009213693952d\" 1)", overflow),
+        ("(format \"%.2305843009213693951d\" 1)", full),
+        ("(format \"%2305843009213693951d\" 1)", full),
+    ] {
+        // Compare the message prefix: GNU substitutes a key into the rest.
+        let n = expected.len() - 2;
+        assert_eq!(
+            eval(&format!(
+                "(condition-case e {src} (error (let ((m (car (cdr e)))) (substring m 0 (min {n} (length m))))))"
+            )),
+            expected,
+            "{src}"
+        );
+    }
+}
+
+/// GNU `allocate_record' rejects records over 4095 slots, the type included.
+/// An impossible `make-record' size used to abort.
+#[test]
+fn oversized_records_signal_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = crate::emacs_core::Context::new();
+    let mut eval = |src: &str| {
+        let value = ev.eval_str(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        crate::emacs_core::print_value_with_eval(&ev, &value)
+    };
+    for (src, expected) in [
+        (
+            "(make-record 'foo most-positive-fixnum nil)",
+            "(error \"Attempt to allocate a record of 2305843009213693952 slots; max is 4095\")",
+        ),
+        (
+            "(make-record 'foo 4095 nil)",
+            "(error \"Attempt to allocate a record of 4096 slots; max is 4095\")",
+        ),
+        (
+            "(apply #'record 'foo (make-list 4095 nil))",
+            "(error \"Attempt to allocate a record of 4096 slots; max is 4095\")",
+        ),
+        ("(length (make-record 'foo 4094 nil))", "4095"),
+        (
+            "(length (apply #'record 'foo (make-list 4094 nil)))",
+            "4095",
+        ),
+    ] {
+        assert_eq!(
+            eval(&format!("(condition-case e {src} (error e))")),
+            expected,
+            "{src}"
+        );
+    }
+}
+
 #[test]
 fn vconcat_signals_circular_list_like_gnu() {
     crate::test_utils::init_test_tracing();
