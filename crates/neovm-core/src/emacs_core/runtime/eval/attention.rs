@@ -20,7 +20,7 @@
 //! `Context` and the parent's private items (`use super::*`).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::Context;
 use crate::emacs_core::value::Value;
@@ -292,24 +292,39 @@ pub struct QuitRequest(Arc<QuitRequestCell>);
 
 #[derive(Debug)]
 struct QuitRequestCell {
-    raised: AtomicBool,
+    /// C-g presses since the evaluator last took the request; the request
+    /// is raised exactly while this is non-zero.  GNU runs
+    /// `handle_interrupt' once per press, and its force-quit count depends
+    /// on every one of them, so presses between two safe points must not
+    /// collapse into one.  Keeping the raise and the count in one word makes
+    /// raising, taking and clearing single atomic steps: a press can never
+    /// be left raised without its count.
+    presses: AtomicU32,
 }
 
 impl QuitRequest {
     /// A lowered request.
     pub fn new() -> Self {
         Self(Arc::new(QuitRequestCell {
-            raised: AtomicBool::new(false),
+            presses: AtomicU32::new(0),
         }))
     }
 
     /// Raise the request (the input-bridge threads, on a C-g).
     ///
-    /// The flag goes up before the count, so a safe point that sees the
-    /// count finds the flag; one that polls in between notices the request
-    /// at its next poll, which is GNU's own latency ("the next maybe_quit").
+    /// The press that raises it also counts it in [`ASYNC_ATTENTION`].  A
+    /// take may consume the press before that count lands; the word then
+    /// dips below this request's unit for that instant and every safe point
+    /// that looks finds nothing raised, which is harmless.
     pub fn request(&self) {
-        if !self.0.raised.swap(true, Ordering::AcqRel) {
+        let before = self
+            .0
+            .presses
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_add(1))
+            })
+            .unwrap_or_else(|n| n);
+        if before == 0 {
             ASYNC_ATTENTION
                 .word
                 .fetch_add(QUIT_REQUEST_UNIT, Ordering::Release);
@@ -319,26 +334,32 @@ impl QuitRequest {
     /// Whether the request is raised, without consuming it.
     #[inline(always)]
     pub(crate) fn is_requested(&self) -> bool {
-        self.0.raised.load(Ordering::Relaxed)
+        self.0.presses.load(Ordering::Relaxed) != 0
     }
 
     /// Consume the request on the evaluator thread: true when it was raised.
     #[inline]
     pub(crate) fn take(&self) -> bool {
-        if self.0.raised.swap(false, Ordering::AcqRel) {
+        self.take_presses() != 0
+    }
+
+    /// Consume the request on the evaluator thread and return how many
+    /// presses raised it since the last take (0 when it was lowered).
+    #[inline]
+    pub(crate) fn take_presses(&self) -> u32 {
+        let presses = self.0.presses.swap(0, Ordering::AcqRel);
+        if presses != 0 {
             ASYNC_ATTENTION
                 .word
                 .fetch_sub(QUIT_REQUEST_UNIT, Ordering::Release);
-            true
-        } else {
-            false
         }
+        presses
     }
 
-    /// Lower the request without looking at it.
+    /// Lower the request and drop its presses, in one step.
     #[inline]
     pub(crate) fn clear(&self) {
-        let _ = self.take();
+        let _ = self.take_presses();
     }
 }
 
@@ -352,7 +373,7 @@ impl Drop for QuitRequestCell {
     /// The last handle is gone while the request is raised: nobody can take
     /// it any more, so release its unit of [`ASYNC_ATTENTION`].
     fn drop(&mut self) {
-        if *self.raised.get_mut() {
+        if *self.presses.get_mut() != 0 {
             ASYNC_ATTENTION
                 .word
                 .fetch_sub(QUIT_REQUEST_UNIT, Ordering::Release);

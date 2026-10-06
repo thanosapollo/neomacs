@@ -2251,6 +2251,7 @@ impl Context {
             input_rx: None,
             eval_task_rx: None,
             quit_requested: QuitRequest::new(),
+            force_quit_count: 0,
             redisplay_fn: None,
             mode_line_display_flow: None,
             redisplay_prepare_fn: None,

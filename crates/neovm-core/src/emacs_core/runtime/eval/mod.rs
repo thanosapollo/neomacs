@@ -3314,6 +3314,9 @@ pub struct Context {
     /// `maybe_quit` polling from `eval_sub` / `Ffuncall` / the bytecode
     /// VM to pick it up.
     pub quit_requested: QuitRequest,
+    /// GNU `force_quit_count` (src/keyboard.c): C-g presses received while
+    /// `quit-flag` was already set, see `Context::handle_interrupt`.
+    pub(crate) force_quit_count: u32,
     /// Redisplay callback — called before blocking for input in `read_char()`.
     ///
     /// In GNU Emacs, `read_char()` calls `redisplay()` directly (keyboard.c

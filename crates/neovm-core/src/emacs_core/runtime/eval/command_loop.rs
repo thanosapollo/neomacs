@@ -2972,11 +2972,10 @@ impl Context {
         // keystroke while the evaluator is busy (e.g. deep in bytecode
         // and not reading from `input_rx`). See
         // `Context::quit_requested` for the design rationale.
-        if self.quit_requested.is_requested()
-            && self.quit_requested.take()
-            && self.quit_flag.is_nil()
-        {
-            self.set_quit_flag_value(Value::T);
+        if self.quit_requested.is_requested() {
+            for _ in 0..self.quit_requested.take_presses() {
+                self.handle_interrupt();
+            }
         }
         let quit_flag = self.quit_flag;
         if quit_flag.is_nil() || self.inhibit_quit.is_truthy() {
@@ -2996,6 +2995,26 @@ impl Context {
         }
 
         self.process_quit_flag()
+    }
+
+    /// One C-g press from the input bridge: GNU `handle_interrupt` in a
+    /// graphical session (src/keyboard.c), which requests a quit and counts
+    /// the presses that arrive while one is already pending.  The third
+    /// clears `inhibit-quit`, so a loop that inhibits quitting can still be
+    /// stopped.
+    fn handle_interrupt(&mut self) {
+        let count = if self.quit_flag.is_nil() {
+            1
+        } else {
+            self.force_quit_count.saturating_add(1)
+        };
+        self.force_quit_count = count;
+        if count == 3 {
+            self.assign("inhibit-quit", Value::NIL);
+        }
+        // Like GNU, a real C-g replaces whatever the flag held, including
+        // `throw-on-input`'s tag: the user asked to quit, not to throw.
+        self.set_quit_flag_value(Value::T);
     }
 
     /// The printed name of `debug-on-event`, or `None` when it does not hold a
@@ -3067,9 +3086,23 @@ impl Context {
         event.as_fixnum() == Some(self.quit_char)
     }
 
+    /// A C-g read as an event.  The input bridge raised the quit request
+    /// for this key before queueing it, so its presses are counted here, as
+    /// GNU's `handle_interrupt` counts them on arrival, against the flag
+    /// they found -- not at a later safe point, where they would see the
+    /// flag this key sets and continue an old force-quit count.  As in GNU's
+    /// `read_char`, a C-g returned as an event while quitting is inhibited
+    /// is not also left pending as a quit.
     pub(crate) fn request_quit_from_keyboard_input(&mut self) {
-        if self.quit_flag_value().is_nil() {
+        let presses = self.quit_requested.take_presses();
+        for _ in 0..presses {
+            self.handle_interrupt();
+        }
+        if presses == 0 && self.quit_flag_value().is_nil() {
             self.set_quit_flag_value(Value::T);
+        }
+        if self.inhibit_quit.is_truthy() {
+            self.set_quit_flag_value(Value::NIL);
         }
     }
 
