@@ -804,6 +804,97 @@ fn renderer_loss_makes_current_p_nil_before_a_later_key() {
     assert_eq!(current_p(&mut ctx), "t");
 }
 
+/// MODEL's glyph sizes in BUFFER as `((W H) ...)`, nil for a glyph
+/// without a display spec.
+fn glyph_sizes(ctx: &mut Context, buffer: &str) -> String {
+    eval_printed(
+        ctx,
+        &format!(
+            r#"(with-current-buffer {buffer:?}
+                 (let (sizes)
+                   (dotimes (i (buffer-size))
+                     (let ((display (get-text-property (1+ i) 'display)))
+                       (push (and display
+                                  (list (plist-get (cdr display) :width)
+                                        (plist-get (cdr display) :height)))
+                             sizes)))
+                   (nreverse sizes)))"#
+        ),
+    )
+}
+
+fn resize_error(ctx: &mut Context, req: u64) {
+    deliver(
+        ctx,
+        ModelEvent::Error {
+            req: Some(req),
+            error: "model resize exceeds the GPU budget".to_owned(),
+        },
+    );
+}
+
+#[test]
+fn rejected_resize_restores_the_accepted_glyph_size() {
+    let (mut ctx, host) = lisp_context("lisp-resize-refusal");
+    create_model(&mut ctx);
+    eval_printed(
+        &mut ctx,
+        r#"(with-current-buffer (get-buffer-create "model-resize-a")
+             (neomacs-model-insert model-test-m))"#,
+    );
+    deliver(
+        &mut ctx,
+        ModelEvent::Ready {
+            triangles: vec![1, 1],
+        },
+    );
+    readiness(&mut ctx, true, 1, 0);
+    assert_eq!(glyph_sizes(&mut ctx, "model-resize-a"), "((64 48))");
+
+    // Two outstanding resizes; the glyph follows the latest at once.
+    eval_printed(
+        &mut ctx,
+        "(list (neomacs-model-resize model-test-m 128 96) \
+               (neomacs-model-resize model-test-m 256 192))",
+    );
+    assert_eq!(glyph_sizes(&mut ctx, "model-resize-a"), "((256 192))");
+    assert_eq!(updates(&host).len(), 2);
+    // The renderer applies 1 and refuses 2 over budget: the glyph falls
+    // back to 1's size, which is now the accepted one.
+    resize_error(&mut ctx, 2);
+    assert_eq!(glyph_sizes(&mut ctx, "model-resize-a"), "((128 96))");
+    readiness(&mut ctx, true, 2, 2);
+    assert_eq!(current_p(&mut ctx), "t");
+    assert_eq!(glyph_sizes(&mut ctx, "model-resize-a"), "((128 96))");
+
+    // Refusing an older request never overwrites a newer one, even after
+    // the model moved to another buffer.
+    eval_printed(&mut ctx, "(neomacs-model-resize model-test-m 300 200)");
+    eval_printed(
+        &mut ctx,
+        r#"(with-current-buffer (get-buffer-create "model-resize-b")
+             (insert "x")
+             (neomacs-model-insert model-test-m))"#,
+    );
+    assert_eq!(glyph_sizes(&mut ctx, "model-resize-a"), "(nil)");
+    assert_eq!(glyph_sizes(&mut ctx, "model-resize-b"), "(nil (300 200))");
+    eval_printed(&mut ctx, "(neomacs-model-resize model-test-m 400 300)");
+    assert_eq!(glyph_sizes(&mut ctx, "model-resize-b"), "(nil (400 300))");
+    resize_error(&mut ctx, 3);
+    assert_eq!(glyph_sizes(&mut ctx, "model-resize-b"), "(nil (400 300))");
+    readiness(&mut ctx, false, 3, 4);
+    assert_eq!(glyph_sizes(&mut ctx, "model-resize-b"), "(nil (400 300))");
+
+    // A refusal with nothing newer pending returns to the accepted 4.
+    eval_printed(&mut ctx, "(neomacs-model-resize model-test-m 512 512)");
+    assert_eq!(glyph_sizes(&mut ctx, "model-resize-b"), "(nil (512 512))");
+    resize_error(&mut ctx, 5);
+    assert_eq!(glyph_sizes(&mut ctx, "model-resize-b"), "(nil (400 300))");
+    assert_eq!(glyph_sizes(&mut ctx, "model-resize-a"), "(nil)");
+    readiness(&mut ctx, true, 4, 5);
+    assert_eq!(current_p(&mut ctx), "t");
+}
+
 #[test]
 fn weak_registry_collects_a_callback_to_handle_cycle() {
     let (mut ctx, host) = lisp_context("lisp-registry-gc");

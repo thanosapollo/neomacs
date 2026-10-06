@@ -93,7 +93,13 @@ state: never call user code, wait or read input.")
   (status '(loading))
   ;; Vector of mesh ID strings, in renderer index order.
   mesh-ids
-  view initial-view width height
+  view initial-view
+  ;; Size the glyph shows: the latest pending resize, else the accepted one.
+  width height
+  ;; Size of the last resize the renderer applied, (WIDTH HEIGHT).
+  accepted-size
+  ;; Resizes not yet settled, ((REQ WIDTH HEIGHT) ...), oldest first.
+  resizes
   ;; Latest request number sent to the renderer.
   (issued 0)
   ;; Last `readiness' as (CURRENT REV REQ), or nil.
@@ -193,7 +199,8 @@ renderer."
                 :mesh-ids (vconcat ids)
                 :view (copy-sequence view)
                 :initial-view (copy-sequence view)
-                :width width :height height)
+                :width width :height height
+                :accepted-size (list width height))
                neomacs-model--registry)
       model)))
 
@@ -249,13 +256,47 @@ Return the request number."
 (defun neomacs-model-resize (model width height)
   "Resize MODEL to WIDTH x HEIGHT logical pixels (32..2048).
 Return the request number.  The glyph inserted by
-`neomacs-model-insert' or `neomacs-model-open' follows."
-  (prog1 (neomacs-model--request
-          model (lambda (req) (neomacs-model--resize model req width height)))
-    (let ((entry (neomacs-model--entry model)))
-      (setf (neomacs-model--entry-width entry) width
-            (neomacs-model--entry-height entry) height)
+`neomacs-model-insert' or `neomacs-model-open' follows at once, and
+returns to the previous size if the renderer refuses the request."
+  (let ((req (neomacs-model--request
+              model (lambda (req)
+                      (neomacs-model--resize model req width height))))
+        (entry (neomacs-model--entry model)))
+    (setf (neomacs-model--entry-resizes entry)
+          (nconc (neomacs-model--entry-resizes entry)
+                 (list (list req width height))))
+    (neomacs-model--show-size model entry)
+    req))
+
+(defun neomacs-model--show-size (model entry)
+  "Give MODEL's glyphs ENTRY's latest pending size, else its accepted one."
+  (let ((size (or (cdr (car (last (neomacs-model--entry-resizes entry))))
+                  (neomacs-model--entry-accepted-size entry))))
+    (unless (and (eql (car size) (neomacs-model--entry-width entry))
+                 (eql (cadr size) (neomacs-model--entry-height entry)))
+      (setf (neomacs-model--entry-width entry) (car size)
+            (neomacs-model--entry-height entry) (cadr size))
       (neomacs-model--update-glyphs model entry))))
+
+(defun neomacs-model--settle-resizes (entry settled)
+  "Accept ENTRY's pending resizes up to request SETTLED.
+The renderer settles requests in order, so each of them it did not
+refuse (see `neomacs-model--refuse-resize') was applied."
+  (let (applied)
+    (while (and (neomacs-model--entry-resizes entry)
+                (<= (car (car (neomacs-model--entry-resizes entry))) settled))
+      (setq applied (pop (neomacs-model--entry-resizes entry))))
+    (when applied
+      (setf (neomacs-model--entry-accepted-size entry) (cdr applied)))))
+
+(defun neomacs-model--refuse-resize (model entry req)
+  "Forget the pending resize REQ in MODEL's ENTRY: the renderer refused it.
+The glyph shows the newest resize still pending, else the accepted size."
+  (let ((resize (assq req (neomacs-model--entry-resizes entry))))
+    (when resize
+      (setf (neomacs-model--entry-resizes entry)
+            (delq resize (neomacs-model--entry-resizes entry)))
+      (neomacs-model--show-size model entry))))
 
 (defun neomacs-model-freeze (model)
   "Keep MODEL's last picture and stop interaction and requests.
@@ -341,6 +382,13 @@ only records state; `neomacs-model--dispatch' runs the callback."
         ('failed
          (setf (neomacs-model--entry-status entry)
                (list 'failed :error (plist-get plist :error))))
+        ('error
+         ;; Error{REQ} settles REQ and everything before it; a refused
+         ;; resize changes nothing in the renderer.
+         (let ((req (plist-get plist :req)))
+           (when req
+             (neomacs-model--settle-resizes entry (1- req))
+             (neomacs-model--refuse-resize model entry req))))
         ('view
          ;; The channel settles a camera request before reporting an
          ;; interaction begun after it.  Until then, these reports can
@@ -352,6 +400,7 @@ only records state; `neomacs-model--dispatch' runs the callback."
                (list (plist-get plist :current)
                      (plist-get plist :rev)
                      (plist-get plist :req)))
+         (neomacs-model--settle-resizes entry (plist-get plist :req))
          (let ((pending (neomacs-model--entry-pending-view entry)))
            (when (and pending (>= (plist-get plist :req) pending))
              (setf (neomacs-model--entry-pending-view entry) nil))))
