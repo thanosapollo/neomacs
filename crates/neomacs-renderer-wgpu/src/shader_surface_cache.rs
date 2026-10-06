@@ -168,6 +168,10 @@ pub struct CachedShaderSurface {
     scale: f32,
 }
 
+/// A rendered-texture surface entry built by
+/// [`ShaderSurfaceCache::prepare_rendered`] and not yet installed.
+pub struct PreparedSurface(CachedShaderSurface);
+
 pub struct ShaderSurfaceCache {
     surfaces: HashMap<u32, CachedShaderSurface>,
     uniform_bind_group_layout: wgpu::BindGroupLayout,
@@ -252,6 +256,14 @@ impl ShaderSurfaceCache {
     /// without a single shader surface are the common case, and this lets the
     /// pointer path skip searching a frame's glyphs for one.
     #[must_use]
+    /// Logical and physical size of surface `id` (tests).
+    #[cfg(test)]
+    pub(crate) fn sizes(&self, id: u32) -> Option<((u32, u32), (u32, u32))> {
+        self.surfaces
+            .get(&id)
+            .map(|s| ((s.width, s.height), (s.width_px, s.height_px)))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.surfaces.is_empty()
     }
@@ -514,9 +526,34 @@ impl ShaderSurfaceCache {
         id: u32,
         texture: wgpu::Texture,
         view: wgpu::TextureView,
+        logical: (u32, u32),
+        physical: (u32, u32),
+    ) -> Result<(), String> {
+        let prepared = Self::prepare_rendered(
+            device,
+            composite_layout,
+            composite_sampler,
+            texture,
+            view,
+            logical,
+            physical,
+        )?;
+        self.install_prepared(id, prepared);
+        Ok(())
+    }
+
+    /// The fallible half of [`Self::insert_rendered`]: build the surface
+    /// entry (its composite bind group) without touching the cache, so a
+    /// caller can stage it with other resources and commit all or nothing.
+    pub fn prepare_rendered(
+        device: &wgpu::Device,
+        composite_layout: &wgpu::BindGroupLayout,
+        composite_sampler: &wgpu::Sampler,
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
         (width, height): (u32, u32),
         (width_px, height_px): (u32, u32),
-    ) -> Result<(), String> {
+    ) -> Result<PreparedSurface, String> {
         let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let composite_bind_group =
@@ -526,33 +563,35 @@ impl ShaderSurfaceCache {
         if let Some(error) = rejected.or(exhausted) {
             return Err(format!("composite bind group rejected: {error}"));
         }
-        self.surfaces.insert(
-            id,
-            CachedShaderSurface {
-                texture,
-                view,
-                composite_bind_group,
-                pipeline: None,
-                uniform_buffer: None,
-                channel0: None,
-                uniform_slots: HashMap::new(),
-                custom: [[0.0; 4]; SURFACE_USER_UNIFORM_SLOTS],
-                mouse: [0.0; 4],
-                elapsed: 0.0,
-                frame_index: 0,
-                animate: false,
-                fps: None,
-                last_render: None,
-                dirty: false,
-                active_until: None,
-                width,
-                height,
-                width_px,
-                height_px,
-                scale: 1.0,
-            },
-        );
-        Ok(())
+        Ok(PreparedSurface(CachedShaderSurface {
+            texture,
+            view,
+            composite_bind_group,
+            pipeline: None,
+            uniform_buffer: None,
+            channel0: None,
+            uniform_slots: HashMap::new(),
+            custom: [[0.0; 4]; SURFACE_USER_UNIFORM_SLOTS],
+            mouse: [0.0; 4],
+            elapsed: 0.0,
+            frame_index: 0,
+            animate: false,
+            fps: None,
+            last_render: None,
+            dirty: false,
+            active_until: None,
+            width,
+            height,
+            width_px,
+            height_px,
+            scale: 1.0,
+        }))
+    }
+
+    /// The infallible half of [`Self::insert_rendered`]: install (or
+    /// replace) surface `id`.
+    pub fn install_prepared(&mut self, id: u32, prepared: PreparedSurface) {
+        self.surfaces.insert(id, prepared.0);
     }
 
     /// Resample every shader surface's render target to a new scale factor

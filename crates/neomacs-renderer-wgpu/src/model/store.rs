@@ -32,6 +32,10 @@ pub const WHEEL_QUIET: Duration = Duration::from_millis(150);
 pub const PICK_TIMEOUT: Duration = Duration::from_millis(500);
 /// Poll interval while a load or a pick is outstanding.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(16);
+/// Most vertices over every live model's retained scene (design §4.3).
+pub const MAX_LIVE_VERTICES: u64 = 8_000_000;
+/// Most triangles over every live model's retained scene (design §4.3).
+pub const MAX_LIVE_TRIANGLES: u64 = 8_000_000;
 
 /// The GPU operations the store needs. Each `Err` leaves the model's GPU
 /// state as it was before the call.
@@ -308,12 +312,48 @@ impl ModelStore {
         }
     }
 
+    /// Vertices and triangles of every retained scene: the live totals the
+    /// aggregate caps bound. Derived from the scenes themselves, so a
+    /// scene dropped by free or failure releases its share with it.
+    fn live_geometry(&self) -> (u64, u64) {
+        self.entries
+            .values()
+            .filter_map(|e| e.scene.as_ref())
+            .fold((0, 0), |(v, t), scene| {
+                let (sv, st) = scene_geometry(scene);
+                (v + sv, t + st)
+            })
+    }
+
+    /// Why `scene` may not join the live models, if it may not.
+    fn admission_error(&self, scene: &ModelScene) -> Option<String> {
+        let (vertices, triangles) = self.live_geometry();
+        let (sv, st) = scene_geometry(scene);
+        if vertices + sv > MAX_LIVE_VERTICES {
+            Some(format!(
+                "live models would exceed {MAX_LIVE_VERTICES} vertices"
+            ))
+        } else if triangles + st > MAX_LIVE_TRIANGLES {
+            Some(format!(
+                "live models would exceed {MAX_LIVE_TRIANGLES} triangles"
+            ))
+        } else {
+            None
+        }
+    }
+
     fn loaded(&mut self, result: LoadResult, host: Option<&mut dyn ModelGpuHost>) {
         let LoadResult { id, token, outcome } = result;
         // A result whose (id, token) is no longer live is dropped.
         if self.entries.get(&id).is_none_or(|e| e.token != token) {
             return;
         }
+        // Admission against the live aggregate caps comes before the scene
+        // is retained or uploaded, renderer or not.
+        let outcome = outcome.and_then(|scene| match self.admission_error(&scene) {
+            Some(error) => Err(error),
+            None => Ok(scene),
+        });
         match outcome {
             Err(error) => self.fail(id, error, host),
             Ok(scene) => {
@@ -340,11 +380,37 @@ impl ModelStore {
     }
 
     /// The renderer is gone: its GPU resources went with it.
+    ///
+    /// Invalidated at once (design §4.6, §6.2), not at the next upload: an
+    /// active orbit or wheel burst settles with its `View` (the applied view
+    /// stays); every model with pixels gets a new revision; what each window
+    /// presented, and what the lost texture showed, is forgotten; the fence
+    /// is evaluated, so a model that was current reports `Readiness{current:
+    /// nil}` now. The caller sends these events on the ordered input channel
+    /// before any later input.
     pub fn renderer_lost(&mut self) {
-        for entry in self.entries.values_mut() {
+        let orbiting = self.capture.take().filter(|c| c.orbiting).map(|c| c.id);
+        let ids: Vec<u32> = self.entries.keys().copied().collect();
+        for id in ids {
+            let entry = self.entries.get_mut(&id).expect("live");
+            let had_pixels = entry.uploaded;
             entry.uploaded = false;
             entry.pick = None;
             entry.queued_pick = None;
+            entry.rendered = None;
+            entry.presented.clear();
+            entry.readiness.left_all();
+            // Provenance is gone first, so settling cannot report a stale
+            // true level on the way.
+            let wheel = entry.wheel_deadline.take().is_some();
+            if wheel || orbiting == Some(id) {
+                self.settle_interaction(id);
+            }
+            let entry = self.entries.get_mut(&id).expect("live");
+            if had_pixels {
+                entry.readiness.bump();
+            }
+            self.evaluate(id);
         }
     }
 
@@ -767,13 +833,32 @@ impl ModelStore {
         }
     }
 
+    /// Whether `id` has an active interaction reason: a held orbit or a
+    /// wheel burst before its quiet deadline. The two are independent.
+    fn interaction_active(&self, id: u32) -> bool {
+        self.capture.is_some_and(|c| c.id == id && c.orbiting)
+            || self
+                .entries
+                .get(&id)
+                .is_some_and(|e| e.wheel_deadline.is_some())
+    }
+
+    /// One interaction reason of `id` ended (the caller already cleared
+    /// it). Once none remains, the interaction settles with one `View`,
+    /// then the fence is evaluated; while another is still active nothing
+    /// is reported.
     fn settle_interaction(&mut self, id: u32) {
+        if self.interaction_active(id) {
+            return;
+        }
         let Some(entry) = self.entries.get_mut(&id) else {
             return;
         };
+        if !entry.readiness.interacting() {
+            return;
+        }
         let (view, rev) = (entry.view, entry.readiness.rev());
         entry.readiness.set_interacting(false);
-        entry.wheel_deadline = None;
         self.emit(id, ModelEvent::View { view, rev });
         self.evaluate(id);
     }
@@ -820,6 +905,7 @@ impl ModelStore {
             .map(|(id, _)| *id)
             .collect();
         for id in quiet {
+            self.entries.get_mut(&id).expect("live").wheel_deadline = None;
             self.settle_interaction(id);
         }
         let Some(host) = host else {
@@ -915,6 +1001,12 @@ impl ModelStore {
         }
         self.start_queued_pick(id, now, host);
     }
+}
+
+/// (vertices, triangles) of `scene`.
+fn scene_geometry(scene: &ModelScene) -> (u64, u64) {
+    let vertices: usize = scene.meshes().iter().map(|m| m.vertices.len()).sum();
+    (vertices as u64, scene.triangle_count() as u64)
 }
 
 /// Map a GPU pick to the Lisp-facing hit: per-mesh face and the point in

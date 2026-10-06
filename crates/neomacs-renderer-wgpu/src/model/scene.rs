@@ -30,6 +30,19 @@ pub enum SceneError {
     DegenerateScene,
     #[error("model exceeds {MAX_MODEL_VERTICES} vertices or {MAX_MODEL_TRIANGLES} triangles")]
     TooLarge,
+    #[error("model load cancelled")]
+    Cancelled,
+}
+
+/// Triangles or vertices handled between two cancellation polls.
+const CHECK_EVERY: usize = 1 << 16;
+
+/// Poll `cancelled` every [`CHECK_EVERY`]th item.
+fn checkpoint(i: usize, cancelled: &dyn Fn() -> bool) -> Result<(), SceneError> {
+    if i % CHECK_EVERY == CHECK_EVERY - 1 && cancelled() {
+        return Err(SceneError::Cancelled);
+    }
+    Ok(())
 }
 
 /// A validated, normalised scene: original geometry plus its frame.
@@ -98,6 +111,15 @@ impl ModelScene {
     /// Validate `meshes` (already parsed within the model caps) and compute
     /// the scene frame.
     pub fn new(meshes: Vec<ObjMesh>) -> Result<Self, SceneError> {
+        Self::new_cancellable(meshes, &|| false)
+    }
+
+    /// [`ModelScene::new`], polling `cancelled` every [`CHECK_EVERY`]
+    /// triangles or vertices of validation and framing.
+    pub fn new_cancellable(
+        meshes: Vec<ObjMesh>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, SceneError> {
         if meshes.is_empty() || meshes.len() > MAX_MODEL_MESHES {
             return Err(SceneError::MeshCount);
         }
@@ -108,6 +130,7 @@ impl ModelScene {
         }
         let mut face_starts = Vec::with_capacity(meshes.len());
         let mut next = 0u32;
+        let mut work = 0usize;
         for (mesh_index, mesh) in meshes.iter().enumerate() {
             face_starts.push(next);
             // Within the caps above, so the narrowing cannot fail; checked
@@ -116,18 +139,19 @@ impl ModelScene {
                 .ok()
                 .and_then(|n| next.checked_add(n))
                 .ok_or(SceneError::TooLarge)?;
-            if mesh
-                .triangles
-                .iter()
-                .flatten()
-                .any(|&i| i as usize >= mesh.vertices.len())
-            {
-                return Err(SceneError::Obj {
-                    mesh: mesh_index,
-                    source: ObjError::IndexOutOfRange { line: 0 },
-                });
+            for tri in &mesh.triangles {
+                checkpoint(work, cancelled)?;
+                work += 1;
+                if tri.iter().any(|&i| i as usize >= mesh.vertices.len()) {
+                    return Err(SceneError::Obj {
+                        mesh: mesh_index,
+                        source: ObjError::IndexOutOfRange { line: 0 },
+                    });
+                }
             }
             for (face, tri) in mesh.triangles.iter().enumerate() {
+                checkpoint(work, cancelled)?;
+                work += 1;
                 let corners = tri.map(|i| mesh.vertices[i as usize]);
                 if face_normal(corners).is_none() {
                     return Err(SceneError::DegenerateTriangle {
@@ -140,20 +164,21 @@ impl ModelScene {
         let mut lo = [f64::INFINITY; 3];
         let mut hi = [f64::NEG_INFINITY; 3];
         for v in meshes.iter().flat_map(|m| m.vertices.iter()) {
+            checkpoint(work, cancelled)?;
+            work += 1;
             for axis in 0..3 {
                 lo[axis] = lo[axis].min(v[axis]);
                 hi[axis] = hi[axis].max(v[axis]);
             }
         }
         let centre = [0, 1, 2].map(|axis| (hi[axis] + lo[axis]) / 2.0);
-        let radius = meshes
-            .iter()
-            .flat_map(|m| m.vertices.iter())
-            .map(|v| {
-                let d = sub(*v, centre);
-                d[0].hypot(d[1]).hypot(d[2])
-            })
-            .fold(0.0f64, f64::max);
+        let mut radius = 0.0f64;
+        for v in meshes.iter().flat_map(|m| m.vertices.iter()) {
+            checkpoint(work, cancelled)?;
+            work += 1;
+            let d = sub(*v, centre);
+            radius = radius.max(d[0].hypot(d[1]).hypot(d[2]));
+        }
         if !radius.is_finite() || radius <= 0.0 {
             return Err(SceneError::DegenerateScene);
         }

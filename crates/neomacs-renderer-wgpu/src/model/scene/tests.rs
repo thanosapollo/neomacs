@@ -121,3 +121,52 @@ fn parity_with_canvas_3d_on_real_asset() {
     );
     ModelScene::new(vec![parsed]).unwrap();
 }
+
+/// Review MUST 2: validation and framing poll the cancel flag at bounded
+/// intervals, so a flag raised mid-scene stops it within one step.
+#[test]
+fn scene_validation_and_framing_poll_cancellation() {
+    let calls = std::cell::Cell::new(0usize);
+    let counting = || {
+        calls.set(calls.get() + 1);
+        false
+    };
+    // Many triangles: polled through validation.
+    let triangles = ObjMesh {
+        vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        triangles: vec![[0, 1, 2]; 1_000_000],
+    };
+    ModelScene::new_cancellable(vec![triangles.clone()], &counting).unwrap();
+    assert!(
+        calls.get() >= 1_000_000 / CHECK_EVERY,
+        "{} polls",
+        calls.get()
+    );
+    // Many vertices, one triangle: polled through framing.
+    calls.set(0);
+    let mut points = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    points.extend((3..1_000_000).map(|i| [i as f64, 1.0, 0.0]));
+    let vertices = ObjMesh {
+        vertices: points,
+        triangles: vec![[0, 1, 2]],
+    };
+    ModelScene::new_cancellable(vec![vertices.clone()], &counting).unwrap();
+    assert!(
+        calls.get() >= 2 * 1_000_000 / CHECK_EVERY,
+        "{} polls",
+        calls.get()
+    );
+    // A flag that rises at the second poll stops at once.
+    for mesh in [triangles, vertices] {
+        calls.set(0);
+        let late = || {
+            calls.set(calls.get() + 1);
+            calls.get() >= 2
+        };
+        assert_eq!(
+            ModelScene::new_cancellable(vec![mesh], &late),
+            Err(SceneError::Cancelled)
+        );
+        assert_eq!(calls.get(), 2, "no work after the flag rose");
+    }
+}

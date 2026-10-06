@@ -267,3 +267,145 @@ fn oversized_file_is_rejected_before_reading() {
     );
     std::fs::remove_file(path).unwrap();
 }
+
+// ----------------------------------------------------------------------
+// Review MUST 2: cancellation reaches the parse, including long lines.
+
+const TRIANGLE_HEAD: &[u8] = b"v 0 0 0\nv 1 0 0\nv 0 1 0\n";
+
+/// `count` one-triangle face lines.
+fn many_faces(count: usize) -> Vec<u8> {
+    let mut body = TRIANGLE_HEAD.to_vec();
+    for _ in 0..count {
+        body.extend_from_slice(b"f 1 2 3\n");
+    }
+    body
+}
+
+/// One face line of `refs` references.
+fn one_long_face(refs: usize) -> Vec<u8> {
+    let mut body = TRIANGLE_HEAD.to_vec();
+    body.extend_from_slice(b"f");
+    for i in 0..refs {
+        body.extend_from_slice([&b" 1"[..], b" 2", b" 3"][i % 3]);
+    }
+    body.push(b'\n');
+    body
+}
+
+/// Read `body` with a cancel flag that rises only after the read loop has
+/// polled it once per read step and once more: a flag raised then must
+/// still stop the work promptly. Answers the outcome, how many polls ran
+/// and the time from the first `true` to the return.
+fn read_cancelled_late(
+    name: &str,
+    body: &[u8],
+) -> (
+    Result<ObjMesh, ObjError>,
+    usize,
+    Option<std::time::Duration>,
+) {
+    let path = scratch(name, body);
+    let read_steps = body.len().div_ceil(1 << 20) + 1;
+    let calls = std::cell::Cell::new(0usize);
+    let tripped = std::cell::Cell::new(None::<std::time::Instant>);
+    let cancelled = || {
+        calls.set(calls.get() + 1);
+        if calls.get() > read_steps + 1 {
+            if tripped.get().is_none() {
+                tripped.set(Some(std::time::Instant::now()));
+            }
+            true
+        } else {
+            false
+        }
+    };
+    let limits = ObjLimits {
+        max_vertices: 1000,
+        max_triangles: 2_000_000,
+    };
+    let outcome = read_obj_file(&path, None, limits, &cancelled);
+    let stopped = tripped.get().map(|t| t.elapsed());
+    std::fs::remove_file(path).unwrap();
+    (outcome, calls.get(), stopped)
+}
+
+/// Many short lines: the parse itself polls the flag.
+#[test]
+fn cancellation_is_polled_while_parsing_many_lines() {
+    let body = many_faces(1_500_000);
+    let (outcome, calls, stopped) = read_cancelled_late("cancel-lines.obj", &body);
+    assert_eq!(
+        outcome.map(|m| m.triangles.len()),
+        Err(ObjError::Cancelled),
+        "a flag raised after the read steps must stop the parse ({calls} polls)"
+    );
+    let stopped = stopped.unwrap();
+    assert!(
+        stopped < std::time::Duration::from_millis(250),
+        "stopped {stopped:?} after the flag rose"
+    );
+}
+
+/// One face line of 1,500,000 references (about 3 MB): checkpoints run
+/// inside the line, not only between lines.
+#[test]
+fn cancellation_is_polled_inside_one_long_face_line() {
+    let body = one_long_face(1_500_000);
+    let (outcome, calls, stopped) = read_cancelled_late("cancel-long-line.obj", &body);
+    assert_eq!(
+        outcome.map(|m| m.triangles.len()),
+        Err(ObjError::Cancelled),
+        "a flag raised after the read steps must stop the long line ({calls} polls)"
+    );
+    let stopped = stopped.unwrap();
+    assert!(
+        stopped < std::time::Duration::from_millis(250),
+        "stopped {stopped:?} after the flag rose"
+    );
+}
+
+/// The incremental parser gives the same mesh whatever the chunking, and
+/// polls inside one long line.
+#[test]
+fn the_incremental_parser_is_chunking_independent_and_polls_long_lines() {
+    let text = b"# c\nv 0 0 0\nv 1 0 0 # x\r\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\nf -4 -2 -1";
+    let whole = parse_obj(text, WIDE).unwrap();
+    for step in 1..text.len() {
+        let mut parser = ObjParser::new(WIDE);
+        for piece in text.chunks(step) {
+            parser.feed(piece, &|| false).unwrap();
+        }
+        assert_eq!(parser.finish(&|| false).unwrap(), whole, "step {step}");
+    }
+    // Line numbers survive chunking.
+    let mut parser = ObjParser::new(WIDE);
+    parser.feed(b"v 0 0 0\nv 1 ", &|| false).unwrap();
+    assert_eq!(
+        parser.feed(b"0\n", &|| false).unwrap_err(),
+        ObjError::ShortVertex { line: 2 }
+    );
+    // Invalid UTF-8 split across chunks is still found, with its line.
+    let mut parser = ObjParser::new(WIDE);
+    parser.feed(b"v 0 0 0\n# \xc3", &|| false).unwrap();
+    assert_eq!(
+        parser.feed(b"\xa9\n# \xff\n", &|| false).unwrap_err(),
+        ObjError::NotUtf8 { line: 3 }
+    );
+    // One long face: polled within the line, stopping at the first `true`.
+    let body = one_long_face(1_500_000);
+    let calls = std::cell::Cell::new(0usize);
+    let late = || {
+        calls.set(calls.get() + 1);
+        calls.get() >= 3
+    };
+    let limits = ObjLimits {
+        max_vertices: 1000,
+        max_triangles: 2_000_000,
+    };
+    assert_eq!(
+        parse_obj_cancellable(&body, limits, &late).unwrap_err(),
+        ObjError::Cancelled
+    );
+    assert_eq!(calls.get(), 3);
+}
