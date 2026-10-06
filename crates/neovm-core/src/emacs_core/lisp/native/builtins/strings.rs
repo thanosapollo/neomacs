@@ -415,6 +415,46 @@ pub(crate) fn builtin_concat_slice(args: &[Value]) -> EvalResult {
     crate::emacs_core::perf_trace::time_op(crate::emacs_core::perf_trace::HotpathOp::Concat, || {
         use crate::emacs_core::emacs_char;
 
+        // GNU `concat_to_string` (fns.c) first checks every argument in
+        // order: `Flength` of a list (so a circular list signals
+        // `circular-list` instead of spinning below without a quit check),
+        // `CHECK_CHARACTER` on each list or vector element, and `sequencep`
+        // for anything else.  The code below may then walk the arguments
+        // freely, and the first error raised is GNU's.
+        fn check_concat_char(value: Value) -> Result<(), Flow> {
+            match value.kind() {
+                ValueKind::Fixnum(c) if (0..=emacs_char::MAX_CHAR as i64).contains(&c) => Ok(()),
+                _ => Err(signal(
+                    LispCondition::WrongTypeArgument,
+                    vec![Value::symbol("characterp"), value],
+                )),
+            }
+        }
+        for &arg in args {
+            match arg.kind() {
+                ValueKind::String | ValueKind::Nil => {}
+                ValueKind::Veclike(VecLikeType::Vector) => {
+                    for &item in arg.as_vector_data().unwrap().iter() {
+                        check_concat_char(item)?;
+                    }
+                }
+                ValueKind::Cons => {
+                    super::cons_list::proper_list_length_or_signal(arg)?;
+                    let mut cursor = arg;
+                    while cursor.is_cons() {
+                        check_concat_char(cursor.cons_car())?;
+                        cursor = cursor.cons_cdr();
+                    }
+                }
+                _ => {
+                    return Err(signal(
+                        LispCondition::WrongTypeArgument,
+                        vec![Value::symbol("sequencep"), arg],
+                    ));
+                }
+            }
+        }
+
         fn concat_arg_makes_multibyte(value: Value) -> bool {
             match value.kind() {
                 ValueKind::String => value
