@@ -396,12 +396,16 @@ impl Context {
 
         let temp_scope = self.save_eval_temp_roots();
         let val_temp_slot = self.push_eval_temp_root_slot(Value::NIL);
+        // GNU `Flet_star` walks VARLIST with `FOR_EACH_TAIL`, whose current
+        // cons and tortoise live in C locals across every init form: root
+        // both, as an init may drop every other reference to them.
+        let bindings_temp_slot = self.push_eval_temp_root_slot(varlist);
+        let tortoise_temp_slot = self.push_eval_temp_root_slot(varlist);
         let init_result: Result<(), Flow> = (|| {
             let mut bindings = varlist;
             let mut cycle = crate::emacs_core::builtins::ForEachTail::new(varlist);
             while bindings.is_cons() {
                 let binding = self.unwrap_symbol(bindings.cons_car());
-                bindings = bindings.cons_cdr();
                 let (id, value) = if let Some(id) = binding.as_symbol_id() {
                     (id, Value::NIL)
                 } else if binding.is_cons() {
@@ -461,11 +465,17 @@ impl Context {
                 } else {
                     self.try_specbind(id, value)?;
                 }
-                // GNU `Flet_star` walks VARLIST with `FOR_EACH_TAIL`.
+                // `FOR_EACH_TAIL` reads the cdr once the element is bound,
+                // so an init form that changed it is seen.
+                bindings = bindings.cons_cdr();
                 cycle.step(bindings)?;
+                self.set_eval_temp_root_slot(bindings_temp_slot, bindings);
+                self.set_eval_temp_root_slot(tortoise_temp_slot, cycle.tortoise());
             }
             if !bindings.is_nil() {
-                return Err(self.listp_error(varlist));
+                // GNU `CHECK_LIST_END (varlist, XCAR (args))`: the varlist
+                // the form holds now, which the backtrace frame keeps alive.
+                return Err(self.listp_error(tail.cons_car()));
             }
             Ok(())
         })();

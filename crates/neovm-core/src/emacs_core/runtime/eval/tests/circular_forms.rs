@@ -9,6 +9,7 @@
 //! expected strings are GNU 32.0.50's output for the same forms.  The cases
 //! run on a worker thread so a regression fails here instead of hanging.
 
+use crate::emacs_core::eval::{TierIEvent, TierIMode};
 use crate::emacs_core::print::print_value;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -20,6 +21,10 @@ const PRELUDE: &str = r#"
 (defvar fix15-n 0)
 (defalias 'fix15-f (lambda (&rest x) x))
 (defalias 'fix15-g (make-byte-code 128 "\300\207" [nil] 1))
+(defvar fix15-c nil)
+(defvar fix15-form nil)
+(defvar fix15-gc nil)
+(defvar fix15-datum nil)
 "#;
 
 /// Evaluate each `(SOURCE EXPECTED)` case in one runtime-startup context on
@@ -338,4 +343,190 @@ fn circular_form_macroexpand_args_signal_circular_list() {
             gnu,
         ),
     ]);
+}
+
+/// Evaluate each `(SOURCE EXPECTED)` case as [`assert_cases`] does, once
+/// under the tree walker and once each under Tier-I in `on` and `verify`
+/// mode at threshold 1 (every body compiled at its first call), and assert
+/// every printed result.  A cons a case leaves in `fix15-datum` must still
+/// be an allocated cons: the printed result gets ` live` or ` FREED`.  In
+/// the Tier-I modes compiled code must have run.
+fn assert_tier_i_cases(cases: &[(&'static str, &'static str)]) {
+    const MODES: [TierIMode; 3] = [TierIMode::Off, TierIMode::On, TierIMode::Verify];
+    crate::test_utils::init_test_tracing();
+    let sources: Vec<&'static str> = cases.iter().map(|(src, _)| *src).collect();
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::Builder::new()
+        .name("circular-forms-tier-i".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let mut eval = crate::test_utils::runtime_startup_context();
+            let prelude = match eval.eval_str(PRELUDE) {
+                Ok(_) => String::new(),
+                Err(err) => format!("prelude: {err:?}"),
+            };
+            if tx.send(prelude).is_err() {
+                return;
+            }
+            for mode in MODES {
+                eval.tier_i.set_mode(mode);
+                eval.tier_i.set_threshold(1);
+                eval.tier_i.clear_for_test();
+                for src in &sources {
+                    let mut printed = match eval.eval_str(src) {
+                        Ok(value) => print_value(&value),
+                        Err(err) => format!("ERR {err:?}"),
+                    };
+                    let datum = eval.obarray.symbol_value("fix15-datum").copied();
+                    if let Some(datum) = datum.filter(|datum| datum.is_cons()) {
+                        let live = eval.tagged_heap.owns_heap_value_for_test(datum);
+                        printed.push_str(if live { " live" } else { " FREED" });
+                    }
+                    let _ = eval.eval_str("(setq fix15-datum nil fix15-c nil fix15-form nil)");
+                    if tx.send(printed).is_err() {
+                        return;
+                    }
+                }
+                let runs = eval.tier_i.stats().count(TierIEvent::Run);
+                if tx.send(runs.to_string()).is_err() {
+                    return;
+                }
+            }
+        })
+        .expect("spawn circular-forms-tier-i thread");
+    let prelude = rx
+        .recv_timeout(STARTUP_TIMEOUT)
+        .expect("runtime startup and prelude should finish");
+    assert_eq!(prelude, "");
+    let mut mismatches = Vec::new();
+    for mode in MODES {
+        for (src, expected) in cases {
+            let printed = rx.recv_timeout(CASE_TIMEOUT).unwrap_or_else(|_| {
+                panic!("{mode:?}: did not finish within {CASE_TIMEOUT:?}: {src}")
+            });
+            if printed != *expected {
+                mismatches.push(format!(
+                    "{mode:?}: {src}\n  left: {printed}\n right: {expected}"
+                ));
+            }
+        }
+        let runs = rx.recv_timeout(CASE_TIMEOUT).expect("Tier-I run count");
+        if mode != TierIMode::Off && runs == "0" {
+            mismatches.push(format!("{mode:?}: no compiled body ran"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// GNU `Flet_star` walks the live VARLIST with `FOR_EACH_TAIL`, reading
+/// each cdr after evaluating and binding the element before it: an init
+/// form that breaks a cycle lets `let*' return, one that makes the varlist
+/// circular or improper signals.  The `fix15-ls' cases run the `let*' as a
+/// function body, which Tier-I compiles while the varlist is still proper
+/// and then runs over the mutated one.
+#[test]
+fn circular_form_let_star_walks_the_live_varlist() {
+    let mut cases: Vec<(&'static str, &'static str)> = Vec::new();
+    for (src, gnu) in [
+        (
+            "(progn
+               (setq fix15-c (list (list 'a '(progn (setcdr fix15-c nil) 7))))
+               (setcdr fix15-c fix15-c)
+               (condition-case e (eval (list 'let* fix15-c 'a) LEX)
+                 (error (list (car e) (eq (cadr e) fix15-c)))))",
+            "7",
+        ),
+        (
+            "(progn
+               (setq fix15-c (list (list 'a '(progn (setcdr fix15-c fix15-c) 7))))
+               (condition-case e (eval (list 'let* fix15-c 'a) LEX)
+                 (error (list (car e) (eq (cadr e) fix15-c)))))",
+            "(circular-list t)",
+        ),
+        (
+            "(progn
+               (setq fix15-c (list (list 'a '(progn (setcdr fix15-c 5) 7))))
+               (condition-case e (eval (list 'let* fix15-c 'a) LEX)
+                 (error (list (car e) (cadr e)))))",
+            "(wrong-type-argument listp)",
+        ),
+    ] {
+        for lex in ["nil", "t"] {
+            let src: &'static str = src.replace("LEX", lex).leak();
+            cases.push((src, gnu));
+        }
+    }
+    cases.extend([
+        (
+            "(progn
+               (setq fix15-gc nil)
+               (setq fix15-c
+                     (list (list 'a '(progn (when fix15-gc (setcdr fix15-c nil)) 7))))
+               (defalias 'fix15-ls1
+                 (eval (list 'function (list 'lambda nil (list 'let* fix15-c 'a))) t))
+               (list (fix15-ls1)
+                     (progn (setcdr fix15-c fix15-c) (setq fix15-gc t)
+                            (condition-case e (fix15-ls1)
+                              (error (list (car e) (eq (cadr e) fix15-c)))))))",
+            "(7 7)",
+        ),
+        (
+            "(progn
+               (setq fix15-gc nil)
+               (setq fix15-c
+                     (list (list 'a '(progn (when fix15-gc (setcdr fix15-c fix15-c)) 7))))
+               (defalias 'fix15-ls2
+                 (eval (list 'function (list 'lambda nil (list 'let* fix15-c 'a))) t))
+               (list (fix15-ls2)
+                     (progn (setq fix15-gc t)
+                            (condition-case e (fix15-ls2)
+                              (error (list (car e) (eq (cadr e) fix15-c)))))))",
+            "(7 (circular-list t))",
+        ),
+    ]);
+    assert_tier_i_cases(&cases);
+}
+
+/// GNU `Flet_star` keeps the cons it is walking, and `FOR_EACH_TAIL` its
+/// tortoise, in C locals across each init form, so a garbage collection
+/// inside an init that dropped every other reference to the varlist leaves
+/// them alive and `circular-list` reports the very cons.
+#[test]
+fn circular_form_let_star_keeps_its_varlist_alive_across_gc() {
+    let mut cases: Vec<(&'static str, &'static str)> = Vec::new();
+    for lex in ["nil", "t"] {
+        let src: &'static str = "(progn
+               (setq fix15-c
+                     (list (list 'a '(progn (setcar (cdr fix15-form) nil)
+                                            (setq fix15-c nil)
+                                            (garbage-collect) (garbage-collect) 7))))
+               (setcdr fix15-c fix15-c)
+               (setq fix15-form (list 'let* fix15-c 'a))
+               (identity nil)
+               (condition-case e (eval fix15-form LEX)
+                 (error (setq fix15-datum (cadr e))
+                        (list (car e) (consp (cadr e)) (caar (cadr e))))))"
+            .replace("LEX", lex)
+            .leak();
+        cases.push((src, "(circular-list t a) live"));
+    }
+    cases.push((
+        "(progn
+           (setq fix15-gc nil)
+           (setq fix15-c
+                 (list (list 'a '(progn (when fix15-gc
+                                          (setcar (cdr fix15-form) nil)
+                                          (setq fix15-c nil fix15-form nil)
+                                          (garbage-collect) (garbage-collect))
+                                        7))))
+           (setq fix15-form (list 'let* fix15-c 'a))
+           (defalias 'fix15-ls3 (eval (list 'function (list 'lambda nil fix15-form)) t))
+           (list (fix15-ls3)
+                 (progn (setcdr fix15-c fix15-c) (setq fix15-gc t)
+                        (condition-case e (fix15-ls3)
+                          (error (setq fix15-datum (cadr e))
+                                 (list (car e) (consp (cadr e)) (caar (cadr e))))))))",
+        "(7 (circular-list t a)) live",
+    ));
+    assert_tier_i_cases(&cases);
 }

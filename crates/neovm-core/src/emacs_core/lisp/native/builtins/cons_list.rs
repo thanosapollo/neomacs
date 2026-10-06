@@ -212,6 +212,13 @@ impl ForEachTail {
         }
     }
 
+    /// The cons the walk compares each step with.  A walk that runs Lisp
+    /// between steps must keep it alive: GNU's lives in a C local.
+    #[inline]
+    pub(crate) fn tortoise(&self) -> Value {
+        self.tortoise
+    }
+
     /// Account for the walk's step onto TAIL: a step back onto the tortoise
     /// signals `circular-list` with TAIL, as GNU's `circular_list (tail)`.
     #[inline]
