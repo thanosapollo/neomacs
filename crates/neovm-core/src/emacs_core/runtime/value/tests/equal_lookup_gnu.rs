@@ -144,3 +144,76 @@ fn equal_hash_iteration_and_printing_keep_insertion_order() {
         )
     );
 }
+
+/// A key reached by 2^64 paths through shared structure is inserted,
+/// found, iterated and removed in bounded time and memory, as GNU does:
+/// `sxhash` looks at a bounded prefix and lookups compare the live key.
+/// Materializing the stored key as a tree copied every shared node once per
+/// path, so the profiler's `equal` log of closure backtraces (closures share
+/// their captured environments) exhausted memory.
+#[test]
+fn equal_hash_keys_with_shared_substructure_stay_bounded() {
+    crate::test_utils::init_test_tracing();
+    let form = r#"
+(let* ((h (make-hash-table :test 'equal))
+       (x (list 1)))
+  (dotimes (_ 64) (setq x (list x x)))
+  (let* ((f (let ((env x)) (lambda () env)))
+         (key (vector f f)))
+    (puthash x 'dag h)
+    (puthash key 'closure h)
+    (puthash (list 'small x) 'small h)
+    (list (gethash x h) (gethash key h) (gethash (list 'small x) h)
+          (gethash (list 'other x) h) (hash-table-count h)
+          (let (n) (maphash (lambda (k _v) (push (eq k x) n)) h) (nreverse n))
+          (progn (remhash x h) (list (gethash x h 'gone) (hash-table-count h)))
+          (hash-table-count (copy-hash-table h)))))
+"#;
+    assert_eq!(
+        runtime_startup_eval_one(form),
+        oracle_expect_transcript(r#""OK (dag closure small nil 3 (t nil nil) (gone 2) 2)""#)
+    );
+}
+
+/// Rust maps keyed by `Value` (menu ancestors, text-property maps) hash
+/// with the bounded `equal` hash too, so a value with shared substructure
+/// hashes in bounded time and still finds its `equal` twin.
+#[test]
+fn value_hash_of_shared_substructure_is_bounded_and_equal_consistent() {
+    crate::test_utils::init_test_tracing();
+    super::with_test_heap(|| {
+        let mut x = super::Value::list(vec![super::Value::fixnum(1)]);
+        for _ in 0..64 {
+            x = super::Value::list(vec![x, x]);
+        }
+        let mut set = std::collections::HashSet::new();
+        assert!(set.insert(x));
+        assert!(set.contains(&x));
+        let twin = super::Value::list(vec![super::Value::symbol("a"), x]);
+        let other = super::Value::list(vec![super::Value::symbol("a"), x]);
+        assert!(set.insert(twin));
+        assert!(!set.insert(other), "an `equal` twin must hash alike");
+        assert_eq!(set.len(), 2);
+    });
+}
+
+/// A hash-table literal files `equal` keys once, however large: two equal
+/// 256-element vectors or 300-element lists are one entry, the later value
+/// winning, as GNU's reader gives.
+#[test]
+fn equal_hash_literals_merge_equal_keys_beyond_the_key_budget() {
+    crate::test_utils::init_test_tracing();
+    let form = r##"
+(list
+ (let* ((v (make-vector 256 0))
+        (h (read (format "#s(hash-table test equal data (%S a %S b))" v v))))
+   (list (hash-table-count h) (gethash v h) (progn (remhash v h) (hash-table-count h))))
+ (let* ((l (make-list 300 'x))
+        (h (read (format "#s(hash-table test equal data (%S a %S b))" l l))))
+   (list (hash-table-count h) (gethash l h) (progn (remhash l h) (hash-table-count h)))))
+"##;
+    assert_eq!(
+        runtime_startup_eval_one(form),
+        oracle_expect_transcript(r#""OK ((1 b 0) (1 b 0))""#)
+    );
+}

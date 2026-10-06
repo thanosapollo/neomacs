@@ -143,6 +143,28 @@ fn structurally_equal_export_keys_preserve_all_counts() {
 }
 
 #[test]
+fn equal_export_keys_beyond_the_key_budget_preserve_all_counts() {
+    // Two equal but distinct closures whose structure exceeds the bounded
+    // `equal` key still export as one backtrace carrying both counts.
+    let mut ctx = Context::new();
+    let source = format!("(lambda (value) (list value [{}]))", "0 ".repeat(300));
+    let first = ctx.eval_str(&source).unwrap();
+    let second = ctx.eval_str(&source).unwrap();
+    assert_ne!(first.bits(), second.bits());
+    assert_eq!(first, second, "the two closures are `equal`");
+
+    let mut log = ProfilerLog::new(1, 10);
+    log.record(&[first], 2);
+    log.record(&[second], 3);
+    assert_eq!(log.entries.len(), 2);
+
+    let table = log.to_value();
+    let table = table.as_hash_table().unwrap();
+    assert_eq!(table.data.len(), 1);
+    assert_eq!(table.data.values().next().unwrap().as_fixnum(), Some(5));
+}
+
+#[test]
 fn zero_capacity_discards_samples_without_panicking() {
     let mut log = ProfilerLog::new(0, 0);
     log.record(&[Value::symbol("ignored")], 7);
