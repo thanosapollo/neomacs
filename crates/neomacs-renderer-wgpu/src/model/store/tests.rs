@@ -262,7 +262,10 @@ fn a_refused_resize_keeps_the_texture_and_settles() {
         },
         h(&mut host),
     );
-    assert_eq!(kinds(&store.take_events()), ["Error{Some(8)}", "R{true,1,8}"]);
+    assert_eq!(
+        kinds(&store.take_events()),
+        ["Error{Some(8)}", "R{true,1,8}"]
+    );
     assert!(!store.has_dirty());
 }
 
@@ -296,10 +299,16 @@ fn an_invalid_highlight_is_cleared_redrawn_and_reported() {
         },
         h(&mut host),
     );
-    assert_eq!(kinds(&store.take_events()), ["Error{Some(9)}", "R{false,4,9}"]);
+    assert_eq!(
+        kinds(&store.take_events()),
+        ["Error{Some(9)}", "R{false,4,9}"]
+    );
     shown(&mut store, &mut host);
     assert_eq!(kinds(&store.take_events()), ["R{true,4,9}"]);
-    assert_eq!(host.draws.last().unwrap().highlight, GpuHighlight::default());
+    assert_eq!(
+        host.draws.last().unwrap().highlight,
+        GpuHighlight::default()
+    );
 }
 
 #[test]
@@ -310,7 +319,10 @@ fn frozen_models_reject_requests_and_interaction() {
     store.update(5, 1, ModelChange::Freeze, h(&mut host));
     store.take_events();
     store.update(5, 2, ModelChange::View(ModelView::default()), h(&mut host));
-    assert_eq!(kinds(&store.take_events()), ["Error{Some(2)}", "R{true,1,2}"]);
+    assert_eq!(
+        kinds(&store.take_events()),
+        ["Error{Some(2)}", "R{true,1,2}"]
+    );
     let hit = GlyphHit {
         id: 5,
         u: 0.5,

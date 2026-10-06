@@ -263,7 +263,14 @@ fn check_target_size(device: &wgpu::Device, (w, h): (u32, u32)) -> Result<(), St
 impl Targets {
     fn new(device: &wgpu::Device, size: (u32, u32)) -> Self {
         let sampled = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
-        let texture = target(device, "model colour", size, MODEL_TEXTURE_FORMAT, 1, sampled);
+        let texture = target(
+            device,
+            "model colour",
+            size,
+            MODEL_TEXTURE_FORMAT,
+            1,
+            sampled,
+        );
         let msaa = target(
             device,
             "model msaa",
@@ -476,41 +483,42 @@ impl ModelGpu {
                 bind_group_layouts: &[Some(&layout)],
                 immediate_size: 0,
             });
-            let pipeline = |label, fragment, targets: &[Option<wgpu::ColorTargetState>], samples| {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some("vs_main"),
-                        compilation_options: Default::default(),
-                        buffers: &[],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some(fragment),
-                        compilation_options: Default::default(),
-                        targets,
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        cull_mode: None,
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: DEPTH_FORMAT,
-                        depth_write_enabled: Some(true),
-                        depth_compare: Some(wgpu::CompareFunction::Less),
-                        stencil: Default::default(),
-                        bias: Default::default(),
-                    }),
-                    multisample: wgpu::MultisampleState {
-                        count: samples,
-                        ..Default::default()
-                    },
-                    multiview_mask: None,
-                    cache: None,
-                })
-            };
+            let pipeline =
+                |label, fragment, targets: &[Option<wgpu::ColorTargetState>], samples| {
+                    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some(label),
+                        layout: Some(&pipeline_layout),
+                        vertex: wgpu::VertexState {
+                            module: &shader,
+                            entry_point: Some("vs_main"),
+                            compilation_options: Default::default(),
+                            buffers: &[],
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &shader,
+                            entry_point: Some(fragment),
+                            compilation_options: Default::default(),
+                            targets,
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            cull_mode: None,
+                            ..Default::default()
+                        },
+                        depth_stencil: Some(wgpu::DepthStencilState {
+                            format: DEPTH_FORMAT,
+                            depth_write_enabled: Some(true),
+                            depth_compare: Some(wgpu::CompareFunction::Less),
+                            stencil: Default::default(),
+                            bias: Default::default(),
+                        }),
+                        multisample: wgpu::MultisampleState {
+                            count: samples,
+                            ..Default::default()
+                        },
+                        multiview_mask: None,
+                        cache: None,
+                    })
+                };
             let colour = |format| {
                 Some(wgpu::ColorTargetState {
                     format,
@@ -582,7 +590,12 @@ impl ModelGpu {
         uniform.paint[0] = highlight.mesh.map_or(0.0, |m| m as f32 + 1.0);
         if let Some(point) = highlight.point {
             uniform.paint[1] = point.mesh as f32 + 1.0;
-            uniform.point = [point.centre[0], point.centre[1], point.centre[2], point.radius];
+            uniform.point = [
+                point.centre[0],
+                point.centre[1],
+                point.centre[2],
+                point.radius,
+            ];
         }
         uniform.paint[2] = if highlight.faces.is_some() { 1.0 } else { 0.0 };
         // Both writes allocate staging memory: scope them with the pass.

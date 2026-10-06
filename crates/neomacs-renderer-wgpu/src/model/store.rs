@@ -47,8 +47,12 @@ pub trait ModelGpuHost {
     ) -> Result<(u32, u32), String>;
     /// New render targets for a new logical size or scale (old and new
     /// overlap in the budget until the new ones exist).
-    fn model_resize(&mut self, id: u32, logical: (u32, u32), scale: f32)
-    -> Result<(u32, u32), String>;
+    fn model_resize(
+        &mut self,
+        id: u32,
+        logical: (u32, u32),
+        scale: f32,
+    ) -> Result<(u32, u32), String>;
     fn model_render(&mut self, id: u32, draw: &ModelDraw) -> Result<(), String>;
     /// Release every GPU resource and reservation of `id`. Idempotent.
     fn model_free(&mut self, id: u32);
@@ -361,7 +365,13 @@ impl ModelStore {
                     let triangles = scene.triangle_counts();
                     self.emit(id, ModelEvent::Ready { triangles });
                 }
-                if let Some(req) = self.entries.get_mut(&id).unwrap().unvalidated_highlight.take() {
+                if let Some(req) = self
+                    .entries
+                    .get_mut(&id)
+                    .unwrap()
+                    .unvalidated_highlight
+                    .take()
+                {
                     self.validate_highlight(id, Some(req));
                 }
                 self.evaluate(id);
@@ -444,10 +454,13 @@ impl ModelStore {
         };
         if let Some(error) = rejection {
             entry.readiness.settle(req);
-            self.emit(id, ModelEvent::Error {
-                req: Some(req),
-                error,
-            });
+            self.emit(
+                id,
+                ModelEvent::Error {
+                    req: Some(req),
+                    error,
+                },
+            );
             self.evaluate(id);
             return;
         }
@@ -461,10 +474,13 @@ impl ModelStore {
                         entry.readiness.bump();
                     }
                 }
-                Err(error) => self.emit(id, ModelEvent::Error {
-                    req: Some(req),
-                    error,
-                }),
+                Err(error) => self.emit(
+                    id,
+                    ModelEvent::Error {
+                        req: Some(req),
+                        error,
+                    },
+                ),
             },
             ModelChange::Highlight { target, selected } => {
                 let target = match target.map(ModelTarget::validated).transpose() {
@@ -472,10 +488,13 @@ impl ModelStore {
                     Err(error) => {
                         // Malformed beyond topology: the same applied
                         // fallback as an out-of-range face.
-                        self.emit(id, ModelEvent::Error {
-                            req: Some(req),
-                            error,
-                        });
+                        self.emit(
+                            id,
+                            ModelEvent::Error {
+                                req: Some(req),
+                                error,
+                            },
+                        );
                         None
                     }
                 };
@@ -497,10 +516,13 @@ impl ModelStore {
                 let logical = (width, height);
                 let range = neomacs_display_protocol::model::MODEL_EDGE_RANGE;
                 if !range.contains(&width) || !range.contains(&height) {
-                    self.emit(id, ModelEvent::Error {
-                        req: Some(req),
-                        error: format!("model size {width}x{height} outside 32..2048"),
-                    });
+                    self.emit(
+                        id,
+                        ModelEvent::Error {
+                            req: Some(req),
+                            error: format!("model size {width}x{height} outside 32..2048"),
+                        },
+                    );
                 } else if ready && entry.uploaded {
                     match host.map(|h| h.model_resize(id, logical, self.scale)) {
                         Some(Ok(size_px)) => {
@@ -511,10 +533,13 @@ impl ModelStore {
                             entry.readiness.bump();
                         }
                         // A refused resize keeps the old texture.
-                        Some(Err(error)) => self.emit(id, ModelEvent::Error {
-                            req: Some(req),
-                            error,
-                        }),
+                        Some(Err(error)) => self.emit(
+                            id,
+                            ModelEvent::Error {
+                                req: Some(req),
+                                error,
+                            },
+                        ),
                         None => self.entries.get_mut(&id).expect("live").logical = logical,
                     }
                 } else {
@@ -693,7 +718,13 @@ impl ModelStore {
     /// Button release, landing on `hit` (if a model glyph) in `window`.
     /// An orbit settles with one `View`; a click without an orbit, on the
     /// model it pressed, picks.
-    pub fn release(&mut self, window: WindowKey, hit: Option<GlyphHit>, now: Instant, host: &mut dyn ModelGpuHost) {
+    pub fn release(
+        &mut self,
+        window: WindowKey,
+        hit: Option<GlyphHit>,
+        now: Instant,
+        host: &mut dyn ModelGpuHost,
+    ) {
         let Some(capture) = self.capture.take() else {
             return;
         };
@@ -841,14 +872,19 @@ impl ModelStore {
         };
         let event = match poll {
             PickPoll::Pending => {
-                if !pending.abandoned && now.saturating_duration_since(pending.started) >= PICK_TIMEOUT {
+                if !pending.abandoned
+                    && now.saturating_duration_since(pending.started) >= PICK_TIMEOUT
+                {
                     // Dropped; its staging buffer is reused only once the
                     // mapping returns, and that late answer is discarded.
                     pending.abandoned = true;
-                    self.emit(id, ModelEvent::Error {
-                        req: None,
-                        error: "model pick timed out".to_owned(),
-                    });
+                    self.emit(
+                        id,
+                        ModelEvent::Error {
+                            req: None,
+                            error: "model pick timed out".to_owned(),
+                        },
+                    );
                 }
                 return;
             }

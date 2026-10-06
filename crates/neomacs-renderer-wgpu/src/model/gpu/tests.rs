@@ -310,7 +310,10 @@ fn missing_vertex_storage_is_a_scoped_error_and_the_device_survives() {
             timeout: Some(std::time::Duration::from_secs(10)),
         })
         .unwrap();
-    assert_eq!(&buffer.slice(..).get_mapped_range().unwrap()[..], &[7u8; 16]);
+    assert_eq!(
+        &buffer.slice(..).get_mapped_range().unwrap()[..],
+        &[7u8; 16]
+    );
 }
 
 #[test]
@@ -584,7 +587,10 @@ fn region_and_point_targets_paint_the_right_fragments() {
     assert!(pixel(&rgba, 64, 18, 18)[0] > 150, "on the quad");
     assert!(!blue_marked(pixel(&rgba, 64, 18, 18)), "outside the disc");
     // The same point on another mesh index paints nothing here.
-    d.highlight.point = Some(GpuPoint { mesh: 1, ..d.highlight.point.unwrap() });
+    d.highlight.point = Some(GpuPoint {
+        mesh: 1,
+        ..d.highlight.point.unwrap()
+    });
     gpu.render(&device, &queue, &d).unwrap();
     let rgba = read_rgba(&device, &queue, &gpu);
     assert!(!blue_marked(pixel(&rgba, 64, 32, 32)), "other mesh only");
@@ -652,7 +658,10 @@ fn picks_name_the_covering_face_and_point() {
     let want_y = (1.0 - 36.5 / 64.0 * 2.0) / 0.8 * r;
     assert!((point[0] - want_x).abs() < 1e-4, "{point:?} x {want_x}");
     assert!((point[1] - want_y).abs() < 1e-4, "{point:?} y {want_y}");
-    assert!((point[2] - 1.0).abs() < 1e-9, "on the near plane: {point:?}");
+    assert!(
+        (point[2] - 1.0).abs() < 1e-9,
+        "on the near plane: {point:?}"
+    );
 
     assert_eq!(
         pick_now(&device, &queue, &mut gpu, request(64, (0, 0))).hit,
@@ -735,5 +744,9 @@ fn resize_replaces_the_targets_and_keeps_drawing() {
     assert!(pixel(&rgba, 48, 24, 12)[0] > 150, "quad drawn after resize");
     let over = device.limits().max_texture_dimension_2d + 1;
     assert!(gpu.resize(&device, (over, 4)).is_err());
-    assert_eq!(gpu.size_px(), (48, 24), "failed resize keeps the old targets");
+    assert_eq!(
+        gpu.size_px(),
+        (48, 24),
+        "failed resize keeps the old targets"
+    );
 }

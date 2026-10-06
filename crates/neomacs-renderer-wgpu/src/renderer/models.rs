@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use super::WgpuRenderer;
 use crate::model::budget::ModelBudget;
 use crate::model::gpu::{
-    MAX_MODEL_EDGE_PX, ModelDraw, ModelGpu, PickPoll, PickRequest, geometry_bytes,
-    model_target_px, target_bytes,
+    MAX_MODEL_EDGE_PX, ModelDraw, ModelGpu, PickPoll, PickRequest, geometry_bytes, model_target_px,
+    target_bytes,
 };
 use crate::model::scene::ModelScene;
 use crate::model::store::ModelGpuHost;
@@ -115,9 +115,7 @@ impl ModelGpuHost for WgpuRenderer {
                 self.models.budget.release(id, new_bytes);
                 return Err(error);
             }
-            self.models
-                .budget
-                .release(id, target_bytes(old.0, old.1));
+            self.models.budget.release(id, target_bytes(old.0, old.1));
         }
         // The surface entry carries the logical size the composite uses.
         self.install_model_texture(id, logical)?;
@@ -125,7 +123,11 @@ impl ModelGpuHost for WgpuRenderer {
     }
 
     fn model_render(&mut self, id: u32, draw: &ModelDraw) -> Result<(), String> {
-        let gpu = self.models.models.get_mut(&id).ok_or("model not uploaded")?;
+        let gpu = self
+            .models
+            .models
+            .get_mut(&id)
+            .ok_or("model not uploaded")?;
         gpu.render(&self.device, &self.queue, draw)
     }
 
@@ -137,7 +139,11 @@ impl ModelGpuHost for WgpuRenderer {
     }
 
     fn model_pick_start(&mut self, id: u32, request: &PickRequest) -> Result<(), String> {
-        let gpu = self.models.models.get_mut(&id).ok_or("model not uploaded")?;
+        let gpu = self
+            .models
+            .models
+            .get_mut(&id)
+            .ok_or("model not uploaded")?;
         gpu.pick_start(&self.device, &self.queue, request)
     }
 

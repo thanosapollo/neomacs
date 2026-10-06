@@ -1022,9 +1022,10 @@ impl RenderApp {
         let key = window_state.render.emacs_frame_id;
         let (x, y) = window_state.render.mouse_pos;
         let (ev_x, ev_y, target_fid) = Self::pointer_target_for_frame_window(window_state, x, y);
-        let hit = Self::surface_target_for_frame_window(&window_state.render, target_fid, ev_x, ev_y)
-            .filter(|(id, _, _)| self.models.contains(*id))
-            .map(|(id, u, v)| neomacs_renderer_wgpu::model::GlyphHit { id, u, v });
+        let hit =
+            Self::surface_target_for_frame_window(&window_state.render, target_fid, ev_x, ev_y)
+                .filter(|(id, _, _)| self.models.contains(*id))
+                .map(|(id, u, v)| neomacs_renderer_wgpu::model::GlyphHit { id, u, v });
         match state {
             ElementState::Pressed => {
                 if self.modifiers == 0
@@ -1642,9 +1643,10 @@ impl RenderApp {
                 .unwrap_or_else(|| Self::pointer_target_for_frame_window(window_state, lx, ly));
             // A model orbit owns the motion of its capture: it is not
             // forwarded to Lisp, so no drag tracking can start (design §5.1).
-            let model_owned = self
-                .models
-                .motion(window_state.render.emacs_frame_id, (f64::from(lx), f64::from(ly)));
+            let model_owned = self.models.motion(
+                window_state.render.emacs_frame_id,
+                (f64::from(lx), f64::from(ly)),
+            );
             // iMouse hover state (docs/display-engine/SHADER_SURFACES.md):
             // resolved here rather than while drawing, because which surface
             // the pointer is over is a question about the composition, and the

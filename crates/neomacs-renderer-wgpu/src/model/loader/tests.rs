@@ -15,7 +15,10 @@ fn scratch_dir(name: &str) -> std::path::PathBuf {
 
 fn obj_file(dir: &std::path::Path, name: &str, body: &[u8]) -> std::path::PathBuf {
     let path = dir.join(name);
-    std::fs::File::create(&path).unwrap().write_all(body).unwrap();
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(body)
+        .unwrap();
     path
 }
 
@@ -75,7 +78,11 @@ fn digest_mismatch_and_missing_files_fail_with_the_path() {
     };
     assert!(load_scene(&[right], &cancel).is_ok());
     let missing = spec(dir.as_path().join("missing.obj"));
-    assert!(load_scene(&[missing], &cancel).unwrap_err().contains("missing.obj"));
+    assert!(
+        load_scene(&[missing], &cancel)
+            .unwrap_err()
+            .contains("missing.obj")
+    );
 }
 
 /// Deferred Sol slice SHOULD: 255 files of mostly comments must not each
@@ -100,7 +107,10 @@ fn input_bytes_are_bounded_across_the_whole_scene() {
     }
     let cancel = AtomicBool::new(false);
     let err = load_scene(&paths, &cancel).unwrap_err();
-    assert!(err.contains("big3.obj") && err.contains("allowance"), "{err}");
+    assert!(
+        err.contains("big3.obj") && err.contains("allowance"),
+        "{err}"
+    );
 }
 
 #[test]

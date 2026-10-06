@@ -84,7 +84,9 @@ impl Readiness {
         let emit = match self.last {
             None => fence || self.settled != 0,
             Some((last_fence, last_rev, last_settled)) => {
-                fence != last_fence || self.settled != last_settled || (fence && self.rev != last_rev)
+                fence != last_fence
+                    || self.settled != last_settled
+                    || (fence && self.rev != last_rev)
             }
         };
         if emit {
