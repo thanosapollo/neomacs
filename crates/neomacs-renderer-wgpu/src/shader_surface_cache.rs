@@ -188,11 +188,15 @@ pub struct ShaderSurfaceCache {
     /// composite ran at all (native model showing sets, design §6.2).
     drawn: std::collections::HashSet<u32>,
     composited: bool,
-    /// Surfaces a glyph composite reached since the last
-    /// `take_referenced`, drawn or not: a glyph naming a surface the cache
+    /// Surfaces a glyph composite reached since `collect_referenced`, drawn
+    /// or not: a glyph naming a surface the cache
     /// does not hold yet (a model still loading) is referenced but not
     /// drawn. A retained raster depends on these (design §6.2).
     referenced: std::collections::HashSet<u32>,
+    /// Whether references are collected: only between a retained build's
+    /// `collect_referenced` and its `take_referenced`, so full-render-only
+    /// workloads keep no reference history (SOL-REVIEW-3 SHOULD 1).
+    collecting_referenced: bool,
 }
 
 impl ShaderSurfaceCache {
@@ -247,6 +251,7 @@ impl ShaderSurfaceCache {
             pressed: None,
             drawn: std::collections::HashSet::new(),
             referenced: std::collections::HashSet::new(),
+            collecting_referenced: false,
             composited: false,
         }
     }
@@ -261,6 +266,12 @@ impl ShaderSurfaceCache {
         self.surfaces
             .get(&id)
             .map(|s| ((s.width, s.height), (s.width_px, s.height_px)))
+    }
+
+    /// How many surface references the collector holds (tests).
+    #[cfg(test)]
+    pub(crate) fn referenced_len(&self) -> usize {
+        self.referenced.len()
     }
 
     /// Whether any shader surface exists at all.
@@ -756,13 +767,25 @@ impl ShaderSurfaceCache {
     }
 
     /// A glyph composite pass reached a visible surface glyph for `id`,
-    /// whether or not the cache holds a texture for it.
+    /// whether or not the cache holds a texture for it. Recorded only while
+    /// a retained build collects ([`Self::collect_referenced`]).
     pub fn note_referenced(&mut self, id: u32) {
-        self.referenced.insert(id);
+        if self.collecting_referenced {
+            self.referenced.insert(id);
+        }
     }
 
-    /// The surfaces referenced since the last call.
+    /// A retained build starts: collect the references its passes make,
+    /// until [`Self::take_referenced`].
+    pub fn collect_referenced(&mut self) {
+        self.referenced.clear();
+        self.collecting_referenced = true;
+    }
+
+    /// The surfaces referenced since [`Self::collect_referenced`]; ends the
+    /// collection.
     pub fn take_referenced(&mut self) -> std::collections::HashSet<u32> {
+        self.collecting_referenced = false;
         std::mem::take(&mut self.referenced)
     }
 

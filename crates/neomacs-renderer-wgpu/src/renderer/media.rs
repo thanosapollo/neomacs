@@ -605,9 +605,16 @@ impl WgpuRenderer {
         self.caches.surface.take_drawn()
     }
 
-    /// The surfaces whose glyphs a composite reached since the last call,
-    /// drawn or not (a superset of the drawn ones): what a retained raster
-    /// depends on, including models not yet drawable.
+    /// A retained build starts: collect the surfaces its glyph passes
+    /// reach, for [`Self::take_referenced_surfaces`].
+    pub fn collect_referenced_surfaces(&mut self) {
+        self.caches.surface.collect_referenced();
+    }
+
+    /// The surfaces whose glyphs a composite reached since
+    /// [`Self::collect_referenced_surfaces`], drawn or not (a superset of
+    /// the drawn ones): what a retained raster depends on, including models
+    /// not yet drawable. Ends the collection.
     pub fn take_referenced_surfaces(&mut self) -> std::collections::HashSet<u32> {
         self.caches.surface.take_referenced()
     }

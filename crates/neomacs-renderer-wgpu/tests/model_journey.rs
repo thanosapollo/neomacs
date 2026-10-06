@@ -139,6 +139,8 @@ fn render_root(
     let (texture, view) = target(r);
     let frame = frame(with_model);
     atlas.set_current_frame_fonts(frame.font_bindings());
+    // Collect references as a retained build does.
+    r.collect_referenced_surfaces();
     r.render_frame_glyphs(
         &view,
         &frame,
@@ -176,7 +178,7 @@ fn render_child(
         None,
     );
     r.take_drawn_surfaces();
-    r.take_referenced_surfaces();
+    r.collect_referenced_surfaces();
     let child = frame(true);
     r.render_frame_content(
         &view, &child, atlas, W, H, 16.0, 16.0, false, None, 0.0, None, None, 1.0, 1.0, [0.0; 2],

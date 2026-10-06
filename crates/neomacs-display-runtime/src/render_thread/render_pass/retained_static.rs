@@ -117,7 +117,7 @@ pub(super) fn draw(
         // record which models (root and child) it composited and which it
         // referenced.
         let _ = renderer.take_drawn_surfaces();
-        let _ = renderer.take_referenced_surfaces();
+        renderer.collect_referenced_surfaces();
         super::render_frame_window_contents(
             renderer,
             native,
