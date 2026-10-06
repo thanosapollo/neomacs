@@ -2745,8 +2745,9 @@ impl TaggedValue {
     ///
     /// Returns the same value for the same id (eq-ness) via the process value
     /// cache, exactly like `make_buffer`/`make_timer`.  A process that has
-    /// exited is still a process object in GNU (status `exit`/`signal`), so the
-    /// cached value is never evicted on `delete-process`.
+    /// exited is still a process object in GNU (status `exit`/`signal`), so
+    /// `delete-process` keeps the cached value while anything references it;
+    /// only an unreferenced deleted process's object is freed.
     pub fn make_process(id: crate::emacs_core::process::ProcessId) -> Self {
         with_tagged_heap(|h| {
             if let Some(value) = h.process_value(id) {

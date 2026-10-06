@@ -585,6 +585,12 @@ impl TaggedHeap {
         std::mem::take(&mut self.pending_buffer_reclaims)
     }
 
+    /// Take the ids of deleted processes whose process object the sweep
+    /// freed since the last drain; the evaluator drops their records.
+    pub fn take_pending_process_reclaims(&mut self) -> Vec<crate::emacs_core::process::ProcessId> {
+        std::mem::take(&mut self.pending_process_reclaims)
+    }
+
     /// Allocate an xwidget view object.
     pub fn alloc_xwidget_view(&mut self, model: TaggedValue, window: TaggedValue) -> TaggedValue {
         let obj = Box::new(XwidgetViewObj {

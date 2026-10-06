@@ -1560,11 +1560,13 @@ impl TaggedHeap {
                     .values()
                     .map(|value| (*value, "timer-registry")),
             )
-            .chain(
-                self.process_registry
-                    .values()
-                    .map(|value| (*value, "process-registry")),
-            )
+            .chain(self.process_registry.iter().filter_map(|slot| match slot {
+                // Only live processes are roots (GNU marks them from
+                // `Vprocess_alist`); a deleted one lives only through
+                // references.
+                RegistrySlot::Live(value) => Some((*value, "process-registry")),
+                _ => None,
+            }))
             .chain(
                 self.canonical_empty_strings
                     .values()
@@ -1849,6 +1851,7 @@ impl TaggedHeap {
         self.promote_survivors_world_stopped();
         self.unchain_dead_markers();
         self.prune_unmarked_killed_buffers();
+        self.prune_unmarked_deleted_processes();
         self.reset_generational_remembered_world_stopped();
 
         // -- Sweep phase --

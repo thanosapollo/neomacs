@@ -6779,7 +6779,29 @@ impl ProcessManager {
         if let Some(mut proc) = self.processes.remove(&id) {
             Self::deactivate_process_io(self.wait_backend.poller(), &mut proc);
             self.deleted_processes.insert(id, proc);
+            // The process object stops being a root: like GNU's process
+            // vectorlike once it is off `Vprocess_alist`, it now lives exactly
+            // as long as something references it (`reclaim_deleted_process`).
+            if crate::tagged::gc::tagged_heap_is_installed() {
+                crate::tagged::gc::with_tagged_heap(|heap| heap.note_process_deleted(id));
+            }
         }
+    }
+
+    /// Drop the record of a deleted process whose object the collector freed:
+    /// GNU's `sweep_vectors` (alloc.c) frees the unreferenced process
+    /// vectorlike that `remove_process` (process.c) left behind.  Here the
+    /// object is the handle and this record its contents, so the record goes
+    /// once the handle has; whatever only the record held is collected by the
+    /// next cycle.  A live id is left alone.  Nothing moves a deleted process
+    /// back into the live table, and ids are never reused, so a Rust-held id
+    /// whose record is gone answers like any id `get_any` does not know.
+    ///
+    /// The record is traced as a root while it exists, so a deleted process
+    /// whose own record refers back to its object (a sentinel closure or
+    /// plist holding the process) stays; GNU would collect that cycle.
+    pub fn reclaim_deleted_process(&mut self, id: ProcessId) {
+        self.deleted_processes.remove(&id);
     }
 
     /// Get process status.
@@ -6793,6 +6815,11 @@ impl ProcessManager {
             .get(&id)
             .map(|p| &p.status)
             .or_else(|| self.deleted_processes.get(&id).map(|p| &p.status))
+    }
+
+    /// How many deleted processes still have a record here.
+    pub fn deleted_process_count(&self) -> usize {
+        self.deleted_processes.len()
     }
 
     /// Get a process by id.
@@ -9037,10 +9064,22 @@ impl super::super::eval::Context {
             // unlinks a later event's closure from the process table (its
             // only root), and a GC frees it before its dispatch. Thread the
             // Values onto one rooted heap list for the loop's span.
+            // The server and client objects ride along too: a log function
+            // that deletes either leaves it a deleted process that only
+            // references keep (GNU's `server_accept_connection` holds both on
+            // its stack), and the callbacks below still name it by id.
             let mut accepted_holder = Value::NIL;
             for event in accepted.iter().rev() {
-                accepted_holder =
-                    Value::cons(event.log, Value::cons(event.sentinel, accepted_holder));
+                accepted_holder = Value::cons(
+                    event.log,
+                    Value::cons(
+                        event.sentinel,
+                        Value::cons(
+                            Value::make_process(event.server_id),
+                            Value::cons(Value::make_process(event.client_id), accepted_holder),
+                        ),
+                    ),
+                );
             }
             let accepted_root_scope = self.save_specpdl_roots();
             self.push_specpdl_root(accepted_holder);

@@ -7781,6 +7781,10 @@ mod gc_sweep_cap_tests;
 mod dead_buffer_reclaim_tests;
 
 #[cfg(test)]
+#[path = "tests/deleted_process_reclaim.rs"]
+mod deleted_process_reclaim_tests;
+
+#[cfg(test)]
 #[path = "tests/gc_forced_first_cycle.rs"]
 mod gc_forced_first_cycle_tests;
 

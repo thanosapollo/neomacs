@@ -54,14 +54,17 @@ pub(crate) enum CacheRootScan {
     },
 }
 
-/// The heap's buffer object for one `BufferId`.
+/// The heap's buffer object for one `BufferId`, or process object for one
+/// `ProcessId`.
 ///
 /// GNU keeps every buffer object on `all_buffers` but marks only what Lisp
 /// can reach: live buffers through `Vbuffer_alist`, killed ones only through
 /// ordinary references, so the vector sweep frees a killed buffer nothing
-/// refers to (`kill-buffer` in buffer.c, `mark_buffer` in alloc.c). The
-/// registry mirrors that: a `Live` object is a runtime root, a `Killed` one
-/// is not.
+/// refers to (`kill-buffer` in buffer.c, `mark_buffer` in alloc.c). A
+/// process is the same: live ones are marked through `Vprocess_alist`, and a
+/// deleted one, which `remove_process` (process.c) took off that list, only
+/// through references. The registry mirrors that: a `Live` object is a
+/// runtime root, a `Killed` (killed buffer, deleted process) one is not.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum RegistrySlot {
     /// No object was ever made for this id.
@@ -546,6 +549,9 @@ pub struct TaggedHeap {
     /// (`BufferManager::reclaim_dead_buffer`), GNU's sweep of an unreachable
     /// dead `struct buffer`. Plain data, never marked.
     pending_buffer_reclaims: Vec<crate::buffer::BufferId>,
+    /// The same for deleted processes: drained into
+    /// `ProcessManager::reclaim_deleted_process`. Plain data, never marked.
+    pending_process_reclaims: Vec<crate::emacs_core::process::ProcessId>,
 
     /// Reclaimed cons cells threaded through the dead cells themselves,
     /// matching GNU alloc.c's `cons_free_list`.
@@ -634,7 +640,14 @@ pub struct TaggedHeap {
     window_registry: FxHashMap<u64, TaggedValue>,
     frame_registry: FxHashMap<u64, TaggedValue>,
     timer_registry: FxHashMap<u64, TaggedValue>,
-    process_registry: FxHashMap<crate::emacs_core::process::ProcessId, TaggedValue>,
+    /// Process object per `ProcessId`, indexed by the id (ids are issued
+    /// from 1 upward and never reused). Only live processes' objects are
+    /// roots; a deleted process's object lives exactly as long as Lisp
+    /// references it (see [`RegistrySlot`]).
+    process_registry: Vec<RegistrySlot>,
+    /// Ids whose registry slot is `Killed` (deleted processes), as
+    /// `killed_buffer_ids`.
+    deleted_process_ids: Vec<crate::emacs_core::process::ProcessId>,
 
     /// Cumulative GC statistics.
     gc_collections: usize,
@@ -1025,6 +1038,7 @@ impl TaggedHeap {
             pending_surface_destroys: Vec::new(),
             pending_video_destroys: Vec::new(),
             pending_buffer_reclaims: Vec::new(),
+            pending_process_reclaims: Vec::new(),
             cons_free_list: std::ptr::null_mut(),
             float_arena: ObjectArena::new(chunk_map.clone()),
             string_arena: ObjectArena::new(chunk_map.clone()),
@@ -1050,7 +1064,8 @@ impl TaggedHeap {
             window_registry: FxHashMap::default(),
             frame_registry: FxHashMap::default(),
             timer_registry: FxHashMap::default(),
-            process_registry: FxHashMap::default(),
+            process_registry: Vec::new(),
+            deleted_process_ids: Vec::new(),
             write_tracking_mode: WriteTrackingMode::Disabled,
             dirty_owners: Vec::new(),
             first_cycle_concurrent: false,
@@ -1524,18 +1539,6 @@ impl TaggedHeap {
 
     pub fn register_timer_value(&mut self, id: u64, value: TaggedValue) {
         self.timer_registry.insert(id, value);
-    }
-
-    pub fn process_value(&self, id: crate::emacs_core::process::ProcessId) -> Option<TaggedValue> {
-        self.process_registry.get(&id).copied()
-    }
-
-    pub fn register_process_value(
-        &mut self,
-        id: crate::emacs_core::process::ProcessId,
-        value: TaggedValue,
-    ) {
-        self.process_registry.insert(id, value);
     }
 
     /// Register cons cells whose storage is owned by the loaded pdump image.
@@ -2838,6 +2841,8 @@ mod mutator_gc;
 use mutator_gc::MutatorGcState;
 
 mod knobs;
+
+mod process_registry;
 
 mod chunk_map;
 use chunk_map::{CHUNK_CLASS_COUNT, ChunkClass, ChunkEntry, ChunkMap, HeapChunkMap, PageSnapshot};

@@ -2274,6 +2274,7 @@ impl Context {
         self.drain_pending_surface_destroys();
         self.drain_pending_video_destroys();
         self.drain_pending_buffer_reclaims();
+        self.drain_pending_process_reclaims();
         // GNU `garbage_collect` runs the doomed finalizers before
         // `post-gc-hook`.  A collection that completes while the cconv memo
         // observes a Lisp run leaves both to the end of that run.
@@ -2728,6 +2729,16 @@ impl Context {
         for id in self.tagged_heap.take_pending_buffer_reclaims() {
             if self.tagged_heap.buffer_object_reclaimed(id) {
                 self.buffers.reclaim_dead_buffer(id);
+            }
+        }
+    }
+
+    /// Drop the deleted-process records whose process object this cycle
+    /// freed, as `drain_pending_buffer_reclaims` does for killed buffers.
+    pub(super) fn drain_pending_process_reclaims(&mut self) {
+        for id in self.tagged_heap.take_pending_process_reclaims() {
+            if self.tagged_heap.process_object_reclaimed(id) {
+                self.processes.reclaim_deleted_process(id);
             }
         }
     }

@@ -6120,6 +6120,9 @@ pub(crate) fn builtin_set_binary_mode(args: Vec<Value>) -> EvalResult {
 
 impl GcTrace for ProcessManager {
     fn trace_roots(&self, roots: &mut Vec<Value>) {
+        // A deleted process's record exists only while its object is
+        // referenced (`ProcessManager::reclaim_deleted_process`), so its
+        // slots are marked as GNU marks a referenced process vectorlike.
         for process in self
             .processes
             .values()
