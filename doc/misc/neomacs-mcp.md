@@ -19,7 +19,13 @@ not start a listener, select a buffer, or connect to an agent service.
 ```
 
 The containing directory must belong to the editor's owner and be private.
-Existing nodes, including dangling symlinks, are refused rather than replaced.
+Existing nodes, including dangling symlinks, are refused rather than replaced,
+except an owned socket that refuses connections: an editor that died without
+stopping MCP leaves one behind, and starting deletes it, as GNU `server-start`
+does with a leftover server socket.  Any other connection failure, or a node
+found replaced before the deletion, is refused.  The final check and the
+deletion are two steps, so a replacement in between is not excluded; the
+private directory keeps that to the owner's own processes.
 Use a short path because Unix sockets have an operating-system path limit.
 
 A standard stdio MCP client launches the bundled byte relay with:

@@ -96,6 +96,139 @@
           (should-error (neomacs-mcp-start socket)))
       (delete-directory root t))))
 
+(ert-deftest neomacs-mcp-reclaim-stale-socket-only ()
+  "A socket left by a dead listener is reclaimed; a live one is refused.
+Like GNU `server-start', which deletes a leftover socket unless
+`server-running-p' can connect to it."
+  (let* ((root (make-temp-file "neomacs-mcp-stale-" t))
+         (socket (expand-file-name "mcp" root))
+         live)
+    (unwind-protect
+        (progn
+          ;; A crashed editor leaves its socket node behind with no listener.
+          (delete-process (make-network-process
+                           :name "neomacs-mcp-ert-dead" :family 'local
+                           :service socket :server t :noquery t))
+          (should (file-exists-p socket))
+          (neomacs-mcp-start socket)
+          (should (process-live-p neomacs-mcp--listener))
+          (should (equal (neomacs-mcp--socket-id socket) neomacs-mcp--socket-identity))
+          (neomacs-mcp-stop)
+          (should-not (file-exists-p socket))
+          ;; Another live listener keeps its socket.
+          (setq live (make-network-process
+                      :name "neomacs-mcp-ert-live" :family 'local
+                      :service socket :server t :noquery t))
+          (let ((identity (neomacs-mcp--socket-id socket)))
+            (should-error (neomacs-mcp-start socket))
+            (should-not neomacs-mcp--listener)
+            (should (process-live-p live))
+            (should (equal identity (neomacs-mcp--socket-id socket)))))
+      (when live (delete-process live))
+      (neomacs-mcp-stop)
+      (delete-directory root t))))
+
+(ert-deftest neomacs-mcp-reclaim-refuses-unconfirmed-stale-socket ()
+  "Only a refused connection proves a socket stale.
+A live listener whose socket cannot be connected to (permission denied)
+keeps its node."
+  (let* ((root (make-temp-file "neomacs-mcp-stale-" t))
+         (socket (expand-file-name "mcp" root))
+         (live (make-network-process
+                :name "neomacs-mcp-ert-live" :family 'local
+                :service socket :server t :noquery t))
+         (identity (neomacs-mcp--socket-id socket)))
+    (unwind-protect
+        (progn
+          (set-file-modes socket 0)
+          (should-error (neomacs-mcp-start socket))
+          (should-not neomacs-mcp--listener)
+          (should (process-live-p live))
+          (should (equal identity (neomacs-mcp--socket-id socket))))
+      (delete-process live)
+      (neomacs-mcp-stop)
+      (delete-directory root t))))
+
+(ert-deftest neomacs-mcp-reclaim-reads-only-the-failure-reason ()
+  "A socket path containing \"refused\" does not make a denial look stale."
+  (let* ((root (make-temp-file "neomacs-mcp-stale-" t))
+         (socket (expand-file-name "refused" root))
+         (live (make-network-process
+                :name "neomacs-mcp-ert-live" :family 'local
+                :service socket :server t :noquery t))
+         (identity (neomacs-mcp--socket-id socket)))
+    (unwind-protect
+        (progn
+          (set-file-modes socket 0)
+          (should-not (neomacs-mcp--stale-socket-id socket))
+          (should-error (neomacs-mcp-start socket))
+          (should (process-live-p live))
+          (should (equal identity (neomacs-mcp--socket-id socket))))
+      (delete-process live)
+      (neomacs-mcp-stop)
+      (delete-directory root t))))
+
+(ert-deftest neomacs-mcp-reclaim-deletes-only-the-node-it-checked ()
+  "A node replaced right after its type check is not deleted.
+The replacement, a regular file, also refuses connections, so only
+checking type, owner and deletion identity on one stat keeps it."
+  (let* ((root (make-temp-file "neomacs-mcp-stale-" t))
+         (socket (expand-file-name "mcp" root))
+         (file-attributes-fn (symbol-function 'file-attributes))
+         replaced)
+    (unwind-protect
+        (progn
+          (delete-process (make-network-process
+                           :name "neomacs-mcp-ert-dead" :family 'local
+                           :service socket :server t :noquery t))
+          (cl-letf (((symbol-function 'file-attributes)
+                     (lambda (name &optional id-format)
+                       (prog1 (funcall file-attributes-fn name id-format)
+                         (when (and (equal name socket) (not replaced))
+                           (setq replaced t)
+                           (delete-file socket)
+                           (with-temp-file socket (insert "successor")))))))
+            (should-error (neomacs-mcp-start socket)))
+          (should replaced)
+          (should-not neomacs-mcp--listener)
+          (should (equal "successor"
+                         (with-temp-buffer
+                           (insert-file-contents socket)
+                           (buffer-string)))))
+      (neomacs-mcp-stop)
+      (delete-directory root t))))
+
+(ert-deftest neomacs-mcp-reclaim-never-deletes-a-successor ()
+  "A socket that another editor replaced after the probe is not deleted."
+  (let* ((root (make-temp-file "neomacs-mcp-stale-" t))
+         (socket (expand-file-name "mcp" root))
+         successor identity)
+    (cl-flet ((replace-after-probe (stale)
+                ;; Another editor reclaims the same stale node first.
+                (when stale
+                  (delete-file socket)
+                  (setq successor (make-network-process
+                                   :name "neomacs-mcp-ert-successor"
+                                   :family 'local :service socket
+                                   :server t :noquery t)
+                        identity (neomacs-mcp--socket-id socket)))
+                stale))
+      (unwind-protect
+          (progn
+            (delete-process (make-network-process
+                             :name "neomacs-mcp-ert-dead" :family 'local
+                             :service socket :server t :noquery t))
+            (advice-add 'neomacs-mcp--stale-socket-id
+                        :filter-return #'replace-after-probe)
+            (should-error (neomacs-mcp-start socket))
+            (should-not neomacs-mcp--listener)
+            (should (process-live-p successor))
+            (should (equal identity (neomacs-mcp--socket-id socket))))
+        (advice-remove 'neomacs-mcp--stale-socket-id #'replace-after-probe)
+        (when successor (delete-process successor))
+        (neomacs-mcp-stop)
+        (delete-directory root t)))))
+
 (ert-deftest neomacs-mcp-filter-never-evaluates ()
   (let ((calls nil))
     (cl-letf (((symbol-function 'neomacs-mcp--enqueue)
