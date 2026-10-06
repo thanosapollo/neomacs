@@ -87,6 +87,14 @@ fn allowlist() -> BTreeMap<&'static str, &'static str> {
              bounded by media_budget's Surface accounting and its eviction driver.",
         ),
         (
+            "src/model/gpu.rs",
+            "Native model colour, depth, MSAA and pick targets, sized to the \
+             model glyph's logical size times the device scale and clamped to \
+             MAX_MODEL_EDGE_PX per side (model_target_px); bounded by the \
+             model's own ModelBudget, admitted before allocation and never \
+             evicted.",
+        ),
+        (
             "src/external_buffer.rs",
             "Sized to the imported platform buffer, whose extent comes from the \
              producer; it backs one media surface and is charged with it.",

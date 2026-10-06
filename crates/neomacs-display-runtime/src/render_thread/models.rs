@@ -9,6 +9,8 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use neomacs_display_protocol::frame_time::EventTime;
+
 use neomacs_renderer_wgpu::model::store::ModelGpuHost;
 
 use super::RenderApp;
@@ -42,10 +44,11 @@ impl RenderApp {
         }
     }
 
-    /// Finished loads, uploads a renderer lacks, wheel deadlines and picks.
-    /// Runs on every loop wake, so an idle editor still completes a load
-    /// and delivers a pick with no further input.
-    pub(super) fn service_models(&mut self) {
+    /// Finished loads, uploads a renderer lacks, wheel deadlines and picks,
+    /// as of the loop's wake `now`. Runs on every loop wake, so an idle
+    /// editor still completes a load and delivers a pick with no further
+    /// input.
+    pub(super) fn service_models(&mut self, now: EventTime) {
         if self.models.is_empty() {
             return;
         }
@@ -54,7 +57,7 @@ impl RenderApp {
         if let Some(host) = self.model_host() {
             models.upload_pending(host);
         }
-        models.tick(Instant::now(), self.model_host());
+        models.tick(now.into_instant(), self.model_host());
         self.models = models;
         self.flush_model_events();
     }
@@ -133,7 +136,7 @@ impl RenderApp {
     /// A renderer is live: publish it and upload what it lacks.
     pub(super) fn note_models_renderer_ready(&mut self) {
         self.comms.capabilities.set_model_renderer_live(true);
-        self.service_models();
+        self.service_models(neomacs_display_protocol::frame_time::observe_platform_now());
     }
 
     /// The next instant the loop must wake for model work.

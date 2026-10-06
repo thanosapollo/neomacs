@@ -560,7 +560,7 @@ fn renderer_loss_reaches_the_input_channel_before_a_later_key() {
     while app.models.status(5) == Some(ModelStatus::Loading) {
         assert!(Instant::now() < deadline, "the load never finished");
         std::thread::sleep(Duration::from_millis(5));
-        app.service_models();
+        app.service_models(neomacs_display_protocol::frame_time::observe_platform_now());
     }
     app.render_dirty_models();
     present(&mut app, 1);

@@ -1122,10 +1122,12 @@ impl RenderApp {
                 }
             }
             ElementState::Released => match self.renderer.as_mut() {
-                Some(renderer) => {
-                    self.models
-                        .release(key, hit, std::time::Instant::now(), renderer)
-                }
+                Some(renderer) => self.models.release(
+                    key,
+                    hit,
+                    neomacs_display_protocol::frame_time::observe_platform_now().into_instant(),
+                    renderer,
+                ),
                 None => self.models.cancel_capture(),
             },
         }
@@ -1885,7 +1887,13 @@ impl RenderApp {
                 )
                 && self.models.is_interactive(surface_id)
             {
-                self.wheel_over_model(device, surface_id, delta, phase, std::time::Instant::now());
+                self.wheel_over_model(
+                    device,
+                    surface_id,
+                    delta,
+                    phase,
+                    neomacs_display_protocol::frame_time::observe_platform_now().into_instant(),
+                );
                 return;
             }
             // Not over an interactive model (or modified): any fraction

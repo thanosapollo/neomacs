@@ -322,7 +322,7 @@ impl RenderApp {
             self.menus.shutdown();
             self.recover_from_device_loss(event_loop);
         }
-        self.service_models();
+        self.service_models(now);
         self.refresh_monitor_snapshot(event_loop, true);
         self.complete_pending_scale_changes();
         self.presentation_observer.dispatch_pending(
@@ -542,7 +542,7 @@ impl RenderApp {
         }
         // Model loads, picks and wheel quiet deadlines complete with no
         // further input (design §4.2, §5).
-        if let Some(model_wake) = self.model_deadline(std::time::Instant::now()) {
+        if let Some(model_wake) = self.model_deadline(now.into_instant()) {
             deadline = Some(deadline.map_or(model_wake, |d| d.min(model_wake)));
         }
         if self.has_pending_images() {
