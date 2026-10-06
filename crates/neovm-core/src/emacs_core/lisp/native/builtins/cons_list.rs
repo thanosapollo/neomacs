@@ -191,24 +191,27 @@ pub(crate) fn proper_list_length_or_signal(list: Value) -> Result<usize, Flow> {
     }
 }
 
+/// GNU `list_length` (fns.c), behind `length`, `Flength` in the mapping
+/// functions and `concat`, and `Fapply`'s spread list. Its `FOR_EACH_TAIL`
+/// keeps the tortoise on the head until step `FOR_EACH_TAIL_THRESHOLD`
+/// (4096) and then moves it to the tail at each power of two (lisp.h
+/// `FOR_EACH_TAIL_STEP_CYCLEP`), so `circular-list`'s datum is the head for
+/// a cycle through it and the cons GNU reports for any other cycle.
 #[inline]
 fn proper_list_length_or_signal_scan<const OBSERVED: bool>(list: Value) -> Result<usize, Flow> {
+    const FOR_EACH_TAIL_THRESHOLD: usize = 4096;
     let mut len = 0usize;
     let mut tail = list;
     let mut tortoise = list;
-    let mut max = 2i64;
-    let mut n = 0i64;
-    let mut q = 2u16;
 
     while tail.is_cons() {
-        len = len.saturating_add(1);
-
         tail = scan_cdr::<OBSERVED>(tail);
-        if tail.is_cons()
-            && let Some(cycle_tail) =
-                for_each_tail_cycle_tail(tail, &mut tortoise, &mut max, &mut n, &mut q)
-        {
-            return Err(signal(LispCondition::CircularList, vec![cycle_tail]));
+        if tail.bits() == tortoise.bits() {
+            return Err(signal(LispCondition::CircularList, vec![tail]));
+        }
+        len = len.saturating_add(1);
+        if len & (FOR_EACH_TAIL_THRESHOLD - 1) == 0 && len.is_power_of_two() {
+            tortoise = tail;
         }
     }
 
