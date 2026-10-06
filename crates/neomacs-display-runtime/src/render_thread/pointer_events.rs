@@ -61,6 +61,25 @@ impl ModelWheel {
     }
 }
 
+impl RenderApp {
+    /// Wheel input from `device` over interactive model `id` zooms it
+    /// (design §5.1) and never scrolls the buffer.
+    pub(super) fn wheel_over_model(
+        &mut self,
+        device: Option<DeviceId>,
+        id: u32,
+        delta: MouseScrollDelta,
+        phase: TouchPhase,
+        now: std::time::Instant,
+    ) {
+        let notches = self.model_wheel.notches(device, id, delta, phase, now);
+        if notches != 0 {
+            self.models.wheel(id, notches, now);
+        }
+        self.flush_model_events();
+    }
+}
+
 // Embedded browsers own their distance policy and fractional viewport. Do not
 // impose the editor's integral Lisp boundary on their input.
 #[cfg(any(test, feature = "webview"))]
@@ -1816,14 +1835,13 @@ impl RenderApp {
                 )
                 && self.models.is_interactive(surface_id)
             {
-                let now = std::time::Instant::now();
-                let notches = self
-                    .model_wheel
-                    .notches(device, surface_id, delta, phase, now);
-                if notches != 0 {
-                    self.models.wheel(surface_id, notches, now);
-                }
-                self.flush_model_events();
+                self.wheel_over_model(
+                    device,
+                    surface_id,
+                    delta,
+                    phase,
+                    std::time::Instant::now(),
+                );
                 return;
             }
             let position = PointerPosition {
