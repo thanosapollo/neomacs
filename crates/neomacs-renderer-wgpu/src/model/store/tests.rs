@@ -544,12 +544,25 @@ fn a_presentation_reports_the_snapshot_its_pixels_came_from() {
     let mut store = loaded_store(&mut host);
     shown(&mut store, &mut host);
     let old = store.rendered(5).unwrap();
-    store.update(5, 1, ModelChange::View(ModelView { yaw: 40.0, pitch: 0.0, zoom: 1.0 }), h(&mut host));
+    store.update(
+        5,
+        1,
+        ModelChange::View(ModelView {
+            yaw: 40.0,
+            pitch: 0.0,
+            zoom: 1.0,
+        }),
+        h(&mut host),
+    );
     store.render_dirty(&mut host);
     store.take_events();
     store.presented(W, &BTreeMap::from([(5, old)]));
     assert!(store.take_events().is_empty(), "behind: fence stays down");
-    let hit = GlyphHit { id: 5, u: 0.5, v: 0.5 };
+    let hit = GlyphHit {
+        id: 5,
+        u: 0.5,
+        v: 0.5,
+    };
     store.press(W, hit, (1.0, 1.0));
     store.release(W, Some(hit), Instant::now(), &mut host);
     assert_eq!(host.picks.last().unwrap().view, old.view);

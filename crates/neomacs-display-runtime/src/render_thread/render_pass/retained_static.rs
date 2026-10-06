@@ -18,10 +18,10 @@
 
 use super::FrameDrawInputs;
 use crate::render_thread::frame_stats;
-use crate::render_thread::models::{ModelPicture, picture_of};
 use crate::render_thread::frame_windows::{
     GuiFrameNativeWindowState, GuiFrameRenderState, RetainedCursorCell, RetainedStatic,
 };
+use crate::render_thread::models::{ModelPicture, picture_of};
 use crate::render_thread::state::PointerAppearanceState;
 use neomacs_renderer_wgpu::{FullFrameTexture, SnapshotSize, UnpooledTexture, WgpuRenderer};
 

@@ -89,7 +89,11 @@ pub(super) fn with_ready_model(app: &mut RenderApp, host: &mut FakeHost) {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("quad.obj");
-    std::fs::write(&path, b"v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nf 1 2 3 4\n").unwrap();
+    std::fs::write(
+        &path,
+        b"v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nf 1 2 3 4\n",
+    )
+    .unwrap();
     app.models.create(
         MODEL,
         vec![ModelMeshSpec { path, sha256: None }],
@@ -120,7 +124,9 @@ pub(super) fn delivered(emacs: &EmacsComms) -> Vec<String> {
     while let Ok(event) = emacs.input_rx.try_recv() {
         if let InputEvent::Model { event, .. } = event {
             out.push(match event {
-                ModelEvent::Readiness { current, rev, req } => format!("R{{{current},{rev},{req}}}"),
+                ModelEvent::Readiness { current, rev, req } => {
+                    format!("R{{{current},{rev},{req}}}")
+                }
                 ModelEvent::View { rev, .. } => format!("View{{{rev}}}"),
                 ModelEvent::Error { req, .. } => format!("Error{{{req:?}}}"),
                 ModelEvent::Pick { rev, .. } => format!("Pick{{{rev}}}"),
@@ -187,7 +193,10 @@ fn occluding_the_sole_showing_window_ends_membership_and_its_capture() {
     present(&mut app, A);
     assert!(delivered(&emacs).is_empty(), "occluded window rejoined");
     app.handle_window_occluded(A, false);
-    assert!(delivered(&emacs).is_empty(), "exposure is not a presentation");
+    assert!(
+        delivered(&emacs).is_empty(),
+        "exposure is not a presentation"
+    );
     present(&mut app, A);
     assert_eq!(delivered(&emacs), ["R{true,2,0}"]);
 }
@@ -324,7 +333,11 @@ fn two_windows_a_retained_child_member_still_counts_for_readiness() {
     update(&mut app, &mut host, 1, yaw(30.0));
     app.models.render_dirty(&mut host);
     present(&mut app, B);
-    assert_eq!(delivered(&emacs), ["R{false,2,1}"], "A still pictures rev 1");
+    assert_eq!(
+        delivered(&emacs),
+        ["R{false,2,1}"],
+        "A still pictures rev 1"
+    );
     assert!(
         present_retained(&mut app, A, &mut retained, &[MODEL], &[]),
         "A's raster pictures the old camera"
@@ -382,7 +395,8 @@ fn a_cursor_frame_after_a_model_change_shows_and_picks_the_new_camera() {
     assert_eq!(retained.as_ref().unwrap()[&MODEL].view.yaw, 30.0);
 
     assert!(app.models.press(A, hit(), (10.0, 10.0)));
-    app.models.release(A, Some(hit()), Instant::now(), &mut host);
+    app.models
+        .release(A, Some(hit()), Instant::now(), &mut host);
     let pick = host.picks.last().expect("a click picks");
     assert_eq!(pick.view.yaw, 30.0);
     assert_ne!(pick.view, before.view);
@@ -423,7 +437,8 @@ fn sub_notch_touchpad_events_add_up_to_a_zoom_that_settles_after_the_quiet_perio
     let events = delivered(&emacs);
     assert!(!events.iter().any(|e| e.starts_with("View")), "{events:?}");
 
-    app.models.tick(ms(20) + WHEEL_QUIET - Duration::from_millis(1), None);
+    app.models
+        .tick(ms(20) + WHEEL_QUIET - Duration::from_millis(1), None);
     app.flush_model_events();
     assert!(delivered(&emacs).is_empty(), "the burst is not quiet yet");
     app.models.tick(ms(20) + WHEEL_QUIET, None);
@@ -449,23 +464,51 @@ fn a_wheel_remainder_resets_on_quiet_gesture_device_and_model_changes() {
         app.model_wheel.notches(device, id, pixels(y), phase, at)
     };
     // 0.6 then 0.6 within one gesture: one notch.
-    assert_eq!(wheel(&mut app, pad, MODEL, 30.0, TouchPhase::Started, ms(0)), 0);
-    assert_eq!(wheel(&mut app, pad, MODEL, 30.0, TouchPhase::Moved, ms(10)), 1);
+    assert_eq!(
+        wheel(&mut app, pad, MODEL, 30.0, TouchPhase::Started, ms(0)),
+        0
+    );
+    assert_eq!(
+        wheel(&mut app, pad, MODEL, 30.0, TouchPhase::Moved, ms(10)),
+        1
+    );
     // 0.2 carried; after a quiet period it is gone.
     assert_eq!(
-        wheel(&mut app, pad, MODEL, 40.0, TouchPhase::Moved, ms(10) + WHEEL_QUIET),
+        wheel(
+            &mut app,
+            pad,
+            MODEL,
+            40.0,
+            TouchPhase::Moved,
+            ms(10) + WHEEL_QUIET
+        ),
         0,
         "a stale remainder joined a later burst"
     );
     // 0.8 carried; a new gesture starts from zero.
-    assert_eq!(wheel(&mut app, pad, MODEL, 30.0, TouchPhase::Started, ms(200)), 0);
+    assert_eq!(
+        wheel(&mut app, pad, MODEL, 30.0, TouchPhase::Started, ms(200)),
+        0
+    );
     // 0.6 carried; another device does not inherit it.
-    assert_eq!(wheel(&mut app, other, MODEL, 30.0, TouchPhase::Moved, ms(210)), 0);
+    assert_eq!(
+        wheel(&mut app, other, MODEL, 30.0, TouchPhase::Moved, ms(210)),
+        0
+    );
     // 0.6 carried for `other`; another model does not inherit it.
-    assert_eq!(wheel(&mut app, other, MODEL + 1, 30.0, TouchPhase::Moved, ms(220)), 0);
+    assert_eq!(
+        wheel(&mut app, other, MODEL + 1, 30.0, TouchPhase::Moved, ms(220)),
+        0
+    );
     // Negative deltas accumulate the same way, toward zoom-out.
-    assert_eq!(wheel(&mut app, pad, MODEL, -30.0, TouchPhase::Started, ms(300)), 0);
-    assert_eq!(wheel(&mut app, pad, MODEL, -30.0, TouchPhase::Moved, ms(310)), -1);
+    assert_eq!(
+        wheel(&mut app, pad, MODEL, -30.0, TouchPhase::Started, ms(300)),
+        0
+    );
+    assert_eq!(
+        wheel(&mut app, pad, MODEL, -30.0, TouchPhase::Moved, ms(310)),
+        -1
+    );
     // A whole notch from a mouse wheel is still exactly one notch.
     assert_eq!(
         app.model_wheel.notches(

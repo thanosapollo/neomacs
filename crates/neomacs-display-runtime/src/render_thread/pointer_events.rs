@@ -1885,13 +1885,7 @@ impl RenderApp {
                 )
                 && self.models.is_interactive(surface_id)
             {
-                self.wheel_over_model(
-                    device,
-                    surface_id,
-                    delta,
-                    phase,
-                    std::time::Instant::now(),
-                );
+                self.wheel_over_model(device, surface_id, delta, phase, std::time::Instant::now());
                 return;
             }
             // Not over an interactive model (or modified): any fraction
