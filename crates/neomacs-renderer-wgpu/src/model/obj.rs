@@ -75,96 +75,289 @@ pub enum ObjError {
     Io(String),
 }
 
-/// Gnosis's number syntax: `[-+]?(D+(.D*)?|.D+)([eE][-+]?D+)?`. Stricter than
-/// Rust's `f64::from_str` (no `inf`, `nan` or bare exponent), so a file the
-/// Gnosis validator rejects is rejected here too.
+/// Longest prefix of an offending word an error quotes: one word can be
+/// megabytes long.
+const QUOTED_BYTES: usize = 32;
+
+/// The first bytes of a word, kept for an error message.
+#[derive(Default)]
+struct Quote {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl Quote {
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.truncated = false;
+    }
+
+    fn push(&mut self, byte: u8) {
+        // A few bytes past the limit, so the text can end on a whole
+        // character.
+        if self.bytes.len() < QUOTED_BYTES + 3 {
+            self.bytes.push(byte);
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    /// The word, or its first [`QUOTED_BYTES`] at most and `…`.
+    fn text(&self) -> String {
+        let cut = self.truncated || self.bytes.len() > QUOTED_BYTES;
+        let mut end = self.bytes.len();
+        if cut {
+            end = QUOTED_BYTES;
+            while end > 0 && std::str::from_utf8(&self.bytes[..end]).is_err() {
+                end -= 1;
+            }
+        }
+        let mut text = String::from_utf8_lossy(&self.bytes[..end]).into_owned();
+        if cut {
+            text.push('…');
+        }
+        text
+    }
+}
+
+/// Significant digits a number keeps. A decimal halfway point between two
+/// `f64` has at most 767 significant digits, so the first 800 digits and
+/// whether any later one is nonzero round exactly as the whole text does.
+const MAX_SIGNIFICANT: usize = 800;
+
+/// An exponent this large in magnitude over- or underflows whatever the
+/// (at most [`MAX_OBJ_FILE_BYTES`]) digits of its mantissa.
+const MAX_EXPONENT: i64 = 1_000_000_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum NumberPart {
+    #[default]
+    Start,
+    Int,
+    Frac,
+    ExpStart,
+    ExpSign,
+    Exp,
+    Bad,
+}
+
+/// One number word, checked and reduced as its bytes arrive, in bounded
+/// state whatever its length. Gnosis's syntax
+/// `[-+]?(D+(.D*)?|.D+)([eE][-+]?D+)?` is stricter than `f64::from_str`
+/// (no `inf`, `nan` or bare exponent), so a file the Gnosis validator
+/// rejects is rejected here too; the value is the correctly rounded one
+/// of the whole text.
+#[derive(Default)]
+struct NumberWord {
+    quote: Quote,
+    part: NumberPart,
+    negative: bool,
+    mantissa_digits: u64,
+    frac_digits: u64,
+    /// ASCII digits from the first nonzero one, at most [`MAX_SIGNIFICANT`].
+    significant: Vec<u8>,
+    significant_count: u64,
+    /// A nonzero digit past [`MAX_SIGNIFICANT`] was dropped.
+    sticky: bool,
+    exp_negative: bool,
+    exp: i64,
+}
+
+impl NumberWord {
+    fn clear(&mut self) {
+        self.quote.clear();
+        self.part = NumberPart::Start;
+        self.negative = false;
+        self.mantissa_digits = 0;
+        self.frac_digits = 0;
+        self.significant.clear();
+        self.significant_count = 0;
+        self.sticky = false;
+        self.exp_negative = false;
+        self.exp = 0;
+    }
+
+    fn mantissa_digit(&mut self, digit: u8) {
+        self.mantissa_digits += 1;
+        if self.significant_count == 0 && digit == b'0' {
+            return;
+        }
+        self.significant_count += 1;
+        if self.significant.len() < MAX_SIGNIFICANT {
+            self.significant.push(digit);
+        } else if digit != b'0' {
+            self.sticky = true;
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        use NumberPart::*;
+        self.quote.push(byte);
+        self.part = match (self.part, byte) {
+            (Start, b'+' | b'-') => {
+                self.negative = byte == b'-';
+                Int
+            }
+            (Start | Int, b'0'..=b'9') => {
+                self.mantissa_digit(byte);
+                Int
+            }
+            (Start | Int, b'.') => Frac,
+            (Frac, b'0'..=b'9') => {
+                self.mantissa_digit(byte);
+                self.frac_digits += 1;
+                Frac
+            }
+            (Int | Frac, b'e' | b'E') => ExpStart,
+            (ExpStart, b'+' | b'-') => {
+                self.exp_negative = byte == b'-';
+                ExpSign
+            }
+            (ExpStart | ExpSign | Exp, b'0'..=b'9') => {
+                self.exp = (self.exp * 10 + i64::from(byte - b'0')).min(MAX_EXPONENT);
+                Exp
+            }
+            _ => Bad,
+        };
+    }
+
+    /// The word's value, within |n| <= 1e6.
+    fn value(&self, line: usize) -> Result<f64, ObjError> {
+        use std::fmt::Write;
+        if !matches!(
+            self.part,
+            NumberPart::Int | NumberPart::Frac | NumberPart::Exp
+        ) || self.mantissa_digits == 0
+        {
+            return Err(ObjError::BadNumber {
+                line,
+                text: self.quote.text(),
+            });
+        }
+        let value = if self.significant_count == 0 {
+            if self.negative { -0.0 } else { 0.0 }
+        } else {
+            // significant × 10^exp, the dropped digits standing in as one
+            // nonzero digit when any was nonzero.
+            let dropped = (self.significant_count - self.significant.len() as u64) as i64;
+            let exp = if self.exp_negative {
+                -self.exp
+            } else {
+                self.exp
+            } - self.frac_digits as i64
+                + dropped
+                - i64::from(self.sticky);
+            let mut text = String::with_capacity(self.significant.len() + 24);
+            if self.negative {
+                text.push('-');
+            }
+            text.push_str(std::str::from_utf8(&self.significant).expect("ASCII digits"));
+            if self.sticky {
+                text.push('1');
+            }
+            let _ = write!(text, "e{exp}");
+            text.parse::<f64>().map_err(|_| ObjError::BadNumber {
+                line,
+                text: self.quote.text(),
+            })?
+        };
+        if !value.is_finite() || value.abs() > MAX_COORDINATE {
+            return Err(ObjError::NumberOutOfBounds { line });
+        }
+        Ok(value)
+    }
+}
+
+/// [`NumberWord`] over a whole `text`.
+#[cfg(test)]
 fn parse_number(text: &str, line: usize) -> Result<f64, ObjError> {
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    if matches!(bytes.first(), Some(b'+' | b'-')) {
-        i += 1;
+    let mut word = NumberWord::default();
+    for &byte in text.as_bytes() {
+        word.push(byte);
     }
-    let int_start = i;
-    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-        i += 1;
-    }
-    let int_digits = i - int_start;
-    let mut frac_digits = 0;
-    if bytes.get(i) == Some(&b'.') {
-        i += 1;
-        let frac_start = i;
-        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-            i += 1;
-        }
-        frac_digits = i - frac_start;
-    }
-    let mantissa_ok = int_digits > 0 || frac_digits > 0;
-    if matches!(bytes.get(i), Some(b'e' | b'E')) {
-        i += 1;
-        if matches!(bytes.get(i), Some(b'+' | b'-')) {
-            i += 1;
-        }
-        let exp_start = i;
-        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-            i += 1;
-        }
-        if i == exp_start {
-            return Err(bad_number(text, line));
-        }
-    }
-    if !mantissa_ok || i != bytes.len() {
-        return Err(bad_number(text, line));
-    }
-    let value: f64 = text.parse().map_err(|_| bad_number(text, line))?;
-    if !value.is_finite() || value.abs() > MAX_COORDINATE {
-        return Err(ObjError::NumberOutOfBounds { line });
-    }
-    Ok(value)
+    word.value(line)
 }
 
-fn bad_number(text: &str, line: usize) -> ObjError {
-    ObjError::BadNumber {
-        line,
-        text: text.to_owned(),
-    }
+/// One face reference (`7`, `7/1`, `-2//3`), checked as its bytes arrive:
+/// its position index is the text before the first `/`, a decimal
+/// integer. Gnosis and canvas-3d read the value, so leading zeros of any
+/// length are valid.
+#[derive(Default)]
+struct IndexWord {
+    quote: Quote,
+    /// Past the first `/`: the rest of the reference is ignored.
+    past_index: bool,
+    len: usize,
+    negative: bool,
+    digits: usize,
+    /// Digits from the first nonzero one (saturating).
+    significant: u32,
+    magnitude: i64,
+    bad: bool,
 }
 
-/// Resolve one face reference (`7`, `7/1`, `-2//3`) against `count`
-/// vertices defined so far.
-fn parse_index(word: &str, count: usize, line: usize) -> Result<u32, ObjError> {
-    let text = word.split('/').next().unwrap_or("");
-    let digits = text.strip_prefix('-').unwrap_or(text);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(ObjError::BadIndex {
-            line,
-            text: text.to_owned(),
-        });
+impl IndexWord {
+    fn clear(&mut self) {
+        self.quote.clear();
+        self.past_index = false;
+        self.len = 0;
+        self.negative = false;
+        self.digits = 0;
+        self.significant = 0;
+        self.magnitude = 0;
+        self.bad = false;
     }
-    // Gnosis and canvas-3d read the value, so leading zeros of any length
-    // are valid; past 18 significant digits it is out of range for any file.
-    let significant = digits.trim_start_matches('0');
-    if significant.len() > 18 {
-        return Err(ObjError::IndexOutOfRange { line });
+
+    fn push(&mut self, byte: u8) {
+        if self.past_index {
+            return;
+        }
+        if byte == b'/' {
+            self.past_index = true;
+            return;
+        }
+        self.quote.push(byte);
+        self.len += 1;
+        match byte {
+            b'-' if self.len == 1 => self.negative = true,
+            b'0'..=b'9' => {
+                self.digits += 1;
+                if self.significant > 0 || byte != b'0' {
+                    self.significant = self.significant.saturating_add(1);
+                    if self.significant <= 18 {
+                        self.magnitude = self.magnitude * 10 + i64::from(byte - b'0');
+                    }
+                }
+            }
+            _ => self.bad = true,
+        }
     }
-    let magnitude: i64 = if significant.is_empty() {
-        0
-    } else {
-        significant.parse().map_err(|_| ObjError::BadIndex {
-            line,
-            text: text.to_owned(),
-        })?
-    };
-    let n = if text.starts_with('-') {
-        -magnitude
-    } else {
-        magnitude
-    };
-    let count = count as i64;
-    let resolved = if n > 0 { n - 1 } else { count + n };
-    if n == 0 || resolved < 0 || resolved >= count {
-        return Err(ObjError::IndexOutOfRange { line });
+
+    /// The 0-based vertex the reference names among `count` defined so
+    /// far: 1-based when positive, relative to `count` when negative.
+    fn resolve(&self, count: usize, line: usize) -> Result<u32, ObjError> {
+        if self.bad || self.digits == 0 {
+            return Err(ObjError::BadIndex {
+                line,
+                text: self.quote.text(),
+            });
+        }
+        // Past 18 significant digits it is out of range for any file.
+        if self.significant > 18 {
+            return Err(ObjError::IndexOutOfRange { line });
+        }
+        let n = if self.negative {
+            -self.magnitude
+        } else {
+            self.magnitude
+        };
+        let count = count as i64;
+        let resolved = if n > 0 { n - 1 } else { count + n };
+        if n == 0 || resolved < 0 || resolved >= count {
+            return Err(ObjError::IndexOutOfRange { line });
+        }
+        Ok(resolved as u32)
     }
-    Ok(resolved as u32)
 }
 
 /// Parse OBJ `bytes` within `limits`.
@@ -183,32 +376,60 @@ pub fn parse_obj_cancellable(
     parser.finish(cancelled)
 }
 
-/// A word already known to be UTF-8 (its line was validated) as text.
-fn utf8(word: &[u8], line: usize) -> Result<&str, ObjError> {
-    std::str::from_utf8(word).map_err(|_| ObjError::NotUtf8 { line })
-}
-
-/// Bytes of one line validated (and searched for a comment) between two
-/// cancellation polls.
+/// Bytes parsed between two cancellation polls, however they split into
+/// lines and words.
 const SCAN_WINDOW: usize = READ_CHUNK;
 
-/// Lines, references or triangles handled between two cancellation polls.
+/// Lines, words or triangles handled between two cancellation polls.
 const CHECK_EVERY: usize = 1 << 16;
 
-/// Incremental OBJ parser: fed the file in chunks as it is read, it keeps
-/// only the unfinished last line, enforces the caps as it goes and polls
-/// the cancel flag at bounded intervals, also inside one long line.
+/// What the current line is, once its first word is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Record {
+    /// Before or inside the line's first word.
+    Keyword,
+    /// A `v` line with this many coordinates read.
+    Vertex(usize),
+    /// An `f` line; its references so far are in `polygon`.
+    Face,
+    /// Any other line, or a `v` line past its third coordinate.
+    Ignored,
+}
+
+/// Incremental OBJ parser, fed the file in chunks as it is read.
+///
+/// It is a byte-level state machine: it keeps no line or word, only
+/// bounded per-word state, so one huge word (a zero-padded index, a long
+/// coordinate) costs no more than many short ones. Every
+/// [`SCAN_WINDOW`] bytes, and every [`CHECK_EVERY`] lines, words or
+/// triangles, it polls the cancel flag; the caps, including a face's
+/// reference allowance, are enforced as the bytes arrive. Errors are
+/// reported in file order (invalid UTF-8 too), whatever the chunking.
 pub struct ObjParser {
     limits: ObjLimits,
     vertices: Vec<[f64; 3]>,
     triangles: Vec<[u32; 3]>,
     polygon: Vec<u32>,
-    /// The current, not yet terminated line.
-    pending: Vec<u8>,
-    /// Number of the next line to complete (1-based).
+    /// Number of the current line (1-based).
     line: usize,
     /// Work units since the last cancellation poll.
     work: usize,
+    /// Bytes parsed since the last cancellation poll.
+    scanned: usize,
+    /// The start of a UTF-8 character split by the end of the last chunk.
+    split_char: Vec<u8>,
+    record: Record,
+    /// Skipping to the end of the line: a comment or an ignored record.
+    skipping: bool,
+    in_word: bool,
+    /// The first byte of the line's first word.
+    keyword: u8,
+    point: [f64; 3],
+    /// References the current face may have: k of them are k - 2
+    /// triangles, within what is left of the allowance.
+    max_refs: usize,
+    number: NumberWord,
+    index: IndexWord,
 }
 
 impl ObjParser {
@@ -218,9 +439,18 @@ impl ObjParser {
             vertices: Vec::new(),
             triangles: Vec::new(),
             polygon: Vec::new(),
-            pending: Vec::new(),
             line: 1,
             work: 0,
+            scanned: 0,
+            split_char: Vec::new(),
+            record: Record::Keyword,
+            skipping: false,
+            in_word: false,
+            keyword: 0,
+            point: [0.0; 3],
+            max_refs: 0,
+            number: NumberWord::default(),
+            index: IndexWord::default(),
         }
     }
 
@@ -236,27 +466,22 @@ impl ObjParser {
         Ok(())
     }
 
-    /// Parse the complete lines of `chunk`; keep its unterminated tail.
+    /// Parse `chunk`, the file's next bytes.
     pub fn feed(&mut self, chunk: &[u8], cancelled: &dyn Fn() -> bool) -> Result<(), ObjError> {
-        let mut rest = chunk;
-        while let Some(end) = rest.iter().position(|b| *b == b'\n') {
-            if self.pending.is_empty() {
-                self.parse_line(&rest[..end], cancelled)?;
-            } else {
-                self.pending.extend_from_slice(&rest[..end]);
-                let line = std::mem::take(&mut self.pending);
-                self.parse_line(&line, cancelled)?;
-            }
-            rest = &rest[end + 1..];
+        for window in chunk.chunks(SCAN_WINDOW) {
+            self.feed_window(window, cancelled)?;
         }
-        self.pending.extend_from_slice(rest);
         Ok(())
     }
 
-    /// The last (possibly empty) line, then the mesh.
+    /// The end of the file: its last (possibly unterminated) line, then
+    /// the mesh.
     pub fn finish(mut self, cancelled: &dyn Fn() -> bool) -> Result<ObjMesh, ObjError> {
-        let line = std::mem::take(&mut self.pending);
-        self.parse_line(&line, cancelled)?;
+        if !self.split_char.is_empty() {
+            return Err(ObjError::NotUtf8 { line: self.line });
+        }
+        self.skipping = false;
+        self.end_line(cancelled)?;
         if self.triangles.is_empty() {
             return Err(ObjError::NoTriangles);
         }
@@ -266,46 +491,165 @@ impl ObjParser {
         })
     }
 
-    fn parse_line(&mut self, raw: &[u8], cancelled: &dyn Fn() -> bool) -> Result<(), ObjError> {
-        let line = self.line;
-        self.line += 1;
-        self.tick(1, cancelled)?;
-        let code_end = self.scan_line(raw, line, cancelled)?;
-        let mut words = raw[..code_end].split(|b| matches!(b, b' ' | b'\t' | b'\r'));
-        match self.next_word(&mut words, cancelled)? {
-            Some(b"v") => {
-                let mut point = [0.0; 3];
-                for slot in &mut point {
-                    let word = self
-                        .next_word(&mut words, cancelled)?
-                        .ok_or(ObjError::ShortVertex { line })?;
-                    *slot = parse_number(utf8(word, line)?, line)?;
-                }
-                if self.vertices.len() >= self.limits.max_vertices {
-                    return Err(ObjError::TooManyVertices {
-                        max: self.limits.max_vertices,
-                    });
-                }
-                self.vertices.push(point);
+    /// Validate `window` as UTF-8 and parse it, then poll once a whole
+    /// [`SCAN_WINDOW`] has gone by.
+    fn feed_window(&mut self, window: &[u8], cancelled: &dyn Fn() -> bool) -> Result<(), ObjError> {
+        let joined;
+        let bytes = if self.split_char.is_empty() {
+            window
+        } else {
+            let mut start = std::mem::take(&mut self.split_char);
+            start.extend_from_slice(window);
+            joined = start;
+            &joined[..]
+        };
+        let (valid, invalid) = match std::str::from_utf8(bytes) {
+            Ok(_) => (bytes.len(), false),
+            // A character split by the end of the chunk: finish it next time.
+            Err(e) if e.error_len().is_none() => (e.valid_up_to(), false),
+            Err(e) => (e.valid_up_to(), true),
+        };
+        // What precedes an invalid byte is parsed first, so the error
+        // reported is the first in the file.
+        self.parse_bytes(&bytes[..valid], cancelled)?;
+        if invalid {
+            return Err(ObjError::NotUtf8 { line: self.line });
+        }
+        self.split_char.extend_from_slice(&bytes[valid..]);
+        self.scanned += window.len();
+        if self.scanned >= SCAN_WINDOW {
+            self.scanned = 0;
+            if cancelled() {
+                return Err(ObjError::Cancelled);
             }
-            Some(b"f") => {
-                self.polygon.clear();
-                // A polygon of k references is k - 2 triangles: stop as soon
-                // as it alone exceeds the remaining allowance.
-                let max_refs = self
-                    .limits
-                    .max_triangles
-                    .saturating_sub(self.triangles.len())
-                    + 2;
-                while let Some(word) = self.next_word(&mut words, cancelled)? {
-                    if self.polygon.len() == max_refs {
+        }
+        Ok(())
+    }
+
+    /// Parse valid UTF-8 `bytes` (whole characters).
+    fn parse_bytes(
+        &mut self,
+        mut bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), ObjError> {
+        while let Some((&byte, rest)) = bytes.split_first() {
+            if self.skipping {
+                match bytes.iter().position(|b| *b == b'\n') {
+                    Some(end) => {
+                        self.skipping = false;
+                        bytes = &bytes[end..];
+                        continue;
+                    }
+                    None => return Ok(()),
+                }
+            }
+            bytes = rest;
+            match byte {
+                b'\n' => self.end_line(cancelled)?,
+                b'#' => {
+                    self.end_word(cancelled)?;
+                    self.skipping = true;
+                }
+                b' ' | b'\t' | b'\r' => self.end_word(cancelled)?,
+                _ => self.word_byte(byte, cancelled)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn word_byte(&mut self, byte: u8, cancelled: &dyn Fn() -> bool) -> Result<(), ObjError> {
+        if !self.in_word {
+            self.in_word = true;
+            self.tick(1, cancelled)?;
+            match self.record {
+                Record::Keyword => {
+                    self.keyword = byte;
+                    return Ok(());
+                }
+                Record::Vertex(_) => self.number.clear(),
+                Record::Face => {
+                    // Stop as soon as the polygon alone exceeds the
+                    // remaining allowance.
+                    if self.polygon.len() == self.max_refs {
                         return Err(ObjError::TooManyTriangles {
                             max: self.limits.max_triangles,
                         });
                     }
-                    let index = parse_index(utf8(word, line)?, self.vertices.len(), line)?;
-                    self.polygon.push(index);
+                    self.index.clear();
                 }
+                Record::Ignored => {}
+            }
+        }
+        match self.record {
+            // A second byte: neither `v` nor `f`, an ignored record.
+            Record::Keyword => {
+                self.in_word = false;
+                self.record = Record::Ignored;
+                self.skipping = true;
+            }
+            Record::Vertex(_) => self.number.push(byte),
+            Record::Face => self.index.push(byte),
+            Record::Ignored => {}
+        }
+        Ok(())
+    }
+
+    fn end_word(&mut self, _cancelled: &dyn Fn() -> bool) -> Result<(), ObjError> {
+        if !self.in_word {
+            return Ok(());
+        }
+        self.in_word = false;
+        let line = self.line;
+        match self.record {
+            Record::Keyword => {
+                self.record = match self.keyword {
+                    b'v' => Record::Vertex(0),
+                    b'f' => {
+                        self.polygon.clear();
+                        self.max_refs = self
+                            .limits
+                            .max_triangles
+                            .saturating_sub(self.triangles.len())
+                            .saturating_add(2);
+                        Record::Face
+                    }
+                    _ => {
+                        self.skipping = true;
+                        Record::Ignored
+                    }
+                };
+            }
+            Record::Vertex(filled) => {
+                self.point[filled] = self.number.value(line)?;
+                if filled < 2 {
+                    self.record = Record::Vertex(filled + 1);
+                } else {
+                    if self.vertices.len() >= self.limits.max_vertices {
+                        return Err(ObjError::TooManyVertices {
+                            max: self.limits.max_vertices,
+                        });
+                    }
+                    self.vertices.push(self.point);
+                    // Coordinates past the third are ignored.
+                    self.record = Record::Ignored;
+                    self.skipping = true;
+                }
+            }
+            Record::Face => {
+                let index = self.index.resolve(self.vertices.len(), line)?;
+                self.polygon.push(index);
+            }
+            Record::Ignored => {}
+        }
+        Ok(())
+    }
+
+    fn end_line(&mut self, cancelled: &dyn Fn() -> bool) -> Result<(), ObjError> {
+        self.end_word(cancelled)?;
+        let line = self.line;
+        match self.record {
+            Record::Vertex(_) => return Err(ObjError::ShortVertex { line }),
+            Record::Face => {
                 if self.polygon.len() < 3 {
                     return Err(ObjError::ShortFace { line });
                 }
@@ -315,60 +659,12 @@ impl ObjParser {
                     self.tick(1, cancelled)?;
                 }
             }
-            _ => {}
+            Record::Keyword | Record::Ignored => {}
         }
-        Ok(())
-    }
-
-    /// The next non-empty word, polling `cancelled` across long runs of
-    /// separators or words.
-    fn next_word<'a>(
-        &mut self,
-        words: &mut impl Iterator<Item = &'a [u8]>,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<Option<&'a [u8]>, ObjError> {
-        for word in words {
-            self.tick(1, cancelled)?;
-            if !word.is_empty() {
-                return Ok(Some(word));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Validate `raw` as UTF-8 and find where its comment starts, one
-    /// window at a time with a cancellation poll between windows.
-    fn scan_line(
-        &mut self,
-        raw: &[u8],
-        line: usize,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<usize, ObjError> {
-        let mut code_end = None;
-        let mut at = 0;
-        while at < raw.len() {
-            let end = (at + SCAN_WINDOW).min(raw.len());
-            let valid = match std::str::from_utf8(&raw[at..end]) {
-                Ok(text) => text,
-                // A character split by the window edge: validate up to it
-                // and start the next window there.
-                Err(e) if e.error_len().is_none() && end < raw.len() && e.valid_up_to() > 0 => {
-                    std::str::from_utf8(&raw[at..at + e.valid_up_to()]).expect("validated prefix")
-                }
-                Err(_) => return Err(ObjError::NotUtf8 { line }),
-            };
-            if code_end.is_none()
-                && let Some(hash) = valid.find('#')
-            {
-                code_end = Some(at + hash);
-            }
-            at += valid.len();
-            // A long line polls between windows.
-            if at < raw.len() && cancelled() {
-                return Err(ObjError::Cancelled);
-            }
-        }
-        Ok(code_end.unwrap_or(raw.len()))
+        self.line += 1;
+        self.record = Record::Keyword;
+        self.skipping = false;
+        self.tick(1, cancelled)
     }
 }
 
@@ -426,7 +722,12 @@ pub fn read_obj_file_within(
     let mut parser = ObjParser::new(limits);
     let mut read = 0u64;
     let mut chunk = vec![0u8; READ_CHUNK];
-    super::loader::probe("parse", path);
+    // The parser's own polls (not the read loop's) report the parse phase
+    // to a test observer: they run only once parsing is under way.
+    let parse_poll = || {
+        super::loader::probe("parse", path);
+        cancelled()
+    };
     loop {
         if cancelled() {
             return Err(ObjError::Cancelled);
@@ -444,7 +745,7 @@ pub fn read_obj_file_within(
         if let Some(hasher) = hasher.as_mut() {
             hasher.update(&chunk[..n]);
         }
-        parser.feed(&chunk[..n], cancelled)?;
+        parser.feed(&chunk[..n], &parse_poll)?;
     }
     if let (Some(expected), Some(hasher)) = (sha256, hasher)
         && hasher.finalize().as_slice() != expected.as_slice()
@@ -454,7 +755,7 @@ pub fn read_obj_file_within(
     if cancelled() {
         return Err(ObjError::Cancelled);
     }
-    parser.finish(cancelled).map(|mesh| (mesh, read))
+    parser.finish(&parse_poll).map(|mesh| (mesh, read))
 }
 
 #[cfg(test)]

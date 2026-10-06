@@ -409,3 +409,287 @@ fn the_incremental_parser_is_chunking_independent_and_polls_long_lines() {
     );
     assert_eq!(calls.get(), 3);
 }
+
+// ----------------------------------------------------------------------
+// Round 3 (SOL-REVIEW-2 MUST 1, OPUS-REVIEW SHOULD 2): one huge token is
+// processed in bounded, cancellable steps, an unfinished face line meets
+// its reference allowance as it arrives, and errors quote a short prefix.
+
+/// A file of `head`, then `fill` repeated `len` times, then `tail`.
+fn huge_token_body(head: &[u8], fill: u8, len: usize, tail: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(head.len() + len + tail.len());
+    body.extend_from_slice(head);
+    body.resize(head.len() + len, fill);
+    body.extend_from_slice(tail);
+    body
+}
+
+/// Read `body` uncancelled, timing every cancellation poll. Answers the
+/// outcome, the whole time, the longest stretch without a poll (from the
+/// start to the first poll, between polls, and from the last poll to the
+/// return) and the number of polls.
+fn timed_polls(
+    path: &std::path::Path,
+    limits: ObjLimits,
+) -> (
+    Result<ObjMesh, ObjError>,
+    std::time::Duration,
+    std::time::Duration,
+    usize,
+) {
+    let start = std::time::Instant::now();
+    let last = std::cell::Cell::new(start);
+    let gap = std::cell::Cell::new(std::time::Duration::ZERO);
+    let polls = std::cell::Cell::new(0usize);
+    let poll = || {
+        let now = std::time::Instant::now();
+        gap.set(gap.get().max(now - last.get()));
+        last.set(now);
+        polls.set(polls.get() + 1);
+        false
+    };
+    let outcome = read_obj_file(path, None, limits, &poll);
+    let end = std::time::Instant::now();
+    gap.set(gap.get().max(end - last.get()));
+    (outcome, end - start, gap.get(), polls.get())
+}
+
+/// The longest stretch without a cancellation poll is a small part of
+/// the whole parse of `body` (best of three runs, so one scheduling
+/// hiccup cannot fail it), and a flag raised at the middle poll stops the
+/// parse promptly. Answers the uncancelled outcome.
+fn assert_polled_throughout(name: &str, body: &[u8]) -> Result<ObjMesh, ObjError> {
+    let path = scratch(name, body);
+    let limits = ObjLimits {
+        max_vertices: 1000,
+        max_triangles: 1000,
+    };
+    let mut best = None;
+    let mut outcome = None;
+    let mut polls = 0;
+    for _ in 0..3 {
+        let (result, total, gap, count) = timed_polls(&path, limits);
+        outcome = Some(result);
+        polls = count;
+        let ratio = gap.as_secs_f64() / total.as_secs_f64();
+        if best.is_none_or(|(r, _, _)| ratio < r) {
+            best = Some((ratio, gap, total));
+        }
+        if ratio * 8.0 < 1.0 {
+            break;
+        }
+    }
+    let (ratio, gap, total) = best.unwrap();
+    assert!(
+        ratio * 8.0 < 1.0,
+        "{name}: {gap:?} without a cancellation poll in a {total:?} parse ({polls} polls)"
+    );
+    // Cancel at the middle poll: the parse stops there.
+    let calls = std::cell::Cell::new(0usize);
+    let tripped = std::cell::Cell::new(None::<std::time::Instant>);
+    let cancelled = || {
+        calls.set(calls.get() + 1);
+        if calls.get() >= polls / 2 {
+            tripped.set(tripped.get().or(Some(std::time::Instant::now())));
+            true
+        } else {
+            false
+        }
+    };
+    assert_eq!(
+        read_obj_file(&path, None, limits, &cancelled).map(|m| m.vertices.len()),
+        Err(ObjError::Cancelled),
+        "{name}: cancelled at poll {} of {polls}",
+        polls / 2
+    );
+    let stopped = tripped.get().unwrap().elapsed();
+    assert!(
+        stopped.as_secs_f64() * 8.0 < total.as_secs_f64(),
+        "{name}: stopped {stopped:?} after the flag rose, in a {total:?} parse"
+    );
+    std::fs::remove_file(path).unwrap();
+    outcome.unwrap()
+}
+
+/// SOL-REVIEW-2 MUST 1: `f <40 MB of leading zeros>1 2 3`, a valid face
+/// (zero padding is read by value), is not one uncancellable token.
+#[test]
+fn cancellation_is_polled_inside_one_huge_zero_padded_index() {
+    let body = huge_token_body(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf ", b'0', 40 << 20, b"1 2 3\n");
+    let mesh = assert_polled_throughout("huge-index.obj", &body).unwrap();
+    assert_eq!(mesh.triangles, vec![[0, 1, 2]]);
+}
+
+/// The same for one huge coordinate, whose digits are all significant:
+/// its value is still the correctly rounded one.
+#[test]
+fn cancellation_is_polled_inside_one_huge_coordinate() {
+    let body = huge_token_body(
+        b"v 0.",
+        b'3',
+        40 << 20,
+        b"7 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n",
+    );
+    let mesh = assert_polled_throughout("huge-coordinate.obj", &body).unwrap();
+    let digits =
+        std::str::from_utf8(&body[2..body.iter().position(|b| *b == b'7').unwrap() + 1]).unwrap();
+    assert_eq!(mesh.vertices[0][0], digits.parse::<f64>().unwrap());
+    assert_eq!(mesh.vertices[0][0], 1.0 / 3.0);
+}
+
+/// SOL-REVIEW-2 MUST 1: an unterminated face line fails at its reference
+/// allowance as the references arrive, not once the whole line is in.
+#[test]
+fn an_unfinished_face_line_fails_at_its_reference_allowance() {
+    let tight = ObjLimits {
+        max_vertices: 10,
+        max_triangles: 4,
+    };
+    let mut parser = ObjParser::new(tight);
+    parser
+        .feed(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf", &|| false)
+        .unwrap();
+    // Six references are four triangles: the seventh exceeds them.
+    let mut outcome = Ok(());
+    for _ in 0..1000 {
+        outcome = parser.feed(b" 1 2 3", &|| false);
+        if outcome.is_err() {
+            break;
+        }
+    }
+    assert_eq!(outcome, Err(ObjError::TooManyTriangles { max: 4 }));
+}
+
+/// OPUS-REVIEW SHOULD 2: an error quotes at most a short prefix of the
+/// offending word, however long the word is.
+#[test]
+fn errors_quote_a_short_prefix_of_the_offending_word() {
+    let long = "x".repeat(1 << 20);
+    for (text, quoted) in [
+        (format!("v 0 0 {long}\n"), "number"),
+        (
+            format!("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 {long}\n"),
+            "index",
+        ),
+        (
+            format!("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3{long}/7\n"),
+            "index",
+        ),
+    ] {
+        let error = parse(&text).unwrap_err();
+        let shown = match &error {
+            ObjError::BadNumber { text, .. } | ObjError::BadIndex { text, .. } => text.clone(),
+            other => panic!("{quoted}: unexpected {other:?}"),
+        };
+        assert!(
+            shown.len() <= 40 && shown.ends_with('…'),
+            "{quoted}: quoted {} bytes",
+            shown.len()
+        );
+        assert!(error.to_string().len() < 80, "{quoted}: {error}");
+    }
+    // A short word is quoted whole.
+    assert_eq!(
+        parse("v 0 0 0x1\n").unwrap_err(),
+        ObjError::BadNumber {
+            line: 1,
+            text: "0x1".into()
+        }
+    );
+    // A multi-byte character is never cut.
+    let accented = format!("v 0 0 {}\n", "é".repeat(40));
+    match parse(&accented).unwrap_err() {
+        ObjError::BadNumber { text, .. } => {
+            assert!(text.starts_with("éé") && text.ends_with('…'), "{text}")
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// The parser's numbers are Rust's correctly rounded `f64` of the whole
+/// text, also for long digit runs (pseudo-random, reproducible).
+#[test]
+fn numbers_match_the_correctly_rounded_value_of_the_whole_text() {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let mut checked = 0;
+    for _ in 0..3000 {
+        let mut text = String::new();
+        if next(3) == 0 {
+            text.push(if next(2) == 0 { '-' } else { '+' });
+        }
+        for _ in 0..next(4) {
+            text.push('0');
+        }
+        let int_len = next(8);
+        for _ in 0..int_len {
+            text.push(char::from(b'0' + next(10) as u8));
+        }
+        let frac_len = match next(4) {
+            0 => 0,
+            1 => next(20),
+            2 => next(900),
+            _ => 700 + next(400),
+        };
+        if frac_len > 0 || int_len == 0 {
+            text.push('.');
+            for i in 0..frac_len.max(1) {
+                // Runs of zeros and nines probe rounding at the cut.
+                let digit = match next(5) {
+                    0 => 0,
+                    1 => 9,
+                    _ => next(10) as u8,
+                };
+                let digit = if i + 1 == frac_len && next(4) == 0 {
+                    5
+                } else {
+                    digit
+                };
+                text.push(char::from(b'0' + digit));
+            }
+        }
+        if next(3) == 0 {
+            text.push(if next(2) == 0 { 'e' } else { 'E' });
+            if next(2) == 0 {
+                text.push('-');
+            }
+            for _ in 0..next(3) {
+                text.push('0');
+            }
+            text.push_str(&next(12).to_string());
+        }
+        let expected: f64 = text.parse().unwrap();
+        match parse_number(&text, 1) {
+            Ok(value) => {
+                assert_eq!(value.to_bits(), expected.to_bits(), "{text}");
+                checked += 1;
+            }
+            Err(ObjError::NumberOutOfBounds { .. }) => assert!(expected.abs() > 1e6, "{text}"),
+            Err(e) => panic!("{text}: {e}"),
+        }
+    }
+    assert!(checked > 1000, "{checked}");
+    // Exponents far beyond any digit count saturate to the same value.
+    assert_eq!(parse_number("1e-99999999999999999999", 1), Ok(0.0));
+    assert_eq!(
+        parse_number("-0.5e-000000000000000000000000000001", 1).map(f64::to_bits),
+        Ok((-0.05f64).to_bits())
+    );
+    assert_eq!(
+        parse_number("0e99999999999999999999", 1).map(f64::to_bits),
+        Ok(0.0f64.to_bits())
+    );
+    assert_eq!(
+        parse_number("-0", 1).map(f64::to_bits),
+        Ok((-0.0f64).to_bits())
+    );
+    assert_eq!(
+        parse_number("1e99999999999999999999", 1),
+        Err(ObjError::NumberOutOfBounds { line: 1 })
+    );
+}
