@@ -140,6 +140,14 @@ fn attention_tracks_every_quit_flag_write_path() {
     assert!(!quit_bit(&ev));
     assert_derived(&ev, "set_quit_flag_value nil");
     ev.request_quit_from_keyboard_input();
+    assert!(
+        !quit_bit(&ev),
+        "under inhibit-quit a C-g read as an event is not left pending (GNU read_char)"
+    );
+    assert_derived(&ev, "request_quit_from_keyboard_input, inhibited");
+    ev.eval_str("(setq inhibit-quit nil)")
+        .expect("inhibit-quit nil");
+    ev.request_quit_from_keyboard_input();
     assert!(quit_bit(&ev), "a keyboard quit request raises the bit");
     assert_derived(&ev, "request_quit_from_keyboard_input");
     let quit_char = Value::fixnum(ev.quit_char());

@@ -127,3 +127,170 @@ fn quit_request_from_another_thread_interrupts_an_evaluator_loop() {
         "nothing is pending after the drain"
     );
 }
+
+// ---------------------------------------------------------------------------
+// GNU force quit (keyboard.c `handle_interrupt'): in a graphical session the
+// third C-g that arrives while `quit-flag' is still set clears `inhibit-quit',
+// so a loop running with quitting inhibited can still be stopped.
+// ---------------------------------------------------------------------------
+
+fn inhibited_context() -> Context {
+    crate::test_utils::init_test_tracing();
+    let mut ctx = Context::new();
+    ctx.assign("inhibit-quit", Value::T);
+    ctx
+}
+
+fn is_quit(result: &Result<(), crate::emacs_core::error::Flow>) -> bool {
+    matches!(result, Err(flow) if format!("{flow:?}").contains("quit"))
+}
+
+#[test]
+fn third_c_g_while_a_quit_is_pending_forces_the_quit() {
+    let mut ctx = inhibited_context();
+    for press in 1..=2 {
+        ctx.quit_requested.request();
+        assert!(ctx.maybe_quit().is_ok(), "press {press} stays inhibited");
+        assert!(
+            ctx.quit_flag_value().is_truthy(),
+            "press {press} leaves the quit pending"
+        );
+        assert!(ctx.eval_str("inhibit-quit").unwrap().is_truthy());
+    }
+    ctx.quit_requested.request();
+    let third = ctx.maybe_quit();
+    assert!(is_quit(&third), "the third press quits: {third:?}");
+    assert!(ctx.eval_str("inhibit-quit").unwrap().is_nil());
+}
+
+#[test]
+fn presses_that_arrive_between_two_safe_points_each_count() {
+    let mut ctx = inhibited_context();
+    ctx.quit_requested.request();
+    ctx.quit_requested.request();
+    assert!(ctx.maybe_quit().is_ok(), "two presses are not a force quit");
+    ctx.quit_requested.request();
+    assert!(is_quit(&ctx.maybe_quit()));
+}
+
+#[test]
+fn a_press_with_no_pending_quit_restarts_the_count() {
+    let mut ctx = inhibited_context();
+    for _ in 0..2 {
+        ctx.quit_requested.request();
+        assert!(ctx.maybe_quit().is_ok());
+    }
+    // The pending quit is consumed (as a key, say): GNU counts from one again.
+    ctx.set_quit_flag_value(Value::NIL);
+    for _ in 0..2 {
+        ctx.quit_requested.request();
+        assert!(ctx.maybe_quit().is_ok(), "the count restarted");
+    }
+    assert!(ctx.eval_str("inhibit-quit").unwrap().is_truthy());
+}
+
+/// The reported wedge: a loop run with `inhibit-quit' bound to t, stopped
+/// from the input bridge's thread by three C-g presses.
+#[test]
+fn three_c_g_from_the_input_bridge_stop_an_inhibited_loop() {
+    crate::test_utils::init_test_tracing();
+    let mut ctx = Context::new();
+    let bridge = ctx.quit_requested.clone();
+    let raiser = std::thread::spawn(move || {
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            bridge.request();
+        }
+    });
+    let result =
+        ctx.eval_str("(condition-case nil (let ((inhibit-quit t)) (while t)) (quit 'escaped))");
+    raiser.join().expect("raiser thread");
+    assert_eq!(result.unwrap(), Value::symbol("escaped"));
+}
+
+/// Lowering a request and dropping its press count are one step: a press
+/// that lands while `clear` runs either is cleared with it or survives with
+/// its count, so a raised request always has a press to report.
+#[test]
+fn a_press_racing_clear_is_never_raised_without_its_count() {
+    use std::sync::{Arc, Barrier};
+    const ROUNDS: usize = 100_000;
+    let request = QuitRequest::new();
+    let bridge = request.clone();
+    let start = Arc::new(Barrier::new(2));
+    let done = Arc::new(Barrier::new(2));
+    let (bridge_start, bridge_done) = (Arc::clone(&start), Arc::clone(&done));
+    let raiser = std::thread::spawn(move || {
+        for _ in 0..ROUNDS {
+            bridge_start.wait();
+            bridge.request();
+            bridge_done.wait();
+            bridge_done.wait();
+        }
+    });
+    let mut lost = 0;
+    for _ in 0..ROUNDS {
+        request.request();
+        start.wait();
+        request.clear();
+        done.wait();
+        let raised = request.is_requested();
+        let presses = request.take_presses();
+        if raised && presses == 0 {
+            lost += 1;
+        }
+        request.clear();
+        done.wait();
+    }
+    raiser.join().expect("raiser thread");
+    assert_eq!(lost, 0, "rounds where a raised request reported no press");
+}
+
+/// GNU's `handle_interrupt` sets `quit-flag` to t on every C-g, replacing
+/// a `throw-on-input` tag: a real C-g quits rather than throwing to
+/// `while-no-input`'s catch.
+#[test]
+fn a_c_g_replaces_a_throw_on_input_tag_with_t() {
+    let mut ctx = inhibited_context();
+    ctx.assign("throw-on-input", Value::symbol("tag"));
+    ctx.set_quit_flag_value(Value::symbol("tag"));
+    ctx.quit_requested.request();
+    assert!(ctx.maybe_quit().is_ok(), "one press stays inhibited");
+    assert_eq!(ctx.quit_flag_value(), Value::T);
+    for _ in 0..2 {
+        ctx.quit_requested.request();
+    }
+    let third = ctx.maybe_quit();
+    assert!(
+        is_quit(&third),
+        "the third press quits, not throws: {third:?}"
+    );
+}
+
+/// A C-g read as an event (`read-event' under `inhibit-quit') is counted
+/// when it arrives, against the flag it found, and does not stay a pending
+/// quit (GNU read_char): it neither completes an earlier force-quit count
+/// nor quits later.
+#[test]
+fn a_c_g_read_as_an_event_does_not_complete_an_old_force_quit() {
+    let mut ctx = inhibited_context();
+    for _ in 0..2 {
+        ctx.quit_requested.request();
+        assert!(ctx.maybe_quit().is_ok());
+    }
+    // Lisp handles the pending quit, then reads a fresh C-g as an event.
+    ctx.set_quit_flag_value(Value::NIL);
+    ctx.quit_requested.request();
+    ctx.request_quit_from_keyboard_input();
+    assert!(
+        ctx.quit_flag_value().is_nil(),
+        "the event is not also a quit"
+    );
+    assert!(ctx.maybe_quit().is_ok(), "one fresh press is no force quit");
+    assert!(ctx.eval_str("inhibit-quit").unwrap().is_truthy());
+    // Two more presses while it waits are presses one and two again.
+    ctx.quit_requested.request();
+    ctx.quit_requested.request();
+    assert!(ctx.maybe_quit().is_ok());
+    assert!(ctx.eval_str("inhibit-quit").unwrap().is_truthy());
+}
