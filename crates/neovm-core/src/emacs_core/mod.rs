@@ -409,6 +409,9 @@ mod quit_regression_test;
 mod runtime_string_guard_test;
 
 #[cfg(test)]
+#[path = "display/model/tests/lisp.rs"]
+mod model_lisp_test;
+#[cfg(test)]
 #[path = "display/model/tests/runtime.rs"]
 mod model_test;
 #[cfg(test)]

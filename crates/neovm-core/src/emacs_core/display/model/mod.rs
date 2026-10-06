@@ -16,7 +16,8 @@ pub(crate) use subrs::SUBRS;
 pub(crate) use subrs::register_subrs;
 
 use neomacs_display_protocol::model::{
-    MODEL_EDGE_RANGE, MODEL_MAX_MESHES, ModelEvent, ModelMeshSpec, ModelView,
+    MODEL_EDGE_RANGE, MODEL_MAX_MESHES, ModelChange, ModelEvent, ModelMeshSpec, ModelTarget,
+    ModelView,
 };
 
 use super::error::{EvalResult, Flow, signal};
@@ -63,7 +64,7 @@ fn model_edge(value: Value, what: &str, caller: &str) -> Result<u32, Flow> {
         })
 }
 
-/// `(YAW PITCH ZOOM)`, validated as `gnosis-model--view`.
+/// `(YAW PITCH ZOOM)`, validated against the model camera contract.
 fn model_view(value: Value, caller: &str) -> Result<ModelView, Flow> {
     let [yaw, pitch, zoom] = numbers::<3>(value)
         .ok_or_else(|| model_error(format!("{caller}: VIEW must be (YAW PITCH ZOOM)")))?;
@@ -203,6 +204,181 @@ fn create(eval: &mut Context, args: Vec<Value>) -> EvalResult {
         .map_err(|err| model_error(format!("{CALLER}: {err}")))?;
     eval.live_models.insert(id);
     Ok(Value::make_surface_handle(id))
+}
+
+/// (neomacs-model--id HANDLE) — the integer surface id of a model handle,
+/// the ID that `neomacs-model-event-functions` receives.
+fn id(_eval: &mut Context, args: Vec<Value>) -> EvalResult {
+    let id = args[0].as_surface_handle().ok_or_else(|| {
+        signal(
+            "wrong-type-argument",
+            vec![Value::symbol("neomacs-model"), args[0]],
+        )
+    })?;
+    Ok(Value::fixnum(i64::from(id)))
+}
+
+/// The surface id of HANDLE, a model handle not yet destroyed.
+fn live_model_id(eval: &Context, handle: Value, caller: &str) -> Result<u32, Flow> {
+    let id = handle.as_surface_handle().ok_or_else(|| {
+        signal(
+            "wrong-type-argument",
+            vec![Value::symbol("neomacs-model"), handle],
+        )
+    })?;
+    if !eval.live_models.contains(&id) {
+        return Err(model_error(format!("{caller}: model {id} is destroyed")));
+    }
+    Ok(id)
+}
+
+/// A mesh index: an integer in 0..255.
+fn mesh_index(value: Value, caller: &str) -> Result<u16, Flow> {
+    value
+        .as_fixnum()
+        .and_then(|n| u16::try_from(n).ok())
+        .filter(|n| usize::from(*n) < MODEL_MAX_MESHES)
+        .ok_or_else(|| {
+            model_error(format!(
+                "{caller}: mesh index must be an integer in 0..{}",
+                MODEL_MAX_MESHES - 1
+            ))
+        })
+}
+
+fn face_index(value: Value, caller: &str) -> Result<u32, Flow> {
+    value
+        .as_fixnum()
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| model_error(format!("{caller}: face must be a non-negative integer")))
+}
+
+/// Send request REQ (a positive integer the Lisp wrapper numbers per
+/// model) changing live model HANDLE.
+fn send_update(
+    eval: &mut Context,
+    handle: Value,
+    req: Value,
+    caller: &str,
+    change: ModelChange,
+) -> EvalResult {
+    let id = live_model_id(eval, handle, caller)?;
+    let req = req
+        .as_fixnum()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| model_error(format!("{caller}: REQ must be a positive integer")))?;
+    let host = eval
+        .display_host
+        .as_deref()
+        .ok_or_else(|| model_error(format!("{caller}: no display host in this session")))?;
+    host.update_model(id, req as u64, change)
+        .map_err(|err| model_error(format!("{caller}: {err}")))?;
+    Ok(Value::NIL)
+}
+
+/// (neomacs-model--set-view HANDLE REQ YAW PITCH ZOOM)
+fn set_view(eval: &mut Context, args: Vec<Value>) -> EvalResult {
+    const CALLER: &str = "neomacs-model--set-view";
+    // A non-number becomes NaN, which `validated` rejects.
+    let [yaw, pitch, zoom] =
+        [args[2], args[3], args[4]].map(|v| v.as_number_f64().unwrap_or(f64::NAN));
+    let view = ModelView { yaw, pitch, zoom }
+        .validated()
+        .map_err(|err| model_error(format!("{CALLER}: {err}")))?;
+    send_update(eval, args[0], args[1], CALLER, ModelChange::View(view))
+}
+
+/// Parse a highlight TARGET plist whose `:mesh` is already an index:
+/// `(:mesh I :kind object)`, `(:mesh I :kind point :face N :barycentric
+/// [A B C] :tolerance R)` or `(:mesh I :kind region :faces (N ...))`.
+fn model_target(spec: Value, caller: &str) -> Result<ModelTarget, Flow> {
+    let items = list_to_vec(&spec)
+        .filter(|items| items.len().is_multiple_of(2))
+        .ok_or_else(|| model_error(format!("{caller}: TARGET must be a plist")))?;
+    let get = |key: &str| {
+        items
+            .chunks_exact(2)
+            .find(|pair| pair[0].as_symbol_name() == Some(key))
+            .map(|pair| pair[1])
+            .unwrap_or(Value::NIL)
+    };
+    let mesh = mesh_index(get(":mesh"), caller)?;
+    let target = match get(":kind").as_symbol_name() {
+        Some("object") => ModelTarget::Object { mesh },
+        Some("point") => ModelTarget::Point {
+            mesh,
+            face: face_index(get(":face"), caller)?,
+            barycentric: numbers::<3>(get(":barycentric"))
+                .ok_or_else(|| model_error(format!("{caller}: :barycentric must be [A B C]")))?,
+            tolerance: get(":tolerance")
+                .as_number_f64()
+                .ok_or_else(|| model_error(format!("{caller}: :tolerance must be a number")))?,
+        },
+        Some("region") => ModelTarget::Region {
+            mesh,
+            faces: list_to_vec(&get(":faces"))
+                .ok_or_else(|| model_error(format!("{caller}: :faces must be a list")))?
+                .into_iter()
+                .map(|face| face_index(face, caller))
+                .collect::<Result<_, _>>()?,
+        },
+        _ => {
+            return Err(model_error(format!(
+                "{caller}: :kind must be object, point or region"
+            )));
+        }
+    };
+    target
+        .validated()
+        .map_err(|err| model_error(format!("{caller}: {err}")))
+}
+
+/// (neomacs-model--set-highlight HANDLE REQ TARGET SELECTED)
+///
+/// TARGET is nil or a target plist (see [`model_target`]); SELECTED is nil
+/// or a mesh index. Both replace the current highlight.
+fn set_highlight(eval: &mut Context, args: Vec<Value>) -> EvalResult {
+    const CALLER: &str = "neomacs-model--set-highlight";
+    let target = match args[2] {
+        target if target.is_nil() => None,
+        target => Some(model_target(target, CALLER)?),
+    };
+    let selected = match args[3] {
+        selected if selected.is_nil() => None,
+        selected => Some(mesh_index(selected, CALLER)?),
+    };
+    send_update(
+        eval,
+        args[0],
+        args[1],
+        CALLER,
+        ModelChange::Highlight { target, selected },
+    )
+}
+
+/// (neomacs-model--resize HANDLE REQ WIDTH HEIGHT)
+fn resize(eval: &mut Context, args: Vec<Value>) -> EvalResult {
+    const CALLER: &str = "neomacs-model--resize";
+    let width = model_edge(args[2], "WIDTH", CALLER)?;
+    let height = model_edge(args[3], "HEIGHT", CALLER)?;
+    send_update(
+        eval,
+        args[0],
+        args[1],
+        CALLER,
+        ModelChange::Resize { width, height },
+    )
+}
+
+/// (neomacs-model--freeze HANDLE REQ)
+fn freeze(eval: &mut Context, args: Vec<Value>) -> EvalResult {
+    send_update(
+        eval,
+        args[0],
+        args[1],
+        "neomacs-model--freeze",
+        ModelChange::Freeze,
+    )
 }
 
 /// A renderer counter as a Lisp integer.

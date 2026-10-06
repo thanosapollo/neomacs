@@ -8,22 +8,22 @@ use super::eval::{
     Context, DisplayHost, GuiFrameHostRequest, ShaderSurfaceContent, ShaderSurfaceCreateRequest,
 };
 use neomacs_display_protocol::model::{
-    ModelChange, ModelEvent, ModelHit, ModelMeshSpec, ModelView,
+    ModelChange, ModelEvent, ModelHit, ModelMeshSpec, ModelTarget, ModelView,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// First id the stub host hands out; each create takes the next one.
-const FIRST_MODEL_ID: u32 = 100;
+pub(super) const FIRST_MODEL_ID: u32 = 100;
 
 #[derive(Clone)]
-struct RecordingModelDisplayHost {
-    live: Arc<AtomicBool>,
-    next_id: Arc<AtomicU32>,
-    creates: Arc<Mutex<Vec<ShaderSurfaceCreateRequest>>>,
-    updates: Arc<Mutex<Vec<(u32, u64, ModelChange)>>>,
-    destroys: Arc<Mutex<Vec<u32>>>,
+pub(super) struct RecordingModelDisplayHost {
+    pub(super) live: Arc<AtomicBool>,
+    pub(super) next_id: Arc<AtomicU32>,
+    pub(super) creates: Arc<Mutex<Vec<ShaderSurfaceCreateRequest>>>,
+    pub(super) updates: Arc<Mutex<Vec<(u32, u64, ModelChange)>>>,
+    pub(super) destroys: Arc<Mutex<Vec<u32>>>,
 }
 
 impl Default for RecordingModelDisplayHost {
@@ -78,31 +78,39 @@ fn model_context() -> (Context, RecordingModelDisplayHost) {
 }
 
 /// A per-test scratch directory holding small OBJ files.
-fn scratch_dir(test: &str) -> PathBuf {
+pub(super) fn scratch_dir(test: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("neovm-model-test-{}-{test}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir
 }
 
-fn obj_file(dir: &std::path::Path, name: &str) -> String {
+pub(super) fn obj_file(dir: &std::path::Path, name: &str) -> String {
     let path = dir.join(name);
     std::fs::write(&path, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").expect("write obj");
     path.to_str().expect("utf-8 scratch path").to_owned()
 }
 
-/// Evaluate SOURCE and return `(format "%S" VALUE)`.
-fn eval_printed(ctx: &mut Context, source: &str) -> String {
+/// Evaluate SOURCE and return `(format "%S" VALUE)`; a signal panics
+/// with its printed form.
+pub(super) fn eval_printed(ctx: &mut Context, source: &str) -> String {
     let value = ctx
-        .eval_str(&format!("(format \"%S\" {source})"))
+        .eval_str(&format!(
+            "(condition-case err (concat \"OK \" (format \"%S\" {source})) \
+             (error (concat \"SIGNAL \" (format \"%S\" err))))"
+        ))
         .unwrap_or_else(|err| panic!("{source} failed: {err:?}"));
-    value
+    let printed = value
         .as_lisp_string()
         .and_then(|s| s.as_utf8_str().map(str::to_owned))
-        .expect("format returns a string")
+        .expect("format returns a string");
+    match printed.strip_prefix("OK ") {
+        Some(printed) => printed.to_owned(),
+        None => panic!("{source} signalled {printed}"),
+    }
 }
 
 /// SOURCE's signal as `(SYMBOL . DATA)`, printed; panics when it returns.
-fn signal_of(ctx: &mut Context, source: &str) -> String {
+pub(super) fn signal_of(ctx: &mut Context, source: &str) -> String {
     eval_printed(
         ctx,
         &format!("(condition-case err (progn {source} 'no-signal) (error err))"),
@@ -441,4 +449,174 @@ fn model_events_without_the_library_loaded_are_dropped() {
         .handle_model_input_event(1, &ModelEvent::Ready { triangles: vec![1] })
         .expect("an unbound hook runs nothing");
     assert!(result.is_nil());
+}
+
+// ---------------------------------------------------------------------------
+// Update primitives (`neomacs-model--set-view` and friends).
+
+pub(super) fn updates(host: &RecordingModelDisplayHost) -> Vec<(u32, u64, ModelChange)> {
+    host.updates.lock().expect("model updates").clone()
+}
+
+/// A bare context holding one live two-mesh model in `model-test-m`.
+fn context_with_model(test: &str) -> (Context, RecordingModelDisplayHost) {
+    let (mut ctx, host) = model_context();
+    let a = obj_file(&scratch_dir(test), "a.obj");
+    ctx.eval_str(&format!(
+        r#"(setq model-test-m (neomacs-model--create '(("{a}") ("{a}")) '(0 0 1) [0 0 0] 64 64))"#
+    ))
+    .expect("create");
+    (ctx, host)
+}
+
+#[test]
+fn update_primitives_send_each_change_with_its_request_number() {
+    let (mut ctx, host) = context_with_model("updates");
+    assert_eq!(
+        eval_printed(&mut ctx, "(neomacs-model--id model-test-m)"),
+        FIRST_MODEL_ID.to_string()
+    );
+    ctx.eval_str(
+        r#"(progn
+             (neomacs-model--set-view model-test-m 1 30 -90.5 2)
+             (neomacs-model--set-highlight model-test-m 2 '(:mesh 1 :kind object) 0)
+             (neomacs-model--set-highlight
+              model-test-m 3
+              '(:mesh 0 :kind point :face 4 :barycentric [0.2 0.3 0.5] :tolerance 0.1)
+              nil)
+             (neomacs-model--set-highlight
+              model-test-m 4 '(:mesh 1 :kind region :faces (3 1)) nil)
+             (neomacs-model--set-highlight model-test-m 5 nil nil)
+             (neomacs-model--resize model-test-m 6 128 96)
+             (neomacs-model--freeze model-test-m 7))"#,
+    )
+    .expect("updates");
+    let id = FIRST_MODEL_ID;
+    let highlight = |target, selected| ModelChange::Highlight { target, selected };
+    assert_eq!(
+        updates(&host),
+        vec![
+            (
+                id,
+                1,
+                ModelChange::View(ModelView {
+                    yaw: 30.0,
+                    pitch: -90.5,
+                    zoom: 2.0,
+                }),
+            ),
+            (
+                id,
+                2,
+                highlight(Some(ModelTarget::Object { mesh: 1 }), Some(0))
+            ),
+            (
+                id,
+                3,
+                highlight(
+                    Some(ModelTarget::Point {
+                        mesh: 0,
+                        face: 4,
+                        barycentric: [0.2, 0.3, 0.5],
+                        tolerance: 0.1,
+                    }),
+                    None,
+                ),
+            ),
+            (
+                id,
+                4,
+                highlight(
+                    Some(ModelTarget::Region {
+                        mesh: 1,
+                        faces: vec![3, 1],
+                    }),
+                    None,
+                ),
+            ),
+            (id, 5, highlight(None, None)),
+            (
+                id,
+                6,
+                ModelChange::Resize {
+                    width: 128,
+                    height: 96,
+                },
+            ),
+            (id, 7, ModelChange::Freeze),
+        ]
+    );
+}
+
+#[test]
+fn update_primitives_reject_bad_arguments_and_destroyed_models() {
+    let (mut ctx, host) = context_with_model("update-reject");
+    let cases = [
+        ("(neomacs-model--set-view model-test-m 0 0 0 1)", "REQ"),
+        ("(neomacs-model--set-view model-test-m -1 0 0 1)", "REQ"),
+        ("(neomacs-model--set-view model-test-m 1.0 0 0 1)", "REQ"),
+        ("(neomacs-model--set-view model-test-m 1 0 0 5)", "zoom"),
+        ("(neomacs-model--set-view model-test-m 1 'x 0 1)", "zoom"),
+        (
+            "(neomacs-model--set-highlight model-test-m 1 '(:mesh 0 :kind bogus) nil)",
+            ":kind",
+        ),
+        (
+            "(neomacs-model--set-highlight model-test-m 1 '(:mesh 255 :kind object) nil)",
+            "mesh index",
+        ),
+        (
+            "(neomacs-model--set-highlight model-test-m 1 '(:mesh 0 :kind object) 255)",
+            "mesh index",
+        ),
+        (
+            "(neomacs-model--set-highlight model-test-m 1 \
+             '(:mesh 0 :kind point :face 0 :barycentric [0.2 0.3 0.6] :tolerance 1) nil)",
+            "weights",
+        ),
+        (
+            "(neomacs-model--set-highlight model-test-m 1 \
+             '(:mesh 0 :kind point :face 0 :barycentric [0.2 0.3 0.5] :tolerance 0) nil)",
+            "tolerance",
+        ),
+        (
+            "(neomacs-model--set-highlight model-test-m 1 '(:mesh 0 :kind region :faces nil) nil)",
+            "at least one face",
+        ),
+        (
+            "(neomacs-model--set-highlight model-test-m 1 '(:mesh 0 :kind region :faces (1 1)) nil)",
+            "distinct",
+        ),
+        (
+            "(neomacs-model--set-highlight model-test-m 1 '(:mesh 0 :kind region :faces (-1)) nil)",
+            "face",
+        ),
+        (
+            "(neomacs-model--set-highlight model-test-m 1 '(:mesh 0 :kind) nil)",
+            "plist",
+        ),
+        ("(neomacs-model--resize model-test-m 1 31 64)", "WIDTH"),
+        ("(neomacs-model--resize model-test-m 1 64 4096)", "HEIGHT"),
+    ];
+    for (form, expect) in cases {
+        let printed = signal_of(&mut ctx, form);
+        assert!(
+            printed.starts_with("(error ") && printed.contains(expect),
+            "{form} signalled {printed}, expected {expect}"
+        );
+    }
+    assert_eq!(
+        signal_of(&mut ctx, "(neomacs-model--freeze 7 1)"),
+        "(wrong-type-argument neomacs-model 7)"
+    );
+    assert_eq!(
+        signal_of(&mut ctx, "(neomacs-model--id 7)"),
+        "(wrong-type-argument neomacs-model 7)"
+    );
+    // A destroyed handle refuses every request.
+    ctx.eval_str("(neomacs-surface-destroy model-test-m)")
+        .expect("destroy");
+    let printed = signal_of(&mut ctx, "(neomacs-model--freeze model-test-m 1)");
+    assert!(printed.contains("destroyed"), "{printed}");
+    assert!(updates(&host).is_empty(), "rejections never reach the host");
 }
