@@ -588,3 +588,223 @@ fn highlight_resolution_follows_canvas_3d_precedence() {
     assert_eq!((point.mesh, p.mesh), (None, 0));
     assert!((p.radius as f64 - 0.5 / scene.radius()).abs() < 1e-7);
 }
+
+// ----------------------------------------------------------------------
+// Review MUST 10: orbit capture and wheel burst are independent reasons.
+
+fn centre_hit() -> GlyphHit {
+    GlyphHit {
+        id: 5,
+        u: 0.5,
+        v: 0.5,
+    }
+}
+
+/// A wheel burst that goes quiet while an orbit is still held settles
+/// nothing: one `View` and the readiness follow the release (here outside
+/// the glyph), not the wheel deadline.
+#[test]
+fn a_wheel_quiet_deadline_during_a_held_orbit_does_not_settle_it() {
+    let mut host = FakeHost::default();
+    let mut store = loaded_store(&mut host);
+    shown(&mut store, &mut host);
+    store.take_events();
+    let t0 = Instant::now();
+    assert!(store.press(W, centre_hit(), (100.0, 100.0)));
+    assert!(store.motion(W, (110.0, 100.0)));
+    assert_eq!(kinds(&store.take_events()), ["R{false,2,0}"]);
+    assert!(store.wheel(5, 1, t0));
+    // The wheel's revision is presented before its quiet deadline.
+    shown(&mut store, &mut host);
+    assert!(store.take_events().is_empty(), "interacting");
+    store.tick(t0 + WHEEL_QUIET + Duration::from_millis(10), h(&mut host));
+    assert!(
+        store.take_events().is_empty(),
+        "the orbit is still held: no View, no readiness"
+    );
+    assert!(store.motion(W, (120.0, 100.0)), "the capture survives");
+    shown(&mut store, &mut host);
+    assert!(store.take_events().is_empty(), "still interacting");
+    // Released outside the glyph: the orbit ends, and with it the last
+    // active reason.
+    store.release(W, None, t0 + Duration::from_millis(400), &mut host);
+    assert_eq!(kinds(&store.take_events()), ["View{4}", "R{true,4,0}"]);
+    assert!(host.picks.is_empty());
+}
+
+/// An orbit released during a wheel burst does not end the burst: the
+/// wheel's quiet deadline still stands, and its expiry settles both.
+#[test]
+fn releasing_an_orbit_during_a_wheel_burst_waits_for_the_quiet_deadline() {
+    let mut host = FakeHost::default();
+    let mut store = loaded_store(&mut host);
+    shown(&mut store, &mut host);
+    store.take_events();
+    let t0 = Instant::now();
+    assert!(store.wheel(5, 1, t0));
+    assert_eq!(kinds(&store.take_events()), ["R{false,2,0}"]);
+    assert!(store.press(W, centre_hit(), (100.0, 100.0)));
+    assert!(store.motion(W, (110.0, 100.0)));
+    // Everything is presented before the wheel deadline.
+    shown(&mut store, &mut host);
+    assert!(store.take_events().is_empty(), "interacting");
+    store.release(W, None, t0 + Duration::from_millis(50), &mut host);
+    assert!(
+        store.take_events().is_empty(),
+        "the wheel burst is still active: no View, no readiness"
+    );
+    assert_eq!(
+        store.next_deadline(t0 + Duration::from_millis(50)),
+        Some(t0 + WHEEL_QUIET),
+        "the wheel deadline survives the release"
+    );
+    store.tick(t0 + Duration::from_millis(100), h(&mut host));
+    assert!(store.take_events().is_empty(), "quiet not yet elapsed");
+    store.tick(t0 + WHEEL_QUIET, h(&mut host));
+    assert_eq!(kinds(&store.take_events()), ["View{3}", "R{true,3,0}"]);
+    assert_eq!(store.next_deadline(t0 + WHEEL_QUIET), None);
+}
+
+// ----------------------------------------------------------------------
+// Review MUST 9: renderer loss invalidates at once.
+
+/// current -> renderer loss: the false level is published immediately (no
+/// replacement renderer, no later upload needed), then a re-upload and a
+/// presentation restore it.
+#[test]
+fn renderer_loss_publishes_the_false_level_at_once() {
+    let mut host = FakeHost::default();
+    let mut store = loaded_store(&mut host);
+    shown(&mut store, &mut host);
+    assert_eq!(kinds(&store.take_events()), ["ready", "R{true,1,0}"]);
+    store.renderer_lost();
+    assert_eq!(kinds(&store.take_events()), ["R{false,2,0}"]);
+    // A presentation report arriving after the loss (no texture exists any
+    // more) cannot rejoin the old provenance.
+    store.presented(W, &HashSet::from([5]), &HashSet::from([5]));
+    assert!(store.take_events().is_empty(), "no stale rejoin");
+    assert!(!store.is_interactive(5));
+    let mut fresh = FakeHost::default();
+    store.upload_pending(&mut fresh);
+    shown(&mut store, &mut fresh);
+    assert_eq!(kinds(&store.take_events()), ["R{true,3,0}"]);
+}
+
+/// An orbit and a wheel burst active at the loss end with one `View` (the
+/// applied view stays), the capture is gone, and no later deadline fires.
+#[test]
+fn renderer_loss_settles_an_active_interaction() {
+    let mut host = FakeHost::default();
+    let mut store = loaded_store(&mut host);
+    shown(&mut store, &mut host);
+    store.take_events();
+    let t0 = Instant::now();
+    assert!(store.press(W, centre_hit(), (0.0, 0.0)));
+    assert!(store.motion(W, (10.0, 0.0)));
+    assert!(store.wheel(5, 1, t0));
+    assert_eq!(kinds(&store.take_events()), ["R{false,2,0}"]);
+    // Everything was presented while still interacting.
+    shown(&mut store, &mut host);
+    assert!(store.take_events().is_empty());
+    store.renderer_lost();
+    // The View names the interaction's last revision. No transient
+    // R{t} for the presented revision: the provenance is dropped before
+    // settling, and the fence was already down (no second R{nil}).
+    assert_eq!(kinds(&store.take_events()), ["View{3}"]);
+    assert!(!store.motion(W, (20.0, 0.0)), "the capture ended");
+    store.tick(t0 + WHEEL_QUIET, None);
+    assert!(store.take_events().is_empty(), "nothing left to settle");
+    assert_eq!(store.next_deadline(t0), None);
+}
+
+// ----------------------------------------------------------------------
+// Review MUST 1: live aggregate geometry caps (design §4.3).
+
+/// A scene of `vertices` vertices (a fan of distinct points) and
+/// `triangles` repetitions of one nondegenerate triangle.
+fn geometry(vertices: usize, triangles: usize) -> Arc<ModelScene> {
+    let mut points = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    points.extend((3..vertices).map(|i| [i as f64, 2.0, 0.0]));
+    let mesh = crate::model::obj::ObjMesh {
+        vertices: points,
+        triangles: vec![[0, 1, 2]; triangles],
+    };
+    Arc::new(ModelScene::new(vec![mesh]).unwrap())
+}
+
+fn deliver(
+    store: &mut ModelStore,
+    id: u32,
+    scene: &Arc<ModelScene>,
+    host: Option<&mut dyn ModelGpuHost>,
+) {
+    store.entries.insert(id, loading_entry(1));
+    store.loaded(
+        LoadResult {
+            id,
+            token: 1,
+            outcome: Ok(scene.clone()),
+        },
+        host,
+    );
+}
+
+/// The reviewer's case: five valid 2,000,000-triangle scenes exceed the
+/// 8,000,000 live triangle cap; with no renderer at all (no byte budget
+/// runs) the fifth must still be refused, and freeing one admits it.
+#[test]
+fn the_live_triangle_cap_holds_without_a_renderer() {
+    let big = geometry(3, crate::model::scene::MAX_MODEL_TRIANGLES);
+    let mut store = ModelStore::new();
+    for id in 1..=4 {
+        deliver(&mut store, id, &big, None);
+        assert!(store.entries[&id].scene.is_some(), "model {id} at the cap");
+    }
+    store.take_events();
+    deliver(&mut store, 5, &big, None);
+    assert_eq!(store.status(5), Some(ModelStatus::Failed));
+    let events = store.take_events();
+    assert_eq!(kinds(&events), ["failed"]);
+    assert!(store.entries[&5].scene.is_none(), "not retained");
+    // The refused one holds nothing; freeing a live one releases its share.
+    store.free(5, None);
+    store.free(1, None);
+    deliver(&mut store, 6, &big, None);
+    assert!(store.entries[&6].scene.is_some(), "admitted after a free");
+}
+
+/// Both caps at their exact boundary: 8,000,000 is admitted, one more is
+/// not; a failed model releases its reservation; an admitted scene
+/// uploads, a refused one never reaches the GPU.
+#[test]
+fn the_live_vertex_cap_is_exact_and_released_on_failure() {
+    let big = geometry(crate::model::scene::MAX_MODEL_VERTICES, 1);
+    let small = geometry(3, 1);
+    let mut host = FakeHost::default();
+    let mut store = ModelStore::new();
+    for id in 1..=4 {
+        deliver(&mut store, id, &big, h(&mut host));
+        assert_eq!(store.status(id), Some(ModelStatus::Ready), "model {id}");
+    }
+    host.log.clear();
+    deliver(&mut store, 5, &small, h(&mut host));
+    assert_eq!(store.status(5), Some(ModelStatus::Failed));
+    assert!(
+        !host.log.iter().any(|l| l == "upload 5"),
+        "refused before uploading: {:?}",
+        host.log
+    );
+    // A model that fails later (its upload refused) gives its share back.
+    store.free(5, h(&mut host));
+    store.free(4, h(&mut host));
+    host.refuse_upload = true;
+    deliver(&mut store, 6, &big, h(&mut host));
+    assert_eq!(store.status(6), Some(ModelStatus::Failed));
+    host.refuse_upload = false;
+    deliver(&mut store, 7, &big, h(&mut host));
+    assert_eq!(
+        store.status(7),
+        Some(ModelStatus::Ready),
+        "exactly 8,000,000"
+    );
+}

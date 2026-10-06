@@ -67,6 +67,11 @@ impl Readiness {
         self.showing.remove(&window);
     }
 
+    /// No window shows this model any more (its texture is gone).
+    pub fn left_all(&mut self) {
+        self.showing.clear();
+    }
+
     pub fn is_showing_in(&self, window: WindowKey) -> bool {
         self.showing.contains_key(&window)
     }
