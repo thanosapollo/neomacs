@@ -480,13 +480,23 @@ const MODEL_EVENT_HOOK: &str = "neomacs-model-event-functions";
 /// members only record state, so input read afterwards sees it.
 const MODEL_STATE_HOOK: &str = "neomacs-model--state-functions";
 
+/// `neomacs-model.el`'s variable that both hooks see bound to the serial
+/// number of the event they run for. The library tags each callback it
+/// queues with it, so its event-hook member runs only the callbacks of
+/// the event being delivered: a later event's wait for their own
+/// delivery, after every member has handled this one.
+const MODEL_EVENT_SERIAL: &str = "neomacs-model--event";
+
 /// Model events waiting for [`MODEL_EVENT_HOOK`] (design §6.1).
 #[derive(Default)]
 pub(crate) struct ModelEventQueue {
-    pending: std::collections::VecDeque<(u32, ModelEvent)>,
+    /// (serial, id, event), oldest first.
+    pending: std::collections::VecDeque<(u64, u32, ModelEvent)>,
     /// True while a [`deliver_model_event`] further up the stack runs the
     /// event hook; it delivers what is queued behind its current event.
     draining: bool,
+    /// Serial number of the latest event received.
+    serial: u64,
 }
 
 /// Deliver one model event from either keyboard special-input site: run
@@ -499,8 +509,12 @@ pub(crate) struct ModelEventQueue {
 /// `safe_run_hooks`; a throw propagates, and the events behind it wait
 /// for the next wait or command-loop read.
 pub(crate) fn deliver_model_event(eval: &mut Context, id: u32, event: &ModelEvent) -> EvalResult {
-    run_model_hook(eval, MODEL_STATE_HOOK, id, event)?;
-    eval.model_events.pending.push_back((id, event.clone()));
+    eval.model_events.serial += 1;
+    let serial = eval.model_events.serial;
+    run_model_hook(eval, MODEL_STATE_HOOK, serial, id, event)?;
+    eval.model_events
+        .pending
+        .push_back((serial, id, event.clone()));
     drain_model_events(eval)?;
     Ok(Value::NIL)
 }
@@ -517,8 +531,8 @@ pub(crate) fn drain_model_events(eval: &mut Context) -> Result<bool, Flow> {
     }
     eval.model_events.draining = true;
     let mut result = Ok(true);
-    while let Some((id, event)) = eval.model_events.pending.pop_front() {
-        if let Err(flow) = run_model_hook(eval, MODEL_EVENT_HOOK, id, &event) {
+    while let Some((serial, id, event)) = eval.model_events.pending.pop_front() {
+        if let Err(flow) = run_model_hook(eval, MODEL_EVENT_HOOK, serial, id, &event) {
             result = Err(flow);
             break;
         }
@@ -530,19 +544,33 @@ pub(crate) fn drain_model_events(eval: &mut Context) -> Result<bool, Flow> {
 /// Call each member of HOOK with `(ID TYPE PLIST)`, isolating errors:
 /// like GNU's `safe_run_hooks` an error is reported as `Error in HOOK
 /// (FUNCTION): ERR`, but the member stays on the hook.
-fn run_model_hook(eval: &mut Context, hook: &str, id: u32, event: &ModelEvent) -> Result<(), Flow> {
+///
+/// [`MODEL_EVENT_SERIAL`] is bound to SERIAL while the members run.
+fn run_model_hook(
+    eval: &mut Context,
+    hook: &str,
+    serial: u64,
+    id: u32,
+    event: &ModelEvent,
+) -> Result<(), Flow> {
     let hook_sym = hook_runtime::hook_symbol_by_name(eval, hook);
     let value = hook_runtime::hook_value_by_id(eval, hook_sym).unwrap_or(Value::NIL);
     let funcs = hook_runtime::collect_hook_functions_in_state(eval, hook_sym, value, true);
     if funcs.is_empty() {
         return Ok(());
     }
+    let count = eval.specpdl.len();
+    eval.try_specbind_or_unwind_to(
+        count,
+        super::intern::intern(MODEL_EVENT_SERIAL),
+        Value::fixnum(serial as i64),
+    )?;
     let args = [
         Value::fixnum(i64::from(id)),
         Value::symbol(event.kind()),
         model_event_plist(event),
     ];
-    eval.with_hook_root_scope(|eval| {
+    let result = eval.with_hook_root_scope(|eval| {
         for value in funcs.iter().chain(&args).copied() {
             eval.push_hook_root(value);
         }
@@ -561,5 +589,7 @@ fn run_model_hook(eval: &mut Context, hook: &str, id: u32, event: &ModelEvent) -
             }
         }
         Ok(())
-    })
+    });
+    eval.unbind_to(count);
+    result
 }

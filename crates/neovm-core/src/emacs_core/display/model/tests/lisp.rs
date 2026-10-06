@@ -479,7 +479,7 @@ fn open_shows_a_standalone_buffer_with_camera_keys() {
     );
     assert_eq!(
         printed,
-        r#"("*Model: Arm*" neomacs-model-view-mode t quit-window neomacs-model-yaw-forward (15 -15 1.1) (0 0 1))"#
+        r#"("*Model: Arm*" neomacs-model-view-mode t quit-window neomacs-model-yaw-forward (15 345 1.1) (0 0 1))"#
     );
     assert_eq!(updates(&host).len(), 4);
     // Zoom keys stay inside 0.25..4.
@@ -1130,7 +1130,8 @@ fn a_vector_view_works_with_the_camera_keys() {
                  (prog1 (neomacs-model-view model-test-m)
                    (neomacs-model-reset-view)))"#
         ),
-        "(15 -75 1.5)"
+        // Requested angles are wrapped into 0..360 (OPUS-REVIEW NIT 8).
+        "(15 285 1.5)"
     );
     assert_eq!(
         updates(&host).last(),
@@ -1139,7 +1140,7 @@ fn a_vector_view_works_with_the_camera_keys() {
             3,
             ModelChange::View(ModelView {
                 yaw: 0.0,
-                pitch: -90.0,
+                pitch: 270.0,
                 zoom: 1.5,
             }),
         ))
@@ -1238,4 +1239,287 @@ fn an_empty_insert_string_is_refused() {
         ),
         "(refused 0 t)"
     );
+}
+
+// ----------------------------------------------------------------------
+// Round 3: SOL-REVIEW-2 MUST 4-5.
+
+/// The nested-delivery context, plus one chronological log
+/// `model-test-order' of the callback and of event-hook members both
+/// before and after `neomacs-model--dispatch'.
+fn whole_event_order_context(test: &str, wait: &str) -> Context {
+    let mut ctx = nested_delivery_context(test, wait);
+    eval_printed(
+        &mut ctx,
+        r#"(progn
+             (defvar model-test-inner nil)
+             (setq model-test-order nil
+                   model-test-inner (neomacs-model--entry-callback
+                                     (neomacs-model--entry model-test-m)))
+             (add-hook 'neomacs-model-event-functions
+                       (lambda (_id type _plist)
+                         (push (list 'first type) model-test-order)))
+             (add-hook 'neomacs-model-event-functions
+                       (lambda (_id type _plist)
+                         (push (list 'last type) model-test-order))
+                       t)
+             (setf (neomacs-model--entry-callback
+                    (neomacs-model--entry model-test-m))
+                   (lambda (model type plist)
+                     (push (list 'callback type) model-test-order)
+                     (funcall model-test-inner model type plist))))"#,
+    );
+    ctx
+}
+
+/// Every member, the callback included, handles the view event before
+/// any of them handles the readiness event that arrived meanwhile.
+fn assert_whole_event_order(ctx: &mut Context) {
+    assert_eq!(
+        eval_printed(ctx, "(reverse model-test-order)"),
+        "((first view) (callback view) (last view) \
+         (first readiness) (callback readiness) (last readiness))"
+    );
+}
+
+#[test]
+fn every_member_handles_an_event_before_the_next_at_the_read_route() {
+    let mut ctx = whole_event_order_context("lisp-order-read", "nil");
+    queue_input(&mut ctx, nested_delivery_input());
+    assert_eq!(eval_printed(&mut ctx, "(read-event)"), "121");
+    assert_whole_event_order(&mut ctx);
+    assert_nested_delivery(&mut ctx, "((view nil) (key 120 nil) (readiness nil))");
+}
+
+#[test]
+fn every_member_handles_an_event_before_the_next_at_the_wait_route() {
+    let mut ctx = whole_event_order_context(
+        "lisp-order-wait",
+        "(accept-process-output nil 0.05)
+         (push (list 'waited (neomacs-model-current-p model)) model-test-log)",
+    );
+    queue_input(&mut ctx, nested_delivery_input());
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            "(progn (accept-process-output nil 0.05) (read-event))"
+        ),
+        "121"
+    );
+    assert_whole_event_order(&mut ctx);
+    assert_nested_delivery(
+        &mut ctx,
+        "((view nil) (waited nil) (key 120 nil) (readiness nil))",
+    );
+}
+
+/// Models 1 and 2, model 2 ready and current at rev 1. Model 1's
+/// callback, for a `view' event, runs WAIT then ACTION; both callbacks
+/// log `(N TYPE)' onto `model-test-log'.
+fn stale_pick_context(test: &str, wait: &str, action: &str) -> Context {
+    let (mut ctx, _host) = lisp_context(test);
+    eval_printed(
+        &mut ctx,
+        &format!(
+            r#"(progn
+             (setq model-test-log nil)
+             (setq model-test-m
+                   (neomacs-model-create
+                    :meshes (list (list "a" model-test-a))
+                    :callback (lambda (_model type _plist)
+                                (push (list 1 type) model-test-log)
+                                (when (eq type 'view)
+                                  {wait}
+                                  {action}))))
+             (setq model-test-m2
+                   (neomacs-model-create
+                    :meshes (list (list "a" model-test-a))
+                    :callback (lambda (_model type _plist)
+                                (push (list 2 type) model-test-log)))))"#
+        ),
+    );
+    let second = FIRST_MODEL_ID + 1;
+    for event in [
+        ModelEvent::Ready { triangles: vec![1] },
+        ModelEvent::Readiness {
+            current: true,
+            rev: 1,
+            req: 0,
+        },
+    ] {
+        ctx.handle_model_input_event(second, &event)
+            .expect("model event hook runs");
+    }
+    assert_eq!(
+        eval_printed(&mut ctx, "(neomacs-model-current-p model-test-m2)"),
+        "t"
+    );
+    eval_printed(&mut ctx, "(setq model-test-log nil)");
+    ctx
+}
+
+fn model_2_pick() -> crate::keyboard::InputEvent {
+    crate::keyboard::InputEvent::Model {
+        id: FIRST_MODEL_ID + 1,
+        event: ModelEvent::Pick {
+            hit: Some(ModelHit {
+                mesh: 0,
+                face: 0,
+                barycentric: [0.25, 0.25, 0.5],
+                point: [0.0, 0.0, 0.0],
+            }),
+            view: ModelView::default(),
+            rev: 1,
+            req: 0,
+        },
+    }
+}
+
+/// Model 1's view event, then a pick of model 2's current picture, then
+/// model 2's R{nil}, then the keys model 1's callback and the test read.
+fn pick_then_invalidation_input() -> Vec<crate::keyboard::InputEvent> {
+    vec![
+        model_input(ModelEvent::View {
+            view: ModelView::default(),
+            rev: 1,
+        }),
+        model_2_pick(),
+        crate::keyboard::InputEvent::Model {
+            id: FIRST_MODEL_ID + 1,
+            event: ModelEvent::Readiness {
+                current: false,
+                rev: 2,
+                req: 0,
+            },
+        },
+        key_input('x'),
+        key_input('y'),
+    ]
+}
+
+const READ_KEY: &str = "(push (list 'key (read-event) (neomacs-model-current-p model-test-m2)) \
+                        model-test-log)";
+
+/// A pick accepted while current, then invalidated (R{nil}) before its
+/// callback can run: the callback must not run (read route).
+#[test]
+fn a_queued_pick_invalidated_before_its_callback_is_dropped_at_the_read_route() {
+    let mut ctx = stale_pick_context("lisp-stale-pick-read", "nil", READ_KEY);
+    queue_input(&mut ctx, pick_then_invalidation_input());
+    assert_eq!(eval_printed(&mut ctx, "(read-event)"), "121");
+    assert_eq!(
+        eval_printed(&mut ctx, "(reverse model-test-log)"),
+        "((1 view) (key 120 nil) (2 readiness))"
+    );
+}
+
+/// The same through a nested wait.
+#[test]
+fn a_queued_pick_invalidated_before_its_callback_is_dropped_at_the_wait_route() {
+    let mut ctx = stale_pick_context(
+        "lisp-stale-pick-wait",
+        "(accept-process-output nil 0.05)",
+        READ_KEY,
+    );
+    queue_input(&mut ctx, pick_then_invalidation_input());
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            "(progn (accept-process-output nil 0.05) (read-event))"
+        ),
+        "121"
+    );
+    assert_eq!(
+        eval_printed(&mut ctx, "(reverse model-test-log)"),
+        "((1 view) (key 120 nil) (2 readiness))"
+    );
+}
+
+/// A pick accepted while current, then a new Lisp request for that model
+/// before its callback runs: the pick names an obsolete picture.
+#[test]
+fn a_queued_pick_is_dropped_after_a_newer_lisp_request() {
+    let mut ctx = stale_pick_context(
+        "lisp-stale-pick-request",
+        "(accept-process-output nil 0.05)",
+        "(push (list 'requested (neomacs-model-set-view model-test-m2 10 0 1)) model-test-log)",
+    );
+    queue_input(
+        &mut ctx,
+        vec![
+            model_input(ModelEvent::View {
+                view: ModelView::default(),
+                rev: 1,
+            }),
+            model_2_pick(),
+        ],
+    );
+    eval_printed(
+        &mut ctx,
+        "(progn (accept-process-output nil 0.05) (accept-process-output nil 0.01))",
+    );
+    assert_eq!(
+        eval_printed(&mut ctx, "(reverse model-test-log)"),
+        "((1 view) (requested 1))"
+    );
+    // A pick of the picture current again is delivered.
+    for event in [
+        ModelEvent::Readiness {
+            current: true,
+            rev: 2,
+            req: 1,
+        },
+        ModelEvent::Pick {
+            hit: None,
+            view: ModelView::default(),
+            rev: 2,
+            req: 1,
+        },
+    ] {
+        ctx.handle_model_input_event(FIRST_MODEL_ID + 1, &event)
+            .expect("model event hook runs");
+    }
+    assert_eq!(
+        eval_printed(&mut ctx, "(mapcar #'cadr (reverse model-test-log))"),
+        "(view 1 readiness pick)"
+    );
+}
+
+/// OPUS-REVIEW NIT 8: a requested camera is wrapped into 0..360 like the
+/// renderer's own views; an invalid angle still reaches the renderer
+/// unchanged, to be refused there.
+#[test]
+fn requested_angles_are_wrapped_like_renderer_views() {
+    let (mut ctx, host) = lisp_context("lisp-wrapped-view");
+    create_model(&mut ctx);
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            "(progn (neomacs-model-set-view model-test-m 450 -15 1.5) \
+                    (neomacs-model-view model-test-m))"
+        ),
+        "(90 345 1.5)"
+    );
+    assert_eq!(
+        updates(&host).last(),
+        Some(&(
+            FIRST_MODEL_ID,
+            1,
+            ModelChange::View(ModelView {
+                yaw: 90.0,
+                pitch: 345.0,
+                zoom: 1.5,
+            }),
+        ))
+    );
+    // Out of range is not wrapped into range: it is still refused.
+    assert!(
+        signal_of(&mut ctx, "(neomacs-model-set-view model-test-m 2e6 0 1)")
+            .contains("finite angles"),
+    );
+    assert_eq!(
+        eval_printed(&mut ctx, "(neomacs-model-view model-test-m)"),
+        "(90 345 1.5)"
+    );
+    assert_eq!(updates(&host).len(), 1);
 }

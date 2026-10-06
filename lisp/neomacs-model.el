@@ -39,7 +39,8 @@
 ;; picture in every window showing MODEL.  The callback is called with
 ;; (MODEL EVENT PLIST) for the events `ready', `failed', `error', `view',
 ;; `readiness' and `pick'; a `pick' is delivered only when it names the
-;; picture Lisp holds as current, with its hit mesh given by ID.
+;; picture Lisp holds as current when the callback runs, with its hit
+;; mesh given by ID.
 ;;
 ;; Left-dragging a model orbits it and a click picks; the wheel zooms.
 ;; Mesh IDs never reach the renderer: they are mapped to indices here.
@@ -224,10 +225,20 @@ Return the request number once SEND succeeds."
     (setf (neomacs-model--entry-issued entry) req)
     req))
 
+(defun neomacs-model--wrap-angle (angle)
+  "Return ANGLE (degrees) in 0..360, as the renderer's views report it.
+An angle the renderer refuses (not a number, not finite or beyond 1e6
+in magnitude) is returned unchanged, to be refused."
+  (if (and (numberp angle) (<= (abs angle) 1e6))
+      (mod angle 360)
+    angle))
+
 (defun neomacs-model-set-view (model yaw pitch zoom)
   "Request camera YAW PITCH (degrees) and ZOOM (0.25..4) for MODEL.
-Return the request number."
+The angles are kept wrapped into 0..360.  Return the request number."
   (let* ((entry (neomacs-model--entry model))
+         (yaw (neomacs-model--wrap-angle yaw))
+         (pitch (neomacs-model--wrap-angle pitch))
          (req (neomacs-model--request
                model (lambda (req)
                        (neomacs-model--set-view model req yaw pitch zoom)))))
@@ -361,9 +372,16 @@ showing MODEL."
 
 ;;;; Events
 
+(defvar neomacs-model--event nil
+  "Serial number of the model event whose hooks run now, or nil.
+The evaluator binds it around both hooks, so `neomacs-model--note'
+can tag the callback it queues with its event and
+`neomacs-model--dispatch' run only the current event's callbacks.")
+
 (defvar neomacs-model--queue nil
-  "Callbacks (ID TYPE PLIST) waiting to run, oldest first.
-By id, so a queued callback does not keep its model alive.")
+  "Callbacks (SERIAL ID TYPE PLIST) waiting to run, oldest first.
+SERIAL is the event's `neomacs-model--event'.  By id, so a queued
+callback does not keep its model alive.")
 
 (defvar neomacs-model--draining nil
   "Non-nil while `neomacs-model--dispatch' runs callbacks.")
@@ -410,31 +428,44 @@ only records state; `neomacs-model--dispatch' runs the callback."
              (setf (neomacs-model--entry-pending-view entry) nil))))
         ('pick
          ;; Only a pick of the picture Lisp holds as current names what
-         ;; the user saw (design §6.2); anything else is stale.
+         ;; the user saw (design §6.2); anything else is stale.  It is
+         ;; checked again when its callback runs.
          (setq plist
-               (and (neomacs-model-current-p model)
-                    (eql (plist-get plist :rev)
-                         (nth 1 (neomacs-model--entry-readiness entry)))
+               (and (neomacs-model--pick-current-p model entry plist)
                     (neomacs-model--pick-plist entry plist)))
          (unless plist (setq type nil))))
       (when (and type (neomacs-model--entry-callback entry))
         (setq neomacs-model--queue
-              (nconc neomacs-model--queue (list (list id type plist))))))))
+              (nconc neomacs-model--queue
+                     (list (list neomacs-model--event id type plist))))))))
 
 (add-hook 'neomacs-model--state-functions #'neomacs-model--note)
 
 (defun neomacs-model--dispatch (&rest _event)
-  "Run the queued model callbacks, oldest first.
+  "Run the queued callbacks of the current model event, oldest first.
 A member of `neomacs-model-event-functions'; the queue holds the
-callbacks of the events `neomacs-model--note' recorded.  An event
-that arrives while a callback runs (for example inside its
-`sit-for') has its callback run after it instead of nested."
+callbacks of the events `neomacs-model--note' recorded.  Only those
+of the event being delivered run, after any an earlier delivery's
+non-local exit left behind.  The callback of an event that arrives
+meanwhile (for example inside a callback's `sit-for') runs when that
+event is delivered, once every member has handled this one."
   (unless neomacs-model--draining
-    (let ((neomacs-model--draining t))
-      (while neomacs-model--queue
-        (apply #'neomacs-model--run-callback (pop neomacs-model--queue))))))
+    (let ((neomacs-model--draining t)
+          (current neomacs-model--event))
+      (while (and neomacs-model--queue
+                  (let ((serial (car (car neomacs-model--queue))))
+                    (or (null current) (null serial) (<= serial current))))
+        (apply #'neomacs-model--run-callback
+               (cdr (pop neomacs-model--queue)))))))
 
 (add-hook 'neomacs-model-event-functions #'neomacs-model--dispatch)
+
+(defun neomacs-model--pick-current-p (model entry plist)
+  "Return non-nil if pick PLIST names the picture MODEL holds as current.
+ENTRY is MODEL's registry entry."
+  (and (neomacs-model-current-p model)
+       (eql (plist-get plist :rev)
+            (nth 1 (neomacs-model--entry-readiness entry)))))
 
 (defun neomacs-model--pick-plist (entry plist)
   "Return pick PLIST with its hit mesh index mapped to ENTRY's mesh ID."
@@ -449,14 +480,18 @@ that arrives while a callback runs (for example inside its
 
 (defun neomacs-model--run-callback (id type plist)
   "Call the callback of model ID with (MODEL TYPE PLIST), logging any error.
-Nothing runs once MODEL is destroyed.  The attached buffer is
-current while it is live."
+Nothing runs once MODEL is destroyed, nor for a `pick' whose picture
+is no longer current: a request, readiness or renderer loss may have
+come since it was queued.  The attached buffer is current while it
+is live."
   (let* ((model (neomacs-model--find id))
          (entry (and model (gethash model neomacs-model--registry)))
          (callback (and entry (neomacs-model--entry-callback entry)))
          (buffer (and entry (neomacs-model--entry-buffer entry))))
     (when (and callback
-               (not (eq (car (neomacs-model--entry-status entry)) 'destroyed)))
+               (not (eq (car (neomacs-model--entry-status entry)) 'destroyed))
+               (or (not (eq type 'pick))
+                   (neomacs-model--pick-current-p model entry plist)))
       (condition-case err
           (if (buffer-live-p buffer)
               (with-current-buffer buffer
