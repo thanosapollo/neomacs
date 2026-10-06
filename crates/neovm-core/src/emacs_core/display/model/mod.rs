@@ -65,7 +65,9 @@ fn model_edge(value: Value, what: &str, caller: &str) -> Result<u32, Flow> {
         })
 }
 
-/// `(YAW PITCH ZOOM)`, validated against the model camera contract.
+/// `(YAW PITCH ZOOM)` or `[YAW PITCH ZOOM]`, validated against the model
+/// camera contract. (`neomacs-model-create` passes a list: it keeps the
+/// camera Lisp-side as one, so a vector `:view` is converted there.)
 fn model_view(value: Value, caller: &str) -> Result<ModelView, Flow> {
     let [yaw, pitch, zoom] = numbers::<3>(value)
         .ok_or_else(|| model_error(format!("{caller}: VIEW must be (YAW PITCH ZOOM)")))?;

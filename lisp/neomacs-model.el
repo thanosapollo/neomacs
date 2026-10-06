@@ -169,7 +169,8 @@ Keys:
             unique string IDs and absolute .obj PATHs; SHA256 is the
             lowercase hex digest the loader checks.
   :width, :height  logical pixels, 32..2048 (default 512).
-  :view (YAW PITCH ZOOM)  initial camera (default (0 0 1)).
+  :view (YAW PITCH ZOOM)  initial camera, a list or vector
+            (default (0 0 1)).
   :background  colour name or (R G B) in 0..1 (default: the
             `default' face background).
   :callback FUNCTION  called with (MODEL EVENT PLIST), see Commentary.
@@ -178,7 +179,10 @@ as a `failed' event.  Signals a `user-error' without a graphical
 renderer."
   (let* ((meshes (plist-get plist :meshes))
          (ids (mapcar #'car meshes))
-         (view (or (plist-get plist :view) (list 0 0 1)))
+         ;; Kept as a list: `neomacs-model-view' and the camera keys
+         ;; take one apart with `nth'.
+         (view (let ((view (or (plist-get plist :view) (list 0 0 1))))
+                 (if (vectorp view) (append view nil) view)))
          (width (or (plist-get plist :width) 512))
          (height (or (plist-get plist :height) 512)))
     (unless (and (consp meshes) (cl-every #'consp meshes)
@@ -597,13 +601,20 @@ Bound on `down-mouse-1' over a model so the press never starts
                           (neomacs-model--display-spec model entry))))))
 
 (defun neomacs-model--detach (model entry)
-  "Blank MODEL's glyphs in the buffer ENTRY attaches it to; forget it."
+  "Blank MODEL's glyphs in the buffer ENTRY attaches it to; forget it.
+Nothing of MODEL stays there: a later resize cannot revive an old
+glyph, and the camera keys no longer find MODEL in that buffer."
   (let ((old (neomacs-model--entry-buffer entry)))
     (neomacs-model--map-glyphs
      old model
      (lambda (start end)
        (with-silent-modifications
-         (remove-text-properties start end '(display nil keymap nil)))))
+         (remove-text-properties start end
+                                 '(display nil keymap nil neomacs-model nil)))))
+    (when (buffer-live-p old)
+      (with-current-buffer old
+        (when (eq neomacs-model--buffer-model model)
+          (setq neomacs-model--buffer-model nil))))
     (setf (neomacs-model--entry-buffer entry) nil)))
 
 (defun neomacs-model-insert (model &rest plist)
@@ -612,7 +623,7 @@ A model is attached to one buffer: inserting it elsewhere moves it,
 and killing that buffer destroys MODEL.  PLIST keys:
 :keymap  the glyph's keymap (default `neomacs-model-view-map', nil
          for none); `neomacs-model-mouse-map' always comes first.
-:string  the text carrying the glyph (default \" \")."
+:string  the text carrying the glyph, not empty (default \" \")."
   (let* ((entry (neomacs-model--entry model))
          (keymap (if (plist-member plist :keymap)
                      (plist-get plist :keymap)
@@ -620,8 +631,10 @@ and killing that buffer destroys MODEL.  PLIST keys:
          (string (or (plist-get plist :string) " ")))
     (when (eq (car (neomacs-model--entry-status entry)) 'destroyed)
       (error "Model is destroyed"))
+    (unless (and (stringp string) (> (length string) 0))
+      (error "Model :string must be a non-empty string"))
     ;; Do not transfer attachment until insertion succeeds: a read-only
-    ;; destination or invalid string/keymap must leave the old glyph live.
+    ;; destination must leave the old glyph live.
     (insert (propertize string
                         'display (neomacs-model--display-spec model entry)
                         'keymap (make-composed-keymap

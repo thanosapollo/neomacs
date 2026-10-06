@@ -1100,3 +1100,142 @@ fn a_quit_out_of_a_callback_is_logged_and_strands_nothing() {
         ),
     );
 }
+
+// ----------------------------------------------------------------------
+// Round 2: pre-review SHOULD 2-3, NIT 1-2.
+
+/// A vector `:view' is kept as a list: `neomacs-model-view' and the
+/// camera keys work before any renderer `view' event.
+#[test]
+fn a_vector_view_works_with_the_camera_keys() {
+    let (mut ctx, host) = lisp_context("lisp-vector-view");
+    eval_printed(
+        &mut ctx,
+        r#"(setq model-test-m
+                 (neomacs-model-create :meshes (list (list "a" model-test-a))
+                                       :view [0 -90 1.5]))"#,
+    );
+    assert_eq!(
+        eval_printed(&mut ctx, "(neomacs-model-view model-test-m)"),
+        "(0 -90 1.5)"
+    );
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            r#"(with-current-buffer (get-buffer-create "model-test-vector")
+                 (neomacs-model-insert model-test-m)
+                 (goto-char (point-min))
+                 (neomacs-model-yaw-forward)
+                 (neomacs-model-pitch-next)
+                 (prog1 (neomacs-model-view model-test-m)
+                   (neomacs-model-reset-view)))"#
+        ),
+        "(15 -75 1.5)"
+    );
+    assert_eq!(
+        updates(&host).last(),
+        Some(&(
+            FIRST_MODEL_ID,
+            3,
+            ModelChange::View(ModelView {
+                yaw: 0.0,
+                pitch: -90.0,
+                zoom: 1.5,
+            }),
+        ))
+    );
+}
+
+/// The kill hook survives a major-mode change in the attached buffer.
+#[test]
+fn killing_the_buffer_destroys_the_model_after_a_major_mode_change() {
+    let (mut ctx, host) = lisp_context("lisp-mode-change");
+    create_model(&mut ctx);
+    eval_printed(
+        &mut ctx,
+        r#"(with-current-buffer (get-buffer-create "model-test-mode")
+             (neomacs-model-insert model-test-m)
+             (fundamental-mode))"#,
+    );
+    eval_printed(&mut ctx, r#"(kill-buffer "model-test-mode")"#);
+    assert_eq!(
+        *host.destroys.lock().expect("destroys"),
+        vec![FIRST_MODEL_ID]
+    );
+    assert_eq!(
+        eval_printed(&mut ctx, "(neomacs-model-status model-test-m)"),
+        "(destroyed)"
+    );
+}
+
+/// Moving a model leaves nothing of it in the old buffer: no glyph
+/// property a later resize could revive, and no buffer model the camera
+/// keys would still drive.
+#[test]
+fn moving_a_model_leaves_nothing_of_it_in_the_old_buffer() {
+    let (mut ctx, _host) = lisp_context("lisp-detach");
+    create_model(&mut ctx);
+    // A -> B -> A, then resize: only A's newest glyph shows the model.
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            r#"(progn
+                 (with-current-buffer (get-buffer-create "model-test-a")
+                   (neomacs-model-insert model-test-m))
+                 (with-current-buffer (get-buffer-create "model-test-b")
+                   (neomacs-model-insert model-test-m))
+                 (with-current-buffer "model-test-a"
+                   (goto-char (point-max))
+                   (neomacs-model-insert model-test-m))
+                 (neomacs-model-resize model-test-m 96 96)
+                 (with-current-buffer "model-test-a"
+                   (list (get-text-property 1 'neomacs-model)
+                         (get-text-property 1 'display)
+                         (eq (get-text-property 2 'neomacs-model) model-test-m)
+                         (plist-get (cdr (get-text-property 2 'display)) :width))))"#
+        ),
+        "(nil nil t 96)"
+    );
+    // A standalone buffer's model moved elsewhere is no longer its own.
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            r#"(let* ((buffer (neomacs-model-open (list (list "a" model-test-a))
+                                                  :name "detach"))
+                      (model (buffer-local-value 'neomacs-model--buffer-model
+                                                 buffer)))
+                 (with-current-buffer (get-buffer-create "model-test-c")
+                   (neomacs-model-insert model))
+                 (with-current-buffer buffer
+                   (goto-char (point-min))
+                   (list neomacs-model--buffer-model
+                         (get-text-property (point-min) 'neomacs-model)
+                         (condition-case nil (neomacs-model--at-point)
+                           (user-error 'no-model)))))"#
+        ),
+        "(nil nil no-model)"
+    );
+}
+
+/// An empty `:string' is refused and leaves the attachment alone.
+#[test]
+fn an_empty_insert_string_is_refused() {
+    let (mut ctx, _host) = lisp_context("lisp-empty-string");
+    create_model(&mut ctx);
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            r#"(progn
+                 (with-current-buffer (get-buffer-create "model-test-a")
+                   (neomacs-model-insert model-test-m))
+                 (with-current-buffer (get-buffer-create "model-test-b")
+                   (list (condition-case nil
+                             (neomacs-model-insert model-test-m :string "")
+                           (error 'refused))
+                         (buffer-size)
+                         (with-current-buffer "model-test-a"
+                           (and (get-text-property 1 'display) t)))))"#
+        ),
+        "(refused 0 t)"
+    );
+}
