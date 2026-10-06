@@ -11,6 +11,7 @@ struct FakeHost {
     log: Vec<String>,
     refuse_resize: bool,
     refuse_upload: bool,
+    refuse_render: bool,
     draws: Vec<ModelDraw>,
     picks: Vec<PickRequest>,
     pick_answer: Option<PickPoll>,
@@ -50,6 +51,9 @@ impl ModelGpuHost for FakeHost {
     }
     fn model_render(&mut self, id: u32, draw: &ModelDraw) -> Result<(), String> {
         self.log.push(format!("render {id}"));
+        if self.refuse_render {
+            return Err("device lost".to_owned());
+        }
         self.draws.push(draw.clone());
         Ok(())
     }
@@ -935,4 +939,70 @@ fn wheel_input_without_a_zoom_change_keeps_a_burst_but_starts_none() {
     assert!(store.take_events().is_empty(), "the burst is still active");
     store.tick(ms(100) + WHEEL_QUIET, h(&mut host));
     assert_eq!(kinds(&store.take_events()), ["View{3}", "R{true,3,1}"]);
+}
+
+// ----------------------------------------------------------------------
+// Round 3: OPUS-REVIEW NIT 3-4.
+
+/// A highlight request with both a malformed target and an out-of-range
+/// `selected` is one applied fallback: one `Error{req}`.
+#[test]
+fn a_doubly_invalid_highlight_reports_one_error() {
+    let mut host = FakeHost::default();
+    let mut store = loaded_store(&mut host);
+    shown(&mut store, &mut host);
+    store.take_events();
+    store.update(
+        5,
+        9,
+        ModelChange::Highlight {
+            target: Some(ModelTarget::Point {
+                mesh: 0,
+                face: 0,
+                barycentric: [f64::NAN, 0.0, 0.0],
+                tolerance: 0.1,
+            }),
+            selected: Some(99),
+        },
+        h(&mut host),
+    );
+    let events = kinds(&store.take_events());
+    assert_eq!(
+        events.iter().filter(|e| *e == "Error{Some(9)}").count(),
+        1,
+        "{events:?}"
+    );
+    shown(&mut store, &mut host);
+    assert_eq!(
+        host.draws.last().unwrap().highlight,
+        GpuHighlight::default()
+    );
+}
+
+/// A model failing mid-orbit ends its interaction with its `View` (design
+/// §6.2: interacting lasts until its `View`), before `failed`.
+#[test]
+fn failing_mid_orbit_settles_the_interaction_with_a_view() {
+    let mut host = FakeHost::default();
+    let mut store = loaded_store(&mut host);
+    shown(&mut store, &mut host);
+    store.take_events();
+    assert!(store.press(W, centre_hit(), (0.0, 0.0)));
+    assert!(store.motion(W, (10.0, 0.0)));
+    assert_eq!(kinds(&store.take_events()), ["R{false,2,0}"]);
+    host.refuse_render = true;
+    store.render_dirty(&mut host);
+    let events = kinds(&store.take_events());
+    let view = events.iter().position(|e| e.starts_with("View"));
+    let failed = events.iter().position(|e| e == "failed");
+    assert!(
+        view.is_some() && failed.is_some() && view < failed,
+        "{events:?}"
+    );
+    assert_eq!(
+        events.iter().filter(|e| e.starts_with("View")).count(),
+        1,
+        "{events:?}"
+    );
+    assert!(!store.motion(W, (20.0, 0.0)), "the capture ended");
 }

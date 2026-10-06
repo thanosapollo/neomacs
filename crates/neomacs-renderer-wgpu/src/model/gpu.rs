@@ -624,11 +624,14 @@ impl ModelGpu {
             ];
         }
         uniform.paint[2] = if highlight.faces.is_some() { 1.0 } else { 0.0 };
+        let marks = highlight
+            .faces
+            .as_ref()
+            .filter(|faces| self.marks_written.as_ref() != Some(*faces));
         // Both writes allocate staging memory: scope them with the pass.
-        scoped(device, "model render rejected", || {
-            if let Some(faces) = &highlight.faces
-                && self.marks_written.as_ref() != Some(faces)
-            {
+        // The marks count as written only once the scope reports success.
+        let rendered = scoped(device, "model render rejected", || {
+            if let Some(faces) = marks {
                 let mut words = vec![0u32; self.marks_words];
                 for &face in faces {
                     if let Some(word) = words.get_mut(face as usize / 32) {
@@ -636,7 +639,6 @@ impl ModelGpu {
                     }
                 }
                 queue.write_buffer(&self.marks, 0, bytemuck::cast_slice(&words));
-                self.marks_written = Some(faces.clone());
             }
             queue.write_buffer(&self.camera, 0, bytemuck::bytes_of(&uniform));
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -671,7 +673,16 @@ impl ModelGpu {
                 pass.draw(0..self.vertex_count, 0..1);
             }
             queue.submit(Some(encoder.finish()));
-        })
+        });
+        match rendered {
+            Ok(()) => {
+                if let Some(faces) = marks {
+                    self.marks_written = Some(faces.clone());
+                }
+            }
+            Err(_) => self.marks_written = None,
+        }
+        rendered
     }
 
     /// Start a pick of `request`'s texel. One pick at a time: the staging

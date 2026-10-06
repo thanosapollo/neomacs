@@ -205,6 +205,16 @@ impl ModelStore {
         if let Some(host) = host {
             host.model_free(id);
         }
+        // An interaction it ends settles first with its `View` (design
+        // §6.2: interacting lasts until its `View`).
+        let settled = self
+            .entries
+            .get(&id)
+            .filter(|e| e.readiness.interacting())
+            .map(|e| (e.view, e.readiness.rev()));
+        if let Some((view, rev)) = settled {
+            self.emit(id, ModelEvent::View { view, rev });
+        }
         if let Some(entry) = self.entries.get_mut(&id) {
             entry.status = ModelStatus::Failed;
             entry.scene = None;
@@ -554,11 +564,12 @@ impl ModelStore {
                 ),
             },
             ModelChange::Highlight { target, selected } => {
-                let target = match target.map(ModelTarget::validated).transpose() {
-                    Ok(target) => target,
+                let (target, selected) = match target.map(ModelTarget::validated).transpose() {
+                    Ok(target) => (target, selected),
                     Err(error) => {
                         // Malformed beyond topology: the same applied
-                        // fallback as an out-of-range face.
+                        // fallback as an out-of-range face (no highlight),
+                        // reported by one `Error` for the request.
                         self.emit(
                             id,
                             ModelEvent::Error {
@@ -566,7 +577,7 @@ impl ModelStore {
                                 error,
                             },
                         );
-                        None
+                        (None, None)
                     }
                 };
                 let entry = self.entries.get_mut(&id).expect("live");
