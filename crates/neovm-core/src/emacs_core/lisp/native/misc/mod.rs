@@ -390,9 +390,12 @@ pub(crate) fn rassq_exact_for_test(key: Value, alist: Value, swp: bool) -> EvalR
 /// `(make-list LENGTH INIT)` -- create a list of LENGTH elements, each INIT.
 pub(crate) fn builtin_make_list(args: Vec<Value>) -> EvalResult {
     expect_args("make-list", &args, 2)?;
-    let length = expect_wholenump(&args[0])?;
-    let init = &args[1];
-    let items: Vec<Value> = (0..length as usize).map(|_| *init).collect();
+    let length = expect_wholenump(&args[0])? as usize;
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(length)
+        .map_err(|_| crate::emacs_core::alloc::memory_full())?;
+    items.resize(length, args[1]);
     Ok(Value::list(items))
 }
 

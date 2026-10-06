@@ -9927,6 +9927,403 @@ fn list_length_callers_signal_gnu_circular_list_data() {
     assert_eq!(crate::emacs_core::print_value_with_eval(&ev, &value), gnu);
 }
 
+/// GNU signals `memory_full` -- `(error "Memory exhausted--...")` -- when an
+/// allocation this large fails, and prints floats with any precision.  These
+/// requests used to abort or panic the whole process.
+#[test]
+fn oversized_requests_signal_or_succeed_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = crate::emacs_core::Context::new();
+    let mut eval = |src: &str| {
+        let value = ev.eval_str(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        crate::emacs_core::print_value_with_eval(&ev, &value)
+    };
+    for size in [
+        "(make-string most-positive-fixnum ?a)",
+        "(make-string most-positive-fixnum ?\u{e9})",
+        "(make-string (/ most-positive-fixnum 2) ?\u{e9})",
+        "(make-vector most-positive-fixnum nil)",
+        "(make-list most-positive-fixnum nil)",
+        "(make-hash-table :size most-positive-fixnum)",
+        "(make-bool-vector most-positive-fixnum nil)",
+    ] {
+        assert_eq!(
+            eval(&format!(
+                "(condition-case e {size} (error (substring (car (cdr e)) 0 16)))"
+            )),
+            "\"Memory exhausted\"",
+            "{size}"
+        );
+    }
+    // Lengths, heads and tails are GNU Emacs output.
+    for (spec, x, expected) in [
+        (
+            "%.70000f",
+            "0.1",
+            "(70002 \"0.1000000000000000055511\" \"000000\")",
+        ),
+        (
+            "%.70000f",
+            "1e300",
+            "(70302 \"100000000000000005250476\" \"000000\")",
+        ),
+        (
+            "%.70000e",
+            "-2.5e-300",
+            "(70008 \"-2.499999999999999979757\" \"0e-300\")",
+        ),
+        (
+            "%.70000e",
+            "5e-324",
+            "(70007 \"4.9406564584124654417656\" \"0e-324\")",
+        ),
+        (
+            "%.70000g",
+            "0.1",
+            "(57 \"0.1000000000000000055511\" \"015625\")",
+        ),
+        (
+            "%.70000g",
+            "1e300",
+            "(301 \"100000000000000005250476\" \"540160\")",
+        ),
+        (
+            "%.70000g",
+            "5e-324",
+            "(757 \"4.9406564584124654417656\" \"5e-324\")",
+        ),
+        (
+            "%#.70000g",
+            "123456.789",
+            "(70001 \"123456.78900000000430736\" \"000000\")",
+        ),
+        (
+            "%#.70000e",
+            "123456.789",
+            "(70006 \"1.2345678900000000430736\" \"00e+05\")",
+        ),
+    ] {
+        assert_eq!(
+            eval(&format!(
+                "(let ((s (format \"{spec}\" {x}))) (list (length s) (substring s 0 24) (substring s -6)))"
+            )),
+            expected,
+            "{spec} {x}"
+        );
+    }
+}
+
+/// GNU `styled_format` prints at most `USEFUL_PRECISION_MAX' float digits and
+/// adds any excess precision as zeros (none for `%g' without `#'), and pads
+/// to any width.  Huge precisions used to print the wrong `%g' text and
+/// widths above 65535 panicked.  Expected values are GNU Emacs output.
+#[test]
+fn huge_format_precision_and_width_print_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = crate::emacs_core::Context::new();
+    let mut eval = |src: &str| {
+        let value = ev.eval_str(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        crate::emacs_core::print_value_with_eval(&ev, &value)
+    };
+    let exact = "\"0.1000000000000000055511151231257827021181583404541015625\"";
+    for (src, expected) in [
+        ("(format \"%.4294967297g\" 0.1)", exact),
+        ("(format \"%.2147483648g\" 0.1)", exact),
+        ("(format \"%.2305843009213693951g\" 0.1)", exact),
+        ("(length (format \"%.2305843009213693951g\" 1e300))", "301"),
+        ("(length (format \"%.2305843009213693951g\" 5e-324))", "757"),
+        ("(format \"%.99999999999999999999s\" \"abc\")", "\"abc\""),
+        (
+            "(let ((s (format \"%70000f\" 1.0))) (list (length s) (substring s -8)))",
+            "(70000 \"1.000000\")",
+        ),
+        (
+            "(let ((s (format \"%-70000e\" 1.0))) (list (length s) (substring s 0 8)))",
+            "(70000 \"1.000000\")",
+        ),
+        (
+            "(let ((s (format \"%070000f\" -1.0))) (list (length s) (substring s 0 3)))",
+            "(70000 \"-00\")",
+        ),
+        (
+            "(let ((s (format \"%+070000.2f\" 1.0))) (list (length s) (substring s 0 3)))",
+            "(70000 \"+00\")",
+        ),
+        ("(length (format \"%70000d\" 1.0))", "70000"),
+    ] {
+        assert_eq!(eval(src), expected, "{src}");
+    }
+}
+
+/// GNU `styled_format` signals "Maximum string size exceeded" once a field
+/// width or conversion would reach `STRING_BYTES_BOUND + 1' bytes, and
+/// `memory_full' when the result cannot grow.  These used to abort.
+#[test]
+fn oversized_format_requests_signal_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = crate::emacs_core::Context::new();
+    let mut eval = |src: &str| {
+        let value = ev.eval_str(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        crate::emacs_core::print_value_with_eval(&ev, &value)
+    };
+    let overflow = "\"Maximum string size exceeded\"";
+    let full = "\"Memory exhausted\"";
+    for (src, expected) in [
+        ("(format \"%.2305843009213693951f\" 1.0)", overflow),
+        ("(format \"%.2305843009213693950f\" 1.0)", overflow),
+        ("(format \"%.2305843009213693949f\" 1.0)", full),
+        ("(format \"%.2305843009213693951e\" 0.1)", overflow),
+        ("(format \"%.2305843009213693946e\" 1.0)", overflow),
+        ("(format \"%.2305843009213693945e\" -1.0)", overflow),
+        ("(format \"%.2305843009213693945e\" 1.0)", full),
+        ("(format \"%#.2305843009213693951g\" 0.1)", overflow),
+        ("(format \"%#.2305843009213693950g\" 1.0)", full),
+        ("(format \"%2305843009213693952f\" 1.0)", overflow),
+        ("(format \"%2305843009213693951f\" 1.0)", full),
+        ("(format \"%2305843009213693951s\" \"a\")", full),
+        ("(format \"%.2305843009213693952d\" 1)", overflow),
+        ("(format \"%.2305843009213693951d\" 1)", full),
+        ("(format \"%2305843009213693951d\" 1)", full),
+    ] {
+        // Compare the message prefix: GNU substitutes a key into the rest.
+        let n = expected.len() - 2;
+        assert_eq!(
+            eval(&format!(
+                "(condition-case e {src} (error (let ((m (car (cdr e)))) (substring m 0 (min {n} (length m))))))"
+            )),
+            expected,
+            "{src}"
+        );
+    }
+}
+
+/// GNU `styled_format` validates the conversion and its argument before it
+/// sizes the field, and counts the text already emitted towards
+/// `max_bufsize' (editfns.c:4257-4264).  A huge width used to signal
+/// memory-full first, and a field just short of the bound signalled
+/// memory-full instead of string_overflow when text preceded it.  Expected
+/// values are GNU Emacs output.
+#[test]
+fn format_size_errors_follow_gnu_order_and_count_emitted_text() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = crate::emacs_core::Context::new();
+    let mut eval = |src: &str| {
+        let value = ev.eval_str(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        crate::emacs_core::print_value_with_eval(&ev, &value)
+    };
+    let mismatch = "\"Format specifier doesn’t match argument type\"";
+    let overflow = "\"Maximum string size exceeded\"";
+    let full = "\"Memory exhausted\"";
+    let mut mismatches = Vec::new();
+    for (src, expected) in [
+        ("(format \"%2305843009213693951f\" \"x\")", mismatch),
+        ("(format \"%2305843009213693951d\" nil)", mismatch),
+        ("(format \"%2305843009213693951c\" \"x\")", mismatch),
+        ("(format \"%.2305843009213693951f\" \"x\")", mismatch),
+        (
+            "(format \"%2305843009213693951Q\" 1)",
+            "\"Invalid format operation %Q\"",
+        ),
+        ("(format \"X%.2305843009213693949f\" 1.0)", overflow),
+        ("(format \"X%2305843009213693951f\" 1.0)", overflow),
+        ("(format \"X%2305843009213693950f\" 1.0)", full),
+        ("(format \"X%2305843009213693951s\" \"a\")", overflow),
+        ("(format \"X%2305843009213693950s\" \"a\")", full),
+        ("(format \"X%.2305843009213693951d\" 1)", overflow),
+        ("(format \"X%.2305843009213693950d\" 1)", full),
+        ("(format \"%s%2305843009213693951d\" \"ab\" 1)", overflow),
+        ("(format \"%s%2305843009213693949d\" \"ab\" 1)", full),
+        ("(format \"ab%-2305843009213693950c\" ?a)", overflow),
+        ("(format \"%c%02305843009213693950d\" ?a 1)", full),
+        ("(format \"%.99999999999999999999d\" 1)", overflow),
+        ("(format \"%.99999999999999999999f\" 1.0)", overflow),
+        ("(format \"%2305843009213693951f%Q\" 1.0 1)", full),
+    ] {
+        // Compare the message prefix: GNU substitutes a key into the rest.
+        let n = expected.len() - 2;
+        let actual = eval(&format!(
+            "(condition-case e {src} (error (let ((m (car (cdr e)))) (substring m 0 (min {n} (length m))))))"
+        ));
+        if actual != expected {
+            mismatches.push(format!("{src}: {actual} instead of {expected}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// Environment variable carrying the form for
+/// `format_padding_child_under_address_limit`.
+const FORMAT_PADDING_CHILD_FORM: &str = "NEOVM_FORMAT_PADDING_CHILD_FORM";
+
+/// Child half of `format_padding_is_written_into_the_reserved_result`: eval
+/// the form with only 384 MiB of address space to spare, and print it.
+#[test]
+#[ignore = "run in a child process by format_padding_is_written_into_the_reserved_result"]
+fn format_padding_child_under_address_limit() {
+    let Ok(src) = std::env::var(FORMAT_PADDING_CHILD_FORM) else {
+        return;
+    };
+    let mut ev = crate::emacs_core::Context::new();
+    let status = fs::read_to_string("/proc/self/status").expect("/proc/self/status");
+    let vm_kib: u64 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmSize:"))
+        .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
+        .expect("VmSize");
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit only access LIMIT; this process runs
+    // this test alone.
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) }, 0);
+    let wanted = vm_kib * 1024 + (384 << 20);
+    assert!(wanted <= limit.rlim_max, "hard RLIMIT_AS below {wanted}");
+    limit.rlim_cur = wanted;
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
+    // An abort here must not dump a core of that size.
+    let no_core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) }, 0);
+    // A piped core_pattern ignores RLIMIT_CORE; an undumpable process is
+    // never dumped.
+    // SAFETY: PR_SET_DUMPABLE takes no pointers.
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) }, 0);
+    let value = ev.eval_str(&src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+    println!(
+        "RESULT={}",
+        crate::emacs_core::print_value_with_eval(&ev, &value)
+    );
+}
+
+/// Padding and excess-precision zeros are sized by the user, so GNU
+/// `styled_format` writes them straight into its one result buffer and
+/// signals memory-full when that cannot grow.  Building them in a separate
+/// string aborted the process once the result had room for the field but
+/// the heap had none for a second copy.  Every later growth must signal
+/// the same way: the text after a field, and the final copy into a string.
+/// Each form runs in a child process limited to 384 MiB more address space:
+/// a 256 MiB field fits once, not twice, and a 1 GiB field never fits.
+#[test]
+fn format_padding_is_written_into_the_reserved_result() {
+    crate::test_utils::init_test_tracing();
+    let child = format!(
+        "{}::format_padding_child_under_address_limit",
+        module_path!().split_once("::").expect("crate path").1
+    );
+    let mut failures = Vec::new();
+    for (src, expected) in [
+        ("(length (format \"%268435456f\" 1.0))", "268435456"),
+        ("(length (format \"%-268435456f\" 1.0))", "268435456"),
+        ("(length (format \"%0268435456f\" -1.0))", "268435456"),
+        ("(length (format \"%268435456d\" 1))", "268435456"),
+        ("(length (format \"%268435456s\" \"a\"))", "268435456"),
+        ("(length (format \"%.268435456d\" 1))", "268435456"),
+        ("(length (format \"%.268435456f\" 1.0))", "268435458"),
+        (
+            "(condition-case e (format \"%1073741824f\" 1.0) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        // Whatever follows a 256 MiB field doubles the result, which no
+        // longer fits: GNU signals memory-full.  The final unibyte copy of
+        // a 256 MiB result does not fit either.
+        (
+            "(condition-case e (format \"%268435456fX\" 1.0) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format \"%268435456dX\" 1) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format \"%.268435456fX\" 1.0) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format \"%268435456f%%\" 1.0) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format \"%268435456f%s\" 1.0 \"X\") (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format \"%268435456f%d\" 1.0 1) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format-message \"%268435456f`\" 1.0) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format \"%268435456s\" (unibyte-string 255)) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                child.as_str(),
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(FORMAT_PADDING_CHILD_FORM, src)
+            .output()
+            .expect("spawn child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            failures.push(format!(
+                "{src}: child {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        } else if !stdout.contains(&format!("RESULT={expected}\n")) {
+            failures.push(format!("{src}: expected {expected}\n{stdout}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// GNU `allocate_record' rejects records over 4095 slots, the type included.
+/// An impossible `make-record' size used to abort.
+#[test]
+fn oversized_records_signal_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = crate::emacs_core::Context::new();
+    let mut eval = |src: &str| {
+        let value = ev.eval_str(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        crate::emacs_core::print_value_with_eval(&ev, &value)
+    };
+    for (src, expected) in [
+        (
+            "(make-record 'foo most-positive-fixnum nil)",
+            "(error \"Attempt to allocate a record of 2305843009213693952 slots; max is 4095\")",
+        ),
+        (
+            "(make-record 'foo 4095 nil)",
+            "(error \"Attempt to allocate a record of 4096 slots; max is 4095\")",
+        ),
+        (
+            "(apply #'record 'foo (make-list 4095 nil))",
+            "(error \"Attempt to allocate a record of 4096 slots; max is 4095\")",
+        ),
+        ("(length (make-record 'foo 4094 nil))", "4095"),
+        (
+            "(length (apply #'record 'foo (make-list 4094 nil)))",
+            "4095",
+        ),
+    ] {
+        assert_eq!(
+            eval(&format!("(condition-case e {src} (error e))")),
+            expected,
+            "{src}"
+        );
+    }
+}
+
 #[test]
 fn vconcat_signals_circular_list_like_gnu() {
     crate::test_utils::init_test_tracing();

@@ -165,10 +165,17 @@ pub(crate) fn make_bool_vector_from_words(nbits: usize, words: Vec<u64>) -> Valu
     Value::make_bool_vector(nbits, words)
 }
 
-/// A new bool-vector of `nbits` bits, all `init`.
-pub(crate) fn make_bool_vector_filled(nbits: usize, init: bool) -> Value {
+/// A new bool-vector of `nbits` bits, all `init`; `memory_full` when the
+/// words cannot be allocated.
+fn make_bool_vector_filled(nbits: usize, init: bool) -> EvalResult {
     let pattern = if init { u64::MAX } else { 0 };
-    make_bool_vector_from_words(nbits, vec![pattern; BoolVectorObj::words_for(nbits)])
+    let nwords = BoolVectorObj::words_for(nbits);
+    let mut words = Vec::new();
+    words
+        .try_reserve_exact(nwords)
+        .map_err(|_| memory_exhausted())?;
+    words.resize(nwords, pattern);
+    Ok(make_bool_vector_from_words(nbits, words))
 }
 
 /// A new bool-vector holding `bits`.
@@ -236,15 +243,9 @@ pub(crate) fn copy_bool_vector(value: &Value) -> Option<Value> {
     ))
 }
 
-/// GNU's `memory_full` signal (`alloc.c:4104`): `memory-signal-data`'s
-/// `(error "Memory exhausted--...")`.
+/// GNU's `memory_full` signal (`alloc.c:4104`).
 fn memory_exhausted() -> Flow {
-    signal(
-        LispCondition::Error,
-        vec![Value::string(
-            "Memory exhausted--use M-x save-some-buffers then exit and restart Emacs",
-        )],
-    )
+    crate::emacs_core::alloc::memory_full()
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +303,7 @@ pub(crate) fn builtin_make_bool_vector(args: Vec<Value>) -> EvalResult {
     if BoolVectorObj::words_for(length) > isize::MAX as usize / size_of::<u64>() {
         return Err(memory_exhausted());
     }
-    Ok(make_bool_vector_filled(length, args[1].is_truthy()))
+    make_bool_vector_filled(length, args[1].is_truthy())
 }
 
 /// `(bool-vector &rest OBJECTS)`.
