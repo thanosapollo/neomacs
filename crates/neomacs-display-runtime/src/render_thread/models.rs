@@ -14,6 +14,10 @@ use neomacs_renderer_wgpu::model::store::ModelGpuHost;
 
 use super::RenderApp;
 
+/// The models a picture holds, each with the snapshot its pixels show.
+pub(super) type ModelPicture =
+    std::collections::BTreeMap<u32, neomacs_renderer_wgpu::model::store::Snapshot>;
+
 impl RenderApp {
     fn model_host(&mut self) -> Option<&mut dyn ModelGpuHost> {
         self.renderer
@@ -84,6 +88,16 @@ impl RenderApp {
         else {
             return;
         };
+        self.note_models_composited(emacs_frame_id, &drawn, frame);
+    }
+
+    /// The composite of `frame` in window `emacs_frame_id` drew `drawn`.
+    pub(super) fn note_models_composited(
+        &mut self,
+        emacs_frame_id: u64,
+        drawn: &HashSet<u32>,
+        frame: &crate::core::frame_glyphs::FrameGlyphBuffer,
+    ) {
         if self.models.is_empty() {
             return;
         }
@@ -95,7 +109,7 @@ impl RenderApp {
                 _ => None,
             })
             .collect();
-        self.models.presented(emacs_frame_id, &drawn, &in_frame);
+        self.models.presented(emacs_frame_id, drawn, &in_frame);
         self.flush_model_events();
     }
 
@@ -160,3 +174,7 @@ impl RenderApp {
         true
     }
 }
+
+#[cfg(test)]
+#[path = "models/tests.rs"]
+mod tests;

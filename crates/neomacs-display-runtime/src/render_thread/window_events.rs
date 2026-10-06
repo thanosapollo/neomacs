@@ -114,6 +114,22 @@ impl RenderApp {
         }
     }
 
+    /// `WindowEvent::Occluded` for native frame `emacs_frame_id`.
+    ///
+    /// Occlusion is scheduling input: an occluded window presents nothing;
+    /// exposure issues exactly one recovery frame. On Wayland this event
+    /// also stands in for hidden/minimized, where frame callbacks would
+    /// otherwise stop delivering.
+    pub(super) fn handle_window_occluded(&mut self, emacs_frame_id: u64, occluded: bool) {
+        let id = super::frame_sched::NativeWindowId(emacs_frame_id);
+        let action = self.frame_coordinator.set_occluded(id, occluded);
+        if action == super::frame_sched::PacingAction::RequestRedraw
+            && let Some(window_state) = self.frame_windows.get(emacs_frame_id)
+        {
+            window_state.request_redraw();
+        }
+    }
+
     pub(super) fn handle_window_event(
         &mut self,
         event_loop: &dyn ActiveEventLoop,
@@ -292,18 +308,8 @@ impl RenderApp {
 
             WindowEvent::Occluded(occluded) => {
                 tracing::info!("WindowEvent::Occluded: {occluded}");
-                // Occlusion is scheduling input: an occluded window presents
-                // nothing; exposure issues exactly one recovery frame. On
-                // Wayland this event also stands in for hidden/minimized,
-                // where frame callbacks would otherwise stop delivering.
                 if let Some(sched_id) = self.frame_windows.event_frame_for_winit(window_id) {
-                    let id = super::frame_sched::NativeWindowId(sched_id);
-                    let action = self.frame_coordinator.set_occluded(id, occluded);
-                    if action == super::frame_sched::PacingAction::RequestRedraw
-                        && let Some(window_state) = self.frame_windows.get(sched_id)
-                    {
-                        window_state.request_redraw();
-                    }
+                    self.handle_window_occluded(sched_id, occluded);
                 }
             }
 

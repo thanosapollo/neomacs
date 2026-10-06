@@ -18,6 +18,7 @@
 
 use super::FrameDrawInputs;
 use crate::render_thread::frame_stats;
+use crate::render_thread::models::ModelPicture;
 use crate::render_thread::frame_windows::{
     GuiFrameNativeWindowState, GuiFrameRenderState, RetainedCursorCell, RetainedStatic,
 };
@@ -91,7 +92,10 @@ pub(super) fn draw(
     let generation = render.compositor.current_scene_generation;
     let retained_valid = matches!(
         &render.compositor.retained_static,
-        Some(rs) if rs.generation == generation && rs.texture.size() == native_size
+        Some(rs) if retained_scene_is_current(
+            (rs.generation, rs.texture.size(), &ModelPicture::new()),
+            (generation, native_size, &ModelPicture::new()),
+        )
     );
     if !retained_valid {
         ensure_retained_static_texture(renderer, render, native_size);
@@ -158,6 +162,15 @@ pub(super) fn draw(
         );
     }
     frame_stats::count(&frame_stats::COMPOSITE_ONLY_FRAMES);
+}
+
+/// Whether a retained scene built as `built` (editor scene generation,
+/// size, and the models it pictures) still pictures the scene `now`.
+pub(super) fn retained_scene_is_current(
+    built: (u64, SnapshotSize, &ModelPicture),
+    now: (u64, SnapshotSize, &ModelPicture),
+) -> bool {
+    built.0 == now.0 && built.1 == now.1
 }
 
 /// Build a single-glyph mini-frame for each filled-box cursor in the frame

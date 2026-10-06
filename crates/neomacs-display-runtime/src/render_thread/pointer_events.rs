@@ -43,6 +43,24 @@ fn model_wheel_notches(delta: MouseScrollDelta) -> i32 {
     (notches.round() as i32).clamp(-10, 10)
 }
 
+/// Wheel input over models, turned into whole zoom notches.
+#[derive(Debug, Default)]
+pub(super) struct ModelWheel {}
+
+impl ModelWheel {
+    /// The whole notches `delta` from `device` over model `id` amounts to.
+    pub(super) fn notches(
+        &mut self,
+        _device: Option<DeviceId>,
+        _id: u32,
+        delta: MouseScrollDelta,
+        _phase: TouchPhase,
+        _now: std::time::Instant,
+    ) -> i32 {
+        model_wheel_notches(delta)
+    }
+}
+
 // Embedded browsers own their distance policy and fractional viewport. Do not
 // impose the editor's integral Lisp boundary on their input.
 #[cfg(any(test, feature = "webview"))]
@@ -1798,10 +1816,12 @@ impl RenderApp {
                 )
                 && self.models.is_interactive(surface_id)
             {
-                let notches = model_wheel_notches(delta);
+                let now = std::time::Instant::now();
+                let notches = self
+                    .model_wheel
+                    .notches(device, surface_id, delta, phase, now);
                 if notches != 0 {
-                    self.models
-                        .wheel(surface_id, notches, std::time::Instant::now());
+                    self.models.wheel(surface_id, notches, now);
                 }
                 self.flush_model_events();
                 return;
