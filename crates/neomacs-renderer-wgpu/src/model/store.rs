@@ -741,6 +741,33 @@ impl ModelStore {
         }
     }
 
+    /// `window` presented a frame whose composition also shows an older
+    /// picture than its fresh glyph passes (a pane morph, a frame or theme
+    /// transition, a child resize crossfade), with `fresh` what those
+    /// passes composited. The older pixels may hold any model the window
+    /// showed before at an older snapshot, which one snapshot cannot
+    /// describe (SOL-REVIEW-2 MUST 2). So every model the window showed or
+    /// now composites stays (or joins) as a member at no one rev: the fence
+    /// stays down and no pick resolves in this window until it presents a
+    /// settled frame. A model in neither is untouched.
+    pub fn presented_blended(&mut self, window: WindowKey, fresh: &BTreeMap<u32, Snapshot>) {
+        if self.hidden.contains(&window) {
+            return;
+        }
+        let ids: Vec<u32> = self.entries.keys().copied().collect();
+        for id in ids {
+            let entry = self.entries.get_mut(&id).expect("live");
+            if entry.status != ModelStatus::Ready {
+                continue;
+            }
+            if fresh.contains_key(&id) || entry.readiness.is_showing_in(window) {
+                entry.readiness.presented_unsettled(window);
+                entry.presented.remove(&window);
+                self.evaluate(id);
+            }
+        }
+    }
+
     /// `window` is deleted, or showed nothing in its last attempt: it
     /// leaves every showing set and its capture ends.
     pub fn window_gone(&mut self, window: WindowKey) {
@@ -874,6 +901,14 @@ impl ModelStore {
     pub fn cancel_capture(&mut self) {
         if let Some(capture) = self.capture {
             self.end_capture(capture.id);
+        }
+    }
+
+    /// Window `window` lost focus: the capture it holds, if any, ends (as
+    /// [`Self::cancel_capture`]); a capture held in another window stays.
+    pub fn cancel_capture_in(&mut self, window: WindowKey) {
+        if self.capture.is_some_and(|c| c.window == window) {
+            self.cancel_capture();
         }
     }
 

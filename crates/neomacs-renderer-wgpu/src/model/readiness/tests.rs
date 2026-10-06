@@ -115,3 +115,24 @@ fn nothing_is_emitted_before_anything_happened() {
     r.presented(A, 1);
     assert_eq!(r.evaluate(), Some((true, 1, 0)));
 }
+
+/// SOL-REVIEW-2 MUST 2: a member whose presentation blended an older
+/// picture in holds the fence down, at any rev, until it presents a
+/// settled frame; it stays a member meanwhile.
+#[test]
+fn an_unsettled_member_holds_the_fence_down_until_it_settles() {
+    let mut r = Readiness::default();
+    r.bump();
+    r.presented(A, 1);
+    r.presented(B, 1);
+    assert_eq!(r.evaluate(), Some((true, 1, 0)));
+    r.presented_unsettled(A);
+    assert!(r.is_showing_in(A));
+    assert_eq!(r.evaluate(), Some((false, 1, 0)));
+    r.presented(A, 1);
+    assert_eq!(r.evaluate(), Some((true, 1, 0)));
+    // Leaving clears it like any member.
+    r.presented_unsettled(A);
+    r.left(A);
+    assert_eq!(r.evaluate(), None, "B alone still holds rev 1");
+}

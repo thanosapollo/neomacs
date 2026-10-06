@@ -117,9 +117,12 @@ impl RenderApp {
     /// `WindowEvent::Occluded` for native frame `emacs_frame_id`.
     ///
     /// Occlusion is scheduling input: an occluded window presents nothing;
-    /// exposure issues exactly one recovery frame. On Wayland this event
-    /// also stands in for hidden/minimized, where frame callbacks would
-    /// otherwise stop delivering.
+    /// exposure issues exactly one recovery frame. winit sends it on X11,
+    /// macOS, iOS and the web; on Wayland it is never sent (a hidden or
+    /// minimized Wayland window just stops receiving frame callbacks), so
+    /// there the models learn of hiding only from Lisp's visibility
+    /// requests, which leave until the next presentation
+    /// ([`Self::note_models_visibility`]).
     ///
     /// An occluded window shows no model: it leaves the showing sets and
     /// its capture ends at once (both reported before any later input),
@@ -136,6 +139,23 @@ impl RenderApp {
             && let Some(window_state) = self.frame_windows.get(emacs_frame_id)
         {
             window_state.request_redraw();
+        }
+    }
+
+    /// `WindowEvent::Focused` for native frame `emacs_frame_id`, as far as
+    /// the models are concerned.
+    pub(super) fn handle_window_focus_models(&mut self, emacs_frame_id: u64, focused: bool) {
+        if focused {
+            // A focused window is shown, whether or not the window
+            // system reported its exposure (Wayland reports none).
+            self.note_models_window_shown(emacs_frame_id);
+        } else {
+            // A model orbit held in this window ends with its focus
+            // (design §4.6); one held in another window does not.
+            self.models.cancel_capture_in(emacs_frame_id);
+            // Wheel input after focus returns starts a new gesture.
+            self.model_wheel.reset();
+            self.flush_model_events();
         }
     }
 
@@ -275,14 +295,8 @@ impl RenderApp {
                     self.frame_coordinator
                         .set_focused(super::frame_sched::NativeWindowId(sched_id), focused);
                 }
-                if focused {
-                    // A focused window is shown, whether or not the window
-                    // system reported its exposure (Wayland reports none).
-                    self.note_models_window_shown(emacs_fid);
-                } else {
-                    // A model orbit ends with focus (design §4.6).
-                    self.models.cancel_capture();
-                    self.flush_model_events();
+                self.handle_window_focus_models(emacs_fid, focused);
+                if !focused {
                     // Focus left: any modifier-side observation is stale
                     // (the keys are tracked on this window's own key
                     // events), so the next ModifiersChanged must fall back

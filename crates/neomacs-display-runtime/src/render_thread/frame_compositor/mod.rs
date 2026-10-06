@@ -247,11 +247,10 @@ pub(crate) struct RetainedStatic {
     /// frame. The box color still cycles: it is recomputed from the frame
     /// sample time inside `emit_cursor_visual`, not baked here.
     pub(super) cursor_cells: Vec<RetainedCursorCell>,
-    /// Every native model this raster composited (root glyphs and child
-    /// frames alike) with the snapshot its texture showed at the build:
-    /// the raster's model provenance. A model redrawn since makes the
-    /// raster stale; a frame blitting it presents exactly these.
-    pub(super) models: crate::render_thread::models::ModelPicture,
+    /// The raster's model provenance (every model it composited, root and
+    /// child, at the snapshot drawn) and dependencies (every model its
+    /// glyphs referenced, drawable or not, as the store had it then).
+    pub(super) models: crate::render_thread::render_pass::retained_static::RetainedModels,
 }
 
 /// A retained single-glyph mini-frame for one filled-box cursor cell, plus the

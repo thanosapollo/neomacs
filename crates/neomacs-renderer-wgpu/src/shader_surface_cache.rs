@@ -188,6 +188,11 @@ pub struct ShaderSurfaceCache {
     /// composite ran at all (native model showing sets, design §6.2).
     drawn: std::collections::HashSet<u32>,
     composited: bool,
+    /// Surfaces a glyph composite reached since the last
+    /// `take_referenced`, drawn or not: a glyph naming a surface the cache
+    /// does not hold yet (a model still loading) is referenced but not
+    /// drawn. A retained raster depends on these (design §6.2).
+    referenced: std::collections::HashSet<u32>,
 }
 
 impl ShaderSurfaceCache {
@@ -241,12 +246,21 @@ impl ShaderSurfaceCache {
             fallback_channel_view,
             pressed: None,
             drawn: std::collections::HashSet::new(),
+            referenced: std::collections::HashSet::new(),
             composited: false,
         }
     }
 
     pub fn get(&self, id: u32) -> Option<&CachedShaderSurface> {
         self.surfaces.get(&id)
+    }
+
+    /// Logical and physical size of surface `id` (tests).
+    #[cfg(test)]
+    pub(crate) fn sizes(&self, id: u32) -> Option<((u32, u32), (u32, u32))> {
+        self.surfaces
+            .get(&id)
+            .map(|s| ((s.width, s.height), (s.width_px, s.height_px)))
     }
 
     /// Whether any shader surface exists at all.
@@ -256,14 +270,6 @@ impl ShaderSurfaceCache {
     /// without a single shader surface are the common case, and this lets the
     /// pointer path skip searching a frame's glyphs for one.
     #[must_use]
-    /// Logical and physical size of surface `id` (tests).
-    #[cfg(test)]
-    pub(crate) fn sizes(&self, id: u32) -> Option<((u32, u32), (u32, u32))> {
-        self.surfaces
-            .get(&id)
-            .map(|s| ((s.width, s.height), (s.width_px, s.height_px)))
-    }
-
     pub fn is_empty(&self) -> bool {
         self.surfaces.is_empty()
     }
@@ -747,6 +753,17 @@ impl ShaderSurfaceCache {
             // outside a frame where no sample exists.
             surface.active_until = Some(Instant::now() + ACTIVE_GRACE);
         }
+    }
+
+    /// A glyph composite pass reached a visible surface glyph for `id`,
+    /// whether or not the cache holds a texture for it.
+    pub fn note_referenced(&mut self, id: u32) {
+        self.referenced.insert(id);
+    }
+
+    /// The surfaces referenced since the last call.
+    pub fn take_referenced(&mut self) -> std::collections::HashSet<u32> {
+        std::mem::take(&mut self.referenced)
     }
 
     /// A glyph composite pass ran (even one drawing no surface).
