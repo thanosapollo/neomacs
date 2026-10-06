@@ -1012,6 +1012,23 @@ impl Context {
         self.push_specpdl_with(|| SpecBinding::GcRoot { value });
     }
 
+    /// Run BODY with VALUES rooted: for a Rust frame that holds them, or
+    /// ids naming them, across Lisp, as a GNU C frame holds a Lisp_Object.
+    /// The roots go however BODY returns.
+    pub(crate) fn with_specpdl_roots<T>(
+        &mut self,
+        values: &[Value],
+        body: impl FnOnce(&mut Self) -> Result<T, Flow>,
+    ) -> Result<T, Flow> {
+        let scope = self.save_specpdl_roots();
+        for &value in values {
+            self.push_specpdl_root(value);
+        }
+        let result = body(self);
+        self.restore_specpdl_roots(scope);
+        result
+    }
+
     /// Push a GcRoot whose value can be UPDATED in place: one reusable root
     /// for traversals that must keep a moving cursor (list tail, hook chain
     /// cons) alive across per-element Lisp callbacks. A single slot per

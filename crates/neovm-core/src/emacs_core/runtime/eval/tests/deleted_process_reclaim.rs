@@ -317,11 +317,12 @@ fn a_process_deleted_while_its_output_decodes_still_gets_its_output() {
                (defun dpr-post-read (len)
                  (when (get-process \"dpr\")
                    (delete-process \"dpr\")
-                   (garbage-collect))
+                   (garbage-collect)
+                   (setq dpr-collected t))
                  len)
                (define-coding-system 'dpr-test \"test\" :coding-type 'raw-text
                  :mnemonic ?T :post-read-conversion 'dpr-post-read)
-               (setq dpr-seen nil)
+               (setq dpr-seen nil dpr-collected nil)
                (make-process :name \"dpr\" :command '(\"printf\" \"hello\")
                              :coding 'dpr-test :connection-type 'pipe
                              :noquery t :sentinel #'ignore
@@ -331,17 +332,49 @@ fn a_process_deleted_while_its_output_decodes_still_gets_its_output() {
                  (while (and (null dpr-seen) (< n 50))
                    (accept-process-output nil 0.1)
                    (setq n (1+ n))))
-               dpr-seen)"
+               (list dpr-collected dpr-seen))"
         ),
-        "OK ((\"dpr\" \"hello\"))"
+        "OK (t ((\"dpr\" \"hello\")))"
     );
 }
 
-/// GNU `send_process` holds the process while it waits for a `:nowait`
-/// connection; a timer that deletes it by name and collects meanwhile
-/// leaves a deleted process, and the send signals that it is not running.
-/// GNU 32.0.50 signals exactly this for both primitives.  Without a route
-/// that keeps the connection pending there is nothing to test.
+/// A network process that stays connecting until it is deleted: it has no
+/// socket and no pending connect, so nothing but the deletion ends a wait
+/// for its connection.
+fn pending_connection(ev: &mut Context, name: &str) {
+    use crate::emacs_core::process::{ProcessCodingSystems, ProcessKindWithoutDevice};
+    use crate::heap_types::LispString;
+    let id = ev.processes.create_process_with_kind_lisp(
+        LispString::from_utf8(name),
+        Value::NIL,
+        LispString::from_utf8("network"),
+        Vec::new(),
+        ProcessKindWithoutDevice::Network,
+        ProcessCodingSystems::gnu_make_process_initial(),
+    );
+    ev.processes.get_mut(id).expect("network process").status = Value::symbol("connect");
+}
+
+/// A timer that deletes process NAME by name and collects twice, then
+/// records that it did, in `deleted-and-collected'.
+fn delete_and_collect_from_a_timer(ev: &mut Context, name: &str, secs: &str) {
+    ev.eval_str(&format!(
+        "(progn
+           (setq deleted-and-collected nil)
+           (run-at-time {secs} nil
+                        (lambda ()
+                          (delete-process \"{name}\")
+                          (garbage-collect)
+                          (garbage-collect)
+                          (setq deleted-and-collected t))))"
+    ))
+    .expect("timer");
+}
+
+/// GNU `send_process` holds the process while `wait_while_connecting`
+/// runs timers. A timer that deletes it by name and collects leaves a
+/// deleted process, and the send signals that it is not running; GNU
+/// 32.0.50 signals exactly this for both primitives.
 #[test]
 fn sending_to_a_process_deleted_while_it_connects_says_not_running() {
     for send in [
@@ -349,29 +382,58 @@ fn sending_to_a_process_deleted_while_it_connects_says_not_running() {
         "(process-send-region \"dps\" 1 2)",
     ] {
         let mut ev = crate::test_utils::runtime_startup_context();
-        let status = eval_ok(
-            &mut ev,
-            "(progn
-               (set-buffer (get-buffer-create \"dps-src\"))
-               (insert \"x\")
-               (process-status
-                (make-network-process :name \"dps\" :host \"10.255.255.1\"
-                                      :service 9 :nowait t :noquery t
-                                      :sentinel #'ignore)))",
-        );
-        if status != "OK connect" {
-            eprintln!("skipped: the connection is not pending ({status})");
-            return;
-        }
-        ev.eval_str("(run-at-time 0 nil (lambda () (delete-process \"dps\") (garbage-collect)))")
+        ev.eval_str("(progn (set-buffer (get-buffer-create \"dps-src\")) (insert \"x\"))")
             .unwrap();
+        pending_connection(&mut ev, "dps");
+        delete_and_collect_from_a_timer(&mut ev, "dps", "0");
         assert_eq!(
             eval_ok(
                 &mut ev,
-                &format!("(condition-case err (progn {send} 'sent) (error err))")
+                &format!(
+                    "(list (condition-case err (progn {send} 'sent) (error err))
+                           deleted-and-collected)"
+                )
             ),
-            "OK (error \"Process dps not running: deleted\n\")",
+            "OK ((error \"Process dps not running: deleted\n\") t)",
             "{send}"
         );
     }
+}
+
+/// GNU runs a filter with the match data saved and restores it afterwards,
+/// keeping the searched buffer object meanwhile. A filter that replaces
+/// the match data and collects leaves the saved copy the only holder of a
+/// killed searched buffer: once restored, it still names that buffer.
+/// GNU 32.0.50 gives (t "srch2").
+#[cfg(unix)]
+#[test]
+fn a_filter_that_replaces_the_match_data_keeps_the_saved_killed_buffer() {
+    let mut ev = crate::test_utils::runtime_startup_context();
+    assert_eq!(
+        eval_ok(
+            &mut ev,
+            "(progn
+               (save-current-buffer
+                 (set-buffer (get-buffer-create \"srch2\"))
+                 (insert \"abc\")
+                 (goto-char 1)
+                 (re-search-forward \"b\"))
+               (kill-buffer \"srch2\")
+               (setq md-filter-ran nil)
+               (let ((p (make-process
+                         :name \"mdf\" :command '(\"printf\" \"hi\")
+                         :connection-type 'pipe :noquery t :sentinel #'ignore
+                         :filter (lambda (_p _s)
+                                   (string-match \"x\" \"x\")
+                                   (garbage-collect)
+                                   (garbage-collect)
+                                   (setq md-filter-ran t))))
+                     (n 0))
+                 (while (and (not md-filter-ran) (< n 50))
+                   (accept-process-output p 0.1)
+                   (setq n (1+ n))))
+               (list md-filter-ran (buffer-last-name (nth 2 (match-data t)))))"
+        ),
+        "OK (t \"srch2\")"
+    );
 }

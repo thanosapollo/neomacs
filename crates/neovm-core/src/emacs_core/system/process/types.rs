@@ -8241,15 +8241,13 @@ impl super::super::eval::Context {
         ids: &[ProcessId],
         body: impl FnOnce(&mut Self) -> Result<T, Flow>,
     ) -> Result<T, Flow> {
-        let scope = self.save_specpdl_roots();
-        for &id in ids {
-            if self.processes.get_any(id).is_some() {
-                self.push_specpdl_root(Value::make_process(id));
-            }
-        }
-        let result = body(self);
-        self.restore_specpdl_roots(scope);
-        result
+        let roots: Vec<Value> = ids
+            .iter()
+            .copied()
+            .filter(|&id| self.processes.get_any(id).is_some())
+            .map(Value::make_process)
+            .collect();
+        self.with_specpdl_roots(&roots, body)
     }
 
     pub(super) fn run_process_filter_callback(

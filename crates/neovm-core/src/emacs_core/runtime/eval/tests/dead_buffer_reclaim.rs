@@ -468,10 +468,8 @@ fn a_weak_table_drops_an_unreferenced_killed_buffer_key() {
 /// for a major collection, which frees it if nothing refers to it.
 #[test]
 fn an_old_killed_buffer_waits_for_a_major_collection() {
-    unsafe { std::env::set_var("NEOVM_GC_GENERATIONAL", "1") };
-    let mut ev = Context::new();
+    let mut ev = generational_context();
     ev.gc_stress = false;
-    assert!(ev.tagged_heap.generational_enabled());
     ev.tagged_heap.set_gc_threshold(usize::MAX);
     ev.eval_str(
         "(setq old-held (list (get-buffer-create \"old-held\"))
@@ -545,5 +543,188 @@ fn a_killed_buffer_named_by_a_dump_is_not_a_root_after_loading() {
     assert!(
         ev.tagged_heap.buffer_object_reclaimed(id),
         "the loaded object of a killed buffer stayed rooted"
+    );
+}
+
+// The tests below name buffers by name or through global variables, never
+// through `let`: the evaluator keeps a `let`'s values among its temporary
+// roots for a while after the form returns, which would keep the killed
+// buffer for a reason other than the holder under test.
+
+/// The current match data holds the searched buffer object, as GNU's
+/// `last_thing_searched` does: a weak-key entry for that killed buffer
+/// stays, and is the match data's buffer. GNU 32.0.50 gives (1 t "srch").
+#[test]
+fn match_data_keeps_the_killed_buffer_object_it_searched() {
+    let mut ev = Context::new();
+    ev.eval_str(
+        "(progn
+           (setq wk (make-hash-table :weakness 'key))
+           (save-current-buffer
+             (set-buffer (get-buffer-create \"srch\"))
+             (insert \"abc\")
+             (goto-char 1)
+             (re-search-forward \"b\"))
+           (puthash (get-buffer \"srch\") t wk)
+           (kill-buffer \"srch\")
+           nil)",
+    )
+    .unwrap();
+    for _ in 0..2 {
+        churn_strings(&mut ev);
+        collect_twice(&mut ev);
+    }
+    assert_eq!(
+        eval_ok(
+            &mut ev,
+            "(let (key)
+               (maphash (lambda (k _v) (setq key k)) wk)
+               (list (hash-table-count wk)
+                     (eq key (nth 2 (match-data t)))
+                     (buffer-last-name key)))"
+        ),
+        "OK (1 t \"srch\")"
+    );
+}
+
+/// `get-buffer-create` holds the buffer it made across
+/// `buffer-list-update-hook`: a hook that kills it and collects leaves the
+/// caller that dead buffer, name kept. GNU 32.0.50 gives (t nil "nb").
+#[test]
+fn get_buffer_create_keeps_a_buffer_its_hook_kills() {
+    let mut ev = Context::new();
+    ev.eval_str(
+        "(setq ran nil
+               buffer-list-update-hook
+               (list (lambda ()
+                       (if ran nil
+                         (setq ran t)
+                         (kill-buffer \"nb\")
+                         (garbage-collect)
+                         (garbage-collect)))))",
+    )
+    .unwrap();
+    ev.eval_str("(setq r (get-buffer-create \"nb\"))").unwrap();
+    assert_eq!(
+        eval_ok(
+            &mut ev,
+            "(progn (setq buffer-list-update-hook nil)
+                    (list ran (buffer-live-p r) (buffer-last-name r)))"
+        ),
+        "OK (t nil \"nb\")"
+    );
+}
+
+/// The same for `make-indirect-buffer` and its clone hook, which runs in
+/// the new buffer. GNU 32.0.50 gives (t nil "ind").
+#[test]
+fn make_indirect_buffer_keeps_a_buffer_its_hook_kills() {
+    let mut ev = Context::new();
+    ev.eval_str(
+        "(progn
+           (get-buffer-create \"base\")
+           (setq ran nil
+                 clone-indirect-buffer-hook
+                 (list (lambda ()
+                         (if ran nil
+                           (setq ran t)
+                           (kill-buffer (buffer-name))
+                           (garbage-collect)
+                           (garbage-collect))))))",
+    )
+    .unwrap();
+    ev.eval_str("(setq r (make-indirect-buffer \"base\" \"ind\" t))")
+        .unwrap();
+    assert_eq!(
+        eval_ok(&mut ev, "(list ran (buffer-live-p r) (buffer-last-name r))"),
+        "OK (t nil \"ind\")"
+    );
+}
+
+/// `save-current-buffer` and a buffer-local `let` hold their buffers as
+/// objects on the specpdl (`record_unwind_current_buffer`, `specbind`), so
+/// buffers killed inside them keep their weak-key entries until the forms
+/// unwind. GNU 32.0.50 counts 2 inside.
+#[test]
+fn specpdl_buffer_holders_keep_killed_buffers() {
+    let mut ev = Context::new();
+    ev.eval_str(
+        "(progn
+           (setq wk (make-hash-table :weakness 'key))
+           (puthash (get-buffer-create \"sb\") t wk)
+           (puthash (get-buffer-create \"lb\") t wk)
+           (save-current-buffer
+             (set-buffer \"lb\")
+             (set (make-local-variable 'fill-column) 70))
+           (set-buffer \"sb\")
+           nil)",
+    )
+    .unwrap();
+    assert_eq!(
+        eval_ok(
+            &mut ev,
+            "(save-current-buffer
+               (set-buffer \"lb\")
+               (let ((fill-column 3))
+                 (set-buffer (get-buffer-create \"other\"))
+                 (kill-buffer \"sb\")
+                 (kill-buffer \"lb\")
+                 (garbage-collect)
+                 (garbage-collect)
+                 (hash-table-count wk)))"
+        ),
+        "OK 2"
+    );
+    collect_twice(&mut ev);
+    assert_eq!(eval_ok(&mut ev, "(hash-table-count wk)"), "OK 0");
+}
+
+/// A window configuration holds its saved current buffer as an object
+/// (`Fcurrent_window_configuration`), so that buffer, killed after the
+/// capture, keeps its weak-key entry while the configuration lives. GNU
+/// 32.0.50 counts 1.
+#[test]
+fn a_window_configuration_keeps_its_killed_current_buffer() {
+    let mut ev = crate::test_utils::runtime_startup_context();
+    ev.eval_str(
+        "(progn
+           (setq wk (make-hash-table :weakness 'key))
+           (puthash (get-buffer-create \"cfg\") t wk)
+           (setq conf (save-current-buffer
+                        (set-buffer \"cfg\")
+                        (current-window-configuration)))
+           (kill-buffer \"cfg\")
+           nil)",
+    )
+    .unwrap();
+    collect_twice(&mut ev);
+    assert_eq!(eval_ok(&mut ev, "(hash-table-count wk)"), "OK 1");
+    ev.eval_str("(setq conf nil)").unwrap();
+    collect_twice(&mut ev);
+    assert_eq!(eval_ok(&mut ev, "(hash-table-count wk)"), "OK 0");
+}
+
+/// A buffer-local variable read in a buffer caches that buffer as its
+/// binding's `where`. GNU's mark puts a binding set up for a killed buffer
+/// back to the global one (`mark_localized_symbol`), so the cache does not
+/// keep the killed buffer. GNU 32.0.50 gives (0 global).
+#[test]
+fn a_buffer_local_binding_cache_does_not_keep_a_killed_buffer() {
+    let mut ev = Context::new();
+    ev.eval_str(
+        "(progn
+           (setq wk (make-hash-table :weakness 'key))
+           (make-variable-buffer-local 'zz-blv-probe)
+           (set-default 'zz-blv-probe 'global)
+           (puthash (get-buffer-create \"blv\") t wk)
+           (save-current-buffer (set-buffer \"blv\") zz-blv-probe)
+           (kill-buffer \"blv\")
+           nil)",
+    )
+    .unwrap();
+    collect_twice(&mut ev);
+    assert_eq!(
+        eval_ok(&mut ev, "(list (hash-table-count wk) zz-blv-probe)"),
+        "OK (0 global)"
     );
 }

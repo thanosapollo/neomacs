@@ -2107,6 +2107,18 @@ impl Context {
         {
             crate::emacs_core::undo::compact_buffers_for_gc(self);
         }
+        // GNU's mark puts a buffer-local binding still set up for a killed
+        // buffer back to the global one (`mark_localized_symbol`), so the
+        // binding cache does not keep the killed buffer alive. Once per
+        // collection, before its mark: the concurrent marker may be reading
+        // these roots while it runs.
+        let mark_or_sweep_running =
+            self.tagged_heap.mark_in_progress() || self.tagged_heap.sweep_in_progress();
+        if !mark_or_sweep_running || (force_complete && !self.tagged_heap.mark_in_progress()) {
+            let buffers = &self.buffers;
+            self.obarray
+                .swap_out_killed_buffer_bindings(|id| buffers.is_killed(id));
+        }
         let start = std::time::Instant::now();
         // These two are the caches keyed on a raw heap address -- the address
         // of a lexical environment's head cons -- so a swept and recycled cons

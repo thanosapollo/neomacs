@@ -216,10 +216,14 @@ pub(crate) fn builtin_get_buffer_create(
                 let id = eval
                     .buffers
                     .create_buffer_with_hook_inhibition(&name, inhibit_buffer_hooks);
+                // GNU returns the object it made before running the hook
+                // (`Fget_buffer_create`, buffer.c), so a hook that kills
+                // the new buffer still leaves the caller that buffer.
+                let buffer = Value::make_buffer(id);
                 if !inhibit_buffer_hooks {
-                    run_buffer_list_update_hook(eval)?;
+                    eval.with_specpdl_roots(&[buffer], run_buffer_list_update_hook)?;
                 }
-                Ok(Value::make_buffer(id))
+                Ok(buffer)
             }
         }
     }
@@ -304,6 +308,20 @@ pub(crate) fn finish_make_indirect_buffer_hooks(
     eval: &mut super::eval::Context,
     plan: MakeIndirectBufferPlan,
 ) -> EvalResult {
+    // As in `Fmake_indirect_buffer` (buffer.c), the new buffer and the
+    // saved current buffer are objects held across the hooks, so a hook
+    // that kills either leaves them dead buffers, not freed ones.
+    let buffer = Value::make_buffer(plan.id);
+    let saved = plan.saved_current.map(Value::make_buffer);
+    let roots: Vec<Value> = std::iter::once(buffer).chain(saved).collect();
+    eval.with_specpdl_roots(&roots, |eval| run_make_indirect_buffer_hooks(eval, &plan))?;
+    Ok(buffer)
+}
+
+fn run_make_indirect_buffer_hooks(
+    eval: &mut super::eval::Context,
+    plan: &MakeIndirectBufferPlan,
+) -> Result<(), Flow> {
     if plan.run_clone_hook {
         eval.switch_current_buffer(plan.id)?;
         let clone_result =
@@ -316,7 +334,7 @@ pub(crate) fn finish_make_indirect_buffer_hooks(
     if !eval.buffers.buffer_hooks_inhibited(plan.id) {
         run_buffer_list_update_hook(eval)?;
     }
-    Ok(Value::make_buffer(plan.id))
+    Ok(())
 }
 
 pub(crate) fn builtin_get_buffer(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
