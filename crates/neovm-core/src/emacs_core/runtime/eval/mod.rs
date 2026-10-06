@@ -3408,6 +3408,8 @@ pub struct Context {
     /// destroyed, so update primitives refuse a destroyed or non-model
     /// handle. GC-freed handles leave no Lisp reference to refuse.
     pub(crate) live_models: std::collections::HashSet<u32>,
+    /// Native model events awaiting `neomacs-model-event-functions`.
+    pub(crate) model_events: crate::emacs_core::model::ModelEventQueue,
     /// Frontend-owned opener for additional text terminals requested by
     /// `make-terminal-frame`. The VM owns identities; platform code owns the
     /// device, raw-mode, input, renderer, and lifecycle resources.

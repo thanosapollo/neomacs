@@ -8,7 +8,7 @@
 //! `lisp/neomacs-model.el`, which maps mesh ID strings to the indices used
 //! here. Loading is asynchronous; its outcome and every later report arrive
 //! as `keyboard::InputEvent::Model` and reach Lisp through
-//! `neomacs-model-event-functions` (see [`model_event_hook_args`]).
+//! `neomacs-model-event-functions` (see [`deliver_model_event`]).
 
 mod subrs;
 #[cfg(test)]
@@ -20,8 +20,9 @@ use neomacs_display_protocol::model::{
     ModelView,
 };
 
-use super::error::{EvalResult, Flow, signal};
+use super::error::{EvalResult, Flow, FlowKind, FlowResultExt, signal};
 use super::eval::{Context, ShaderSurfaceContent, ShaderSurfaceCreateRequest};
+use super::hook_runtime::{self, HookRuntime};
 use super::value::{Value, list_to_vec};
 
 /// Largest OBJ file a model accepts (design §2), checked before loading.
@@ -467,15 +468,84 @@ pub(crate) fn model_event_plist(event: &ModelEvent) -> Value {
     }
 }
 
-/// Arguments for `run_named_hook_with_args`: the hook
-/// `neomacs-model-event-functions` and `(ID TYPE PLIST)`. An unbound or
-/// nil hook runs nothing, so events before `neomacs-model.el` loads are
-/// dropped.
-pub(crate) fn model_event_hook_args(id: u32, event: &ModelEvent) -> [Value; 4] {
-    [
-        Value::symbol("neomacs-model-event-functions"),
+/// The hook delivering model events to Lisp, each member called with
+/// `(ID TYPE PLIST)`. An unbound or nil hook runs nothing, so events
+/// before `neomacs-model.el` loads are dropped.
+const MODEL_EVENT_HOOK: &str = "neomacs-model-event-functions";
+
+/// `neomacs-model.el`'s internal hook, run with the same arguments the
+/// moment an event arrives, even while an event hook member runs. Its
+/// members only record state, so input read afterwards sees it.
+const MODEL_STATE_HOOK: &str = "neomacs-model--state-functions";
+
+/// Model events waiting for [`MODEL_EVENT_HOOK`] (design §6.1).
+#[derive(Default)]
+pub(crate) struct ModelEventQueue {
+    pending: std::collections::VecDeque<(u32, ModelEvent)>,
+    /// True while a [`deliver_model_event`] further up the stack runs the
+    /// event hook; it delivers what is queued behind its current event.
+    draining: bool,
+}
+
+/// Deliver one model event from either keyboard special-input site: run
+/// the state hook now, then the event hook for this event and every
+/// event queued behind it, oldest first. While a member runs (inside its
+/// `sit-for`, `accept-process-output` or `read-event`), a newly arrived
+/// event only updates state and waits in the queue, so no member is ever
+/// re-entered. A member's error is logged and the next member still runs;
+/// a quit or throw propagates, leaving later events queued for the next
+/// delivery.
+pub(crate) fn deliver_model_event(eval: &mut Context, id: u32, event: &ModelEvent) -> EvalResult {
+    run_model_hook(eval, MODEL_STATE_HOOK, id, event)?;
+    eval.model_events.pending.push_back((id, event.clone()));
+    if eval.model_events.draining {
+        return Ok(Value::NIL);
+    }
+    eval.model_events.draining = true;
+    let mut result = Ok(Value::NIL);
+    while let Some((id, event)) = eval.model_events.pending.pop_front() {
+        if let Err(flow) = run_model_hook(eval, MODEL_EVENT_HOOK, id, &event) {
+            result = Err(flow);
+            break;
+        }
+    }
+    eval.model_events.draining = false;
+    result
+}
+
+/// Call each member of HOOK with `(ID TYPE PLIST)`, isolating errors:
+/// like GNU's `safe_run_hooks` an error is reported as `Error in HOOK
+/// (FUNCTION): ERR`, but the member stays on the hook.
+fn run_model_hook(eval: &mut Context, hook: &str, id: u32, event: &ModelEvent) -> Result<(), Flow> {
+    let hook_sym = hook_runtime::hook_symbol_by_name(eval, hook);
+    let value = hook_runtime::hook_value_by_id(eval, hook_sym).unwrap_or(Value::NIL);
+    let funcs = hook_runtime::collect_hook_functions_in_state(eval, hook_sym, value, true);
+    if funcs.is_empty() {
+        return Ok(());
+    }
+    let args = [
         Value::fixnum(i64::from(id)),
         Value::symbol(event.kind()),
         model_event_plist(event),
-    ]
+    ];
+    eval.with_hook_root_scope(|eval| {
+        for value in funcs.iter().chain(&args).copied() {
+            eval.push_hook_root(value);
+        }
+        for func in funcs {
+            // Delivery runs outside any Lisp body, so retire each member's
+            // temps here: a handle it `let'-bound must not stay rooted
+            // (the registry's weak keys depend on it, design §6.3).
+            let result =
+                eval.with_eval_temp_root_boundary(|eval| eval.call_hook_callable(func, &args));
+            match result.kinded() {
+                Ok(_) => {}
+                Err(FlowKind::Signal(ref sig)) => {
+                    eval.report_safe_hook_error(hook_sym, func, sig)?;
+                }
+                Err(flow) => return Err(Flow::from_kind(flow)),
+            }
+        }
+        Ok(())
+    })
 }

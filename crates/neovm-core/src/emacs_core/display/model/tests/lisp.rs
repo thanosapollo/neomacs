@@ -257,8 +257,11 @@ fn callback_errors_are_logged_and_nested_events_are_queued() {
                     (push type model-test-log)
                     (when (eq type 'ready)
                       ;; An event arriving while this callback runs (as
-                      ;; inside its `sit-for') must wait for it to return.
-                      (neomacs-model--dispatch
+                      ;; inside its `sit-for') must wait for it to return,
+                      ;; even when both hooks are run for it directly.
+                      (run-hook-with-args 'neomacs-model--state-functions
+                       {FIRST_MODEL_ID} 'readiness '(:current t :rev 1 :req 0))
+                      (run-hook-with-args 'neomacs-model-event-functions
                        {FIRST_MODEL_ID} 'readiness '(:current t :rev 1 :req 0))
                       (push 'ready-end model-test-log)
                       (error "Model test boom")))))"#
@@ -598,4 +601,261 @@ fn rejected_insert_preserves_attachment_and_callbacks_use_that_buffer() {
         *host.destroys.lock().expect("destroys"),
         vec![FIRST_MODEL_ID]
     );
+}
+
+/// Queue `events` as frontend input, as the render thread's ordered input
+/// channel delivers them: model events and keys interleaved.
+fn queue_input(ctx: &mut Context, events: Vec<crate::keyboard::InputEvent>) {
+    for event in events {
+        ctx.command_loop
+            .keyboard
+            .pending_input_events
+            .push_back(event);
+    }
+}
+
+fn model_input(event: ModelEvent) -> crate::keyboard::InputEvent {
+    crate::keyboard::InputEvent::Model {
+        id: FIRST_MODEL_ID,
+        event,
+    }
+}
+
+fn key_input(c: char) -> crate::keyboard::InputEvent {
+    crate::keyboard::InputEvent::key_press(crate::keyboard::KeyEvent::char(c))
+}
+
+/// A ready, current `model-test-m` whose callback logs `(TYPE NESTED)`
+/// and, for a `view' event, runs WAIT (a nested wait or input reader)
+/// and logs `(key KEY CURRENT-P)` for the key it then reads. Two more
+/// members follow `neomacs-model--dispatch' on the event hook: one that
+/// always signals and one that logs `(hook TYPE NESTED)`.
+fn nested_delivery_context(test: &str, wait: &str) -> Context {
+    let (mut ctx, _host) = lisp_context(test);
+    create_model(&mut ctx);
+    deliver(
+        &mut ctx,
+        ModelEvent::Ready {
+            triangles: vec![1, 1],
+        },
+    );
+    readiness(&mut ctx, true, 1, 0);
+    assert_eq!(current_p(&mut ctx), "t");
+    eval_printed(
+        &mut ctx,
+        &format!(
+            r#"(progn
+             (defvar model-test-active nil)
+             (setq model-test-log nil model-test-hooks nil)
+             (setf (neomacs-model--entry-callback
+                    (neomacs-model--entry model-test-m))
+                   (lambda (model type _plist)
+                     (push (list type model-test-active) model-test-log)
+                     (when (eq type 'view)
+                       (let ((model-test-active t))
+                         {wait}
+                         (let ((key (read-event)))
+                           (push (list 'key key (neomacs-model-current-p model))
+                                 model-test-log))))))
+             (add-hook 'neomacs-model-event-functions
+                       (lambda (_id _type _plist) (error "Model test hook boom"))
+                       t)
+             (add-hook 'neomacs-model-event-functions
+                       (lambda (_id type _plist)
+                         (push (list 'hook type model-test-active)
+                               model-test-hooks))
+                       t))"#
+        ),
+    );
+    ctx
+}
+
+/// The view event's callback waits; behind it on the channel come
+/// R{nil} and then the key it reads.
+fn nested_delivery_input() -> Vec<crate::keyboard::InputEvent> {
+    vec![
+        model_input(ModelEvent::View {
+            view: ModelView {
+                yaw: 30.0,
+                pitch: 0.0,
+                zoom: 1.0,
+            },
+            rev: 2,
+        }),
+        model_input(ModelEvent::Readiness {
+            current: false,
+            rev: 3,
+            req: 0,
+        }),
+        key_input('x'),
+        key_input('y'),
+    ]
+}
+
+fn assert_nested_delivery(ctx: &mut Context, log: &str) {
+    // The callback for R{nil} ran after the view callback returned, but
+    // the key read inside it already saw R{nil}: current-p is nil.
+    assert_eq!(eval_printed(ctx, "(reverse model-test-log)"), log);
+    // Every member saw both events, in order, none nested; the signalling
+    // member stopped neither the others nor the delivery.
+    assert_eq!(
+        eval_printed(ctx, "(reverse model-test-hooks)"),
+        "((hook view nil) (hook readiness nil))"
+    );
+    assert_eq!(
+        eval_printed(
+            ctx,
+            r#"(with-current-buffer (messages-buffer)
+                 (let ((n 0) (start 0))
+                   (while (string-match "Model test hook boom" (buffer-string) start)
+                     (setq n (1+ n) start (match-end 0)))
+                   n))"#
+        ),
+        "2",
+        "each member error is logged to *Messages*"
+    );
+    assert_eq!(current_p(ctx), "nil");
+}
+
+#[test]
+fn nested_input_reader_sees_readiness_queued_behind_the_callback() {
+    // Route: the read-event path (`handle_read_char_input_event`).
+    let mut ctx = nested_delivery_context("lisp-nested-read", "nil");
+    queue_input(&mut ctx, nested_delivery_input());
+    assert_eq!(eval_printed(&mut ctx, "(read-event)"), "121");
+    assert_nested_delivery(&mut ctx, "((view nil) (key 120 nil) (readiness nil))");
+}
+
+#[test]
+fn nested_wait_sees_readiness_queued_behind_the_callback() {
+    // Route: special input serviced inside a wait
+    // (`service_wait_request_special_input_events`), both for the outer
+    // delivery and inside the callback.
+    let mut ctx = nested_delivery_context(
+        "lisp-nested-wait",
+        "(accept-process-output nil 0.05)
+         (push (list 'waited (neomacs-model-current-p model)) model-test-log)",
+    );
+    queue_input(&mut ctx, nested_delivery_input());
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            "(progn (accept-process-output nil 0.05) (read-event))"
+        ),
+        "121"
+    );
+    assert_nested_delivery(
+        &mut ctx,
+        "((view nil) (waited nil) (key 120 nil) (readiness nil))",
+    );
+}
+
+#[test]
+fn renderer_loss_makes_current_p_nil_before_a_later_key() {
+    let (mut ctx, host) = lisp_context("lisp-renderer-loss");
+    create_model(&mut ctx);
+    deliver(
+        &mut ctx,
+        ModelEvent::Ready {
+            triangles: vec![1, 1],
+        },
+    );
+    readiness(&mut ctx, true, 1, 0);
+    assert_eq!(current_p(&mut ctx), "t");
+
+    // Loss reported only through availability (no readiness event yet):
+    // the key read afterwards must not see the old acknowledgement.
+    host.live.store(false, std::sync::atomic::Ordering::SeqCst);
+    queue_input(&mut ctx, vec![key_input('x')]);
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            "(list (read-event) (neomacs-model-current-p model-test-m) \
+             (neomacs-model-available-p))"
+        ),
+        "(120 nil nil)"
+    );
+    // The store's R{nil} at loss, then a later key, still no renderer.
+    queue_input(
+        &mut ctx,
+        vec![
+            model_input(ModelEvent::Readiness {
+                current: false,
+                rev: 2,
+                req: 0,
+            }),
+            key_input('y'),
+        ],
+    );
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            "(list (read-event) (neomacs-model-current-p model-test-m))"
+        ),
+        "(121 nil)"
+    );
+    // A replacement renderer alone does not revive the pre-loss level ...
+    host.live.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(current_p(&mut ctx), "nil");
+    // ... its re-upload and presentation do.
+    readiness(&mut ctx, false, 3, 0);
+    assert_eq!(current_p(&mut ctx), "nil");
+    readiness(&mut ctx, true, 3, 0);
+    assert_eq!(current_p(&mut ctx), "t");
+}
+
+#[test]
+fn weak_registry_collects_a_callback_to_handle_cycle() {
+    let (mut ctx, host) = lisp_context("lisp-registry-gc");
+    // The callback closes over its own handle: the registry value refers
+    // to its key. Only `model-test-keep' holds the handle from outside.
+    eval_printed(
+        &mut ctx,
+        r#"(progn
+             (setq model-test-keep
+                   (let ((model (neomacs-model-create
+                                 :meshes (list (list "a" model-test-a)))))
+                     (setf (neomacs-model--entry-callback
+                            (neomacs-model--entry model))
+                           (lambda (m type _plist)
+                             (push (list type (eq m model)) model-test-log)))
+                     model))
+             nil)"#,
+    );
+    eval_printed(&mut ctx, "(garbage-collect)");
+    assert!(
+        host.destroys.lock().expect("destroys").is_empty(),
+        "GC freed a model still reachable from a global"
+    );
+    assert_eq!(
+        eval_printed(&mut ctx, "(hash-table-count neomacs-model--registry)"),
+        "1"
+    );
+    // Still reachable: the callback still runs.
+    deliver(&mut ctx, ModelEvent::Ready { triangles: vec![1] });
+    assert_eq!(eval_printed(&mut ctx, "model-test-log"), "((ready t))");
+    assert!(ctx.live_models.contains(&FIRST_MODEL_ID));
+
+    // Unreachable apart from the cycle: collected, its surface freed.
+    eval_printed(&mut ctx, "(setq model-test-keep nil)");
+    eval_printed(&mut ctx, "(garbage-collect)");
+    assert_eq!(
+        *host.destroys.lock().expect("destroys"),
+        vec![FIRST_MODEL_ID]
+    );
+    assert!(!ctx.live_models.contains(&FIRST_MODEL_ID));
+    assert_eq!(
+        eval_printed(&mut ctx, "(hash-table-count neomacs-model--registry)"),
+        "0"
+    );
+    // Later events for its id are dropped.
+    deliver(
+        &mut ctx,
+        ModelEvent::Readiness {
+            current: true,
+            rev: 1,
+            req: 0,
+        },
+    );
+    assert_eq!(eval_printed(&mut ctx, "model-test-log"), "((ready t))");
 }

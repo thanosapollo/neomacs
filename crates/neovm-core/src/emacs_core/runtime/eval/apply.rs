@@ -1040,9 +1040,20 @@ impl Context {
         }
     }
 
-    #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
     pub(super) fn restore_eval_temp_roots(&mut self, scope: EvalTempRootScopeState) {
         self.eval_temp_roots.truncate(scope.saved_len);
+    }
+
+    /// Run F, a Rust-level call into Lisp, then retire the eval temp roots
+    /// it left behind. A function body is not a sequence frame, so the
+    /// temps of a `let` directly in it stay rooted after it returns until
+    /// an enclosing sequence retires them; called from outside any (an
+    /// input event's hook), nothing ever does.
+    pub(crate) fn with_eval_temp_root_boundary<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let scope = self.save_eval_temp_roots();
+        let result = f(self);
+        self.restore_eval_temp_roots(scope);
+        result
     }
 
     /// A special form returned: its temps stay visible to the rest of the

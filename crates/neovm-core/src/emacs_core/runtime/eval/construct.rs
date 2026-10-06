@@ -2263,6 +2263,7 @@ impl Context {
             scroll_goal: None,
             display_host: None,
             live_models: std::collections::HashSet::new(),
+            model_events: Default::default(),
             tty_frame_host_factory: None,
             visual_config: neomacs_display_protocol::VisualConfig::default(),
             pending_menu_bar_popup_anchor: None,

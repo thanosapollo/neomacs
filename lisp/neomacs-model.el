@@ -69,8 +69,19 @@
 (defvar neomacs-model-event-functions nil
   "Abnormal hook run for each native model event.
 Each function is called with (ID TYPE PLIST): the integer surface
-id, the event symbol and its plist.  `neomacs-model--dispatch' is
-the member that serves `neomacs-model-create' callbacks.")
+id, the event symbol and its plist.  Events are delivered in order
+and never nested: one arriving while a member runs (for example
+inside its `sit-for') waits until every member has handled the
+current one.  A member's error is logged and the others still run.
+`neomacs-model--dispatch' is the member that serves
+`neomacs-model-create' callbacks.")
+
+(defvar neomacs-model--state-functions nil
+  "Internal hook run with (ID TYPE PLIST) as soon as an event arrives.
+Unlike `neomacs-model-event-functions' it also runs while a member
+of that hook is active, so input read afterwards always sees the
+event's effect on the model state.  Members must only record
+state: never call user code, wait or read input.")
 
 ;;;; Registry
 
@@ -268,15 +279,20 @@ One of (loading), (ready :triangles (N ...) :meshes (ID ...)),
 
 (defun neomacs-model-current-p (model)
   "Return non-nil if MODEL shows its latest content everywhere.
-That is: loaded, not frozen, no interaction in progress, and the
-renderer's last readiness settles the latest request and reports
-the latest picture presented in every window showing MODEL."
-  (let* ((entry (neomacs-model--entry model))
-         (readiness (neomacs-model--entry-readiness entry)))
-    (and (eq (car (neomacs-model--entry-status entry)) 'ready)
-         (not (neomacs-model--entry-frozen entry))
-         (car readiness)
-         (eql (nth 2 readiness) (neomacs-model--entry-issued entry)))))
+That is: loaded, not frozen, a renderer live, no interaction in
+progress, and the renderer's last readiness settles the latest
+request and reports the latest picture presented in every window
+showing MODEL."
+  (let ((entry (neomacs-model--entry model)))
+    ;; A lost renderer presents nothing: its last readiness is void even
+    ;; after a replacement starts, until that one reports again.
+    (unless (neomacs-model-available-p)
+      (setf (neomacs-model--entry-readiness entry) nil))
+    (let ((readiness (neomacs-model--entry-readiness entry)))
+      (and (eq (car (neomacs-model--entry-status entry)) 'ready)
+           (not (neomacs-model--entry-frozen entry))
+           (car readiness)
+           (eql (nth 2 readiness) (neomacs-model--entry-issued entry))))))
 
 ;;;; Destruction
 
@@ -301,41 +317,16 @@ the latest picture presented in every window showing MODEL."
 ;;;; Events
 
 (defvar neomacs-model--queue nil
-  "Model events (ID TYPE PLIST) waiting to be handled, oldest first.")
+  "Callbacks (ID TYPE PLIST) waiting to run, oldest first.
+By id, so a queued callback does not keep its model alive.")
 
 (defvar neomacs-model--draining nil
-  "Non-nil while `neomacs-model--dispatch' drains the queue.")
+  "Non-nil while `neomacs-model--dispatch' runs callbacks.")
 
-(defun neomacs-model--dispatch (id type plist)
-  "Queue the model event (ID TYPE PLIST) and handle the queue.
-An event that arrives while a callback runs (for example inside its
-`sit-for') is queued behind it instead of dispatched nested."
-  (setq neomacs-model--queue
-        (nconc neomacs-model--queue (list (list id type plist))))
-  (unless neomacs-model--draining
-    (let ((neomacs-model--draining t))
-      (while neomacs-model--queue
-        (let ((event (pop neomacs-model--queue)))
-          (condition-case err
-              (apply #'neomacs-model--handle event)
-            (error (message "neomacs-model: event %S failed: %S"
-                            (nth 1 event) err))))))))
-
-(add-hook 'neomacs-model-event-functions #'neomacs-model--dispatch)
-
-(defun neomacs-model--pick-plist (entry plist)
-  "Return pick PLIST with its hit mesh index mapped to ENTRY's mesh ID."
-  (let ((hit (plist-get plist :hit))
-        (copy (copy-sequence plist)))
-    (when hit
-      (setq hit (copy-sequence hit))
-      (plist-put hit :mesh (aref (neomacs-model--entry-mesh-ids entry)
-                                 (plist-get hit :mesh)))
-      (plist-put copy :hit hit))
-    copy))
-
-(defun neomacs-model--handle (id type plist)
-  "Apply the model event (ID TYPE PLIST) and run its callback."
+(defun neomacs-model--note (id type plist)
+  "Apply the model event (ID TYPE PLIST) and queue its callback.
+Runs as soon as the event arrives, even inside a callback, so it
+only records state; `neomacs-model--dispatch' runs the callback."
   (let* ((model (neomacs-model--find id))
          (entry (and model (gethash model neomacs-model--registry))))
     (when (and entry
@@ -373,15 +364,46 @@ An event that arrives while a callback runs (for example inside its
                          (nth 1 (neomacs-model--entry-readiness entry)))
                     (neomacs-model--pick-plist entry plist)))
          (unless plist (setq type nil))))
-      (when type
-        (neomacs-model--run-callback model entry type plist)))))
+      (when (and type (neomacs-model--entry-callback entry))
+        (setq neomacs-model--queue
+              (nconc neomacs-model--queue (list (list id type plist))))))))
 
-(defun neomacs-model--run-callback (model entry type plist)
-  "Call ENTRY's callback with (MODEL TYPE PLIST), logging any error.
-The attached buffer is current while it is live."
-  (let ((callback (neomacs-model--entry-callback entry))
-        (buffer (neomacs-model--entry-buffer entry)))
-    (when callback
+(add-hook 'neomacs-model--state-functions #'neomacs-model--note)
+
+(defun neomacs-model--dispatch (&rest _event)
+  "Run the queued model callbacks, oldest first.
+A member of `neomacs-model-event-functions'; the queue holds the
+callbacks of the events `neomacs-model--note' recorded.  An event
+that arrives while a callback runs (for example inside its
+`sit-for') has its callback run after it instead of nested."
+  (unless neomacs-model--draining
+    (let ((neomacs-model--draining t))
+      (while neomacs-model--queue
+        (apply #'neomacs-model--run-callback (pop neomacs-model--queue))))))
+
+(add-hook 'neomacs-model-event-functions #'neomacs-model--dispatch)
+
+(defun neomacs-model--pick-plist (entry plist)
+  "Return pick PLIST with its hit mesh index mapped to ENTRY's mesh ID."
+  (let ((hit (plist-get plist :hit))
+        (copy (copy-sequence plist)))
+    (when hit
+      (setq hit (copy-sequence hit))
+      (plist-put hit :mesh (aref (neomacs-model--entry-mesh-ids entry)
+                                 (plist-get hit :mesh)))
+      (plist-put copy :hit hit))
+    copy))
+
+(defun neomacs-model--run-callback (id type plist)
+  "Call the callback of model ID with (MODEL TYPE PLIST), logging any error.
+Nothing runs once MODEL is destroyed.  The attached buffer is
+current while it is live."
+  (let* ((model (neomacs-model--find id))
+         (entry (and model (gethash model neomacs-model--registry)))
+         (callback (and entry (neomacs-model--entry-callback entry)))
+         (buffer (and entry (neomacs-model--entry-buffer entry))))
+    (when (and callback
+               (not (eq (car (neomacs-model--entry-status entry)) 'destroyed)))
       (condition-case err
           (if (buffer-live-p buffer)
               (with-current-buffer buffer

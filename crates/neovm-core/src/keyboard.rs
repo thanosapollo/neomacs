@@ -4332,17 +4332,16 @@ impl crate::emacs_core::eval::Context {
     }
 
     /// Deliver one native model event to Lisp: run
-    /// `neomacs-model-event-functions` with `(ID TYPE PLIST)`
-    /// (`model::model_event_hook_args`). Queueing, reentrancy and callback
-    /// error isolation are `neomacs-model.el`'s job; an unbound hook (the
+    /// `neomacs-model-event-functions` with `(ID TYPE PLIST)`, queued
+    /// behind any delivery already running and with each member's errors
+    /// isolated (`model::deliver_model_event`). An unbound hook (the
     /// library not loaded) runs nothing.
     pub(crate) fn handle_model_input_event(
         &mut self,
         id: u32,
         event: &neomacs_display_protocol::model::ModelEvent,
     ) -> crate::emacs_core::error::EvalResult {
-        let args = crate::emacs_core::model::model_event_hook_args(id, event);
-        crate::emacs_core::hook_runtime::run_named_hook_with_args(self, &args)
+        crate::emacs_core::model::deliver_model_event(self, id, event)
     }
 
     fn handle_terminal_exited_input_event(
