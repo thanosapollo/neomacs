@@ -2748,6 +2748,13 @@ pub enum ShaderSurfaceContent {
     Pixels {
         data: Vec<u8>,
     },
+    /// Native model view (vertical slice): absolute OBJ paths drawn with
+    /// the canvas-3d camera `[yaw, pitch, zoom]` on an sRGB RGBA background.
+    Model {
+        meshes: Vec<String>,
+        view: [f64; 3],
+        background: [f32; 4],
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

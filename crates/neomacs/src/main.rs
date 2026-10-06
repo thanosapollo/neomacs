@@ -2581,6 +2581,15 @@ impl DisplayHost for PrimaryWindowDisplayHost {
                 }
             }
             ShaderSurfaceContent::Pixels { data } => SurfaceSource::Pixels { data },
+            ShaderSurfaceContent::Model {
+                meshes,
+                view: [yaw, pitch, zoom],
+                background,
+            } => SurfaceSource::Model {
+                meshes: meshes.into_iter().map(std::path::PathBuf::from).collect(),
+                view: neomacs_display_runtime::model::ModelView { yaw, pitch, zoom },
+                background,
+            },
         };
         let surface_id = next_host_surface_id();
         self.send_render_command(

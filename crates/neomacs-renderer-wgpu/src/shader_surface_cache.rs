@@ -495,6 +495,60 @@ impl ShaderSurfaceCache {
         Ok((width, height))
     }
 
+    /// Install an already-rendered texture (a native model view, design
+    /// §4.1) as surface `id`, so both composite paths sample it unchanged.
+    /// Like pixel surfaces it has no pipeline, so DPI rescale leaves it as is.
+    /// A rejected composite bind group is an error and installs nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_rendered(
+        &mut self,
+        device: &wgpu::Device,
+        composite_layout: &wgpu::BindGroupLayout,
+        composite_sampler: &wgpu::Sampler,
+        id: u32,
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        (width, height): (u32, u32),
+        (width_px, height_px): (u32, u32),
+    ) -> Result<(), String> {
+        let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let composite_bind_group =
+            Self::composite_bind_group(device, composite_layout, composite_sampler, &view);
+        let rejected = pollster::block_on(validation.pop());
+        let exhausted = pollster::block_on(oom.pop());
+        if let Some(error) = rejected.or(exhausted) {
+            return Err(format!("composite bind group rejected: {error}"));
+        }
+        self.surfaces.insert(
+            id,
+            CachedShaderSurface {
+                texture,
+                view,
+                composite_bind_group,
+                pipeline: None,
+                uniform_buffer: None,
+                channel0: None,
+                uniform_slots: HashMap::new(),
+                custom: [[0.0; 4]; SURFACE_USER_UNIFORM_SLOTS],
+                mouse: [0.0; 4],
+                elapsed: 0.0,
+                frame_index: 0,
+                animate: false,
+                fps: None,
+                last_render: None,
+                dirty: false,
+                active_until: None,
+                width,
+                height,
+                width_px,
+                height_px,
+                scale: 1.0,
+            },
+        );
+        Ok(())
+    }
+
     /// Resample every shader surface's render target to a new scale factor
     /// (DPI change / monitor move). Physical size is recomputed from the
     /// retained logical size EXACTLY as `create_shader` would at the new

@@ -454,6 +454,13 @@ pub enum SurfaceSource {
     },
     /// Raw RGBA8 pixels, row-major, tightly packed.
     Pixels { data: Vec<u8> },
+    /// Native model view: OBJ meshes drawn by the renderer's mesh pass.
+    Model {
+        meshes: Vec<std::path::PathBuf>,
+        view: neomacs_renderer_wgpu::model::ModelView,
+        /// sRGB RGBA background (a face colour; alpha linear).
+        background: [f32; 4],
+    },
 }
 
 /// Asset and embedded-content commands.

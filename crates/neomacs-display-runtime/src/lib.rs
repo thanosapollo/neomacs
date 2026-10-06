@@ -58,6 +58,11 @@ pub mod shader_surface {
     pub use neomacs_renderer_wgpu::shader_surface::*;
 }
 
+/// Native model view types the frontend passes in `SurfaceSource::Model`.
+pub mod model {
+    pub use neomacs_renderer_wgpu::model::ModelView;
+}
+
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

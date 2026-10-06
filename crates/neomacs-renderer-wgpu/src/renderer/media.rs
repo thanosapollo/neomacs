@@ -497,6 +497,71 @@ impl WgpuRenderer {
         Ok(())
     }
 
+    /// Create surface `id` showing the OBJ meshes at `paths` (vertical slice
+    /// of the native model view, design §9 S2): load, upload, draw once with
+    /// `view` on `background` (sRGB RGBA, like a face colour), and install the
+    /// result as a surface texture of `width` x `height` logical pixels.
+    ///
+    /// Slice limits, lifted by S2–S4: the load runs on the render thread (no
+    /// loader thread), the picture is static (no view updates or picking),
+    /// and only the resolved colour bytes are budgeted.
+    pub fn create_model_surface(
+        &mut self,
+        id: u32,
+        paths: &[std::path::PathBuf],
+        view: crate::model::ModelView,
+        background: [f32; 4],
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        use crate::model::{ModelGpu, ModelScene, read_obj_file, remaining_limits};
+        let view = view.validated()?;
+        if paths.is_empty() || paths.len() > crate::model::MAX_MODEL_MESHES {
+            return Err(format!("model {id}: needs 1..=255 meshes"));
+        }
+        let never = || false;
+        let mut meshes = Vec::with_capacity(paths.len());
+        for path in paths {
+            let mesh = read_obj_file(path, None, remaining_limits(&meshes), &never)
+                .map_err(|e| format!("model {id}: {}: {e}", path.display()))?;
+            meshes.push(mesh);
+        }
+        let scene = ModelScene::new(meshes).map_err(|e| format!("model {id}: {e}"))?;
+        let (width_px, height_px) = crate::model::model_target_px(
+            width,
+            height,
+            self.scale_factor,
+            crate::model::MAX_MODEL_EDGE_PX,
+        );
+        let gpu = ModelGpu::new(&self.device, &self.queue, &scene, width_px, height_px)
+            .map_err(|e| format!("model {id}: {e}"))?;
+        gpu.render(&self.device, &self.queue, &view, None, background)
+            .map_err(|e| format!("model {id}: {e}"))?;
+        let layout = self.caches.image.bind_group_layout();
+        let sampler = self.caches.image.sampler();
+        let (texture, texture_view) = gpu.into_texture();
+        self.caches
+            .surface
+            .insert_rendered(
+                &self.device,
+                layout,
+                sampler,
+                id,
+                texture,
+                texture_view,
+                (width, height),
+                (width_px, height_px),
+            )
+            .map_err(|e| format!("model {id}: {e}"))?;
+        self.register_surface_bytes(id, width_px, height_px, false);
+        tracing::info!(
+            "model surface {id}: {} meshes, {} triangles, {width_px}x{height_px}px",
+            scene.meshes.len(),
+            scene.triangle_count()
+        );
+        Ok(())
+    }
+
     /// Register a created surface's physical bytes and run the eviction
     /// driver: over budget, free least-recently-used *recreatable* surfaces
     /// (declarative specs re-resolve on the next redisplay walk). One victim

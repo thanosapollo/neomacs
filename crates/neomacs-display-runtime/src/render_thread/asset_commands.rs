@@ -396,6 +396,12 @@ impl RenderApp {
                         crate::thread_comm::SurfaceSource::Pixels { data } => {
                             renderer.create_pixel_surface(id, data, width, height)
                         }
+                        crate::thread_comm::SurfaceSource::Model {
+                            meshes,
+                            view,
+                            background,
+                        } => renderer
+                            .create_model_surface(id, meshes, *view, *background, width, height),
                     };
                     if let Err(err) = result {
                         tracing::warn!("shader surface {id} create failed: {err}");
