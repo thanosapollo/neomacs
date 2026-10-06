@@ -120,6 +120,30 @@ impl RenderApp {
         self.flush_model_events();
     }
 
+    /// Lisp asked to show, hide or iconify window `emacs_frame_id`.
+    /// `platform_reports_hiding`: whether the window system can tell us
+    /// the window's visibility.
+    pub(super) fn note_models_visibility(
+        &mut self,
+        emacs_frame_id: u64,
+        visibility: crate::thread_comm::WindowVisibility,
+        platform_reports_hiding: bool,
+    ) {
+        let _ = platform_reports_hiding;
+        // Hidden and iconified frames show no model (design §6.2).
+        // The window system may report neither, so act on the
+        // request itself.
+        match visibility {
+            crate::thread_comm::WindowVisibility::Visible => {
+                self.note_models_window_shown(emacs_frame_id);
+            }
+            crate::thread_comm::WindowVisibility::Iconified
+            | crate::thread_comm::WindowVisibility::Invisible => {
+                self.note_models_window_hidden(emacs_frame_id);
+            }
+        }
+    }
+
     /// Window `emacs_frame_id` is shown again: its next presentation
     /// rejoins the showing sets.
     pub(super) fn note_models_window_shown(&mut self, emacs_frame_id: u64) {

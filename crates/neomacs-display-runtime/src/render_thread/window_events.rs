@@ -139,6 +139,20 @@ impl RenderApp {
         }
     }
 
+    /// `WindowEvent::Focused` for native frame `emacs_frame_id`, as far as
+    /// the models are concerned.
+    pub(super) fn handle_window_focus_models(&mut self, emacs_frame_id: u64, focused: bool) {
+        if focused {
+            // A focused window is shown, whether or not the window
+            // system reported its exposure (Wayland reports none).
+            self.note_models_window_shown(emacs_frame_id);
+        } else {
+            // A model orbit ends with focus (design §4.6).
+            self.models.cancel_capture();
+            self.flush_model_events();
+        }
+    }
+
     pub(super) fn handle_window_event(
         &mut self,
         event_loop: &dyn ActiveEventLoop,
@@ -275,14 +289,8 @@ impl RenderApp {
                     self.frame_coordinator
                         .set_focused(super::frame_sched::NativeWindowId(sched_id), focused);
                 }
-                if focused {
-                    // A focused window is shown, whether or not the window
-                    // system reported its exposure (Wayland reports none).
-                    self.note_models_window_shown(emacs_fid);
-                } else {
-                    // A model orbit ends with focus (design §4.6).
-                    self.models.cancel_capture();
-                    self.flush_model_events();
+                self.handle_window_focus_models(emacs_fid, focused);
+                if !focused {
                     // Focus left: any modifier-side observation is stale
                     // (the keys are tracked on this window's own key
                     // events), so the next ModifiersChanged must fall back

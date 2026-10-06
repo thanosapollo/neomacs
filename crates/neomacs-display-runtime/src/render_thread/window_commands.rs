@@ -162,18 +162,7 @@ impl RenderApp {
                         emacs_frame_id
                     );
                 }
-                // Hidden and iconified frames show no model (design §6.2).
-                // The window system may report neither, so act on the
-                // request itself.
-                match visibility {
-                    crate::thread_comm::WindowVisibility::Visible => {
-                        self.note_models_window_shown(emacs_frame_id);
-                    }
-                    crate::thread_comm::WindowVisibility::Iconified
-                    | crate::thread_comm::WindowVisibility::Invisible => {
-                        self.note_models_window_hidden(emacs_frame_id);
-                    }
-                }
+                self.note_models_visibility(emacs_frame_id, visibility, true);
             }
             WindowCommand::SetWindowPosition { x, y } => {
                 if let Some(window) = self

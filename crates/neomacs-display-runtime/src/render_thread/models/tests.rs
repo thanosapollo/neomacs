@@ -83,6 +83,13 @@ pub(super) fn app_with_channel() -> (RenderApp, EmacsComms) {
 /// Model `MODEL` created from a real OBJ file and loaded through the real
 /// loader thread, uploaded and drawn by `host`.
 pub(super) fn with_ready_model(app: &mut RenderApp, host: &mut FakeHost) {
+    create_model(app);
+    finish_loading(app, host);
+}
+
+/// Model `MODEL` created from a real OBJ file: its load is queued on the
+/// real loader thread, and it is still loading.
+pub(super) fn create_model(app: &mut RenderApp) {
     let dir = std::env::temp_dir().join(format!(
         "neomacs-model-runtime-{}-{:?}",
         std::process::id(),
@@ -102,6 +109,10 @@ pub(super) fn with_ready_model(app: &mut RenderApp, host: &mut FakeHost) {
         [0.0, 0.0, 0.0, 1.0],
         (64, 32),
     );
+}
+
+/// Wait for `MODEL`'s load, then upload and draw it with `host`.
+pub(super) fn finish_loading(app: &mut RenderApp, host: &mut FakeHost) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while app.models.status(MODEL) == Some(ModelStatus::Loading) {
         assert!(Instant::now() < deadline, "model load timed out");
@@ -532,49 +543,24 @@ fn model_events(emacs: &EmacsComms) -> Vec<InputEvent> {
 
 /// current -> renderer loss -> a key typed afterwards: the evaluator sees
 /// `Readiness{current: nil}` before that key, with no replacement renderer.
+/// Runs on the fake GPU host: the ordering is the render thread's, not the
+/// device's, so no adapter is needed (OPUS-REVIEW SHOULD 4).
 #[test]
 fn renderer_loss_reaches_the_input_channel_before_a_later_key() {
-    let Ok(renderer) = neomacs_renderer_wgpu::WgpuRenderer::new(None, 64, 64) else {
-        assert!(
-            std::env::var_os("NEOMACS_MODEL_REQUIRE_EVIDENCE").is_none(),
-            "GPU evidence required but no headless wgpu adapter"
-        );
-        eprintln!("SKIP: no GPU adapter");
-        return;
-    };
     let (mut app, emacs) = app_with_channel();
-    app.renderer = Some(renderer);
-    let dir = std::env::temp_dir().join(format!("neomacs-runtime-model-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("triangle.obj");
-    std::fs::write(&path, b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
-
-    app.handle_model_create(
-        5,
-        vec![ModelMeshSpec { path, sha256: None }],
-        ModelView::default(),
-        [0.0, 0.0, 0.0, 1.0],
-        (32, 32),
-    );
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while app.models.status(5) == Some(ModelStatus::Loading) {
-        assert!(Instant::now() < deadline, "the load never finished");
-        std::thread::sleep(Duration::from_millis(5));
-        app.service_models(neomacs_display_protocol::frame_time::observe_platform_now());
-    }
-    app.render_dirty_models();
-    present(&mut app, 1);
-    app.flush_model_events();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    present(&mut app, A);
     let current = model_events(&emacs);
     assert!(
         matches!(
             current.last(),
             Some(InputEvent::Model {
-                id: 5,
+                id: MODEL,
                 event: ModelEvent::Readiness { current: true, .. }
             })
         ),
-        "current before the loss"
+        "current before the loss, got {current:?}"
     );
 
     app.renderer = None;
@@ -583,7 +569,7 @@ fn renderer_loss_reaches_the_input_channel_before_a_later_key() {
         key: neovm_core::keyboard::FrontendKey::Character('x'),
         modifiers: 0,
         pressed: true,
-        emacs_frame_id: 1,
+        emacs_frame_id: A,
     });
     let after = model_events(&emacs);
     assert!(
@@ -591,7 +577,7 @@ fn renderer_loss_reaches_the_input_channel_before_a_later_key() {
             after.as_slice(),
             [
                 InputEvent::Model {
-                    id: 5,
+                    id: MODEL,
                     event: ModelEvent::Readiness { current: false, .. }
                 },
                 InputEvent::Key { .. } | InputEvent::Observed { .. } | InputEvent::Tracked { .. }
@@ -599,7 +585,6 @@ fn renderer_loss_reaches_the_input_channel_before_a_later_key() {
         ),
         "R{{nil}} must precede the later key, got {after:?}"
     );
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 // ----------------------------------------------------------------------
@@ -675,4 +660,134 @@ fn sub_notch_input_keeps_the_wheel_burst_active() {
     app.models.tick(ms(100) + WHEEL_QUIET, None);
     app.flush_model_events();
     assert_eq!(delivered(&emacs), ["View{2}"]);
+}
+
+// ----------------------------------------------------------------------
+// Round 3.
+
+/// SOL-REVIEW-2 MUST 3 / OPUS-REVIEW MUST 1: a retained raster built while
+/// a model it references is still loading pictures nothing of it. Once the
+/// model uploads and a full frame shows it, the next cursor-only frame at
+/// the same editor generation and size must rebuild the raster rather than
+/// blit the one without the model; the window stays a member.
+#[test]
+fn a_raster_built_while_the_model_loads_is_rebuilt_once_the_model_is_drawable() {
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    create_model(&mut app);
+    let mut retained = None;
+    // Inserted while loading: the full frame and the first cursor blink
+    // composite nothing of it, and the raster is built that way.
+    present(&mut app, A);
+    assert!(present_retained(&mut app, A, &mut retained, &[MODEL], &[]));
+    finish_loading(&mut app, &mut host);
+    assert_eq!(delivered(&emacs), ["ready"]);
+    // The upload's full frame shows it.
+    present(&mut app, A);
+    assert_eq!(delivered(&emacs), ["R{true,1,0}"]);
+    // The next blink: same generation, same size, no redisplay.
+    assert!(
+        present_retained(&mut app, A, &mut retained, &[MODEL], &[]),
+        "the raster from before the upload was blitted again"
+    );
+    assert!(
+        delivered(&emacs).is_empty(),
+        "A still shows the model at rev 1"
+    );
+}
+
+/// OPUS-REVIEW SHOULD 1: on Wayland neither hiding nor minimizing can be
+/// observed (winit's `is_visible`/`is_minimized` answer `None`, and no
+/// `Occluded` is sent), and a compositor may ignore the request outright.
+/// Such a request leaves at once, but the window rejoins at its next
+/// presentation instead of staying out until a focus or exposure event
+/// that may never come.
+#[test]
+fn a_hide_the_platform_cannot_confirm_leaves_only_until_the_next_presentation() {
+    use crate::thread_comm::WindowVisibility;
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    present(&mut app, A);
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+    for visibility in [WindowVisibility::Invisible, WindowVisibility::Iconified] {
+        app.note_models_visibility(A, visibility, false);
+        assert_eq!(delivered(&emacs), ["R{false,1,0}"], "{visibility:?}");
+        // The compositor ignored it: the window still presents.
+        present(&mut app, A);
+        assert_eq!(delivered(&emacs), ["R{true,1,0}"], "{visibility:?}");
+    }
+    // Where the platform does report hiding, the window stays out until
+    // shown, as before.
+    app.note_models_visibility(A, WindowVisibility::Iconified, true);
+    assert_eq!(delivered(&emacs), ["R{false,1,0}"]);
+    present(&mut app, A);
+    assert!(delivered(&emacs).is_empty());
+}
+
+/// SOL-REVIEW-2 SHOULD 3: a fraction left over a model does not join a
+/// later wheel event after the pointer left the window or the window lost
+/// focus, even within the quiet period and with no wheel event between.
+#[test]
+fn a_wheel_remainder_does_not_survive_leaving_the_window_or_losing_focus() {
+    use winit::event::{DeviceId, TouchPhase};
+    let (mut app, _emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    let pad = Some(DeviceId::from_raw(1));
+    let t0 = Instant::now();
+    let ms = |n: u64| t0 + Duration::from_millis(n);
+    let wheel = |app: &mut RenderApp, y, phase, at| {
+        app.model_wheel.notches(pad, MODEL, pixels(y), phase, at)
+    };
+    // 0.6 notch left over the model, then the pointer leaves the window.
+    assert_eq!(wheel(&mut app, 30.0, TouchPhase::Started, ms(0)), 0);
+    app.handle_cursor_left(winit::window::WindowId::from_raw(1));
+    assert_eq!(
+        wheel(&mut app, 30.0, TouchPhase::Moved, ms(10)),
+        0,
+        "the remainder survived leaving the window"
+    );
+    // 0.6 left again; the window loses focus.
+    assert_eq!(wheel(&mut app, 30.0, TouchPhase::Started, ms(20)), 0);
+    app.handle_window_focus_models(A, false);
+    assert_eq!(
+        wheel(&mut app, 30.0, TouchPhase::Moved, ms(30)),
+        0,
+        "the remainder survived focus loss"
+    );
+}
+
+/// OPUS-REVIEW NIT 1: a window hidden while no model exists, then deleted,
+/// leaves no hidden mark behind.
+#[test]
+fn a_window_hidden_while_no_model_exists_is_forgotten_when_it_goes() {
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    app.note_models_window_hidden(A);
+    app.note_models_window_gone(A);
+    with_ready_model(&mut app, &mut host);
+    present(&mut app, A);
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+}
+
+/// OPUS-REVIEW NIT 2: focus leaving one window does not end an orbit held
+/// in another; focus leaving the capture's own window does.
+#[test]
+fn focus_loss_ends_only_the_capture_of_that_window() {
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    present(&mut app, A);
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+    assert!(app.models.press(A, hit(), (10.0, 10.0)));
+    assert!(app.models.motion(A, (30.0, 10.0)), "orbiting");
+    app.flush_model_events();
+    assert_eq!(delivered(&emacs), ["R{false,2,0}"]);
+    app.handle_window_focus_models(B, false);
+    assert!(delivered(&emacs).is_empty(), "A's orbit was ended by B");
+    assert!(app.models.motion(A, (40.0, 10.0)), "A's orbit goes on");
+    app.handle_window_focus_models(A, false);
+    assert_eq!(delivered(&emacs), ["View{3}"]);
+    assert!(!app.models.motion(A, (50.0, 10.0)), "the capture ended");
 }
