@@ -2091,6 +2091,18 @@ impl Context {
         self.gc_driver_active = prev;
     }
 
+    /// GNU's mark puts a buffer-local binding still set up for a killed
+    /// buffer back to the global one (`mark_localized_symbol`, alloc.c), so
+    /// the binding cache does not keep the killed buffer alive. Called once
+    /// per collection before its mark, never while a mark runs: the
+    /// concurrent marker may be reading these roots.
+    fn swap_out_killed_buffer_bindings(&mut self) {
+        debug_assert!(!self.tagged_heap.mark_in_progress());
+        let buffers = &self.buffers;
+        self.obarray
+            .swap_out_killed_buffer_bindings(|id| buffers.is_killed(id));
+    }
+
     pub(super) fn gc_collect_from_current_roots_body(&mut self, force_complete: bool) {
         // GNU `garbage_collect' shortens every live buffer's undo list before
         // it marks anything: "Don't keep undo information around forever. Do
@@ -2107,17 +2119,13 @@ impl Context {
         {
             crate::emacs_core::undo::compact_buffers_for_gc(self);
         }
-        // GNU's mark puts a buffer-local binding still set up for a killed
-        // buffer back to the global one (`mark_localized_symbol`), so the
-        // binding cache does not keep the killed buffer alive. Once per
-        // collection, before its mark: the concurrent marker may be reading
-        // these roots while it runs.
-        let mark_or_sweep_running =
-            self.tagged_heap.mark_in_progress() || self.tagged_heap.sweep_in_progress();
-        if !mark_or_sweep_running || (force_complete && !self.tagged_heap.mark_in_progress()) {
-            let buffers = &self.buffers;
-            self.obarray
-                .swap_out_killed_buffer_bindings(|id| buffers.is_killed(id));
+        // A cycle about to start here (not an explicit collection, which
+        // starts its own below) first unloads bindings set up for killed
+        // buffers.
+        if !force_complete
+            && !(self.tagged_heap.mark_in_progress() || self.tagged_heap.sweep_in_progress())
+        {
+            self.swap_out_killed_buffer_bindings();
         }
         let start = std::time::Instant::now();
         // These two are the caches keyed on a raw heap address -- the address
@@ -2156,6 +2164,9 @@ impl Context {
                 if (*heap_ptr).sweep_in_progress() {
                     (*heap_ptr).finish_incremental_sweep_now();
                 }
+                // No mark runs now: unload bindings set up for a buffer
+                // killed meanwhile, including during the cycle drained above.
+                self.swap_out_killed_buffer_bindings();
                 // Disarms a concurrent first cycle drained above, so this
                 // cycle traces the whole image before it promotes (see
                 // `begin_stw_collection`).

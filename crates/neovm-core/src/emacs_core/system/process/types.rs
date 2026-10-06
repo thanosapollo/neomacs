@@ -8156,6 +8156,13 @@ impl super::super::eval::Context {
             self.push_specpdl_root(saved);
         }
         self.push_specpdl_root(saved_deactivate_mark);
+        // GNU's filter and sentinel calls keep the current buffer as an
+        // object on the specpdl (`record_unwind_current_buffer`,
+        // process.c), so a callback that kills it leaves a dead buffer that
+        // stays referenced until the call returns.
+        if let Some(buffer_id) = saved_current_buffer {
+            self.push_specpdl_root(Value::make_buffer(buffer_id));
+        }
 
         let result = (|| {
             self.try_specbind_or_unwind_to(specpdl_count, intern("inhibit-quit"), Value::T)?;

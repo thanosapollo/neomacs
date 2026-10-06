@@ -437,3 +437,42 @@ fn a_filter_that_replaces_the_match_data_keeps_the_saved_killed_buffer() {
         "OK (t \"srch2\")"
     );
 }
+
+/// A filter runs with the current buffer saved as an object
+/// (`record_unwind_current_buffer` in process.c), so a filter that kills
+/// that buffer and collects still finds its weak-key entry. GNU 32.0.50
+/// counts 1.
+#[cfg(unix)]
+#[test]
+fn a_filter_that_kills_the_current_buffer_keeps_it_for_the_call() {
+    let mut ev = crate::test_utils::runtime_startup_context();
+    ev.eval_str(
+        "(progn
+           (setq wk (make-hash-table :weakness 'key) fc-inside nil)
+           (puthash (get-buffer-create \"fc\") t wk)
+           (set-buffer \"fc\")
+           (make-process :name \"fcp\" :command '(\"printf\" \"x\")
+                         :connection-type 'pipe :noquery t :sentinel #'ignore
+                         :filter (lambda (_p _s)
+                                   (set-buffer (get-buffer-create \"fc-other\"))
+                                   (kill-buffer \"fc\")
+                                   (garbage-collect)
+                                   (garbage-collect)
+                                   (setq fc-inside (hash-table-count wk))))
+           nil)",
+    )
+    .unwrap();
+    assert_eq!(
+        eval_ok(
+            &mut ev,
+            "(let ((n 0))
+               (while (and (null fc-inside) (< n 50))
+                 (accept-process-output nil 0.1)
+                 (setq n (1+ n)))
+               fc-inside)"
+        ),
+        "OK 1"
+    );
+    collect_twice(&mut ev);
+    assert_eq!(eval_ok(&mut ev, "(hash-table-count wk)"), "OK 0");
+}

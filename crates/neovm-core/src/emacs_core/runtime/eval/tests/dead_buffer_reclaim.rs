@@ -728,3 +728,158 @@ fn a_buffer_local_binding_cache_does_not_keep_a_killed_buffer() {
         "OK (0 global)"
     );
 }
+
+/// The binding caches are unloaded before an explicit collection's own
+/// mark too, also when it first drains a concurrent cycle that started
+/// before the buffer was killed.
+#[test]
+fn an_explicit_collection_during_a_concurrent_mark_unloads_killed_bindings() {
+    let mut ev = Context::new();
+    ev.gc_collect_exact();
+    ev.eval_str(
+        "(progn
+           (setq wk (make-hash-table :weakness 'key))
+           (make-variable-buffer-local 'zz-blv-probe)
+           (set-default 'zz-blv-probe 'global)
+           (puthash (get-buffer-create \"fm\") t wk)
+           nil)",
+    )
+    .unwrap();
+    for _ in 0..1_000 {
+        ev.gc_collect_from_current_roots();
+        if ev.tagged_heap.mark_in_progress() {
+            break;
+        }
+    }
+    assert!(ev.tagged_heap.mark_in_progress(), "no mark started");
+    ev.eval_str(
+        "(progn (save-current-buffer (set-buffer \"fm\") zz-blv-probe) (kill-buffer \"fm\") nil)",
+    )
+    .unwrap();
+    assert!(
+        ev.tagged_heap.mark_in_progress(),
+        "the mark ended before the explicit collection"
+    );
+    ev.gc_collect_exact();
+    assert_eq!(eval_ok(&mut ev, "(hash-table-count wk)"), "OK 0");
+}
+
+/// A `let` of an automatically buffer-local variable with no local value
+/// binds its default and keeps the buffer it was made in on the specpdl
+/// (GNU's SPECPDL_LET_DEFAULT `where`). GNU 32.0.50 counts 1.
+#[test]
+fn a_let_of_a_default_value_keeps_its_killed_buffer() {
+    let mut ev = Context::new();
+    ev.eval_str(
+        "(progn
+           (setq wk (make-hash-table :weakness 'key))
+           (make-variable-buffer-local 'zz-auto)
+           (set-default 'zz-auto 1)
+           (puthash (get-buffer-create \"db\") t wk)
+           (set-buffer \"db\")
+           nil)",
+    )
+    .unwrap();
+    assert_eq!(
+        eval_ok(
+            &mut ev,
+            "(let ((zz-auto 5))
+               (set-buffer (get-buffer-create \"other\"))
+               (kill-buffer \"db\")
+               (garbage-collect)
+               (garbage-collect)
+               (hash-table-count wk))"
+        ),
+        "OK 1"
+    );
+    collect_twice(&mut ev);
+    assert_eq!(eval_ok(&mut ev, "(hash-table-count wk)"), "OK 0");
+}
+
+/// `save-restriction` keeps the buffer object whether or not the buffer
+/// is narrowed (`save_restriction_save` saves it with the labeled
+/// restrictions too). GNU 32.0.50 counts 1 in both cases.
+#[test]
+fn save_restriction_keeps_its_killed_buffer() {
+    for narrow in ["nil", "(narrow-to-region 2 4)"] {
+        let mut ev = Context::new();
+        ev.eval_str(&format!(
+            "(progn
+               (setq wk (make-hash-table :weakness 'key))
+               (puthash (get-buffer-create \"sr\") t wk)
+               (set-buffer \"sr\")
+               (insert \"abcdef\")
+               {narrow}
+               nil)"
+        ))
+        .unwrap();
+        assert_eq!(
+            eval_ok(
+                &mut ev,
+                "(save-restriction
+                   (set-buffer (get-buffer-create \"other\"))
+                   (kill-buffer \"sr\")
+                   (garbage-collect)
+                   (garbage-collect)
+                   (hash-table-count wk))"
+            ),
+            "OK 1",
+            "{narrow}"
+        );
+        collect_twice(&mut ev);
+        assert_eq!(
+            eval_ok(&mut ev, "(hash-table-count wk)"),
+            "OK 0",
+            "{narrow}"
+        );
+    }
+}
+
+/// A hook that throws out of `get-buffer-create` leaves no root behind:
+/// the killed buffer it made goes once nothing refers to it.
+#[test]
+fn a_throw_out_of_a_creation_hook_leaves_no_root() {
+    let mut ev = Context::new();
+    ev.eval_str(
+        "(setq wk (make-hash-table :weakness 'key)
+               buffer-list-update-hook
+               (list (lambda ()
+                       (if (get-buffer \"tb\")
+                           (progn
+                             (puthash (get-buffer \"tb\") t wk)
+                             (kill-buffer \"tb\")
+                             (throw 'out 'thrown))))))",
+    )
+    .unwrap();
+    assert_eq!(
+        eval_ok(&mut ev, "(catch 'out (get-buffer-create \"tb\"))"),
+        "OK thrown"
+    );
+    ev.eval_str("(setq buffer-list-update-hook nil)").unwrap();
+    collect_twice(&mut ev);
+    assert_eq!(eval_ok(&mut ev, "(hash-table-count wk)"), "OK 0");
+}
+
+/// A window configuration holds the buffer of each saved window too, not
+/// only its current buffer (`Fcurrent_window_configuration`).
+#[test]
+fn a_window_configuration_keeps_a_killed_window_buffer() {
+    let mut ev = crate::test_utils::runtime_startup_context();
+    ev.eval_str(
+        "(progn
+           (setq wk (make-hash-table :weakness 'key))
+           (puthash (get-buffer-create \"lf\") t wk)
+           (set-window-buffer (selected-window) \"lf\")
+           (set-buffer (get-buffer-create \"cur\"))
+           (setq conf (current-window-configuration))
+           (set-window-buffer (selected-window) (get-buffer-create \"other\"))
+           (kill-buffer \"lf\")
+           nil)",
+    )
+    .unwrap();
+    collect_twice(&mut ev);
+    assert_eq!(eval_ok(&mut ev, "(hash-table-count wk)"), "OK 1");
+    ev.eval_str("(setq conf nil)").unwrap();
+    collect_twice(&mut ev);
+    assert_eq!(eval_ok(&mut ev, "(hash-table-count wk)"), "OK 0");
+}

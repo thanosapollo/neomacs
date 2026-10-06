@@ -266,6 +266,12 @@ impl super::eval::Context {
         // its previous root and a GC frees it before the restore below.
         // The GcRoot is popped by unbind_to together with the specbind.
         self.push_specpdl_root(saved_deactivate_mark);
+        // The current buffer saved above is restored after the call, so
+        // hold it as an object until then, as filters and sentinels do: a
+        // timer that kills it leaves a dead buffer that stays referenced.
+        if let Some(buffer_id) = saved_current_buffer {
+            self.push_specpdl_root(Value::make_buffer(buffer_id));
+        }
 
         let result = (|| {
             self.try_specbind_or_unwind_to(specpdl_count, intern("inhibit-quit"), Value::T)?;

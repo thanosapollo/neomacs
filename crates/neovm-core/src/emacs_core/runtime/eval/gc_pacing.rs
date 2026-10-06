@@ -197,12 +197,10 @@ impl Context {
                     visit(*lexenv);
                 }
                 SpecBinding::SaveRestriction { state } => {
-                    // An unnarrowed buffer is saved as the buffer object
-                    // itself (`save_restriction_save`, editfns.c); narrowed
-                    // bounds are markers, which a kill detaches.
-                    if state.state().restriction == crate::buffer::SavedRestrictionKind::None {
-                        self.visit_buffer_object(state.state().buffer_id, visit);
-                    }
+                    // `save_restriction_save` (editfns.c) keeps the buffer
+                    // object either way: as the unnarrowed state, and with
+                    // its labeled restrictions (`labeled_restrictions_save`).
+                    self.visit_buffer_object(state.state().buffer_id, visit);
                     let mut roots = Vec::new();
                     state.state().trace_roots(&mut roots);
                     // The saved bounds live as marker ids only; root the
