@@ -4130,6 +4130,13 @@ impl super::super::eval::Context {
         &mut self,
         id: ProcessId,
     ) -> Result<(), Flow> {
+        let rooted = [id];
+        self.with_processes_rooted(&rooted, |eval| {
+            eval.wait_while_network_process_connecting_body(id)
+        })
+    }
+
+    fn wait_while_network_process_connecting_body(&mut self, id: ProcessId) -> Result<(), Flow> {
         while self.processes.get(id).is_some_and(|proc| {
             proc.kind == ProcessKind::Network && process_status_is_connect(&proc.status)
         }) {
@@ -4144,6 +4151,17 @@ impl super::super::eval::Context {
     }
 
     pub(super) fn send_process_input_reentrant(
+        &mut self,
+        id: ProcessId,
+        input: &LispString,
+    ) -> Result<(), Flow> {
+        let rooted = [id];
+        self.with_processes_rooted(&rooted, |eval| {
+            eval.send_process_input_reentrant_body(id, input)
+        })
+    }
+
+    fn send_process_input_reentrant_body(
         &mut self,
         id: ProcessId,
         input: &LispString,
@@ -8210,6 +8228,30 @@ impl super::super::eval::Context {
         }
     }
 
+    /// Run BODY with the objects of the processes IDS rooted.  GNU's wait
+    /// loop and `send_process` hold the process in a C local (`proc`) while
+    /// they decode output, run filters and sentinels, and wait on a
+    /// connection or a full pipe; this side holds only an id there.  A
+    /// `:post-read-conversion`, filter, sentinel or timer that deletes one of
+    /// these processes and collects must not free the deleted record the
+    /// rest of the pass still reaches by id.  Ids without a record are left
+    /// alone, so no object is made for them.
+    pub(super) fn with_processes_rooted<T>(
+        &mut self,
+        ids: &[ProcessId],
+        body: impl FnOnce(&mut Self) -> Result<T, Flow>,
+    ) -> Result<T, Flow> {
+        let scope = self.save_specpdl_roots();
+        for &id in ids {
+            if self.processes.get_any(id).is_some() {
+                self.push_specpdl_root(Value::make_process(id));
+            }
+        }
+        let result = body(self);
+        self.restore_specpdl_roots(scope);
+        result
+    }
+
     pub(super) fn run_process_filter_callback(
         &mut self,
         pid: ProcessId,
@@ -8465,7 +8507,7 @@ impl super::super::eval::Context {
             if !decoded.run.text.is_empty() {
                 let filter = self
                     .processes
-                    .get(id)
+                    .get_any(id)
                     .map(|p| p.filter)
                     .unwrap_or(Value::NIL);
                 self.run_process_filter_callback(id, filter, &decoded.run.text)?;
@@ -8574,6 +8616,17 @@ impl super::super::eval::Context {
         stderr_id: ProcessId,
         target_process: Option<ProcessId>,
     ) -> Result<ProcessOutputServiceOutcome, Flow> {
+        let rooted = [stderr_id];
+        self.with_processes_rooted(&rooted, |eval| {
+            eval.drain_associated_stderr_output_without_notifying_body(stderr_id, target_process)
+        })
+    }
+
+    fn drain_associated_stderr_output_without_notifying_body(
+        &mut self,
+        stderr_id: ProcessId,
+        target_process: Option<ProcessId>,
+    ) -> Result<ProcessOutputServiceOutcome, Flow> {
         let mut outcome = ProcessOutputServiceOutcome::default();
         let is_target = target_process.is_none_or(|target| target == stderr_id);
 
@@ -8587,7 +8640,7 @@ impl super::super::eval::Context {
                     if !data.is_empty() {
                         let filter = self
                             .processes
-                            .get(stderr_id)
+                            .get_any(stderr_id)
                             .map(|p| p.filter)
                             .unwrap_or(Value::NIL);
                         self.run_process_filter_callback(stderr_id, filter, &data)?;
@@ -8611,6 +8664,17 @@ impl super::super::eval::Context {
         pid: ProcessId,
         target_process: Option<ProcessId>,
     ) -> Result<(ProcessOutputServiceOutcome, ProcessOutputDrainDisposition), Flow> {
+        let rooted = [pid];
+        self.with_processes_rooted(&rooted, |eval| {
+            eval.poll_process_stdout_output_without_status_detailed_body(pid, target_process)
+        })
+    }
+
+    fn poll_process_stdout_output_without_status_detailed_body(
+        &mut self,
+        pid: ProcessId,
+        target_process: Option<ProcessId>,
+    ) -> Result<(ProcessOutputServiceOutcome, ProcessOutputDrainDisposition), Flow> {
         let mut outcome = ProcessOutputServiceOutcome::default();
         let mut saw_output = false;
         let is_target = target_process == Some(pid);
@@ -8626,7 +8690,7 @@ impl super::super::eval::Context {
                     if !data.is_empty() {
                         let filter = self
                             .processes
-                            .get(pid)
+                            .get_any(pid)
                             .map(|p| p.filter)
                             .unwrap_or(Value::NIL);
                         self.run_process_filter_callback(pid, filter, &data)?;
@@ -8912,6 +8976,22 @@ impl super::super::eval::Context {
         target_process: Option<ProcessId>,
         publish_status_before_readable_output: bool,
     ) -> Result<ProcessOutputServiceOutcome, Flow> {
+        let rooted: Vec<ProcessId> = proc_ids.iter().copied().chain(target_process).collect();
+        self.with_processes_rooted(&rooted, |eval| {
+            eval.poll_process_output_for_ids_body(
+                proc_ids,
+                target_process,
+                publish_status_before_readable_output,
+            )
+        })
+    }
+
+    fn poll_process_output_for_ids_body(
+        &mut self,
+        proc_ids: Vec<ProcessId>,
+        target_process: Option<ProcessId>,
+        publish_status_before_readable_output: bool,
+    ) -> Result<ProcessOutputServiceOutcome, Flow> {
         let mut proc_ids = dedupe_process_ids(proc_ids);
 
         if proc_ids.is_empty() {
@@ -9150,7 +9230,7 @@ impl super::super::eval::Context {
                         if !data.is_empty() {
                             let filter = self
                                 .processes
-                                .get(pid)
+                                .get_any(pid)
                                 .map(|p| p.filter)
                                 .unwrap_or(Value::NIL);
                             self.run_process_filter_callback(pid, filter, &data)?;
@@ -9386,6 +9466,17 @@ impl super::super::eval::Context {
         pid: ProcessId,
         target_process: Option<ProcessId>,
     ) -> Result<ProcessOutputServiceOutcome, Flow> {
+        let rooted = [pid];
+        self.with_processes_rooted(&rooted, |eval| {
+            eval.run_process_status_notification_body(pid, target_process)
+        })
+    }
+
+    fn run_process_status_notification_body(
+        &mut self,
+        pid: ProcessId,
+        target_process: Option<ProcessId>,
+    ) -> Result<ProcessOutputServiceOutcome, Flow> {
         let mut outcome = ProcessOutputServiceOutcome::default();
         let owner_is_target = target_process.is_none_or(|target| target == pid);
 
@@ -9411,7 +9502,7 @@ impl super::super::eval::Context {
             if !data.is_empty() {
                 let filter = self
                     .processes
-                    .get(pid)
+                    .get_any(pid)
                     .map(|p| p.filter)
                     .unwrap_or(Value::NIL);
                 self.run_process_filter_callback(pid, filter, &data)?;
