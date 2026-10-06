@@ -36,7 +36,7 @@ fn open_device_with(required_limits: wgpu::Limits) -> Option<(wgpu::Device, wgpu
 
 /// Test-only readback of the resolved texture as tightly packed RGBA8.
 fn read_rgba(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &ModelGpu) -> Vec<u8> {
-    let (w, h) = (gpu.width_px, gpu.height_px);
+    let (w, h) = gpu.size_px();
     let row = (w * 4).div_ceil(256) * 256;
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("model readback"),
@@ -47,7 +47,7 @@ fn read_rgba(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &ModelGpu) -> Vec<
     let mut encoder = device.create_command_encoder(&Default::default());
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
-            texture: &gpu.texture,
+            texture: &gpu.targets.texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
@@ -83,6 +83,21 @@ fn read_rgba(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &ModelGpu) -> Vec<
         out.extend_from_slice(&mapped[start..start + (w * 4) as usize]);
     }
     out
+}
+
+/// A plain draw: `view`, square-or-not logical size, no highlight.
+fn draw(view: ModelView, logical: (u32, u32), background: [f32; 4]) -> ModelDraw {
+    ModelDraw {
+        view,
+        logical,
+        background,
+        highlight: GpuHighlight::default(),
+    }
+}
+
+fn selecting(mut d: ModelDraw, mesh: u16) -> ModelDraw {
+    d.highlight.mesh = Some(mesh);
+    d
 }
 
 fn pixel(rgba: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
@@ -170,16 +185,17 @@ fn oversized_target_is_an_error() {
     .unwrap();
     let scene = ModelScene::new(vec![mesh]).unwrap();
     let over = device.limits().max_texture_dimension_2d + 1;
-    assert!(ModelGpu::new(&device, &queue, &scene, over, 4).is_err());
-    assert!(ModelGpu::new(&device, &queue, &scene, 4, 0).is_err());
+    assert!(ModelGpu::new(&device, &queue, &scene, (over, 4)).is_err());
+    assert!(ModelGpu::new(&device, &queue, &scene, (4, 0)).is_err());
 }
 
-/// Regression (Sol slice review r2 MUST 1): a failed GPU allocation must
-/// come back as an error, never unwind.  A destroyed device fails every
-/// allocation; `create_buffer_init` then panicked mapping the invalid
-/// buffer, inside the error scopes that were meant to catch it.
+/// Regression (Sol slice review r2 MUST 1): a GPU resource rejected at
+/// creation must come back as an error, never unwind. A destroyed device
+/// rejects every buffer before any driver allocation, so this exercises the
+/// invalid-resource path (`create_buffer_init` panicked mapping the invalid
+/// buffer), not real out-of-memory recovery.
 #[test]
-fn failed_allocation_is_an_error_not_a_panic() {
+fn rejected_resources_are_an_error_not_a_panic() {
     let Some((device, queue)) = try_device() else {
         eprintln!("skipping: no headless wgpu adapter");
         return;
@@ -192,26 +208,21 @@ fn failed_allocation_is_an_error_not_a_panic() {
     let scene = ModelScene::new(vec![mesh]).unwrap();
     device.destroy();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let gpu = ModelGpu::new(&device, &queue, &scene, 16, 16)?;
-        gpu.render(
-            &device,
-            &queue,
-            &ModelView::default(),
-            None,
-            [0.0, 0.0, 0.0, 1.0],
-        )
+        ModelGpu::new(&device, &queue, &scene, (16, 16)).map(|_| ())
     }));
     assert!(
-        outcome.is_ok(),
-        "allocation failure unwound instead of returning Err"
+        matches!(outcome, Ok(Err(_))),
+        "rejected creation must be Err (unwound: {})",
+        outcome.is_err()
     );
 }
 
-/// An adapter without vertex-stage storage buffers (WebGL2-level limits)
-/// rejects the mesh pass as an error, and the device stays usable.
+/// Drawing and picking on a device lost after creation must not unwind.
+/// wgpu reports device loss through its callback rather than error scopes,
+/// so the outcome may be Ok; what matters is that the render thread lives.
 #[test]
-fn missing_vertex_storage_is_an_error_and_the_device_survives() {
-    let Some((device, queue)) = open_device_with(wgpu::Limits::downlevel_webgl2_defaults()) else {
+fn drawing_after_device_loss_does_not_unwind() {
+    let Some((device, queue)) = try_device() else {
         eprintln!("skipping: no headless wgpu adapter");
         return;
     };
@@ -221,24 +232,85 @@ fn missing_vertex_storage_is_an_error_and_the_device_survives() {
     )
     .unwrap();
     let scene = ModelScene::new(vec![mesh]).unwrap();
+    let mut gpu = ModelGpu::new(&device, &queue, &scene, (16, 16)).unwrap();
+    device.destroy();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ModelGpu::new(&device, &queue, &scene, 16, 16).map(|_| ())
+        let _ = gpu.render(
+            &device,
+            &queue,
+            &draw(ModelView::default(), (16, 16), [0.0, 0.0, 0.0, 1.0]),
+        );
+        let _ = gpu.pick_start(
+            &device,
+            &queue,
+            &PickRequest {
+                view: ModelView::default(),
+                logical: (16, 16),
+                size_px: (16, 16),
+                texel: (8, 8),
+            },
+        );
+        let _ = gpu.pick_poll(&device);
+        let _ = gpu.resize(&device, (8, 8));
     }));
+    assert!(outcome.is_ok(), "device loss unwound");
+}
+
+/// An adapter without vertex-stage storage buffers rejects the mesh pass as
+/// an error from inside the GPU error scope (not the size preflight: the
+/// binding size limit stays nonzero), and the device stays usable.
+#[test]
+fn missing_vertex_storage_is_a_scoped_error_and_the_device_survives() {
+    let limits = wgpu::Limits {
+        max_storage_buffers_per_shader_stage: 0,
+        ..wgpu::Limits::default()
+    };
+    let device = open_device_with(limits);
     assert!(
-        matches!(outcome, Ok(Err(_))),
-        "no vertex storage must be Err (unwound: {}, ok: {})",
-        outcome.is_err(),
-        matches!(outcome, Ok(Ok(())))
+        device.is_some() || std::env::var_os("NEOMACS_MODEL_REQUIRE_EVIDENCE").is_none(),
+        "GPU evidence required but no headless wgpu adapter"
     );
-    // The device still serves ordinary work after the rejected scope.
+    let Some((device, queue)) = device else {
+        eprintln!("skipping: no headless wgpu adapter");
+        return;
+    };
+    assert!(device.limits().max_storage_buffer_binding_size > 0);
+    let mesh = parse_obj(
+        b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n",
+        remaining_limits(&[]),
+    )
+    .unwrap();
+    let scene = ModelScene::new(vec![mesh]).unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ModelGpu::new(&device, &queue, &scene, (16, 16)).map(|_| ())
+    }));
+    match outcome {
+        Ok(Err(error)) => assert!(
+            error.starts_with("model GPU resources rejected"),
+            "rejected by the scope, not the preflight: {error}"
+        ),
+        Ok(Ok(())) => panic!("no vertex storage must be Err"),
+        Err(_) => panic!("no vertex storage unwound"),
+    }
+    // The device still completes ordinary submitted work afterwards.
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("after"),
         size: 16,
-        usage: wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    queue.write_buffer(&buffer, 0, &[0u8; 16]);
+    queue.write_buffer(&buffer, 0, &[7u8; 16]);
     queue.submit(None);
+    buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(10)),
+        })
+        .unwrap();
+    assert_eq!(&buffer.slice(..).get_mapped_range().unwrap()[..], &[7u8; 16]);
 }
 
 #[test]
@@ -302,13 +374,14 @@ fn nearer_triangle_wins_and_background_clears() {
     )
     .unwrap();
     let scene = ModelScene::new(vec![near, far]).unwrap();
-    let gpu = ModelGpu::new(&device, &queue, &scene, 64, 64).unwrap();
+    let mut gpu = ModelGpu::new(&device, &queue, &scene, (64, 64)).unwrap();
     gpu.render(
         &device,
         &queue,
-        &ModelView::default(),
-        Some(1),
-        [0.0, 0.0, 1.0, 1.0],
+        &selecting(
+            draw(ModelView::default(), (64, 64), [0.0, 0.0, 1.0, 1.0]),
+            1,
+        ),
     )
     .unwrap();
     let rgba = read_rgba(&device, &queue, &gpu);
@@ -344,13 +417,11 @@ fn background_is_srgb_and_lands_as_its_own_bytes() {
     )
     .unwrap();
     let scene = ModelScene::new(vec![mesh]).unwrap();
-    let gpu = ModelGpu::new(&device, &queue, &scene, 16, 16).unwrap();
+    let mut gpu = ModelGpu::new(&device, &queue, &scene, (16, 16)).unwrap();
     gpu.render(
         &device,
         &queue,
-        &ModelView::default(),
-        None,
-        [0.02, 0.02, 0.03, 1.0],
+        &draw(ModelView::default(), (16, 16), [0.02, 0.02, 0.03, 1.0]),
     )
     .unwrap();
     let rgba = read_rgba(&device, &queue, &gpu);
@@ -396,20 +467,273 @@ fn render_real_scene_png() {
         meshes.push(mesh);
     }
     let scene = ModelScene::new(meshes).unwrap();
-    let gpu = ModelGpu::new(&device, &queue, &scene, 768, 768).unwrap();
+    let mut gpu = ModelGpu::new(&device, &queue, &scene, (768, 768)).unwrap();
     let view = ModelView {
         yaw: 0.0,
         pitch: -90.0,
         zoom: 1.1,
     };
-    gpu.render(&device, &queue, &view, Some(1), [0.0, 0.0, 0.0, 1.0])
-        .unwrap();
+    gpu.render(
+        &device,
+        &queue,
+        &selecting(draw(view, (768, 768), [0.0, 0.0, 0.0, 1.0]), 1),
+    )
+    .unwrap();
     let rgba = read_rgba(&device, &queue, &gpu);
     image::save_buffer(&out, &rgba, 768, 768, image::ColorType::Rgba8).unwrap();
     eprintln!(
         "wrote {out}: {} meshes, {} triangles, {} GPU bytes",
-        scene.meshes.len(),
+        scene.meshes().len(),
         scene.triangle_count(),
-        gpu.bytes
+        gpu.geometry_bytes + target_bytes(768, 768)
     );
+}
+
+/// Deferred Sol slice SHOULD: a combined yaw and pitch, checked against
+/// canvas-3d's own construction (`ry @ rx` of the two 4x4 matrices,
+/// render.py) multiplied out here, not against the closed form under test.
+#[test]
+fn combined_yaw_and_pitch_match_canvas_3d() {
+    let (yaw, pitch) = (30.0f64, -50.0f64);
+    let (y, p) = (yaw.to_radians(), pitch.to_radians());
+    let (cy, sy, cp, sp) = (y.cos(), y.sin(), p.cos(), p.sin());
+    let ry = [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]];
+    let rx = [[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]];
+    let mut want = [[0.0f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            want[i][j] = (0..3).map(|k| ry[i][k] * rx[k][j]).sum();
+        }
+    }
+    let got = ModelView {
+        yaw,
+        pitch,
+        zoom: 1.0,
+    }
+    .rotation();
+    for i in 0..3 {
+        for j in 0..3 {
+            assert!((got[i][j] - want[i][j]).abs() < 1e-15, "{i},{j}");
+        }
+    }
+}
+
+/// Deferred Sol slice SHOULD: the camera fit follows the logical aspect,
+/// so a capped or rounded physical target frames the model as its glyph.
+#[test]
+fn camera_fit_uses_the_logical_aspect() {
+    let v = ModelView::default();
+    // 2048x32 logical renders at 2048x32 (or less when capped); the fit is
+    // the logical 64:1, whatever the physical rounding.
+    let [sx, sy] = clip_scale(&v, 2048, 32);
+    assert!((sx as f64 - 0.8 / 64.0).abs() < 1e-7 && sy == 0.8);
+}
+
+#[test]
+fn byte_accounting_matches_the_design_formula() {
+    let uniform = std::mem::size_of::<CameraUniform>() as u64;
+    assert_eq!(
+        geometry_bytes(10, 64),
+        160 + 768 + 1024 + 8 + 2 * uniform + 20 + 512
+    );
+    assert_eq!(target_bytes(10, 20), 200 * 36);
+}
+
+const QUAD: &[u8] = b"v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nf 1 2 3 4\n";
+
+fn blue_marked(px: [u8; 4]) -> bool {
+    // Bone blue 0.59 * light, highlight blue 0.2 * light (light 0.864 for a
+    // facing quad): about 130 against 44 after the sRGB round trip.
+    px[2] < 80
+}
+
+/// Region marks paint exactly the listed faces; a point target paints a
+/// disc of its radius around the barycentric point, on its own mesh.
+#[test]
+fn region_and_point_targets_paint_the_right_fragments() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("skipping: no headless wgpu adapter");
+        return;
+    };
+    let scene = ModelScene::new(vec![parse_obj(QUAD, remaining_limits(&[])).unwrap()]).unwrap();
+    let mut gpu = ModelGpu::new(&device, &queue, &scene, (64, 64)).unwrap();
+    // Faces fan from vertex 0: face 0 is the lower-right half (x > y),
+    // face 1 the upper-left half.
+    let mut d = draw(ModelView::default(), (64, 64), [0.0, 0.0, 0.0, 1.0]);
+    d.highlight.faces = Some(vec![1]);
+    gpu.render(&device, &queue, &d).unwrap();
+    let rgba = read_rgba(&device, &queue, &gpu);
+    assert!(blue_marked(pixel(&rgba, 64, 22, 22)), "face 1 marked");
+    assert!(!blue_marked(pixel(&rgba, 64, 42, 42)), "face 0 not marked");
+
+    let centre = scene
+        .point_on(0, 0, [0.5, 0.0, 0.5])
+        .expect("point on face 0");
+    assert_eq!(centre, [0.0, 0.0, 0.0]);
+    let mut d = draw(ModelView::default(), (64, 64), [0.0, 0.0, 0.0, 1.0]);
+    d.highlight.point = Some(GpuPoint {
+        mesh: 0,
+        centre: scene.normalise(centre),
+        radius: (0.3 / scene.radius()) as f32,
+    });
+    gpu.render(&device, &queue, &d).unwrap();
+    let rgba = read_rgba(&device, &queue, &gpu);
+    assert!(blue_marked(pixel(&rgba, 64, 32, 32)), "inside the disc");
+    // (18, 18) is on the quad (it spans texels 14..50) but 0.74 from the
+    // centre in normalised units, beyond the 0.21 radius.
+    assert!(pixel(&rgba, 64, 18, 18)[0] > 150, "on the quad");
+    assert!(!blue_marked(pixel(&rgba, 64, 18, 18)), "outside the disc");
+    // The same point on another mesh index paints nothing here.
+    d.highlight.point = Some(GpuPoint { mesh: 1, ..d.highlight.point.unwrap() });
+    gpu.render(&device, &queue, &d).unwrap();
+    let rgba = read_rgba(&device, &queue, &gpu);
+    assert!(!blue_marked(pixel(&rgba, 64, 32, 32)), "other mesh only");
+}
+
+fn pick_now(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    gpu: &mut ModelGpu,
+    request: PickRequest,
+) -> RawPick {
+    gpu.pick_start(device, queue, &request).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match gpu.pick_poll(device) {
+            PickPoll::Done(raw) => return raw,
+            PickPoll::Pending => {
+                assert!(std::time::Instant::now() < deadline, "pick timed out");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            other => panic!("pick failed: {other:?}"),
+        }
+    }
+}
+
+/// §5.4 pick cases: depth order, background, barycentric reconstruction
+/// in original coordinates, a coplanar tie, and the same place picked at
+/// two DPI sizes.
+#[test]
+fn picks_name_the_covering_face_and_point() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("skipping: no headless wgpu adapter");
+        return;
+    };
+    let near = parse_obj(
+        b"v -1 -1 1\nv 1 -1 1\nv 0 1 1\nf 1 2 3\n",
+        remaining_limits(&[]),
+    )
+    .unwrap();
+    let far = parse_obj(
+        b"v -1 -1 -1\nv 1 -1 -1\nv 0 1 -1\nf 1 2 3\n",
+        remaining_limits(&[]),
+    )
+    .unwrap();
+    // The far mesh is listed first, so only the depth test can put the near
+    // one (mesh 1) on top.
+    let scene = ModelScene::new(vec![far, near]).unwrap();
+    let mut gpu = ModelGpu::new(&device, &queue, &scene, (64, 64)).unwrap();
+    let request = |size: u32, texel: (u32, u32)| PickRequest {
+        view: ModelView::default(),
+        logical: (64, 64),
+        size_px: (size, size),
+        texel,
+    };
+    let hit = pick_now(&device, &queue, &mut gpu, request(64, (32, 36)))
+        .hit
+        .expect("centre hits");
+    let (mesh, face) = scene.locate(hit.0).unwrap();
+    assert_eq!((mesh, face), (1, 0), "nearer mesh wins");
+    let point = scene.point_on(mesh, face, hit.1).unwrap();
+    // Texel centre (32.5, 36.5) of 64: NDC (0.0156, -0.1406); normalised
+    // position = NDC / 0.8, original = normalised * radius (centre 0).
+    let r = scene.radius();
+    let want_x = (32.5 / 64.0 * 2.0 - 1.0) / 0.8 * r;
+    let want_y = (1.0 - 36.5 / 64.0 * 2.0) / 0.8 * r;
+    assert!((point[0] - want_x).abs() < 1e-4, "{point:?} x {want_x}");
+    assert!((point[1] - want_y).abs() < 1e-4, "{point:?} y {want_y}");
+    assert!((point[2] - 1.0).abs() < 1e-9, "on the near plane: {point:?}");
+
+    assert_eq!(
+        pick_now(&device, &queue, &mut gpu, request(64, (0, 0))).hit,
+        None,
+        "corner is background"
+    );
+
+    // Twice the texels: texel (64, 72) is the same place.
+    let hit2 = pick_now(&device, &queue, &mut gpu, request(128, (64, 72)))
+        .hit
+        .expect("hit at 2x");
+    let point2 = scene.point_on(1, 0, hit2.1).unwrap();
+    let want_x2 = (64.5 / 128.0 * 2.0 - 1.0) / 0.8 * r;
+    assert!((point2[0] - want_x2).abs() < 1e-4, "{point2:?} x {want_x2}");
+
+    // Coplanar duplicates: the first drawn (lowest global face) wins.
+    let a = parse_obj(QUAD, remaining_limits(&[])).unwrap();
+    let b = parse_obj(QUAD, remaining_limits(&[])).unwrap();
+    let tie = ModelScene::new(vec![a, b]).unwrap();
+    let mut gpu = ModelGpu::new(&device, &queue, &tie, (64, 64)).unwrap();
+    let hit = pick_now(&device, &queue, &mut gpu, request(64, (42, 42)))
+        .hit
+        .unwrap();
+    assert_eq!(tie.locate(hit.0), Some((0, 0)));
+}
+
+#[test]
+fn a_second_pick_waits_for_the_first_mapping() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("skipping: no headless wgpu adapter");
+        return;
+    };
+    let scene = ModelScene::new(vec![parse_obj(QUAD, remaining_limits(&[])).unwrap()]).unwrap();
+    let mut gpu = ModelGpu::new(&device, &queue, &scene, (32, 32)).unwrap();
+    let request = PickRequest {
+        view: ModelView::default(),
+        logical: (32, 32),
+        size_px: (32, 32),
+        texel: (16, 16),
+    };
+    gpu.pick_start(&device, &queue, &request).unwrap();
+    assert!(gpu.pick_start(&device, &queue, &request).is_err());
+    let raw = pick_now_after_start(&device, &mut gpu);
+    assert!(raw.hit.is_some());
+    assert_eq!(gpu.pick_poll(&device), PickPoll::Idle);
+}
+
+fn pick_now_after_start(device: &wgpu::Device, gpu: &mut ModelGpu) -> RawPick {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match gpu.pick_poll(device) {
+            PickPoll::Done(raw) => return raw,
+            PickPoll::Pending => assert!(std::time::Instant::now() < deadline),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn resize_replaces_the_targets_and_keeps_drawing() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("skipping: no headless wgpu adapter");
+        return;
+    };
+    let scene = ModelScene::new(vec![parse_obj(QUAD, remaining_limits(&[])).unwrap()]).unwrap();
+    let mut gpu = ModelGpu::new(&device, &queue, &scene, (32, 32)).unwrap();
+    gpu.resize(&device, (48, 24)).unwrap();
+    assert_eq!(gpu.size_px(), (48, 24));
+    assert_eq!(
+        (gpu.texture().0.width(), gpu.texture().0.height()),
+        (48, 24)
+    );
+    gpu.render(
+        &device,
+        &queue,
+        &draw(ModelView::default(), (48, 24), [0.0, 0.0, 0.0, 1.0]),
+    )
+    .unwrap();
+    let rgba = read_rgba(&device, &queue, &gpu);
+    assert!(pixel(&rgba, 48, 24, 12)[0] > 150, "quad drawn after resize");
+    let over = device.limits().max_texture_dimension_2d + 1;
+    assert!(gpu.resize(&device, (over, 4)).is_err());
+    assert_eq!(gpu.size_px(), (48, 24), "failed resize keeps the old targets");
 }

@@ -180,6 +180,10 @@ pub struct ShaderSurfaceCache {
     /// Surface whose `iMouse.zw` is currently held positive by a button
     /// press; `set_mouse_release` negates it and clears this.
     pressed: Option<u32>,
+    /// Surfaces composited since the last `take_drawn`, and whether a glyph
+    /// composite ran at all (native model showing sets, design §6.2).
+    drawn: std::collections::HashSet<u32>,
+    composited: bool,
 }
 
 impl ShaderSurfaceCache {
@@ -232,6 +236,8 @@ impl ShaderSurfaceCache {
             channel_sampler,
             fallback_channel_view,
             pressed: None,
+            drawn: std::collections::HashSet::new(),
+            composited: false,
         }
     }
 
@@ -693,6 +699,8 @@ impl ShaderSurfaceCache {
     /// Stamp a surface as composited this frame; animation demand and the
     /// iTime clock stay live for `ACTIVE_GRACE` past the last composite.
     pub fn mark_drawn(&mut self, id: u32) {
+        self.composited = true;
+        self.drawn.insert(id);
         if let Some(surface) = self.surfaces.get_mut(&id) {
             // LIFETIME, NOT PHASE: a real clock read, because the grace window
             // is compared against real clock reads in `has_active_surfaces`
@@ -700,6 +708,18 @@ impl ShaderSurfaceCache {
             // outside a frame where no sample exists.
             surface.active_until = Some(Instant::now() + ACTIVE_GRACE);
         }
+    }
+
+    /// A glyph composite pass ran (even one drawing no surface).
+    pub fn note_composite(&mut self) {
+        self.composited = true;
+    }
+
+    /// The surfaces composited since the last call; `None` when no glyph
+    /// composite ran.
+    pub fn take_drawn(&mut self) -> Option<std::collections::HashSet<u32>> {
+        let drawn = std::mem::take(&mut self.drawn);
+        std::mem::replace(&mut self.composited, false).then_some(drawn)
     }
 
     /// Whether any animated surface was composited recently — the

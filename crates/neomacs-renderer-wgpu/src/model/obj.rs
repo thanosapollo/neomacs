@@ -63,7 +63,7 @@ pub enum ObjError {
     TooManyTriangles { max: usize },
     #[error("OBJ contains no triangles")]
     NoTriangles,
-    #[error("OBJ exceeds {MAX_OBJ_FILE_BYTES} bytes")]
+    #[error("OBJ exceeds its byte allowance (at most {MAX_OBJ_FILE_BYTES} per file)")]
     TooLarge,
     #[error("OBJ is not a regular file")]
     NotRegular,
@@ -236,6 +236,20 @@ pub fn read_obj_file(
     limits: ObjLimits,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<ObjMesh, ObjError> {
+    read_obj_file_within(path, sha256, limits, MAX_OBJ_FILE_BYTES, cancelled).map(|(mesh, _)| mesh)
+}
+
+/// [`read_obj_file`] reading at most `max_bytes` (itself capped at
+/// [`MAX_OBJ_FILE_BYTES`]), so a caller can bound the input work of a whole
+/// scene, not only of one file. Returns the mesh and the bytes read.
+pub fn read_obj_file_within(
+    path: &Path,
+    sha256: Option<&[u8; 32]>,
+    limits: ObjLimits,
+    max_bytes: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(ObjMesh, u64), ObjError> {
+    let max_bytes = max_bytes.min(MAX_OBJ_FILE_BYTES);
     use sha2::Digest;
     use std::os::unix::fs::OpenOptionsExt;
     // O_NONBLOCK so a FIFO (or a symlink to one) cannot block the open; the
@@ -250,10 +264,10 @@ pub fn read_obj_file(
     if !meta.is_file() {
         return Err(ObjError::NotRegular);
     }
-    if meta.len() > MAX_OBJ_FILE_BYTES {
+    if meta.len() > max_bytes {
         return Err(ObjError::TooLarge);
     }
-    let mut reader = file.take(MAX_OBJ_FILE_BYTES + 1);
+    let mut reader = file.take(max_bytes + 1);
     let mut bytes = Vec::new();
     let mut chunk = vec![0u8; READ_CHUNK];
     loop {
@@ -267,7 +281,7 @@ pub fn read_obj_file(
             break;
         }
         bytes.extend_from_slice(&chunk[..n]);
-        if bytes.len() as u64 > MAX_OBJ_FILE_BYTES {
+        if bytes.len() as u64 > max_bytes {
             return Err(ObjError::TooLarge);
         }
     }
@@ -279,7 +293,8 @@ pub fn read_obj_file(
     if cancelled() {
         return Err(ObjError::Cancelled);
     }
-    parse_obj(&bytes, limits)
+    let read = bytes.len() as u64;
+    parse_obj(&bytes, limits).map(|mesh| (mesh, read))
 }
 
 #[cfg(test)]
