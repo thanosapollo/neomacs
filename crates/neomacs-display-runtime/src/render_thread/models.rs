@@ -49,7 +49,9 @@ impl RenderApp {
     /// editor still completes a load and delivers a pick with no further
     /// input.
     pub(super) fn service_models(&mut self, now: EventTime) {
-        if self.models.is_empty() {
+        // An empty store may still owe a load result (a model freed while
+        // loading): drain it, or the loop polls for it forever.
+        if self.models.is_empty() && !self.models.has_pending_loads() {
             return;
         }
         let mut models = std::mem::take(&mut self.models);

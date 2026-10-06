@@ -123,9 +123,9 @@ impl RenderApp {
         now: std::time::Instant,
     ) {
         let notches = self.model_wheel.notches(device, id, delta, phase, now);
-        if notches != 0 {
-            self.models.wheel(id, notches, now);
-        }
+        // Even input completing no notch reaches the store: it keeps an
+        // active burst from settling while the gesture goes on.
+        self.models.wheel(id, notches, now);
         self.flush_model_events();
     }
 }

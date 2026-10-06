@@ -56,7 +56,7 @@ impl ModelView {
         ]
     }
 
-    /// This view orbited by a pointer drag of `dx`, `dy` physical pixels:
+    /// This view orbited by a pointer drag of `dx`, `dy` logical pixels:
     /// 0.5° per pixel, both angles wrapped into [0, 360) like canvas-3d's
     /// `canvas-3d-rotate` (no clamp, so a stored (0 -90 z) never jumps on
     /// its first step beyond the wrap).

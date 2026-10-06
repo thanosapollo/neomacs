@@ -26,7 +26,8 @@ use super::scene::ModelScene;
 
 /// Pointer travel (logical px) before a press becomes an orbit.
 pub const ORBIT_THRESHOLD: f64 = 4.0;
-/// Quiet time after the last wheel notch before its `View` is reported.
+/// Quiet time after the last wheel input of a burst before its `View` is
+/// reported.
 pub const WHEEL_QUIET: Duration = Duration::from_millis(150);
 /// A pick not answered by then is dropped with `Error{req: None}`.
 pub const PICK_TIMEOUT: Duration = Duration::from_millis(500);
@@ -904,21 +905,31 @@ impl ModelStore {
         self.evaluate(id);
     }
 
-    /// `notches` wheel notches over model `id` (positive zooms in).
-    /// Answers whether the wheel was consumed.
+    /// `notches` wheel notches over model `id` (positive zooms in; zero
+    /// for input that completed no notch). Answers whether the wheel was
+    /// consumed.
+    ///
+    /// Input that changes no camera (no whole notch, or a notch at the
+    /// zoom clamp) starts no interaction, but keeps a burst already
+    /// active alive: the burst settles a quiet period after its last
+    /// input, not after its last zoom.
     pub fn wheel(&mut self, id: u32, notches: i32, now: Instant) -> bool {
-        if !self.is_interactive(id) || notches == 0 {
+        if !self.is_interactive(id) {
             return false;
         }
         let entry = self.entries.get_mut(&id).expect("live");
         let zoomed = entry.view.zoomed(notches);
+        if zoomed == entry.view {
+            if entry.wheel_deadline.is_some() {
+                entry.wheel_deadline = Some(now + WHEEL_QUIET);
+            }
+            return true;
+        }
         entry.wheel_deadline = Some(now + WHEEL_QUIET);
         entry.readiness.set_interacting(true);
-        if zoomed != entry.view {
-            entry.view = zoomed;
-            entry.dirty = true;
-            entry.readiness.bump();
-        }
+        entry.view = zoomed;
+        entry.dirty = true;
+        entry.readiness.bump();
         self.evaluate(id);
         true
     }

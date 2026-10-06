@@ -853,3 +853,86 @@ fn the_live_vertex_cap_is_exact_and_released_on_failure() {
         "exactly 8,000,000"
     );
 }
+
+// ----------------------------------------------------------------------
+// Round 2: a load freed while loading, and wheel input that changes no
+// camera.
+
+/// Pre-review MUST 1 (store level): the result of a load freed while it
+/// was loading is drained with the store empty, emits nothing, and the
+/// poll stops once it is.
+#[test]
+fn a_load_freed_while_loading_is_drained_and_stops_the_poll() {
+    let dir = std::env::temp_dir().join(format!(
+        "neomacs-model-store-freed-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("quad.obj");
+    std::fs::write(&path, QUAD).unwrap();
+    let mut store = ModelStore::new();
+    store.create(
+        5,
+        vec![ModelMeshSpec { path, sha256: None }],
+        ModelView::default(),
+        [0.0, 0.0, 0.0, 1.0],
+        (64, 32),
+    );
+    store.free(5, None);
+    assert!(store.is_empty());
+    let t0 = Instant::now();
+    assert_eq!(
+        store.next_deadline(t0),
+        Some(t0 + POLL_INTERVAL),
+        "the freed load's result is still owed"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while store.has_pending_loads() {
+        assert!(Instant::now() < deadline, "the result never arrived");
+        std::thread::sleep(Duration::from_millis(2));
+        store.poll_loads(None);
+    }
+    assert!(store.take_events().is_empty());
+    assert_eq!(store.next_deadline(Instant::now()), None);
+}
+
+/// Wheel input that changes no camera (a sub-notch event, or a notch at
+/// the zoom clamp) starts no interaction, but keeps a burst already
+/// active alive: it settles a quiet period after the last input
+/// (display-lane open item; pre-review NIT 3).
+#[test]
+fn wheel_input_without_a_zoom_change_keeps_a_burst_but_starts_none() {
+    let mut host = FakeHost::default();
+    let mut store = loaded_store(&mut host);
+    store.update(
+        5,
+        1,
+        ModelChange::View(ModelView {
+            yaw: 0.0,
+            pitch: 0.0,
+            zoom: 4.0,
+        }),
+        h(&mut host),
+    );
+    shown(&mut store, &mut host);
+    store.take_events();
+    let t0 = Instant::now();
+    let ms = |n: u64| t0 + Duration::from_millis(n);
+    // A notch at the clamp, and a sub-notch event: consumed, no burst.
+    assert!(store.wheel(5, 1, ms(0)));
+    assert!(store.wheel(5, 0, ms(0)));
+    assert!(store.take_events().is_empty(), "no R{{nil}} at the clamp");
+    assert_eq!(store.next_deadline(ms(0)), None, "no burst started");
+
+    // A burst zooming out; sub-notch input at 100 ms keeps it active.
+    assert!(store.wheel(5, -1, ms(0)));
+    assert_eq!(kinds(&store.take_events()), ["R{false,3,1}"]);
+    assert!(store.wheel(5, 0, ms(100)));
+    assert_eq!(store.next_deadline(ms(100)), Some(ms(100) + WHEEL_QUIET));
+    shown(&mut store, &mut host);
+    store.tick(ms(0) + WHEEL_QUIET, h(&mut host));
+    assert!(store.take_events().is_empty(), "the burst is still active");
+    store.tick(ms(100) + WHEEL_QUIET, h(&mut host));
+    assert_eq!(kinds(&store.take_events()), ["View{3}", "R{true,3,1}"]);
+}

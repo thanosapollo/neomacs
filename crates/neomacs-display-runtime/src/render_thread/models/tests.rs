@@ -601,3 +601,78 @@ fn renderer_loss_reaches_the_input_channel_before_a_later_key() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// ----------------------------------------------------------------------
+// Round 2.
+
+/// Pre-review MUST 1: a model freed while loading leaves the store empty;
+/// `service_models` still drains its load result, so the loop stops its
+/// 16 ms poll and the parsed scene is not kept in the channel.
+#[test]
+fn a_model_freed_while_loading_stops_the_poll_once_its_result_arrives() {
+    let (mut app, emacs) = app_with_channel();
+    let dir = std::env::temp_dir().join(format!(
+        "neomacs-model-runtime-freed-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("quad.obj");
+    std::fs::write(
+        &path,
+        b"v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nf 1 2 3 4\n",
+    )
+    .unwrap();
+    app.handle_model_create(
+        MODEL,
+        vec![ModelMeshSpec { path, sha256: None }],
+        ModelView::default(),
+        [0.0, 0.0, 0.0, 1.0],
+        (64, 32),
+    );
+    assert!(app.handle_model_free(MODEL));
+    assert!(app.models.is_empty());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.model_deadline(Instant::now()).is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "an empty store still polls: the freed load was never drained"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        app.service_models(neomacs_display_protocol::frame_time::observe_platform_now());
+    }
+    assert!(!app.models.has_pending_loads());
+    assert!(
+        delivered(&emacs).is_empty(),
+        "a freed model reports nothing"
+    );
+}
+
+/// Display-lane open item: touchpad input too small to complete a notch
+/// still extends the burst it belongs to; the burst settles a quiet
+/// period after the last input, not after the last whole notch.
+#[test]
+fn sub_notch_input_keeps_the_wheel_burst_active() {
+    use neomacs_renderer_wgpu::model::store::WHEEL_QUIET;
+    use winit::event::{DeviceId, TouchPhase};
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    present(&mut app, A);
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+    let pad = Some(DeviceId::from_raw(1));
+    let t0 = Instant::now();
+    let ms = |n: u64| t0 + Duration::from_millis(n);
+    // 50 px is one notch; 20 px (0.4 notch) completes none.
+    app.wheel_over_model(pad, MODEL, pixels(50.0), TouchPhase::Started, ms(0));
+    app.wheel_over_model(pad, MODEL, pixels(20.0), TouchPhase::Moved, ms(100));
+    assert!((zoom(&app) - 1.1).abs() < 1e-9);
+    assert_eq!(delivered(&emacs), ["R{false,2,0}"]);
+    assert_eq!(app.model_deadline(ms(100)), Some(ms(100) + WHEEL_QUIET));
+    app.models.tick(ms(0) + WHEEL_QUIET, None);
+    app.flush_model_events();
+    assert!(delivered(&emacs).is_empty(), "input kept arriving");
+    app.models.tick(ms(100) + WHEEL_QUIET, None);
+    app.flush_model_events();
+    assert_eq!(delivered(&emacs), ["View{2}"]);
+}
