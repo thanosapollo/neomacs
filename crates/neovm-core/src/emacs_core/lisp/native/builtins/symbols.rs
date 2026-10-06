@@ -1168,21 +1168,16 @@ fn macroexpand_definition_is_macro(definition: &Value) -> bool {
 }
 
 /// Collect the elements of a list, signalling `(wrong-type-argument listp
-/// BAD-CDR)` for an improper list — matching GNU's `list_length`
-/// (`FOR_EACH_TAIL` + `CHECK_LIST_END (list, list)`), which reports only the
-/// final non-nil cdr, not the whole improper tail.
+/// BAD-CDR)` for an improper list and `circular-list` for a circular one —
+/// GNU's `list_length` (`FOR_EACH_TAIL` + `CHECK_LIST_END (list, list)`),
+/// which reports only the final non-nil cdr, not the whole improper tail.
 fn collect_proper_list_args(list: Value) -> Result<Vec<Value>, Flow> {
-    let mut items = Vec::new();
+    let len = proper_list_length_or_signal(list)?;
+    let mut items = Vec::with_capacity(len);
     let mut tail = list;
     while tail.is_cons() {
         items.push(tail.cons_car());
         tail = tail.cons_cdr();
-    }
-    if !tail.is_nil() {
-        return Err(signal(
-            LispCondition::WrongTypeArgument,
-            vec![Value::symbol("listp"), tail],
-        ));
     }
     Ok(items)
 }

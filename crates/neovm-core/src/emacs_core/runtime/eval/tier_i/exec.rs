@@ -1177,6 +1177,7 @@ impl Context {
 
         let varlist = tail.cons_car();
         let body = tail.cons_cdr();
+        let nvars = self.value_list_len_or_error(varlist)?;
         let mut lexical_bindings: SmallVec<[(SymId, Value, Option<Slot>); 8]> = SmallVec::new();
         let mut dynamic_sym_ids = LetBindingVec::new();
         let mut dynamic_slots: SmallVec<[Slot; 8]> = SmallVec::new();
@@ -1189,7 +1190,7 @@ impl Context {
         let mut bindings = varlist;
         let mut index = 0;
 
-        while bindings.is_cons() {
+        while index < nvars && bindings.is_cons() {
             let element = bindings.cons_car();
             let binding = self.unwrap_symbol(element);
             bindings = bindings.cons_cdr();
@@ -1285,10 +1286,6 @@ impl Context {
                 dynamic_sym_ids.push((id, value));
                 dynamic_slots.extend(slot);
             }
-        }
-        if !bindings.is_nil() {
-            self.bc_buf.truncate(temps_base);
-            return Err(self.listp_error(varlist));
         }
         if let Some(name) = constant_binding_error {
             self.bc_buf.truncate(temps_base);
@@ -1396,6 +1393,7 @@ impl Context {
     ) -> Result<(), Flow> {
         let mut bindings = varlist;
         let mut index = 0;
+        let mut cycle = crate::emacs_core::builtins::ForEachTail::new(varlist);
         while bindings.is_cons() {
             let element = bindings.cons_car();
             let binding = self.unwrap_symbol(element);
@@ -1475,6 +1473,7 @@ impl Context {
                 }
                 self.try_specbind(id, value)?;
             }
+            cycle.step(bindings)?;
         }
         if !bindings.is_nil() {
             return Err(self.listp_error(varlist));
