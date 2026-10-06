@@ -223,6 +223,7 @@ impl RenderApp {
         }
         self.renderer = Some(renderer);
         self.publish_image_cache_usage();
+        self.note_models_renderer_ready();
         #[cfg(feature = "video")]
         if !self.pending_video_recovery.is_empty()
             && let Some(renderer) = self.renderer.as_mut()
@@ -325,6 +326,7 @@ impl RenderApp {
             self.pending_video_recovery = renderer.video_recovery_manifests();
         }
         self.renderer = None;
+        self.note_models_renderer_lost();
         self.publish_image_cache_usage();
         #[cfg(feature = "video")]
         {

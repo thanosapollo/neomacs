@@ -985,6 +985,8 @@ pub(super) struct RenderApp {
     /// Demand-driven frame scheduler: owns per-window redraw coalescing and
     /// wake deadlines (frame scheduling plan, Stage 2).
     pub(super) frame_coordinator: super::frame_sched::FrameCoordinator,
+    /// Native models (design §4.1): survives renderer loss.
+    pub(super) models: neomacs_renderer_wgpu::model::ModelStore,
 }
 
 /// Only terminal causes may authorize display teardown. A native close
@@ -1199,6 +1201,7 @@ impl RenderApp {
             }),
             lifecycle_flags: RenderLifecycle::new(poll_when_idle),
             frame_coordinator: super::frame_sched::FrameCoordinator::new(),
+            models: neomacs_renderer_wgpu::model::ModelStore::new(),
         }
     }
 }

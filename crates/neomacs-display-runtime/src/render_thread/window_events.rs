@@ -251,6 +251,9 @@ impl RenderApp {
                         .set_focused(super::frame_sched::NativeWindowId(sched_id), focused);
                 }
                 if !focused {
+                    // A model orbit ends with focus (design §4.6).
+                    self.models.cancel_capture();
+                    self.flush_model_events();
                     // Focus left: any modifier-side observation is stale
                     // (the keys are tracked on this window's own key
                     // events), so the next ModifiersChanged must fall back

@@ -27,6 +27,22 @@ use winit::dpi::PhysicalPosition;
 use winit::event::{DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase};
 use winit::window::WindowId;
 
+/// Zoom notches for one wheel event over a model: line deltas count as
+/// notches; pixel deltas (touchpads) count one notch per 50 px.
+fn model_wheel_notches(delta: MouseScrollDelta) -> i32 {
+    let notches = match delta {
+        MouseScrollDelta::LineDelta(_, y) | MouseScrollDelta::ContinuousLineDelta(_, y) => {
+            f64::from(y)
+        }
+        MouseScrollDelta::PixelDelta(p) => p.y / 50.0,
+        _ => 0.0,
+    };
+    if !notches.is_finite() {
+        return 0;
+    }
+    (notches.round() as i32).clamp(-10, 10)
+}
+
 // Embedded browsers own their distance policy and fractional viewport. Do not
 // impose the editor's integral Lisp boundary on their input.
 #[cfg(any(test, feature = "webview"))]
@@ -993,6 +1009,41 @@ impl RenderApp {
         }
     }
 
+    /// Left button over a model glyph (design §5.1): an unmodified press
+    /// on a ready, unfrozen model starts a capture; the release ends it,
+    /// picking when there was no orbit. Both still reach Lisp afterwards.
+    fn route_model_button(&mut self, window_id: WindowId, state: ElementState) {
+        if self.models.is_empty() {
+            return;
+        }
+        let Some(window_state) = self.frame_windows.get_by_winit(window_id) else {
+            return;
+        };
+        let key = window_state.render.emacs_frame_id;
+        let (x, y) = window_state.render.mouse_pos;
+        let (ev_x, ev_y, target_fid) = Self::pointer_target_for_frame_window(window_state, x, y);
+        let hit = Self::surface_target_for_frame_window(&window_state.render, target_fid, ev_x, ev_y)
+            .filter(|(id, _, _)| self.models.contains(*id))
+            .map(|(id, u, v)| neomacs_renderer_wgpu::model::GlyphHit { id, u, v });
+        match state {
+            ElementState::Pressed => {
+                if self.modifiers == 0
+                    && let Some(hit) = hit
+                {
+                    self.models.press(key, hit, (f64::from(x), f64::from(y)));
+                }
+            }
+            ElementState::Released => match self.renderer.as_mut() {
+                Some(renderer) => {
+                    self.models
+                        .release(key, hit, std::time::Instant::now(), renderer)
+                }
+                None => self.models.cancel_capture(),
+            },
+        }
+        self.flush_model_events();
+    }
+
     pub(super) fn handle_mouse_input(
         &mut self,
         window_id: WindowId,
@@ -1000,6 +1051,9 @@ impl RenderApp {
         button: MouseButton,
     ) {
         self.record_idle_dim_activity(window_id);
+        if button == MouseButton::Left {
+            self.route_model_button(window_id, state);
+        }
         #[cfg(feature = "webview")]
         let captured_release = if state == ElementState::Released {
             self.webview_pointer_capture.take()
@@ -1586,6 +1640,11 @@ impl RenderApp {
             let (ev_x, ev_y, target_fid) = pointer_owner
                 .raw_target()
                 .unwrap_or_else(|| Self::pointer_target_for_frame_window(window_state, lx, ly));
+            // A model orbit owns the motion of its capture: it is not
+            // forwarded to Lisp, so no drag tracking can start (design §5.1).
+            let model_owned = self
+                .models
+                .motion(window_state.render.emacs_frame_id, (f64::from(lx), f64::from(ly)));
             // iMouse hover state (docs/display-engine/SHADER_SURFACES.md):
             // resolved here rather than while drawing, because which surface
             // the pointer is over is a question about the composition, and the
@@ -1653,7 +1712,7 @@ impl RenderApp {
             if dirty {
                 window_state.render.mark_dirty();
             }
-            if event.is_none() {
+            if event.is_none() && !model_owned {
                 let position = PointerPosition {
                     x: ev_x,
                     y: ev_y,
@@ -1683,6 +1742,7 @@ impl RenderApp {
                 self.comms.send_input(event);
             }
         }
+        self.flush_model_events();
         #[cfg(feature = "webview")]
         if let Some((delivery, input)) = webview_delivery
             && let Some(system) = self.webview_system.as_mut()
@@ -1724,6 +1784,26 @@ impl RenderApp {
                     window_state.render.mouse_pos.1,
                 )
             });
+            // Wheel over a model zooms it instead of scrolling (design §5.1;
+            // the default awaits Thanos's decision).
+            if self.modifiers == 0
+                && !self.models.is_empty()
+                && let Some((surface_id, _, _)) = Self::surface_target_for_frame_window(
+                    &window_state.render,
+                    target_fid,
+                    ev_x,
+                    ev_y,
+                )
+                && self.models.is_interactive(surface_id)
+            {
+                let notches = model_wheel_notches(delta);
+                if notches != 0 {
+                    self.models
+                        .wheel(surface_id, notches, std::time::Instant::now());
+                }
+                self.flush_model_events();
+                return;
+            }
             let position = PointerPosition {
                 x: ev_x,
                 y: ev_y,

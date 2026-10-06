@@ -529,6 +529,8 @@ impl RenderApp {
         self.renderer
             .as_ref()
             .is_some_and(|r| r.has_active_shader_surfaces())
+            // A dirty model redraws once (no continuous cadence).
+            || self.models.has_dirty()
     }
 
     /// The cadence the shader-surface demand should run at (max of active

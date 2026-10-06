@@ -371,7 +371,19 @@ impl RenderApp {
                 fps,
                 recreatable,
             } => {
-                if let Some(ref mut renderer) = self.renderer {
+                if matches!(source, crate::thread_comm::SurfaceSource::Model { .. }) {
+                    // Models load on their own thread and need no renderer
+                    // until upload (design §4.2).
+                    let crate::thread_comm::SurfaceSource::Model {
+                        meshes,
+                        view,
+                        background,
+                    } = source
+                    else {
+                        unreachable!("matched above")
+                    };
+                    self.handle_model_create(id, meshes, view, background, (width, height));
+                } else if let Some(ref mut renderer) = self.renderer {
                     // Budget registration (physical bytes) and the eviction
                     // driver live in the renderer beside the caches
                     // (WgpuRenderer::register_surface_bytes).
@@ -396,12 +408,9 @@ impl RenderApp {
                         crate::thread_comm::SurfaceSource::Pixels { data } => {
                             renderer.create_pixel_surface(id, data, width, height)
                         }
-                        crate::thread_comm::SurfaceSource::Model {
-                            meshes,
-                            view,
-                            background,
-                        } => renderer
-                            .create_model_surface(id, meshes, *view, *background, width, height),
+                        crate::thread_comm::SurfaceSource::Model { .. } => {
+                            unreachable!("models are created above")
+                        }
                     };
                     if let Err(err) = result {
                         tracing::warn!("shader surface {id} create failed: {err}");
@@ -423,9 +432,14 @@ impl RenderApp {
                 }
             }
             AssetCommand::SurfaceFree { id } => {
-                if let Some(ref mut renderer) = self.renderer {
+                if !self.handle_model_free(id)
+                    && let Some(ref mut renderer) = self.renderer
+                {
                     renderer.free_surface(id);
                 }
+            }
+            AssetCommand::ModelUpdate { id, req, change } => {
+                self.handle_model_update(id, req, change);
             }
             AssetCommand::FrameShaderSet { request, composed } => match composed {
                 Some((_source, _language, _uniforms))

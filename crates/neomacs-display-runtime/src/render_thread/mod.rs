@@ -21,6 +21,7 @@ mod gpu_startup;
 mod input;
 mod lifecycle;
 mod media;
+mod models;
 #[cfg(test)]
 #[path = "tests/modifier_policy_cooking_test.rs"]
 mod modifier_policy_cooking_test;

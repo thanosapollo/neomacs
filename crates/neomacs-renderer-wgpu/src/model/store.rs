@@ -630,7 +630,8 @@ impl ModelStore {
     // ------------------------------------------------------------------
     // Interaction (design §5.1)
 
-    fn interactive(&self, id: u32) -> bool {
+    /// Ready, uploaded and not frozen: pointer input may drive it.
+    pub fn is_interactive(&self, id: u32) -> bool {
         self.entries
             .get(&id)
             .is_some_and(|e| e.status == ModelStatus::Ready && !e.frozen && e.uploaded)
@@ -640,7 +641,7 @@ impl ModelStore {
     /// `pos`: starts a capture. Answers whether it did (the press still
     /// reaches Lisp either way).
     pub fn press(&mut self, window: WindowKey, hit: GlyphHit, pos: (f64, f64)) -> bool {
-        if !self.interactive(hit.id) {
+        if !self.is_interactive(hit.id) {
             return false;
         }
         if let Some(previous) = self.capture {
@@ -749,7 +750,7 @@ impl ModelStore {
     /// `notches` wheel notches over model `id` (positive zooms in).
     /// Answers whether the wheel was consumed.
     pub fn wheel(&mut self, id: u32, notches: i32, now: Instant) -> bool {
-        if !self.interactive(id) || notches == 0 {
+        if !self.is_interactive(id) || notches == 0 {
             return false;
         }
         let entry = self.entries.get_mut(&id).expect("live");
