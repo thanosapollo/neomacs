@@ -18,48 +18,7 @@ const SAMPLES: u32 = 4;
 const BONE: [f32; 3] = [0.92, 0.77, 0.59];
 const HIGHLIGHT: [f32; 3] = [1.0, 0.82, 0.2];
 
-/// Camera in canvas-3d units: degrees, degrees, zoom 0.25..=4.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ModelView {
-    pub yaw: f64,
-    pub pitch: f64,
-    pub zoom: f64,
-}
-
-impl Default for ModelView {
-    fn default() -> Self {
-        Self {
-            yaw: 0.0,
-            pitch: 0.0,
-            zoom: 1.0,
-        }
-    }
-}
-
-impl ModelView {
-    /// Validate as `gnosis-model--view` and canvas-3d do.
-    pub fn validated(self) -> Result<Self, String> {
-        let finite = [self.yaw, self.pitch, self.zoom]
-            .iter()
-            .all(|v| v.is_finite() && v.abs() <= 1_000_000.0);
-        if !finite || !(0.25..=4.0).contains(&self.zoom) {
-            return Err("model view needs finite angles and zoom 0.25..4".to_owned());
-        }
-        Ok(self)
-    }
-
-    /// Rows of R = Ry(yaw) * Rx(pitch).
-    pub fn rotation(&self) -> [[f64; 3]; 3] {
-        let (sy, cy) = self.yaw.to_radians().sin_cos();
-        let (sp, cp) = self.pitch.to_radians().sin_cos();
-        // Ry = [[cy,0,sy],[0,1,0],[-sy,0,cy]], Rx = [[1,0,0],[0,cp,-sp],[0,sp,cp]].
-        [
-            [cy, sy * sp, sy * cp],
-            [0.0, cp, -sp],
-            [-sy, cy * sp, cy * cp],
-        ]
-    }
-}
+pub use neomacs_display_protocol::model::ModelView;
 
 /// Per-axis clip scale: zoom * 0.8, with the longer axis shrunk so the unit
 /// sphere fits the shorter one.

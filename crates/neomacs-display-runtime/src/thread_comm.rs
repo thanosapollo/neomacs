@@ -178,6 +178,12 @@ pub enum InputEvent {
         id: u32,
         error: String,
     },
+    /// Something the renderer reports about native model `id` (design §3):
+    /// load outcome, request settlement, readiness, camera and picks.
+    Model {
+        id: u32,
+        event: neomacs_display_protocol::model::ModelEvent,
+    },
     /// A current full-frame shader request passed evaluator-side validation
     /// but was rejected later by the active device or a concurrently changed
     /// quality policy. The evaluator reports this through
@@ -456,8 +462,8 @@ pub enum SurfaceSource {
     Pixels { data: Vec<u8> },
     /// Native model view: OBJ meshes drawn by the renderer's mesh pass.
     Model {
-        meshes: Vec<std::path::PathBuf>,
-        view: neomacs_renderer_wgpu::model::ModelView,
+        meshes: Vec<neomacs_display_protocol::model::ModelMeshSpec>,
+        view: neomacs_display_protocol::model::ModelView,
         /// sRGB RGBA background (a face colour; alpha linear).
         background: [f32; 4],
     },
@@ -565,6 +571,12 @@ pub enum AssetCommand {
     },
     /// Free a shader surface
     SurfaceFree { id: u32 },
+    /// Lisp request number `req` for native model `id` (design §3).
+    ModelUpdate {
+        id: u32,
+        req: u64,
+        change: neomacs_display_protocol::model::ModelChange,
+    },
     /// Install (Some, already composed+validated source in the given
     /// language, plus the user uniforms in slot order) or remove (None) the
     /// full-frame post shader
@@ -813,6 +825,9 @@ impl Default for FrameShaderRuntimeState {
 pub struct SharedRenderCapabilities {
     frame_shader: AtomicU8,
     frame_shader_runtime: Mutex<FrameShaderRuntimeState>,
+    /// A GPU renderer is live now (set on renderer creation, cleared on
+    /// loss and teardown): `neomacs-model-available-p` (design §7).
+    model_renderer: std::sync::atomic::AtomicBool,
 }
 
 impl Default for SharedRenderCapabilities {
@@ -863,7 +878,20 @@ impl SharedRenderCapabilities {
         Self {
             frame_shader: AtomicU8::new(frame_shader as u8),
             frame_shader_runtime: Mutex::new(FrameShaderRuntimeState::default()),
+            model_renderer: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Publish whether a GPU renderer is live (render thread only).
+    pub fn set_model_renderer_live(&self, live: bool) {
+        self.model_renderer
+            .store(live, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether a GPU renderer is live now, so a native model can be drawn.
+    pub fn model_renderer_live(&self) -> bool {
+        self.model_renderer
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn frame_shader_runtime_state(&self) -> std::sync::MutexGuard<'_, FrameShaderRuntimeState> {
@@ -1163,6 +1191,7 @@ impl RenderComms {
             },
             InputEvent::ImageStateChanged { .. } => "image-state-changed",
             InputEvent::SurfaceCreateFailed { .. } => "surface-create-failed",
+            InputEvent::Model { .. } => "model",
             InputEvent::FrameShaderFailed { .. } => "frame-shader-failed",
             InputEvent::MenuSelection { .. } => "menu-selection",
             InputEvent::FileDrop { .. } => "file-drop",
