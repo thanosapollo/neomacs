@@ -113,7 +113,11 @@ impl RenderApp {
         emacs_frame_id: u64,
         picture: &ModelPicture,
     ) {
-        self.note_models_presented(emacs_frame_id, picture);
+        if self.models.is_empty() {
+            return;
+        }
+        self.models.presented_blended(emacs_frame_id, picture);
+        self.flush_model_events();
     }
 
     /// Window `emacs_frame_id` is gone, or showed nothing in its last

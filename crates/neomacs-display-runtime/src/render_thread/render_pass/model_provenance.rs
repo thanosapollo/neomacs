@@ -21,8 +21,9 @@ pub(in crate::render_thread) fn blends_older_pictures(
     pane_placed: bool,
     sample: FrameSample,
 ) -> bool {
-    let _ = (render, pane_placed, sample);
-    false
+    pane_placed
+        || render.compositor.transitions.has_active()
+        || render.compositor.child_frames.has_active_crossfade(sample)
 }
 
 #[cfg(test)]

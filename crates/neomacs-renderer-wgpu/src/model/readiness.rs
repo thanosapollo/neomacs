@@ -5,6 +5,10 @@
 //!
 //! fence = showing set non-empty ∧ every member presented `rev` ∧ ¬interacting
 //!
+//! A member whose last presentation blended an older picture in (a
+//! transition, pane morph or crossfade) presented no one rev: it is in the
+//! set but holds the fence down until it presents a settled frame.
+//!
 //! After every change to an input the caller runs [`Readiness::evaluate`],
 //! which answers the `Readiness` event to emit, if any: one is emitted iff
 //! the fence or `settled` differs from the last emission, or the fence holds
@@ -21,8 +25,9 @@ pub struct Readiness {
     rev: u64,
     settled: u64,
     interacting: bool,
-    /// Window -> the rev it last presented.
-    showing: BTreeMap<WindowKey, u64>,
+    /// Window -> the rev it last presented; `None` when that presentation
+    /// was a blend no one rev describes.
+    showing: BTreeMap<WindowKey, Option<u64>>,
     /// (fence, rev, settled) last emitted; `None` before the first.
     last: Option<(bool, u64, u64)>,
 }
@@ -58,7 +63,14 @@ impl Readiness {
 
     /// `window` presented a frame compositing this model at `rev`.
     pub fn presented(&mut self, window: WindowKey, rev: u64) {
-        self.showing.insert(window, rev);
+        self.showing.insert(window, Some(rev));
+    }
+
+    /// `window` presented a frame that shows this model (or may: an older
+    /// picture blended in) at no one rev. It is a member, and the fence
+    /// stays down until it presents a settled frame.
+    pub fn presented_unsettled(&mut self, window: WindowKey) {
+        self.showing.insert(window, None);
     }
 
     /// `window` no longer shows this model (a presented frame lacks it, or
@@ -78,7 +90,7 @@ impl Readiness {
 
     pub fn fence(&self) -> bool {
         !self.showing.is_empty()
-            && self.showing.values().all(|&rev| rev == self.rev)
+            && self.showing.values().all(|&rev| rev == Some(self.rev))
             && !self.interacting
     }
 
