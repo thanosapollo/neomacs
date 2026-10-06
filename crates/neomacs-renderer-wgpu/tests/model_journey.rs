@@ -176,6 +176,7 @@ fn render_child(
         None,
     );
     r.take_drawn_surfaces();
+    r.take_referenced_surfaces();
     let child = frame(true);
     r.render_frame_content(
         &view, &child, atlas, W, H, 16.0, 16.0, false, None, 0.0, None, None, 1.0, 1.0, [0.0; 2],
@@ -215,6 +216,27 @@ fn a_model_composites_through_both_resolvers_and_free_restores_the_budget() {
         [1.0, 0.0, 0.0, 1.0],
         (32, 32),
     );
+    // Still loading (the store moves on only when polled): both resolvers
+    // reach the glyph and composite nothing for it. A raster built now
+    // depends on the model without picturing it (SOL-REVIEW-2 MUST 3).
+    assert_eq!(store.status(MODEL), Some(ModelStatus::Loading));
+    let (texture, drawn) = render_root(&mut r, &mut atlas, true);
+    assert_eq!(drawn, Some(HashSet::new()), "nothing to draw while loading");
+    assert_eq!(
+        r.take_referenced_surfaces(),
+        HashSet::from([MODEL]),
+        "the root resolver reached the loading model's glyph"
+    );
+    assert!(is_black(pixel(&r, &texture, 10, 10)), "no model pixels yet");
+    let (texture, drawn) = render_child(&mut r, &mut atlas);
+    assert!(!drawn.unwrap_or_default().contains(&MODEL));
+    assert_eq!(
+        r.take_referenced_surfaces(),
+        HashSet::from([MODEL]),
+        "the child resolver reached the loading model's glyph"
+    );
+    assert!(is_black(pixel(&r, &texture, 26, 26)));
+
     let deadline = Instant::now() + Duration::from_secs(20);
     while store.status(MODEL) == Some(ModelStatus::Loading) {
         assert!(Instant::now() < deadline, "the load never finished");
@@ -228,6 +250,7 @@ fn a_model_composites_through_both_resolvers_and_free_restores_the_budget() {
     // Root inline composite (layer_media / draw_inline_surfaces).
     let (texture, drawn) = render_root(&mut r, &mut atlas, true);
     assert_eq!(drawn, Some(HashSet::from([MODEL])), "root resolver drew it");
+    assert_eq!(r.take_referenced_surfaces(), HashSet::from([MODEL]));
     assert!(
         is_red(pixel(&r, &texture, 10, 10)),
         "model pixels in the glyph"
