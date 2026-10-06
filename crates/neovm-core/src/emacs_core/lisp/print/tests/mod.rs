@@ -938,9 +938,7 @@ fn princ_eval(src: &str) -> String {
 
 /// SRC with X bound to N levels of WRAP around nil.
 fn nested(n: usize, wrap: &str, body: &str) -> String {
-    format!(
-        "(let ((x nil) (i 0)) (while (< i {n}) (setq x {wrap}) (setq i (1+ i))) {body})"
-    )
+    format!("(let ((x nil) (i 0)) (while (< i {n}) (setq x {wrap}) (setq i (1+ i))) {body})")
 }
 
 const CIRCULAR: &str = r#"OK (error "Apparently circular structure being printed")"#;
@@ -1017,7 +1015,10 @@ fn princ_prints_tail_cycles_with_gnu_tortoise_index() {
 #[test]
 fn princ_prints_enclosing_aggregates_by_depth() {
     for (src, expected) in [
-        (r#"(let ((v (vector 1 nil))) (aset v 1 v) (format "%s" v))"#, r#"OK "[1 #0]""#),
+        (
+            r#"(let ((v (vector 1 nil))) (aset v 1 v) (format "%s" v))"#,
+            r#"OK "[1 #0]""#,
+        ),
         (
             r#"(let ((v (vector 1 nil))) (aset v 1 (list "s" v)) (format "%s" v))"#,
             r#"OK "[1 (s #0)]""#,
@@ -1026,7 +1027,10 @@ fn princ_prints_enclosing_aggregates_by_depth() {
             r#"(let ((r (record 'foo nil))) (aset r 1 r) (format "%s" r))"#,
             r##"OK "#s(foo #0)""##,
         ),
-        (r#"(let ((c (list nil))) (setcar c c) (format "%s" c))"#, r#"OK "(#0)""#),
+        (
+            r#"(let ((c (list nil))) (setcar c c) (format "%s" c))"#,
+            r#"OK "(#0)""#,
+        ),
         (
             r#"(let ((c (list 'a))) (setcar c (list 'quote c)) (format "%s" c))"#,
             r#"OK "('#0)""#,
@@ -1044,7 +1048,11 @@ fn princ_signals_at_gnu_print_depth_instead_of_overflowing() {
     );
     for wrap in ["(list x)", "(vector x)", "(let ((y x)) (lambda () y))"] {
         assert_eq!(
-            princ_eval(&nested(200, wrap, r#"(condition-case e (format "%s" x) (error e))"#)),
+            princ_eval(&nested(
+                200,
+                wrap,
+                r#"(condition-case e (format "%s" x) (error e))"#
+            )),
             CIRCULAR,
             "{wrap}"
         );
@@ -1067,7 +1075,11 @@ fn princ_signals_at_gnu_print_depth_instead_of_overflowing() {
     );
     // `'X' is a tail call, so only the inner lists count toward the depth.
     assert_eq!(
-        princ_eval(&nested(101, "(list 'quote (list x))", r#"(length (format "%s" x))"#)),
+        princ_eval(&nested(
+            101,
+            "(list 'quote (list x))",
+            r#"(length (format "%s" x))"#
+        )),
         "OK 306"
     );
 }
@@ -1083,27 +1095,198 @@ fn princ_with_print_circle_survives_deep_and_cyclic_data() {
         "OK 20003"
     );
     assert_eq!(
-        princ_eval(r#"(let ((print-circle t) f) (setq f (lambda () f)) (stringp (format "%s" f)))"#),
+        princ_eval(
+            r#"(let ((print-circle t) f) (setq f (lambda () f)) (stringp (format "%s" f)))"#
+        ),
         "OK t"
+    );
+}
+
+#[test]
+fn princ_with_print_circle_labels_shared_objects_like_gnu() {
+    for (src, expected) in [
+        (
+            r#"(let ((print-circle t) (v (vector nil))) (aset v 0 v) (format "%s" v))"#,
+            r##"OK "#1=[#1#]""##,
+        ),
+        (
+            r#"(let ((print-circle t) (x (list 1))) (format "%s" (list x x)))"#,
+            r##"OK "(#1=(1) #1#)""##,
+        ),
+        (
+            r#"(let ((print-circle t) (s "ab")) (format "%s" (list s s)))"#,
+            r##"OK "(#1=ab #1#)""##,
+        ),
+        (
+            r#"(let ((print-circle t) (x (list 1 2))) (setcdr (cdr x) x) (format "%s" x))"#,
+            r##"OK "#1=(1 2 . #1#)""##,
+        ),
+        (
+            r#"(let ((print-circle t) (x (list 1 2))) (format "%s" (list x (cdr x))))"#,
+            r##"OK "((1 . #1=(2)) #1#)""##,
+        ),
+        (
+            r#"(let ((print-circle t) (x (list 1 2))) (format "%s" (list x (cdr x) x)))"#,
+            r##"OK "(#2=(1 . #1=(2)) #1# #2#)""##,
+        ),
+        (
+            r#"(let ((print-circle t) (x 0) (i 0))
+                 (while (< i 3) (setq x (list x x) i (1+ i)))
+                 (format "%s" x))"#,
+            r##"OK "(#2=(#1=(0 0) #1#) #2#)""##,
+        ),
+        (
+            r#"(let ((print-circle t) (print-level 2) (x (list 1))) (format "%s" (list (list x) x)))"#,
+            r##"OK "((#1=...) #1#)""##,
+        ),
+        (
+            r#"(let ((print-circle t) (x (list 1))) (format "%s" (list (list 'quote x) x)))"#,
+            r##"OK "('#1=(1) #1#)""##,
+        ),
+        (
+            r#"(let ((print-circle t) (print-length 1) (x (list 1))) (format "%s" (list x x)))"#,
+            r##"OK "(#1=(1) ...)""##,
+        ),
+        (
+            r#"(let ((print-circle t) (x (make-string 0 ?a))) (format "%s" (list x x)))"#,
+            r#"OK "( )""#,
+        ),
+        (
+            r#"(let ((print-circle t) (r (record 'foo nil))) (aset r 1 r) (format "%s" r))"#,
+            r##"OK "#1=#s(foo #1#)""##,
+        ),
+        (
+            r#"(let ((print-circle t) (v (vector 1))) (format "%s" (vector v v (list v))))"#,
+            r##"OK "[#1=[1] #1# (#1#)]""##,
+        ),
+        // Each `%s' argument is a separate print.
+        (
+            r#"(let ((print-circle t) (x (list 1))) (format "%s %s" x x))"#,
+            r#"OK "(1) (1)""#,
+        ),
+        // GNU's preprocessing walks text properties that `princ' omits.
+        (
+            r#"(let ((print-circle t) (x (list 1))) (format "%s" (list (propertize "a" 'p x) x)))"#,
+            r##"OK "(a #1=(1))""##,
+        ),
+        (
+            r#"(let ((print-circle t) f) (setq f (lambda () f)) (format "%s" f))"#,
+            r##"OK "#1=#[nil (f) ((f . #1#) t)]""##,
+        ),
+        (
+            r#"(let ((print-circle t) (x (list 1)) (s ""))
+                 (princ (list x x) (lambda (ch) (setq s (concat s (string ch)))))
+                 s)"#,
+            r##"OK "(#1=(1) #1#)""##,
+        ),
+        (
+            r#"(let ((print-circle t) (x (list 1)))
+                 (error-message-string (list 'user-error (list x x))))"#,
+            r##"OK "(#1=(1) #1#)""##,
+        ),
+    ] {
+        assert_eq!(princ_eval(src), expected, "{src}");
+    }
+}
+
+/// 60 levels of `(list x x)' are 120 conses but 2^60 leaves unshared; GNU
+/// prints them in 636 characters with `print-circle'.
+#[test]
+fn princ_with_print_circle_prints_a_shared_dag_once() {
+    assert_eq!(
+        princ_eval(
+            r#"(let ((print-circle t) (x 0) (i 0))
+                 (while (< i 60) (setq x (list x x) i (1+ i)))
+                 (length (format "%s" x)))"#
+        ),
+        "OK 636"
+    );
+}
+
+/// GNU reads the print variables in the buffer current while printing: the
+/// current buffer for a function stream, the target buffer for a buffer
+/// stream, and the ` prin1' buffer (default values) for `format'.
+#[test]
+fn princ_honors_the_print_stream_buffers_print_bounds() {
+    assert_eq!(
+        princ_eval(
+            r#"(let ((b (get-buffer-create "neo-princ-locals")))
+                 (save-current-buffer
+                   (set-buffer b)
+                   (set (make-local-variable 'print-level) 1)
+                   (set (make-local-variable 'print-length) 1)
+                   (let ((s ""))
+                     (princ '(1 2 (3)) (lambda (ch) (setq s (concat s (string ch)))))
+                     (list s (format "%s" '(1 2 (3)))))))"#
+        ),
+        r#"OK ("(1 ...)" "(1 2 (3))")"#
+    );
+    assert_eq!(
+        princ_eval(
+            r#"(let ((b (get-buffer-create "neo-princ-target")))
+                 (save-current-buffer (set-buffer b) (set (make-local-variable 'print-length) 1))
+                 (princ '(1 2 (3)) b)
+                 (save-current-buffer (set-buffer b) (buffer-string)))"#
+        ),
+        r#"OK "(1 ...)""#
     );
 }
 
 #[test]
 fn princ_honors_print_level_and_print_length_like_gnu() {
     for (src, expected) in [
-        (r#"(let ((print-level 2)) (format "%s" '(1 (2 (3 (4))))))"#, r#"OK "(1 (2 ...))""#),
-        (r#"(let ((print-level 1)) (format "%s" [1 [2 [3]]]))"#, r#"OK "[1 [2 [3]]]""#),
-        (r#"(let ((print-level 1)) (format "%s" (list 1 [2 (3)])))"#, r#"OK "(1 [2 ...])""#),
-        (r#"(let ((print-level 0)) (format "%s" (list 1)))"#, r#"OK "...""#),
-        (r#"(let ((print-level -1)) (format "%s" (list 1)))"#, r#"OK "...""#),
-        (r#"(let ((print-level 1)) (format "%s" ''(1)))"#, r#"OK "'(1)""#),
-        (r#"(let ((print-length 2)) (format "%s" '(1 2 3 4)))"#, r#"OK "(1 2 ...)""#),
-        (r#"(let ((print-length 0)) (format "%s" (list 1 2)))"#, r#"OK "(...)""#),
-        (r#"(let ((print-length 1)) (format "%s" (cons 1 2)))"#, r#"OK "(1 . 2)""#),
-        (r#"(let ((print-length -1)) (format "%s" (list 1 2)))"#, r#"OK "(1 2)""#),
-        (r#"(let ((print-length 2)) (format "%s" [1 2 3 4]))"#, r#"OK "[1 2 ...]""#),
-        (r#"(let ((print-length 0)) (format "%s" [1 2]))"#, r#"OK "[...]""#),
-        (r#"(let ((print-length 1)) (format "%s" (record 'r 1 2)))"#, r##"OK "#s(r ...)""##),
+        (
+            r#"(let ((print-level 2)) (format "%s" '(1 (2 (3 (4))))))"#,
+            r#"OK "(1 (2 ...))""#,
+        ),
+        (
+            r#"(let ((print-level 1)) (format "%s" [1 [2 [3]]]))"#,
+            r#"OK "[1 [2 [3]]]""#,
+        ),
+        (
+            r#"(let ((print-level 1)) (format "%s" (list 1 [2 (3)])))"#,
+            r#"OK "(1 [2 ...])""#,
+        ),
+        (
+            r#"(let ((print-level 0)) (format "%s" (list 1)))"#,
+            r#"OK "...""#,
+        ),
+        (
+            r#"(let ((print-level -1)) (format "%s" (list 1)))"#,
+            r#"OK "...""#,
+        ),
+        (
+            r#"(let ((print-level 1)) (format "%s" ''(1)))"#,
+            r#"OK "'(1)""#,
+        ),
+        (
+            r#"(let ((print-length 2)) (format "%s" '(1 2 3 4)))"#,
+            r#"OK "(1 2 ...)""#,
+        ),
+        (
+            r#"(let ((print-length 0)) (format "%s" (list 1 2)))"#,
+            r#"OK "(...)""#,
+        ),
+        (
+            r#"(let ((print-length 1)) (format "%s" (cons 1 2)))"#,
+            r#"OK "(1 . 2)""#,
+        ),
+        (
+            r#"(let ((print-length -1)) (format "%s" (list 1 2)))"#,
+            r#"OK "(1 2)""#,
+        ),
+        (
+            r#"(let ((print-length 2)) (format "%s" [1 2 3 4]))"#,
+            r#"OK "[1 2 ...]""#,
+        ),
+        (
+            r#"(let ((print-length 0)) (format "%s" [1 2]))"#,
+            r#"OK "[...]""#,
+        ),
+        (
+            r#"(let ((print-length 1)) (format "%s" (record 'r 1 2)))"#,
+            r##"OK "#s(r ...)""##,
+        ),
         (
             r#"(let ((c (list 1 2))) (setcdr (cdr c) c) (let ((print-length 3)) (format "%s" c)))"#,
             r#"OK "(1 2 1 ...)""#,
@@ -1117,7 +1300,10 @@ fn princ_honors_print_level_and_print_length_like_gnu() {
 fn princ_shorthands_follow_gnu_print_quoted_rules() {
     for (src, expected) in [
         (r#"(format "%s" '(a (\, b)))"#, r#"OK "(a (, b))""#),
-        (r#"(format "%s" '(\` (a (\, b) (\,@ c))))"#, r#"OK "`(a ,b ,@c)""#),
+        (
+            r#"(format "%s" '(\` (a (\, b) (\,@ c))))"#,
+            r#"OK "`(a ,b ,@c)""#,
+        ),
         (r#"(format "%s" '(quote x y))"#, r#"OK "(quote x y)""#),
         (r#"(format "%s" (list 'quote "a\200"))"#, r#"OK "'a\\200""#),
     ] {

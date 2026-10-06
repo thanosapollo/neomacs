@@ -2182,6 +2182,14 @@ fn expect_fixnum_failed(val: &Value) -> Flow {
     )
 }
 
+/// The `print-level` and `print-length` values a command-loop error report
+/// replaced, rooted while the report runs arbitrary Lisp.
+pub(crate) struct CommandErrorPrintBounds {
+    roots: super::eval::SpecpdlRootScopeState,
+    old_level: Value,
+    old_length: Value,
+}
+
 /// GNU's `cmd_error_internal` / `command-error-default-function` (keyboard.c:
 /// 1030-1101): report an error that no Lisp handler caught, under a context
 /// string naming where it happened.
@@ -2235,23 +2243,47 @@ impl super::eval::Context {
         }
     }
 
-    /// GNU `cmd_error`'s report of an error that reached the command loop.
+    /// GNU `cmd_error`'s print bounds for an error that reached the command
+    /// loop.
     ///
     /// GNU sets `print-level` and `print-length` to 10 around
     /// `cmd_error_internal` ("Avoid unquittable loop if data contains a
     /// circular list") and restores them only after a normal return, as it
-    /// does for `inhibit-quit`.  Process filter and sentinel errors call
-    /// [`Self::report_command_error`] directly, without these bounds, as GNU
-    /// calls `cmd_error_internal`.
-    pub(crate) fn report_command_loop_error(&mut self, data: Value) -> Result<(), Flow> {
+    /// does for `inhibit-quit`.  Everything the command loop renders while
+    /// recovering, its own diagnostic included, belongs inside the bounds.
+    /// Process filter and sentinel errors call [`Self::report_command_error`]
+    /// directly, without these bounds, as GNU calls `cmd_error_internal`.
+    ///
+    /// GNU keeps the old values in C locals, which its conservative stack scan
+    /// marks; exact GC does not scan Rust locals, so they are rooted until
+    /// [`Self::end_command_error_print_bounds`].
+    pub(crate) fn begin_command_error_print_bounds(&mut self) -> CommandErrorPrintBounds {
+        let roots = self.save_specpdl_roots();
         let old_level = self.visible_variable_value_or_nil("print-level");
         let old_length = self.visible_variable_value_or_nil("print-length");
+        self.push_specpdl_root(old_level);
+        self.push_specpdl_root(old_length);
         self.assign("print-level", Value::fixnum(10));
         self.assign("print-length", Value::fixnum(10));
-        self.report_command_error(data, "")?;
-        self.assign("print-level", old_level);
-        self.assign("print-length", old_length);
-        Ok(())
+        CommandErrorPrintBounds {
+            roots,
+            old_level,
+            old_length,
+        }
+    }
+
+    /// Unroot the values saved by [`Self::begin_command_error_print_bounds`],
+    /// restoring them first after a normal return of the report.
+    pub(crate) fn end_command_error_print_bounds(
+        &mut self,
+        bounds: CommandErrorPrintBounds,
+        normal_return: bool,
+    ) {
+        if normal_return {
+            self.assign("print-level", bounds.old_level);
+            self.assign("print-length", bounds.old_length);
+        }
+        self.restore_specpdl_roots(bounds.roots);
     }
 
     /// GNU `command-error-default-function` (keyboard.c:1049-1101). Batch and

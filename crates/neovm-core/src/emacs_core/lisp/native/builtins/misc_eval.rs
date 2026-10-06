@@ -1651,7 +1651,20 @@ pub(crate) fn print_value_princ_bytes(
     // `princ` directly, without `print_object`, so its raw bytes pass through
     // verbatim. Non-string arguments are printed via `print_object`, which
     // octal-escapes any eight-bit bytes in nested strings.
-    PrincPrinter::new(ctx).print(*value)
+    print_value_princ_bytes_in_buffer(ctx, value, None)
+}
+
+/// [`print_value_princ_bytes`] for a `princ` stream: GNU reads the print
+/// variables in the buffer current while printing, which is the stream's
+/// buffer for a buffer or marker and the current buffer otherwise.  The
+/// string-producing callers print into GNU's ` prin1` buffer instead and pass
+/// `None`, the variables' default values.
+fn print_value_princ_bytes_in_buffer(
+    ctx: &crate::emacs_core::eval::Context,
+    value: &Value,
+    buf: Option<&crate::buffer::Buffer>,
+) -> Result<Vec<u8>, Flow> {
+    PrincPrinter::new(ctx, buf).print(*value)
 }
 
 /// Render `value` as GNU `Fprinc` does when its print target is a multibyte
@@ -1673,7 +1686,7 @@ pub(crate) fn print_value_princ_bytes_to_multibyte_buffer(
             crate::emacs_core::string_escape::octal_escape_unibyte_eight_bit(string.as_bytes())
         });
     }
-    PrincPrinter::new(ctx).print(*value)
+    PrincPrinter::new(ctx, None).print(*value)
 }
 
 /// GNU `PRINT_CIRCLE` (src/print.c): without `print-circle`, `print_object`
@@ -1686,13 +1699,16 @@ const PRINC_MAX_DEPTH: usize = 200;
 /// per `print_depth`): reaching one again prints `#N`, its depth.  A list's
 /// tail conses are not enclosing objects; a cycle through the tail is found by
 /// the Brent tortoise of GNU's `PE_list` and printed as `. #I`, I being the
-/// tortoise's index in the list.  With `print-circle` GNU numbers shared
-/// objects instead; this printer has no labels, so it keeps the `#N`
-/// detection and grows the native stack instead of capping the depth.
+/// tortoise's index in the list.  With `print-circle` GNU instead labels each
+/// object reached more than once (`#N=` / `#N#`), which also ends every
+/// cycle, and sets no depth limit; deep data then grows the native stack.
 struct PrincPrinter<'a> {
     ctx: &'a crate::emacs_core::eval::Context,
+    options: super::print::PrintOptions,
     print_quoted: bool,
     print_circle: bool,
+    /// Built by `print` when `print-circle` is set.
+    labels: Option<super::print::PrintCircleLabels>,
     print_level: Option<i64>,
     print_length: Option<usize>,
     being_printed: Vec<Value>,
@@ -1701,18 +1717,20 @@ struct PrincPrinter<'a> {
 }
 
 impl<'a> PrincPrinter<'a> {
-    fn new(ctx: &'a crate::emacs_core::eval::Context) -> Self {
-        let options = super::error::print_options_from_state(&ctx.obarray, None);
+    fn new(ctx: &'a crate::emacs_core::eval::Context, buf: Option<&crate::buffer::Buffer>) -> Self {
+        let options = super::error::print_options_from_state(&ctx.obarray, buf);
         Self {
             ctx,
+            options,
             print_quoted: options.print_quoted,
             print_circle: options.print_circle,
+            labels: None,
             // GNU tests `print-level' with FIXNUMP but `print-length' with
             // FIXNATP, so only a negative `print-length' means no limit.  The
             // shared options drop a negative level; read the variable itself.
             print_level: ctx
                 .obarray
-                .value_in_buffer(None, "print-level")
+                .value_in_buffer(buf, "print-level")
                 .and_then(|level| level.as_fixnum()),
             print_length: options
                 .print_length
@@ -1723,6 +1741,12 @@ impl<'a> PrincPrinter<'a> {
     }
 
     fn print(mut self, value: Value) -> Result<Vec<u8>, Flow> {
+        if self.print_circle {
+            self.labels = Some(super::print::PrintCircleLabels::preprocess(
+                &value,
+                self.options,
+            ));
+        }
         let mut out = Vec::new();
         self.object(value, false, &mut out)?;
         Ok(out)
@@ -1752,20 +1776,26 @@ impl<'a> PrincPrinter<'a> {
     ) -> Result<(), Flow> {
         loop {
             let depth = self.being_printed.len();
-            if !self.print_circle && depth >= PRINC_MAX_DEPTH {
-                return Err(signal(
-                    "error",
-                    vec![Value::string("Apparently circular structure being printed")],
-                ));
-            }
-            // GNU compares with BASE_EQ; `Value`'s `==` is `equal'.
-            if let Some(index) = self
-                .being_printed
-                .iter()
-                .position(|seen| seen.bits() == value.bits())
-            {
-                out.extend_from_slice(format!("#{index}").as_bytes());
-                return Ok(());
+            if let Some(labels) = self.labels.as_mut() {
+                if labels.write_label(&value, out) {
+                    return Ok(());
+                }
+            } else {
+                if depth >= PRINC_MAX_DEPTH {
+                    return Err(signal(
+                        "error",
+                        vec![Value::string("Apparently circular structure being printed")],
+                    ));
+                }
+                // GNU compares with BASE_EQ; `Value`'s `==` is `equal'.
+                if let Some(index) = self
+                    .being_printed
+                    .iter()
+                    .position(|seen| seen.bits() == value.bits())
+                {
+                    out.extend_from_slice(format!("#{index}").as_bytes());
+                    return Ok(());
+                }
             }
             if value.is_cons() {
                 // GNU's cons arm, with the object counted in `print_depth`.
@@ -1897,7 +1927,9 @@ impl<'a> PrincPrinter<'a> {
             }
             ValueKind::Veclike(VecLikeType::Record) => {
                 let items = value.as_record_data().unwrap().clone();
-                self.enclosed(value, out, |this, out| this.slots(b"#s(", &items, b")", out))
+                self.enclosed(value, out, |this, out| {
+                    this.slots(b"#s(", &items, b")", out)
+                })
             }
             // Interpreted-function closures are PVEC_CLOSURE in GNU and use the
             // same readable `#[...]` traversal as vectors, with
@@ -1942,7 +1974,9 @@ impl<'a> PrincPrinter<'a> {
         out: &mut Vec<u8>,
     ) -> Result<(), Flow> {
         out.extend_from_slice(open);
-        let shown = self.print_length.map_or(items.len(), |n| n.min(items.len()));
+        let shown = self
+            .print_length
+            .map_or(items.len(), |n| n.min(items.len()));
         for (index, item) in items[..shown].iter().enumerate() {
             if index > 0 {
                 out.push(b' ');
@@ -2005,7 +2039,12 @@ impl<'a> PrincPrinter<'a> {
                 out.push(b')');
                 return Ok(());
             }
-            if !next.is_cons() {
+            if !next.is_cons()
+                || self
+                    .labels
+                    .as_ref()
+                    .is_some_and(|labels| labels.labels_tail(&next))
+            {
                 out.extend_from_slice(b" . ");
                 self.object(next, true, out)?;
                 out.push(b')');
@@ -2194,7 +2233,11 @@ pub(crate) fn builtin_princ(eval: &mut super::eval::Context, args: Vec<Value>) -
         return builtin_princ_impl(eval, args);
     }
 
-    let bytes = print_value_princ_bytes(eval, &args[0])?;
+    let bytes = print_value_princ_bytes_in_buffer(
+        eval,
+        &args[0],
+        print_target_current_buffer(eval, target),
+    )?;
     let roots = eval.save_specpdl_roots();
     eval.push_specpdl_root(target);
     let princ_result =
@@ -2213,7 +2256,9 @@ pub(crate) fn builtin_princ_impl(
     // is inserted as itself, while genuine eight-bit / non-Unicode content is
     // carried as its disjoint extended encoding — neither is ever mistaken for
     // the other, retiring the storage-string sink princ used to fall back to.
-    let bytes = print_value_princ_bytes(ctx, &args[0])?;
+    let target = resolve_print_target_in_state(ctx, args.get(1));
+    let bytes =
+        print_value_princ_bytes_in_buffer(ctx, &args[0], print_target_current_buffer(ctx, target))?;
     write_print_bytes_from_ctx(ctx, args.get(1), &bytes)?;
     Ok(args[0])
 }
