@@ -191,6 +191,49 @@ pub(crate) fn proper_list_length_or_signal(list: Value) -> Result<usize, Flow> {
     }
 }
 
+/// GNU lisp.h `FOR_EACH_TAIL_THRESHOLD`: the steps a `FOR_EACH_TAIL` walk
+/// takes before it first moves its tortoise.
+const FOR_EACH_TAIL_THRESHOLD: usize = 4096;
+
+/// GNU `FOR_EACH_TAIL`'s cycle check (lisp.h `FOR_EACH_TAIL_STEP_CYCLEP`)
+/// for a walk that steps the list itself, on the schedule of
+/// [`proper_list_length_or_signal`].
+pub(crate) struct ForEachTail {
+    tortoise: Value,
+    steps: usize,
+}
+
+impl ForEachTail {
+    #[inline]
+    pub(crate) fn new(list: Value) -> Self {
+        Self {
+            tortoise: list,
+            steps: 0,
+        }
+    }
+
+    /// The cons the walk compares each step with.  A walk that runs Lisp
+    /// between steps must keep it alive: GNU's lives in a C local.
+    #[inline]
+    pub(crate) fn tortoise(&self) -> Value {
+        self.tortoise
+    }
+
+    /// Account for the walk's step onto TAIL: a step back onto the tortoise
+    /// signals `circular-list` with TAIL, as GNU's `circular_list (tail)`.
+    #[inline]
+    pub(crate) fn step(&mut self, tail: Value) -> Result<(), Flow> {
+        if tail.bits() == self.tortoise.bits() {
+            return Err(circular_list_error(tail));
+        }
+        self.steps = self.steps.wrapping_add(1);
+        if self.steps & (FOR_EACH_TAIL_THRESHOLD - 1) == 0 && self.steps.is_power_of_two() {
+            self.tortoise = tail;
+        }
+        Ok(())
+    }
+}
+
 /// GNU `list_length` (fns.c), behind `length`, `Flength` in the mapping
 /// functions and `concat`, and `Fapply`'s spread list. Its `FOR_EACH_TAIL`
 /// keeps the tortoise on the head until step `FOR_EACH_TAIL_THRESHOLD`
@@ -199,7 +242,6 @@ pub(crate) fn proper_list_length_or_signal(list: Value) -> Result<usize, Flow> {
 /// a cycle through it and the cons GNU reports for any other cycle.
 #[inline]
 fn proper_list_length_or_signal_scan<const OBSERVED: bool>(list: Value) -> Result<usize, Flow> {
-    const FOR_EACH_TAIL_THRESHOLD: usize = 4096;
     let mut len = 0usize;
     let mut tail = list;
     let mut tortoise = list;

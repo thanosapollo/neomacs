@@ -7787,6 +7787,10 @@ mod cconv_memo_tests;
 #[cfg(test)]
 #[path = "tests/var_fast.rs"]
 mod var_fast_tests;
+// A form whose argument list is circular signals like GNU, never loops.
+#[cfg(test)]
+#[path = "tests/circular_forms.rs"]
+mod circular_forms_tests;
 
 #[cfg(test)]
 #[path = "tests/builtin_vars.rs"]

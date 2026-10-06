@@ -1177,6 +1177,7 @@ impl Context {
 
         let varlist = tail.cons_car();
         let body = tail.cons_cdr();
+        let nvars = self.value_list_len_or_error(varlist)?;
         let mut lexical_bindings: SmallVec<[(SymId, Value, Option<Slot>); 8]> = SmallVec::new();
         let mut dynamic_sym_ids = LetBindingVec::new();
         let mut dynamic_slots: SmallVec<[Slot; 8]> = SmallVec::new();
@@ -1189,7 +1190,7 @@ impl Context {
         let mut bindings = varlist;
         let mut index = 0;
 
-        while bindings.is_cons() {
+        while index < nvars && bindings.is_cons() {
             let element = bindings.cons_car();
             let binding = self.unwrap_symbol(element);
             bindings = bindings.cons_cdr();
@@ -1286,10 +1287,6 @@ impl Context {
                 dynamic_slots.extend(slot);
             }
         }
-        if !bindings.is_nil() {
-            self.bc_buf.truncate(temps_base);
-            return Err(self.listp_error(varlist));
-        }
         if let Some(name) = constant_binding_error {
             self.bc_buf.truncate(temps_base);
             return Err(signal(
@@ -1372,7 +1369,8 @@ impl Context {
 
         let temp_scope = self.save_eval_temp_roots();
         let val_temp_slot = self.push_eval_temp_root_slot(Value::NIL);
-        let init_result = self.ti_let_star_bindings(act, varlist, use_lexical, val_temp_slot, op);
+        let init_result =
+            self.ti_let_star_bindings(act, tail, varlist, use_lexical, val_temp_slot, op);
         if let Err(error) = init_result {
             let result = self.unbind_to_with_result(specpdl_count, Err(error));
             self.restore_eval_temp_roots_to_sequence(temp_scope);
@@ -1389,17 +1387,20 @@ impl Context {
     fn ti_let_star_bindings(
         &mut self,
         act: &Act,
+        tail: Value,
         varlist: Value,
         use_lexical: bool,
         val_temp_slot: usize,
         op: &LetOp,
     ) -> Result<(), Flow> {
+        let bindings_temp_slot = self.push_eval_temp_root_slot(varlist);
+        let tortoise_temp_slot = self.push_eval_temp_root_slot(varlist);
         let mut bindings = varlist;
         let mut index = 0;
+        let mut cycle = crate::emacs_core::builtins::ForEachTail::new(varlist);
         while bindings.is_cons() {
             let element = bindings.cons_car();
             let binding = self.unwrap_symbol(element);
-            bindings = bindings.cons_cdr();
             let compiled = op.bindings.get(index);
             index += 1;
             let (id, value, slot) = if let Some(id) = binding.as_symbol_id() {
@@ -1475,9 +1476,17 @@ impl Context {
                 }
                 self.try_specbind(id, value)?;
             }
+            bindings = bindings.cons_cdr();
+            cycle.step(bindings)?;
+            self.set_eval_temp_root_slot(bindings_temp_slot, bindings);
+            self.set_eval_temp_root_slot(tortoise_temp_slot, cycle.tortoise());
         }
         if !bindings.is_nil() {
-            return Err(self.listp_error(varlist));
+            // GNU `CHECK_LIST_END (varlist, XCAR (args))`.
+            return Err(signal(
+                LispCondition::WrongTypeArgument,
+                vec![Value::symbol("listp"), tail.cons_car()],
+            ));
         }
         if index != op.bindings.len() {
             self.ti_untrust(act);

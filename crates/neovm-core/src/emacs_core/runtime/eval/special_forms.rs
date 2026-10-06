@@ -116,14 +116,16 @@ impl Context {
         //     -> (wrong-type-argument listp 2)
         //   (condition-case e (let ((x 1) . 2) x) (error e))
         //     -> (wrong-type-argument listp 2)
-        let mut tail = value;
-        while tail.is_cons() {
-            tail = tail.cons_cdr();
+        // A circular VALUE has no tail: GNU's `list_length` signals
+        // `circular-list` instead, with the cons where its `FOR_EACH_TAIL`
+        // walk met the tortoise.
+        match crate::emacs_core::builtins::proper_list_length_or_signal(value) {
+            Err(flow) => flow,
+            Ok(_) => signal(
+                LispCondition::WrongTypeArgument,
+                vec![Value::symbol("listp"), Value::NIL],
+            ),
         }
-        signal(
-            LispCondition::WrongTypeArgument,
-            vec![Value::symbol("listp"), tail],
-        )
     }
 
     pub(super) fn value_list_len_or_error(&self, list: Value) -> Result<usize, Flow> {
@@ -179,6 +181,9 @@ impl Context {
     }
 
     pub(super) fn sf_lambda_value(&mut self, tail: Value) -> EvalResult {
+        // GNU's `lambda` is a macro: `eval_sub` expands it through `apply`,
+        // whose `list_length` signals for an improper or circular TAIL.
+        self.value_list_len_or_error(tail)?;
         self.instantiate_callable_cons_form(Value::cons(Value::from_sym_id(lambda_symbol()), tail))
     }
 
@@ -200,6 +205,9 @@ impl Context {
 
         let varlist = tail.cons_car();
         let body = tail.cons_cdr();
+        // GNU `Flet` measures VARLIST with `list_length` before evaluating
+        // any init form, and binds at most that many elements.
+        let nvars = self.value_list_len_or_error(varlist)?;
         let mut lexical_bindings = LetBindingVec::new();
         let mut dynamic_sym_ids = LetBindingVec::new();
         let use_lexical = self.lexical_binding();
@@ -209,8 +217,10 @@ impl Context {
         // back.
         let temps_base = self.bc_buf.len();
         let mut bindings = varlist;
+        let mut argnum = 0;
 
-        while bindings.is_cons() {
+        while argnum < nvars && bindings.is_cons() {
+            argnum += 1;
             let binding = self.unwrap_symbol(bindings.cons_car());
             bindings = bindings.cons_cdr();
             if let Some(id) = binding.as_symbol_id() {
@@ -290,10 +300,6 @@ impl Context {
             } else {
                 dynamic_sym_ids.push((id, value));
             }
-        }
-        if !bindings.is_nil() {
-            self.bc_buf.truncate(temps_base);
-            return Err(self.listp_error(varlist));
         }
         if let Some(name) = constant_binding_error {
             self.bc_buf.truncate(temps_base);
@@ -390,11 +396,16 @@ impl Context {
 
         let temp_scope = self.save_eval_temp_roots();
         let val_temp_slot = self.push_eval_temp_root_slot(Value::NIL);
+        // GNU `Flet_star` walks VARLIST with `FOR_EACH_TAIL`, whose current
+        // cons and tortoise live in C locals across every init form: root
+        // both, as an init may drop every other reference to them.
+        let bindings_temp_slot = self.push_eval_temp_root_slot(varlist);
+        let tortoise_temp_slot = self.push_eval_temp_root_slot(varlist);
         let init_result: Result<(), Flow> = (|| {
             let mut bindings = varlist;
+            let mut cycle = crate::emacs_core::builtins::ForEachTail::new(varlist);
             while bindings.is_cons() {
                 let binding = self.unwrap_symbol(bindings.cons_car());
-                bindings = bindings.cons_cdr();
                 let (id, value) = if let Some(id) = binding.as_symbol_id() {
                     (id, Value::NIL)
                 } else if binding.is_cons() {
@@ -454,9 +465,21 @@ impl Context {
                 } else {
                     self.try_specbind(id, value)?;
                 }
+                // `FOR_EACH_TAIL` reads the cdr once the element is bound,
+                // so an init form that changed it is seen.
+                bindings = bindings.cons_cdr();
+                cycle.step(bindings)?;
+                self.set_eval_temp_root_slot(bindings_temp_slot, bindings);
+                self.set_eval_temp_root_slot(tortoise_temp_slot, cycle.tortoise());
             }
             if !bindings.is_nil() {
-                return Err(self.listp_error(varlist));
+                // GNU `CHECK_LIST_END (varlist, XCAR (args))`: the whole
+                // varlist the form holds now (not its final cdr), which the
+                // backtrace frame keeps alive.
+                return Err(signal(
+                    LispCondition::WrongTypeArgument,
+                    vec![Value::symbol("listp"), tail.cons_car()],
+                ));
             }
             Ok(())
         })();
