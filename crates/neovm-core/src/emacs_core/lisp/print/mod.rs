@@ -121,7 +121,7 @@ fn append_hash_table_test_string(table: &LispHashTable, out: &mut StatefulPrintO
     }
 }
 
-fn append_hash_table_test_bytes(table: &LispHashTable, out: &mut Vec<u8>) {
+pub(crate) fn append_hash_table_test_bytes(table: &LispHashTable, out: &mut Vec<u8>) {
     if let Some(name) = hash_table_printed_test_name(table) {
         out.extend_from_slice(b" test ");
         out.extend_from_slice(name.as_bytes());
@@ -334,7 +334,6 @@ fn is_print_circle_candidate(value: &Value, print_gensym: bool) -> bool {
         }
         ValueKind::Veclike(VecLikeType::Record) => true,
         ValueKind::Veclike(VecLikeType::HashTable) => true,
-        ValueKind::Veclike(VecLikeType::Obarray) => true,
         ValueKind::Veclike(VecLikeType::CharTable) => true,
         ValueKind::Veclike(VecLikeType::SubCharTable) => true,
         ValueKind::Veclike(VecLikeType::Lambda) => true,
@@ -500,7 +499,12 @@ fn write_print_number_table_entry(
 
 /// Preprocess pass: walk the value tree to find shared/circular structures.
 /// Uses an explicit stack (not recursive) matching GNU Emacs.
-fn print_preprocess(value: &Value, state: &mut PrintCircleState, options: PrintOptions) {
+fn print_preprocess(
+    value: &Value,
+    state: &mut PrintCircleState,
+    options: PrintOptions,
+    closures: PreprocessClosures,
+) {
     let mut stack: Vec<Value> = vec![*value];
     while let Some(obj) = stack.pop() {
         if !is_print_circle_candidate(&obj, options.print_gensym) {
@@ -530,71 +534,115 @@ fn print_preprocess(value: &Value, state: &mut PrintCircleState, options: PrintO
         }
         // First time seen -- mark and process children
         state.number_table.insert(key, 0);
-        match obj.kind() {
-            ValueKind::Cons => {
-                let pair_car = obj.cons_car();
-                let pair_cdr = obj.cons_cdr();
-                // Push cdr first so car is processed first (stack is LIFO)
-                stack.push(pair_cdr);
-                stack.push(pair_car);
-            }
-            ValueKind::Veclike(VecLikeType::Vector) => {
-                let items = obj.as_vector_data().unwrap().clone();
-                for item in items.iter().rev() {
-                    stack.push(*item);
-                }
-            }
-            ValueKind::Veclike(VecLikeType::Record) => {
-                let items = obj.as_record_data().unwrap().clone();
-                for item in items.iter().rev() {
-                    stack.push(*item);
-                }
-            }
-            ValueKind::Veclike(VecLikeType::HashTable) => {
-                let table = obj.as_hash_table().unwrap().clone();
-                for (_, entry) in table.data.keyed_entries_in_slot_order().into_iter().rev() {
-                    stack.push(entry.value);
-                    stack.push(entry.key);
-                }
-            }
-            ValueKind::Veclike(VecLikeType::Obarray) => {
-                if let Some(obarray) = obj.as_obarray_obj() {
-                    for item in obarray.buckets.iter().rev() {
-                        stack.push(*item);
-                    }
-                }
-            }
-            ValueKind::Veclike(VecLikeType::Lambda) | ValueKind::Veclike(VecLikeType::Macro) => {
-                if let Some(doc) = obj.closure_doc_value() {
-                    stack.push(doc);
-                }
-                if let Some(env) = obj.closure_env().flatten() {
-                    stack.push(env);
-                }
-                if let Some(body) = obj.closure_body_value() {
-                    stack.push(body);
-                }
-                if let Some(params) = obj.closure_params() {
-                    stack.push(crate::emacs_core::builtins::lambda_params_to_value(params));
-                }
-            }
-            ValueKind::Veclike(VecLikeType::ByteCode) => {
-                let _ = with_bytecode_literal_slots(&obj, |slots| {
-                    for item in slots.iter().rev() {
-                        stack.push(*item);
-                    }
-                });
-            }
-            ValueKind::String => push_string_text_property_plists(obj, &mut stack),
-            _ => {}
-        }
+        push_print_preprocess_children(obj, &mut stack, closures);
     }
+
     // Remove entries seen only once
     state.number_table.retain(|_, v| *v != 0);
 }
 
-fn print_preprocess_external(value: &Value, table_value: Value, options: PrintOptions) {
-    print_preprocess_external_with_t_removal(value, table_value, options, true);
+/// Which closure slots `print_preprocess` traverses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreprocessClosures {
+    /// The parts this module's printer prints.
+    Printed,
+    /// Every slot, as GNU traverses a closure and as the `princ` printer
+    /// prints one: each object that printer visits must have been counted.
+    AllSlots,
+}
+
+/// Push the objects GNU `print_preprocess` traverses below OBJ.
+fn push_print_preprocess_children(
+    obj: Value,
+    stack: &mut Vec<Value>,
+    closures: PreprocessClosures,
+) {
+    match obj.kind() {
+        ValueKind::Cons => {
+            let pair_car = obj.cons_car();
+            let pair_cdr = obj.cons_cdr();
+            if !pair_cdr.is_nil() {
+                stack.push(pair_cdr);
+            }
+            stack.push(pair_car);
+        }
+        ValueKind::Veclike(VecLikeType::Vector) => {
+            let items = obj.as_vector_data().unwrap().clone();
+            for item in items.iter().rev() {
+                stack.push(*item);
+            }
+        }
+        ValueKind::Veclike(VecLikeType::Record) => {
+            let items = obj.as_record_data().unwrap().clone();
+            for item in items.iter().rev() {
+                stack.push(*item);
+            }
+        }
+        ValueKind::Veclike(VecLikeType::HashTable) => {
+            let table = obj.as_hash_table().unwrap().clone();
+            for (_, entry) in table.data.keyed_entries_in_slot_order().into_iter().rev() {
+                stack.push(entry.value);
+                stack.push(entry.key);
+            }
+        }
+        ValueKind::Veclike(VecLikeType::CharTable) => {
+            for item in char_table_external_slots(&obj)
+                .unwrap_or_default()
+                .iter()
+                .rev()
+            {
+                stack.push(*item);
+            }
+        }
+        ValueKind::Veclike(VecLikeType::SubCharTable) => {
+            if let Some((_, _, items)) = super::chartable::sub_char_table_external_slots(&obj) {
+                for item in items.iter().rev() {
+                    stack.push(*item);
+                }
+            }
+        }
+        ValueKind::Veclike(VecLikeType::Lambda) | ValueKind::Veclike(VecLikeType::Macro)
+            if closures == PreprocessClosures::AllSlots =>
+        {
+            if let Some(slots) = obj.closure_slots() {
+                for item in slots.iter().rev() {
+                    stack.push(*item);
+                }
+            }
+        }
+        ValueKind::Veclike(VecLikeType::Lambda) | ValueKind::Veclike(VecLikeType::Macro) => {
+            if let Some(doc) = obj.closure_doc_value() {
+                stack.push(doc);
+            }
+            if let Some(env) = obj.closure_env().flatten() {
+                stack.push(env);
+            }
+            if let Some(body) = obj.closure_body_value() {
+                stack.push(body);
+            }
+            if let Some(params) = obj.closure_params() {
+                stack.push(crate::emacs_core::builtins::lambda_params_to_value(params));
+            }
+        }
+        ValueKind::Veclike(VecLikeType::ByteCode) => {
+            let _ = with_bytecode_literal_slots(&obj, |slots| {
+                for item in slots.iter().rev() {
+                    stack.push(*item);
+                }
+            });
+        }
+        ValueKind::String => push_string_text_property_plists(obj, stack),
+        _ => {}
+    }
+}
+
+fn print_preprocess_external(
+    value: &Value,
+    table_value: Value,
+    options: PrintOptions,
+    closures: PreprocessClosures,
+) {
+    print_preprocess_external_with_t_removal(value, table_value, options, true, closures);
 }
 
 /// Core of GNU `print_preprocess`. When `remove_t_entries` is true the
@@ -607,6 +655,7 @@ fn print_preprocess_external_with_t_removal(
     table_value: Value,
     options: PrintOptions,
     remove_t_entries: bool,
+    closures: PreprocessClosures,
 ) {
     let mut stack: Vec<Value> = vec![*value];
     while let Some(obj) = stack.pop() {
@@ -625,65 +674,7 @@ fn print_preprocess_external_with_t_removal(
         }
 
         put_print_number_table_entry(table_value, key, obj, Value::T);
-        match obj.kind() {
-            ValueKind::Cons => {
-                let pair_car = obj.cons_car();
-                let pair_cdr = obj.cons_cdr();
-                if !pair_cdr.is_nil() {
-                    stack.push(pair_cdr);
-                }
-                stack.push(pair_car);
-            }
-            ValueKind::Veclike(VecLikeType::Vector) => {
-                let items = obj.as_vector_data().unwrap().clone();
-                for item in items.iter().rev() {
-                    stack.push(*item);
-                }
-            }
-            ValueKind::Veclike(VecLikeType::Record) => {
-                let items = obj.as_record_data().unwrap().clone();
-                for item in items.iter().rev() {
-                    stack.push(*item);
-                }
-            }
-            ValueKind::Veclike(VecLikeType::HashTable) => {
-                let table = obj.as_hash_table().unwrap().clone();
-                for (_, entry) in table.data.keyed_entries_in_slot_order().into_iter().rev() {
-                    stack.push(entry.value);
-                    stack.push(entry.key);
-                }
-            }
-            ValueKind::Veclike(VecLikeType::Obarray) => {
-                if let Some(obarray) = obj.as_obarray_obj() {
-                    for item in obarray.buckets.iter().rev() {
-                        stack.push(*item);
-                    }
-                }
-            }
-            ValueKind::Veclike(VecLikeType::Lambda) | ValueKind::Veclike(VecLikeType::Macro) => {
-                if let Some(doc) = obj.closure_doc_value() {
-                    stack.push(doc);
-                }
-                if let Some(env) = obj.closure_env().flatten() {
-                    stack.push(env);
-                }
-                if let Some(body) = obj.closure_body_value() {
-                    stack.push(body);
-                }
-                if let Some(params) = obj.closure_params() {
-                    stack.push(crate::emacs_core::builtins::lambda_params_to_value(params));
-                }
-            }
-            ValueKind::Veclike(VecLikeType::ByteCode) => {
-                let _ = with_bytecode_literal_slots(&obj, |slots| {
-                    for item in slots.iter().rev() {
-                        stack.push(*item);
-                    }
-                });
-            }
-            ValueKind::String => push_string_text_property_plists(obj, &mut stack),
-            _ => {}
-        }
+        push_print_preprocess_children(obj, &mut stack, closures);
     }
 
     if remove_t_entries {
@@ -725,7 +716,84 @@ pub(crate) fn preprocess_print_number_table(
     // GNU's `print--preprocess` leaves the transient `t` status entries in the
     // table (the printer simply ignores non-fixnum entries), so don't strip
     // them here.
-    print_preprocess_external_with_t_removal(value, table_value, options, false);
+    print_preprocess_external_with_t_removal(
+        value,
+        table_value,
+        options,
+        false,
+        PreprocessClosures::Printed,
+    );
+}
+
+/// GNU `print`'s `print-circle` labels for the `princ` printer, which lives
+/// outside this module: `print_preprocess` numbers every object reached more
+/// than once, and `print_object` prints `#N=` before the first print of one
+/// and `#N#` for each later one.  Like GNU, numbering starts afresh for each
+/// top-level print unless `print-continuous-numbering` keeps a
+/// `print-number-table`.
+pub(crate) struct PrintCircleLabels {
+    options: PrintOptions,
+    circle: PrintCircleState,
+    number_table: Option<Value>,
+    _numbering: PrintNumberingGuard,
+}
+
+impl PrintCircleLabels {
+    pub(crate) fn preprocess(value: &Value, options: PrintOptions) -> Self {
+        let numbering = enter_print_call(&options);
+        let number_table = active_print_number_table(&options);
+        let mut circle = PrintCircleState::new();
+        match number_table {
+            Some(table) => {
+                print_preprocess_external(value, table, options, PreprocessClosures::AllSlots)
+            }
+            None => print_preprocess(value, &mut circle, options, PreprocessClosures::AllSlots),
+        }
+        Self {
+            options,
+            circle,
+            number_table,
+            _numbering: numbering,
+        }
+    }
+
+    /// GNU `print_object`'s `print-circle` arm: write VALUE's `#N=` or `#N#`
+    /// label, if it has one.  True when `#N#` (or a `print-number-table`
+    /// string) printed VALUE in full.
+    pub(crate) fn write_label(&mut self, value: &Value, out: &mut Vec<u8>) -> bool {
+        if !is_print_circle_candidate(value, self.options.print_gensym) {
+            return false;
+        }
+        if self.number_table.is_some() {
+            let mut label = StatefulPrintOutput::default();
+            let action = write_print_number_table_entry(value, &mut label, &self.options);
+            out.extend_from_slice(&label.into_bytes());
+            return action == Some(PrintNumberTableAction::PrintedReference);
+        }
+        let Some(label) =
+            object_identity_key(value).and_then(|key| self.circle.number_table.get_mut(&key))
+        else {
+            return false;
+        };
+        if *label < 0 {
+            *label = -*label;
+            out.extend_from_slice(format!("#{label}=").as_bytes());
+            false
+        } else {
+            out.extend_from_slice(format!("#{label}#").as_bytes());
+            true
+        }
+    }
+
+    /// GNU `PE_list`: a labelled tail cons prints as ` . TAIL`.
+    pub(crate) fn labels_tail(&self, tail: &Value) -> bool {
+        match self.number_table {
+            Some(table) => get_print_number_table_entry(table, tail)
+                .is_some_and(|(_, entry)| print_number_entry_is_cdr_label(entry)),
+            None => object_identity_key(tail)
+                .is_some_and(|key| self.circle.number_table.contains_key(&key)),
+        }
+    }
 }
 
 /// Entry point for stateful printing (circle/level/length aware).
@@ -756,9 +824,9 @@ pub(crate) fn print_value_stateful_bytes_with_buffers(
     if options.print_circle {
         let mut circle = PrintCircleState::new();
         if let Some(table_value) = number_table {
-            print_preprocess_external(value, table_value, options);
+            print_preprocess_external(value, table_value, options, PreprocessClosures::Printed);
         } else {
-            print_preprocess(value, &mut circle, options);
+            print_preprocess(value, &mut circle, options, PreprocessClosures::Printed);
         }
         let mut state = PrintState {
             options,

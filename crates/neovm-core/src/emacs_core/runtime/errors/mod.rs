@@ -941,7 +941,7 @@ fn error_message_string_rendered(
         let detail = join_lisp(
             data.iter()
                 .map(|v| error_arg_lisp(eval, v, ErrorDatumPrintMode::Prin1))
-                .collect(),
+                .collect::<Result<Vec<_>, Flow>>()?,
             ", ",
         );
         return Ok(Value::heap_string(
@@ -983,14 +983,14 @@ fn error_message_string_rendered(
         let detail = join_lisp(
             data.iter()
                 .map(|v| error_arg_lisp(eval, v, ErrorDatumPrintMode::Prin1))
-                .collect(),
+                .collect::<Result<Vec<_>, Flow>>()?,
             ", ",
         );
         return Ok(Value::heap_string(
             lisp_lit("peculiar error: ").concat(&detail),
         ));
     };
-    let base_message = error_arg_lisp(eval, &base_message_value, ErrorDatumPrintMode::Princ);
+    let base_message = error_arg_lisp(eval, &base_message_value, ErrorDatumPrintMode::Princ)?;
 
     if data.is_empty() {
         if symbol == error_symbol {
@@ -1005,7 +1005,7 @@ fn error_message_string_rendered(
     // `user-error` always renders payload data directly.
     if symbol == user_error_symbol {
         if let Some(first) = data.first().filter(|v| v.as_lisp_string().is_some()) {
-            let first_str = error_arg_lisp(eval, first, ErrorDatumPrintMode::Princ);
+            let first_str = error_arg_lisp(eval, first, ErrorDatumPrintMode::Princ)?;
             let rest = &data[1..];
             if rest.is_empty() {
                 return Ok(Value::heap_string(first_str));
@@ -1013,7 +1013,7 @@ fn error_message_string_rendered(
             let rest_j = join_lisp(
                 rest.iter()
                     .map(|v| error_arg_lisp(eval, v, ErrorDatumPrintMode::Princ))
-                    .collect(),
+                    .collect::<Result<Vec<_>, Flow>>()?,
                 ", ",
             );
             return Ok(Value::heap_string(
@@ -1023,7 +1023,7 @@ fn error_message_string_rendered(
         let detail = join_lisp(
             data.iter()
                 .map(|v| error_arg_lisp(eval, v, ErrorDatumPrintMode::Princ))
-                .collect(),
+                .collect::<Result<Vec<_>, Flow>>()?,
             ", ",
         );
         return Ok(Value::heap_string(detail));
@@ -1042,7 +1042,7 @@ fn error_message_string_rendered(
         let detail = join_lisp(
             data.iter()
                 .map(|v| error_arg_lisp(eval, v, ErrorDatumPrintMode::Prin1))
-                .collect(),
+                .collect::<Result<Vec<_>, Flow>>()?,
             ", ",
         );
         return Ok(Value::heap_string(
@@ -1054,7 +1054,7 @@ fn error_message_string_rendered(
     // user-facing detail.
     if symbol == error_symbol || is_file_error_family {
         if let Some(first) = data.first().filter(|v| v.as_lisp_string().is_some()) {
-            let first_str = error_arg_lisp(eval, first, ErrorDatumPrintMode::Princ);
+            let first_str = error_arg_lisp(eval, first, ErrorDatumPrintMode::Princ)?;
             let rest = &data[1..];
             if rest.is_empty() {
                 return Ok(Value::heap_string(first_str));
@@ -1067,7 +1067,7 @@ fn error_message_string_rendered(
             let rest_j = join_lisp(
                 rest.iter()
                     .map(|v| error_arg_lisp(eval, v, print_mode))
-                    .collect(),
+                    .collect::<Result<Vec<_>, Flow>>()?,
                 ", ",
             );
             return Ok(Value::heap_string(
@@ -1083,7 +1083,7 @@ fn error_message_string_rendered(
                 data[1..]
                     .iter()
                     .map(|v| error_arg_lisp(eval, v, ErrorDatumPrintMode::Prin1))
-                    .collect(),
+                    .collect::<Result<Vec<_>, Flow>>()?,
                 ", ",
             );
             return Ok(Value::heap_string(
@@ -1101,7 +1101,7 @@ fn error_message_string_rendered(
     let detail = join_lisp(
         data.iter()
             .map(|v| error_arg_lisp(eval, v, print_mode))
-            .collect(),
+            .collect::<Result<Vec<_>, Flow>>()?,
         ", ",
     );
     Ok(Value::heap_string(
@@ -1135,16 +1135,16 @@ fn error_arg_lisp(
     eval: &super::eval::Context,
     value: &Value,
     mode: ErrorDatumPrintMode,
-) -> crate::heap_types::LispString {
+) -> Result<crate::heap_types::LispString, Flow> {
     let bytes = match mode {
         ErrorDatumPrintMode::Princ => {
-            super::builtins::misc_eval::print_value_princ_bytes_to_multibyte_buffer(eval, value)
+            super::builtins::misc_eval::print_value_princ_bytes_to_multibyte_buffer(eval, value)?
         }
         ErrorDatumPrintMode::Prin1 => {
             super::error::print_value_bytes_escaped_with_eval(eval, value)
         }
     };
-    crate::heap_types::LispString::from_emacs_bytes(bytes)
+    Ok(crate::heap_types::LispString::from_emacs_bytes(bytes))
 }
 
 /// A static ASCII message literal as a LispString piece. Built unibyte so it

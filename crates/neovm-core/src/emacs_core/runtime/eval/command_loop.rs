@@ -352,6 +352,9 @@ impl Context {
                 Ok(Value::NIL)
             }
             Err(FlowKind::Signal(sig)) => {
+                // GNU `top_level_1' recovers through `cmd_error', so every
+                // rendering here is within its print bounds.
+                let print_bounds = self.begin_command_error_print_bounds();
                 let rendered = super::super::error::format_signal_data_with_eval(self, &sig);
                 tracing::warn!("command_loop_top_level_1: top-level SIGNALED: {}", rendered);
                 if self
@@ -363,6 +366,7 @@ impl Context {
                     // debugger to report a failed init/server/action. Retire
                     // it instead, so the readiness parent sees EOF/failure.
                     eprintln!("Error during daemon startup: {rendered}");
+                    self.end_command_error_print_bounds(print_bounds, true);
                     return self.shutdown_with_hooks(ShutdownRequest {
                         exit_code: 1,
                         restart: false,
@@ -370,11 +374,12 @@ impl Context {
                 }
                 let error_msg = self.command_error_message(&sig);
                 let data = self.signal_error_data_value(&sig);
-                // GNU `top_level_1' reports through the same `cmd_error'.
-                self.report_command_error(data, "")
-                    .map_err(|failure| self.command_error_report_failure(failure))?;
-                // GNU cmd_error, not the shared cmd_error_internal reporter,
-                // releases reporting inhibition only after normal return.
+                // GNU `top_level_1' reports through the same `cmd_error', which
+                // restores the print bounds and then releases reporting
+                // inhibition only after a normal return of `cmd_error_internal'.
+                let report = self.report_command_error(data, "");
+                self.end_command_error_print_bounds(print_bounds, report.is_ok());
+                report.map_err(|failure| self.command_error_report_failure(failure))?;
                 self.set_quit_flag_value(Value::NIL);
                 self.assign("inhibit-quit", Value::NIL);
                 if cfg!(test) {
@@ -503,7 +508,9 @@ impl Context {
                     // buffer-local `command-error-function' decides how the
                     // error is presented (notably `minibuffer-error-function').
                     // Capture every diagnostic decision and value before
-                    // arbitrary presentation Lisp can mutate editor state.
+                    // arbitrary presentation Lisp can mutate editor state,
+                    // rendered within the print bounds of GNU `cmd_error'.
+                    let print_bounds = self.begin_command_error_print_bounds();
                     let diagnostic = self.capture_command_loop_diagnostic(&sig);
                     // GNU `cmd_error' clears both prefix arguments and key
                     // echoing before calling `cmd_error_internal'.
@@ -512,12 +519,15 @@ impl Context {
                     self.cancel_key_echo_state();
 
                     let data = self.signal_error_data_value(&sig);
-                    if let Err(failure) = self.report_command_error(data, "") {
+                    let report = self.report_command_error(data, "");
+                    self.end_command_error_print_bounds(print_bounds, report.is_ok());
+                    if let Err(failure) = report {
                         diagnostic.emit();
                         return Err(self.command_error_report_failure(failure));
                     }
                     // GNU cmd_error, not the shared cmd_error_internal reporter,
-                    // releases reporting inhibition only after normal return.
+                    // restores the print bounds and then releases reporting
+                    // inhibition only after normal return.
                     self.set_quit_flag_value(Value::NIL);
                     self.assign("inhibit-quit", Value::NIL);
 

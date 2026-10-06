@@ -23682,6 +23682,149 @@ fn command_loop_batch_exits_after_failed_report() {
     );
 }
 
+/// GNU `cmd_error' sets `print-level' and `print-length' to 10 around the
+/// report ("Avoid unquittable loop if data contains a circular list") and
+/// restores them once `command-error-function' returns.
+#[test]
+fn command_loop_error_report_bounds_printing_like_gnu_cmd_error() {
+    crate::test_utils::init_test_tracing();
+    let (mut ev, global_map) = command_loop_error_test_context();
+    ev.eval_str(
+        r#"(progn
+             (setq neo-command-error-observation nil)
+             (set (make-local-variable 'command-error-function)
+                  (lambda (_data _context _caller)
+                    (setq neo-command-error-observation
+                          (list print-level print-length))))
+             (fset 'neo-signaling-command
+                   (lambda () (interactive) (signal 'error '("boom")))))"#,
+    )
+    .expect("install command-error print-bound probe");
+
+    run_command_loop_error_commands(&mut ev, global_map, &[("f9", "neo-signaling-command")]);
+
+    assert_eq!(
+        ev.eval_symbol("neo-command-error-observation")
+            .expect("command error observation"),
+        Value::list(vec![Value::fixnum(10), Value::fixnum(10)]),
+    );
+    assert!(ev.eval_symbol("print-level").expect("print-level").is_nil());
+    assert!(
+        ev.eval_symbol("print-length")
+            .expect("print-length")
+            .is_nil()
+    );
+}
+
+/// The `print-level' and `print-length' values `cmd_error' replaces must
+/// survive a collection run by `command-error-function'; GNU's conservative
+/// stack scan marks its C locals, exact GC needs them rooted.  Non-fixnum
+/// values mean no limit, so fresh strings are valid bounds held nowhere else.
+#[test]
+fn command_loop_error_report_roots_the_print_bounds_it_replaces() {
+    crate::test_utils::init_test_tracing();
+    let (mut ev, global_map) = command_loop_error_test_context();
+    ev.eval_str(
+        r#"(progn
+             (setq print-level (make-string 3 ?a)
+                   print-length (make-string 3 ?b))
+             nil)"#,
+    )
+    .expect("install heap print bounds");
+    ev.eval_str(
+        r#"(progn
+             (set (make-local-variable 'command-error-function)
+                  (lambda (&rest _) (garbage-collect)))
+             (fset 'neo-signaling-command
+                   (lambda () (interactive) (signal 'error '("boom"))))
+             nil)"#,
+    )
+    .expect("install collecting command-error-function");
+
+    run_command_loop_error_commands(&mut ev, global_map, &[("f9", "neo-signaling-command")]);
+
+    assert_eq!(
+        format_eval_result(&ev.eval_str("(list print-level print-length)")),
+        r#"OK ("aaa" "bbb")"#
+    );
+}
+
+/// The command loop's own diagnostic is rendered while recovering from the
+/// error, so it is bounded like everything `cmd_error' prints: unbounded, a
+/// small shared structure can expand exponentially before the report runs.
+#[tracing_test::traced_test]
+#[test]
+fn command_loop_diagnostic_renders_within_cmd_error_print_bounds() {
+    let (mut ev, global_map) = command_loop_error_test_context();
+    ev.eval_str(
+        r#"(progn
+             (setq print-level nil print-length nil)
+             (set (make-local-variable 'command-error-function) (lambda (&rest _) nil))
+             (fset 'neo-long-data-signaling-command
+                   (lambda ()
+                     (interactive)
+                     (signal 'error '("boom" (1 2 3 4 5 6 7 8 9 10 11 12 13 14 15))))))"#,
+    )
+    .expect("install long-data signaling command");
+
+    run_command_loop_error_commands(
+        &mut ev,
+        global_map,
+        &[("f9", "neo-long-data-signaling-command")],
+    );
+
+    logs_assert(|logs| {
+        let Some(line) = logs
+            .iter()
+            .find(|line| line.contains("Command loop condition:"))
+        else {
+            return Err(format!("missing command-loop condition event in {logs:#?}"));
+        };
+        if !line.contains("Command loop condition: boom: (1 2 3 4 5 6 7 8 9 10 ...)")
+            || !line.contains(r#"signal=(error ("boom" (1 2 3 4 5 6 7 8 9 10 ...)))"#)
+        {
+            return Err(format!(
+                "diagnostic rendered without the print bounds: {line}"
+            ));
+        }
+        Ok(())
+    });
+}
+
+/// GNU `top_level_1' recovers through `cmd_error' too.
+#[tracing_test::traced_test]
+#[test]
+fn top_level_signal_renders_within_cmd_error_print_bounds() {
+    let mut ev = Context::new();
+    ev.set_variable("noninteractive", Value::T);
+    let top_level = crate::emacs_core::value_reader::read_all(
+        r#"(signal 'error '("boom" (1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)))"#,
+        &test_ob(),
+    )
+    .expect("parse top-level form")
+    .into_iter()
+    .next()
+    .expect("top-level form");
+    ev.set_variable("top-level", top_level);
+
+    let _ = ev.recursive_edit();
+
+    logs_assert(|logs| {
+        let Some(line) = logs
+            .iter()
+            .find(|line| line.contains("top-level SIGNALED:"))
+        else {
+            return Err(format!("missing top-level signal event in {logs:#?}"));
+        };
+        if !line.contains(r#"top-level SIGNALED: (error ("boom" (1 2 3 4 5 6 7 8 9 10 ...)))"#) {
+            return Err(format!(
+                "top-level signal rendered without the print bounds: {line}"
+            ));
+        }
+        Ok(())
+    });
+}
+
 /// GNU decides whether an error is ignored while dispatching the signal, before
 /// `cmd_error_internal' invokes the buffer-local `command-error-function'.  A
 /// presentation callback may mutate `debug-ignored-errors', but that mutation

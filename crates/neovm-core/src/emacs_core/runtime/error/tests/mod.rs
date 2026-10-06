@@ -253,6 +253,44 @@ fn minibuffer_quit_does_not_take_down_a_noninteractive_session() {
     );
 }
 
+/// GNU `print_error_message' prints the error data with `Fprinc' and
+/// `Fprin1', so a signal raised while printing it (here `print_object''s
+/// depth limit) propagates out of `command-error-default-function' to Lisp:
+/// it is not reported as a "peculiar error", and a batch session is not
+/// killed.  GNU 32.0.50 prints (caught (error "Apparently circular structure
+/// being printed")) and exits 0.
+#[test]
+fn command_error_default_report_propagates_printing_signals_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    for noninteractive in [Value::T, Value::NIL] {
+        let mut eval = Context::new();
+        eval.set_variable("noninteractive", noninteractive);
+        let result = eval.eval_str(
+            r#"(let ((print-level nil) (print-length nil) (print-circle nil) (x nil) (i 0))
+                 (while (< i 205) (setq x (list x) i (1+ i)))
+                 (prin1-to-string
+                  (condition-case e
+                      (progn
+                        (command-error-default-function (list 'file-error "boom" x) "" nil)
+                        'returned)
+                    (error (list 'caught e)))))"#,
+        );
+        assert_eq!(
+            result
+                .as_ref()
+                .ok()
+                .and_then(|value| value.as_utf8_str().map(str::to_string))
+                .as_deref(),
+            Some(r#"(caught (error "Apparently circular structure being printed"))"#),
+            "noninteractive={noninteractive:?}: {result:?}"
+        );
+        assert!(
+            eval.shutdown_request().is_none(),
+            "noninteractive={noninteractive:?}: a printing signal must not kill the session"
+        );
+    }
+}
+
 #[test]
 fn batch_fatal_report_and_nested_shutdown_share_first_entry_hook_ownership() {
     crate::test_utils::init_test_tracing();
