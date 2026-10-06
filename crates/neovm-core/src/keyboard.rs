@@ -375,6 +375,16 @@ impl SpecialInputServiceOutcome {
         }
     }
 
+    /// Work that may have changed displayed buffers but is no GUI
+    /// activity: it neither completes a wait on activity nor acknowledges
+    /// a frame resize.
+    pub(crate) fn redisplay_only() -> Self {
+        Self {
+            redisplay_needed: true,
+            activity: SpecialInputServiceActivity::None,
+        }
+    }
+
     pub(crate) fn merge(self, other: Self) -> Self {
         Self {
             redisplay_needed: self.redisplay_needed || other.redisplay_needed,
@@ -4140,6 +4150,10 @@ impl crate::emacs_core::eval::Context {
 
         crate::emacs_core::builtins::drain_file_notify_events(self)?;
         crate::emacs_core::dbusbind::drain_events(self)?;
+        // Model events a throw out of a callback left queued.
+        if crate::emacs_core::model::drain_model_events(self)? {
+            outcome = outcome.merge(SpecialInputServiceOutcome::redisplay_only());
+        }
 
         if self.sync_pending_resize_events() {
             outcome = outcome.merge(SpecialInputServiceOutcome::resize_with_redisplay());
@@ -4223,9 +4237,10 @@ impl crate::emacs_core::eval::Context {
                 }
                 InputEvent::Model { id, event } => {
                     // Callbacks may change buffers (status lines, highlights),
-                    // so redisplay after servicing like the WebView arm.
+                    // so redisplay after servicing. Not a resize: a model
+                    // event must not acknowledge a frame-resize wait.
                     self.handle_model_input_event(id, &event)?;
-                    outcome = outcome.merge(SpecialInputServiceOutcome::resize_with_redisplay());
+                    outcome = outcome.merge(SpecialInputServiceOutcome::redisplay_only());
                 }
                 InputEvent::FrameShaderFailed { error } => {
                     let effects =
@@ -5737,6 +5752,8 @@ impl crate::emacs_core::eval::Context {
             self.drain_eval_tasks();
             crate::emacs_core::builtins::drain_file_notify_events(self)?;
             crate::emacs_core::dbusbind::drain_events(self)?;
+            // Model events a throw out of a callback left queued.
+            crate::emacs_core::model::drain_model_events(self)?;
             match self.pop_queued_read_char_event()? {
                 QueuedReadCharEvent::Event(event) => return Ok(Some(event)),
                 QueuedReadCharEvent::HandledInternally => continue,

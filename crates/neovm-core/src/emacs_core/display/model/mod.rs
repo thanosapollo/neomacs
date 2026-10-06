@@ -489,20 +489,32 @@ pub(crate) struct ModelEventQueue {
 
 /// Deliver one model event from either keyboard special-input site: run
 /// the state hook now, then the event hook for this event and every
-/// event queued behind it, oldest first. While a member runs (inside its
-/// `sit-for`, `accept-process-output` or `read-event`), a newly arrived
-/// event only updates state and waits in the queue, so no member is ever
-/// re-entered. A member's error is logged and the next member still runs;
-/// a quit or throw propagates, leaving later events queued for the next
-/// delivery.
+/// event queued behind it, oldest first ([`drain_model_events`]). While a
+/// member runs (inside its `sit-for`, `accept-process-output` or
+/// `read-event`), a newly arrived event only updates state and waits in
+/// the queue, so no member is ever re-entered. A member's error, or quit,
+/// is logged and the next member still runs, as with GNU's
+/// `safe_run_hooks`; a throw propagates, and the events behind it wait
+/// for the next wait or command-loop read.
 pub(crate) fn deliver_model_event(eval: &mut Context, id: u32, event: &ModelEvent) -> EvalResult {
     run_model_hook(eval, MODEL_STATE_HOOK, id, event)?;
     eval.model_events.pending.push_back((id, event.clone()));
-    if eval.model_events.draining {
-        return Ok(Value::NIL);
+    drain_model_events(eval)?;
+    Ok(Value::NIL)
+}
+
+/// Run the event hook for every queued model event, oldest first, unless
+/// a delivery further up the stack is already doing so. Every wait and
+/// every command-loop read also calls this, so events a throw left
+/// queued (their state already recorded) are delivered at the next safe
+/// point without waiting for another model event. Idempotent; answers
+/// whether it delivered anything.
+pub(crate) fn drain_model_events(eval: &mut Context) -> Result<bool, Flow> {
+    if eval.model_events.draining || eval.model_events.pending.is_empty() {
+        return Ok(false);
     }
     eval.model_events.draining = true;
-    let mut result = Ok(Value::NIL);
+    let mut result = Ok(true);
     while let Some((id, event)) = eval.model_events.pending.pop_front() {
         if let Err(flow) = run_model_hook(eval, MODEL_EVENT_HOOK, id, &event) {
             result = Err(flow);

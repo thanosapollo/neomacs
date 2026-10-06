@@ -620,3 +620,38 @@ fn update_primitives_reject_bad_arguments_and_destroyed_models() {
     assert!(printed.contains("destroyed"), "{printed}");
     assert!(updates(&host).is_empty(), "rejections never reach the host");
 }
+
+/// Pre-review SHOULD 1: a model event asks for redisplay but is no GUI
+/// activity, so it never acknowledges a frame-resize wait.
+#[test]
+fn a_model_event_is_not_a_resize_acknowledgement() {
+    let (mut ctx, _host) = model_context();
+    let readiness = || crate::keyboard::InputEvent::Model {
+        id: FIRST_MODEL_ID,
+        event: ModelEvent::Readiness {
+            current: false,
+            rev: 1,
+            req: 0,
+        },
+    };
+    ctx.command_loop
+        .keyboard
+        .pending_input_events
+        .push_back(readiness());
+    let outcome = ctx
+        .service_wait_request_special_input_events()
+        .expect("model event serviced");
+    assert!(outcome.redisplay_needed(), "callbacks may change buffers");
+    assert!(!outcome.has_resize_activity(), "not a resize: {outcome:?}");
+    assert!(!outcome.has_any_activity(), "not GUI activity: {outcome:?}");
+
+    ctx.command_loop
+        .keyboard
+        .pending_input_events
+        .push_back(readiness());
+    let acked = ctx
+        .wait_for_resize_ack_until(std::time::Instant::now() + std::time::Duration::from_millis(30))
+        .expect("resize-ack wait");
+    assert!(!acked, "a model event ended a resize-ack wait");
+    assert!(ctx.command_loop.keyboard.pending_input_events.is_empty());
+}

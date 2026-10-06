@@ -950,3 +950,153 @@ fn weak_registry_collects_a_callback_to_handle_cycle() {
     );
     assert_eq!(eval_printed(&mut ctx, "model-test-log"), "((ready t))");
 }
+
+// ----------------------------------------------------------------------
+// Round 2: non-local exits out of a callback (pre-review MUST 2).
+
+/// Models 1 and 2. Model 1's `ready' callback waits, which services
+/// model 2's `ready' and `readiness{t}' queued behind it, then runs EXIT.
+/// Both callbacks log `(N TYPE)'; a second event-hook member logs
+/// `(hook ID TYPE)'.
+fn non_local_exit_context(test: &str, exit: &str) -> Context {
+    let (mut ctx, _host) = lisp_context(test);
+    eval_printed(
+        &mut ctx,
+        &format!(
+            r#"(progn
+             (setq model-test-log nil model-test-hooks nil)
+             (setq model-test-m
+                   (neomacs-model-create
+                    :meshes (list (list "a" model-test-a))
+                    :callback (lambda (_model type _plist)
+                                (push (list 1 type) model-test-log)
+                                (when (eq type 'ready)
+                                  (accept-process-output nil 0.05)
+                                  {exit}))))
+             (setq model-test-m2
+                   (neomacs-model-create
+                    :meshes (list (list "a" model-test-a))
+                    :callback (lambda (_model type _plist)
+                                (push (list 2 type) model-test-log))))
+             (add-hook 'neomacs-model-event-functions
+                       (lambda (id type _plist)
+                         (push (list 'hook id type) model-test-hooks))
+                       t))"#
+        ),
+    );
+    let model = |id, event| crate::keyboard::InputEvent::Model { id, event };
+    queue_input(
+        &mut ctx,
+        vec![
+            model(FIRST_MODEL_ID, ModelEvent::Ready { triangles: vec![1] }),
+            model(FIRST_MODEL_ID + 1, ModelEvent::Ready { triangles: vec![1] }),
+            model(
+                FIRST_MODEL_ID + 1,
+                ModelEvent::Readiness {
+                    current: true,
+                    rev: 1,
+                    req: 0,
+                },
+            ),
+        ],
+    );
+    ctx
+}
+
+/// Model 2's state is current the moment its events arrive, whatever
+/// model 1's callback then does.
+fn assert_model_2_state(ctx: &mut Context) {
+    assert_eq!(
+        eval_printed(ctx, "(neomacs-model-status model-test-m2)"),
+        r#"(ready :triangles (1) :meshes ("a"))"#
+    );
+    assert_eq!(
+        eval_printed(ctx, "(neomacs-model-current-p model-test-m2)"),
+        "t"
+    );
+}
+
+fn assert_all_delivered(ctx: &mut Context, hooks: &str) {
+    assert_eq!(
+        eval_printed(ctx, "(reverse model-test-log)"),
+        "((1 ready) (2 ready) (2 readiness))"
+    );
+    assert_eq!(eval_printed(ctx, "(reverse model-test-hooks)"), hooks);
+    assert_eq!(eval_printed(ctx, "neomacs-model--queue"), "nil");
+}
+
+/// A `throw' out of a callback (the "wait for the model" idiom) leaves
+/// model 2's state right at once, and its queued callbacks and hook
+/// members run at the next wait, with no further model event.
+#[test]
+fn a_throw_out_of_a_callback_strands_no_event_until_the_next_wait() {
+    let mut ctx = non_local_exit_context("lisp-throw-wait", "(throw 'model-test-done 'thrown)");
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            "(catch 'model-test-done (accept-process-output nil 0.05) 'no-throw)"
+        ),
+        "thrown"
+    );
+    assert_model_2_state(&mut ctx);
+    eval_printed(&mut ctx, "(accept-process-output nil 0.01)");
+    assert_all_delivered(
+        &mut ctx,
+        &format!(
+            "((hook {} ready) (hook {} readiness))",
+            FIRST_MODEL_ID + 1,
+            FIRST_MODEL_ID + 1
+        ),
+    );
+    assert_model_2_state(&mut ctx);
+}
+
+/// The same throw; the next command-loop read delivers what it left.
+#[test]
+fn a_throw_out_of_a_callback_strands_no_event_until_the_next_read() {
+    let mut ctx = non_local_exit_context("lisp-throw-read", "(throw 'model-test-done 'thrown)");
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            "(catch 'model-test-done (accept-process-output nil 0.05) 'no-throw)"
+        ),
+        "thrown"
+    );
+    assert_model_2_state(&mut ctx);
+    assert_eq!(eval_printed(&mut ctx, "(read-event nil nil 0.01)"), "nil");
+    assert_all_delivered(
+        &mut ctx,
+        &format!(
+            "((hook {} ready) (hook {} readiness))",
+            FIRST_MODEL_ID + 1,
+            FIRST_MODEL_ID + 1
+        ),
+    );
+}
+
+/// A quit out of a callback (C-g inside its `sit-for') is a signal: like
+/// GNU's `safe_run_hooks' the delivery logs it and goes on, so model 2's
+/// callbacks run in the same delivery and its state is right.
+#[test]
+fn a_quit_out_of_a_callback_is_logged_and_strands_nothing() {
+    let mut ctx = non_local_exit_context("lisp-quit", "(signal 'quit nil)");
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            "(condition-case nil
+                 (progn (accept-process-output nil 0.05) 'no-quit)
+               (quit 'quit))"
+        ),
+        "no-quit"
+    );
+    assert_model_2_state(&mut ctx);
+    assert_all_delivered(
+        &mut ctx,
+        &format!(
+            "((hook {} ready) (hook {} ready) (hook {} readiness))",
+            FIRST_MODEL_ID,
+            FIRST_MODEL_ID + 1,
+            FIRST_MODEL_ID + 1
+        ),
+    );
+}
