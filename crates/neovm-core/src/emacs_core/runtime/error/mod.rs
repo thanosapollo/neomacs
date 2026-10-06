@@ -2295,7 +2295,7 @@ impl super::eval::Context {
         context: Value,
     ) -> Result<(), Flow> {
         let context_text = context.as_utf8_str().unwrap_or_default().to_string();
-        let rendered = self.error_data_message(data);
+        let rendered = self.error_data_message(data)?;
         // GNU guards this branch with `!is_minibuffer_quit` (keyboard.c:1064):
         // aborting a minibuffer reports like any other quit but must never take
         // the session down, not even before the first frame is displayed.
@@ -2327,14 +2327,16 @@ impl super::eval::Context {
 
     /// GNU `print_error_message`'s message half: `error-message-string` of the
     /// `(SYMBOL . DATA)` pair.
-    fn error_data_message(&mut self, data: Value) -> String {
-        match super::errors::builtin_error_message_string(self, vec![data]) {
-            Ok(text) => text
-                .as_utf8_str()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "peculiar error".to_string()),
-            Err(_) => "peculiar error".to_string(),
-        }
+    ///
+    /// GNU prints the data with `Fprinc` / `Fprin1`, so a signal raised while
+    /// printing it (such as `print_object`'s depth limit) propagates out of
+    /// the reporter to Lisp; it is not a "peculiar error".
+    fn error_data_message(&mut self, data: Value) -> Result<String, Flow> {
+        let text = super::errors::builtin_error_message_string(self, vec![data])?;
+        Ok(text
+            .as_lisp_string()
+            .map(|ls| crate::emacs_core::emacs_char::to_utf8_lossy(ls.as_bytes()))
+            .unwrap_or_else(|| "peculiar error".to_string()))
     }
 }
 
