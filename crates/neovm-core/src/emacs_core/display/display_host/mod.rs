@@ -118,6 +118,29 @@ pub struct TerminalCreateRequest {
     pub size: TerminalGridSize,
     pub target: TerminalDisplayTarget,
     pub shell: Option<String>,
+    /// None preserves the historical interactive-shell API.
+    pub invocation: Option<TerminalInvocation>,
+}
+
+/// Exact UTF-8 local invocation, never executable shell text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalInvocation {
+    pub executable: String,
+    pub argv: Vec<String>,
+    pub directory: String,
+    /// Emacs process-environment: first name wins, bare names mean unset.
+    pub environment: Vec<String>,
+}
+
+/// Authoritative direct-child wait and reader settlement. EOF is not exit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalCompletion {
+    pub exit_code: Option<u32>,
+    /// portable-pty exposes the native signal description, not its number.
+    pub signal: Option<String>,
+    pub wait_error: Option<String>,
+    pub output_drained: bool,
+    pub read_error: Option<String>,
 }
 
 /// Typed request crossing from GNU-compatible face realization into the
@@ -299,6 +322,20 @@ impl GuiResourceQuery {
 }
 
 pub trait DisplayHost {
+    /// A deferred GUI connection owns a terminal independently of the initial
+    /// daemon terminal and any attached TTYs.
+    fn gui_terminal(&self) -> Option<(u64, neomacs_display_protocol::GraphicalDisplayIdentity)> {
+        None
+    }
+
+    /// Font-owned geometry for frames opened from a non-graphical selection.
+    fn gui_frame_metrics(&self) -> Option<(f32, f32, f32, f64)> {
+        None
+    }
+
+    fn default_gui_font(&self) -> Option<&str> {
+        None
+    }
     #[cfg(target_os = "macos")]
     fn ns_resource(&self, _name: &str) -> Option<String> {
         None
@@ -321,6 +358,14 @@ pub trait DisplayHost {
     }
 
     fn realize_gui_frame(&mut self, request: GuiFrameHostRequest) -> Result<(), String>;
+    /// Pending until the native window and render surface exist. Legacy hosts
+    /// realize synchronously; asynchronous native hosts must report completion.
+    fn poll_gui_frame_ready(
+        &mut self,
+        _frame: crate::window::FrameId,
+    ) -> Option<Result<(), String>> {
+        Some(Ok(()))
+    }
     fn resize_gui_frame(&mut self, request: GuiFrameHostRequest) -> Result<(), String>;
     /// Whether this concrete graphical backend can represent ATTRIBUTE.
     ///
@@ -385,6 +430,27 @@ pub trait DisplayHost {
     ) -> Result<(), String> {
         Ok(())
     }
+    /// Apply each accepted legacy alpha operation synchronously, independently
+    /// of replaceable scene transport. Negative components mean retain.
+    fn set_gui_frame_alpha(
+        &mut self,
+        _frame: crate::window::FrameId,
+        _alpha: [f32; 2],
+        _limit: f32,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn set_gui_frame_focus_redirects(
+        &mut self,
+        _redirects: Vec<(crate::window::FrameId, Option<crate::window::FrameId>)>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn retire_gui_frame_alpha(&mut self, _frame: crate::window::FrameId) -> Result<(), String> {
+        Ok(())
+    }
+    fn set_gui_frame_alpha_lower_limit(&mut self, _limit: f32) {}
+
     fn opening_gui_frame_pending(&self) -> bool {
         false
     }
@@ -640,6 +706,13 @@ pub trait DisplayHost {
         Ok(())
     }
     fn create_terminal(&self, _request: TerminalCreateRequest) -> Result<TerminalId, String> {
+        Err("neo-term is unsupported by this display host".to_owned())
+    }
+    fn set_terminal_palette(
+        &self,
+        _frame: crate::window::FrameId,
+        _palette: Option<neomacs_display_protocol::neo_term_palette::NeoTermPalette>,
+    ) -> Result<(), String> {
         Err("neo-term is unsupported by this display host".to_owned())
     }
     fn write_terminal(&self, _id: TerminalId, _data: Vec<u8>) -> Result<(), String> {

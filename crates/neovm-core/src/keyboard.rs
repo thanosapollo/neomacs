@@ -1428,6 +1428,15 @@ pub enum InputEvent {
     TerminalExited {
         id: crate::emacs_core::display_host::TerminalId,
     },
+    TerminalSettled {
+        id: crate::emacs_core::display_host::TerminalId,
+        completion: crate::emacs_core::display_host::TerminalCompletion,
+    },
+    /// Admitted local cwd metadata; not a user key or idle-time reset.
+    TerminalDirectoryChanged {
+        id: crate::emacs_core::display_host::TerminalId,
+        directory: String,
+    },
     /// A compositor-owned neo-term published a new title.
     TerminalTitleChanged {
         id: crate::emacs_core::display_host::TerminalId,
@@ -1468,6 +1477,9 @@ impl InputEvent {
     /// `C-g`, and should wake an evaluator that is busy outside `read_char`.
     pub fn requests_default_quit(&self) -> bool {
         match self {
+            Self::Tracked { event, .. } | Self::Observed { event, .. } => {
+                event.requests_default_quit()
+            }
             Self::RawTtyBytes { bytes, .. } => bytes.contains(&0x07),
             Self::TtyByte { byte, .. } => *byte == 0x07,
             Self::TtyCharacter { character, .. } => character.code() == 0x07,
@@ -3931,6 +3943,18 @@ impl crate::emacs_core::eval::Context {
         crate::frontend_events::is_wait_special(event, self.track_mouse_enabled())
     }
 
+    // Cwd metadata is background service, not user activity. Leave both idle
+    // timestamps untouched, including None after an earlier epoch was stopped.
+    fn stop_idle_for_dequeued_input_event(&mut self, event: &InputEvent) {
+        match event {
+            InputEvent::TerminalDirectoryChanged { .. } | InputEvent::TerminalSettled { .. } => {}
+            InputEvent::Tracked { event, .. } | InputEvent::Observed { event, .. } => {
+                self.stop_idle_for_dequeued_input_event(event);
+            }
+            _ => self.timer_stop_idle(),
+        }
+    }
+
     fn take_next_wait_request_special_input_event(
         &mut self,
         internal_effects: &mut crate::frontend_events::InternalEventEffects,
@@ -3949,7 +3973,7 @@ impl crate::emacs_core::eval::Context {
                     .keyboard
                     .pending_input_events
                     .pop_visible_front();
-                self.timer_stop_idle();
+                self.stop_idle_for_dequeued_input_event(&event);
                 return Ok(Some(event));
             }
             return Ok(None);
@@ -3970,7 +3994,7 @@ impl crate::emacs_core::eval::Context {
                     .keyboard
                     .pending_input_events
                     .pop_visible_front();
-                self.timer_stop_idle();
+                self.stop_idle_for_dequeued_input_event(&event);
                 return Ok(Some(event));
             }
             return Ok(None);
@@ -4180,8 +4204,14 @@ impl crate::emacs_core::eval::Context {
                 InputEvent::TerminalCreateFailed { id, error } => {
                     self.handle_terminal_create_failed_input_event(id, &error)?;
                 }
+                InputEvent::TerminalSettled { id, completion } => {
+                    self.handle_terminal_settled_input_event(id, &completion)?;
+                }
                 InputEvent::TerminalExited { id } => {
                     self.handle_terminal_exited_input_event(id)?;
+                }
+                InputEvent::TerminalDirectoryChanged { id, directory } => {
+                    self.handle_terminal_directory_changed_input_event(id, &directory)?;
                 }
                 InputEvent::TerminalTitleChanged { id, title } => {
                     self.handle_terminal_title_changed_input_event(id, &title)?;
@@ -4275,6 +4305,43 @@ impl crate::emacs_core::eval::Context {
         crate::emacs_core::hook_runtime::run_named_hook_with_args(self, &args)
     }
 
+    fn handle_terminal_settled_input_event(
+        &mut self,
+        id: crate::emacs_core::display_host::TerminalId,
+        completion: &crate::emacs_core::display_host::TerminalCompletion,
+    ) -> crate::emacs_core::error::EvalResult {
+        let args = [
+            Value::symbol("neo-term-settled-functions"),
+            Value::fixnum(i64::from(id.get())),
+            completion
+                .exit_code
+                .map(|code| Value::fixnum(i64::from(code)))
+                .unwrap_or(Value::NIL),
+            completion
+                .signal
+                .as_deref()
+                .map(Value::string)
+                .unwrap_or(Value::NIL),
+            if completion.output_drained {
+                Value::T
+            } else {
+                Value::NIL
+            },
+            completion
+                .wait_error
+                .as_deref()
+                .map(Value::string)
+                .unwrap_or(Value::NIL),
+            completion
+                .read_error
+                .as_deref()
+                .map(Value::string)
+                .unwrap_or(Value::NIL),
+        ];
+        crate::emacs_core::hook_runtime::run_named_hook_with_args(self, &args)?;
+        self.handle_terminal_exited_input_event(id)
+    }
+
     fn handle_terminal_exited_input_event(
         &mut self,
         id: crate::emacs_core::display_host::TerminalId,
@@ -4299,6 +4366,19 @@ impl crate::emacs_core::eval::Context {
         crate::emacs_core::hook_runtime::run_named_hook_with_args(self, &args)
     }
 
+    fn handle_terminal_directory_changed_input_event(
+        &mut self,
+        id: crate::emacs_core::display_host::TerminalId,
+        directory: &str,
+    ) -> crate::emacs_core::error::EvalResult {
+        let args = [
+            Value::symbol("neo-term-directory-changed-functions"),
+            Value::fixnum(i64::from(id.get())),
+            Value::string(directory),
+        ];
+        crate::emacs_core::hook_runtime::run_named_hook_with_args(self, &args)
+    }
+
     fn handle_terminal_title_changed_input_event(
         &mut self,
         id: crate::emacs_core::display_host::TerminalId,
@@ -4317,9 +4397,26 @@ impl crate::emacs_core::eval::Context {
         emacs_frame_id: u64,
     ) -> Result<(), crate::emacs_core::error::Flow> {
         self.timer_resume_idle();
+        // A late event for a retired daemon GUI frame cannot terminate the root.
+        if self.daemon.is_some()
+            && emacs_frame_id != 0
+            && self
+                .frames
+                .get(crate::window::FrameId(emacs_frame_id))
+                .is_none()
+        {
+            return Ok(());
+        }
         if let Some(event) = self.make_lispy_delete_frame_event(emacs_frame_id)
             && self.execute_special_event_if_bound(event)?
         {
+            return Ok(());
+        }
+        if self.daemon.is_some() && emacs_frame_id != 0 {
+            crate::emacs_core::frame::builtin_delete_frame(
+                self,
+                vec![Value::make_frame(emacs_frame_id)],
+            )?;
             return Ok(());
         }
         self.command_loop.running = false;
@@ -4944,7 +5041,7 @@ impl crate::emacs_core::eval::Context {
                 .pending_input_events
                 .pop_visible_front()
             {
-                self.timer_stop_idle();
+                self.stop_idle_for_dequeued_input_event(&event);
                 return Some(event);
             }
 
@@ -5228,8 +5325,16 @@ impl crate::emacs_core::eval::Context {
                 self.handle_terminal_create_failed_input_event(id, &error)?;
                 Ok(None)
             }
+            InputEvent::TerminalSettled { id, completion } => {
+                self.handle_terminal_settled_input_event(id, &completion)?;
+                Ok(None)
+            }
             InputEvent::TerminalExited { id } => {
                 self.handle_terminal_exited_input_event(id)?;
+                Ok(None)
+            }
+            InputEvent::TerminalDirectoryChanged { id, directory } => {
+                self.handle_terminal_directory_changed_input_event(id, &directory)?;
                 Ok(None)
             }
             InputEvent::TerminalTitleChanged { id, title } => {

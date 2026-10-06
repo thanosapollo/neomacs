@@ -29,6 +29,7 @@ pub mod interaction_projection;
 pub mod menu;
 pub mod modifier_policy;
 pub mod motion_spec;
+pub mod neo_term_palette;
 pub mod popup_placement;
 pub mod present_mapping;
 pub mod presentation_origin;

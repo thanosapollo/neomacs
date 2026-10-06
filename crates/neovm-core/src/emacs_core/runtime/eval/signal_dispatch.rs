@@ -110,6 +110,10 @@ impl Context {
             .iter()
             .rev()
             .find_map(|frame| match frame {
+                ConditionFrame::ConditionCase {
+                    resume: ResumeTarget::ModuleCallback,
+                    ..
+                } => Some(ResumeTarget::ModuleCallback),
                 ConditionFrame::Catch {
                     tag: catch_tag,
                     resume,

@@ -263,7 +263,8 @@ DISPLAY is the name of the display Emacs should connect to."
 
   ;; Open the display connection
   (x-open-connection (or display
-                         (setq x-display-name (or (getenv "DISPLAY" (selected-frame))
+                         (setq x-display-name (or (getenv "WAYLAND_DISPLAY")
+                                                  (getenv "DISPLAY" (selected-frame))
                                                   (getenv "DISPLAY"))))
 		     x-command-line-resources
 		     ;; Exit Emacs with fatal error if this fails and we
@@ -596,8 +597,6 @@ This sets the `alpha-background' frame parameter, which makes the
 background transparent while keeping text fully opaque."
   (interactive "nOpacity (0.0-1.0 or 0-100): ")
   (let ((f (or frame (selected-frame))))
-    (when (and (integerp opacity) (> opacity 1))
-      (setq opacity (/ (float opacity) 100.0)))
     (set-frame-parameter f 'alpha-background opacity)))
 
 ;; Menu bar keyboard access (F10)

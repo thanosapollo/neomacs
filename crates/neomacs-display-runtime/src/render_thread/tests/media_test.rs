@@ -89,6 +89,7 @@ fn terminal_face_for_flags_and_font(
                 c: 'x',
                 fg: Color::WHITE,
                 bg: Color::BLACK,
+                ansi: None, // Legacy pre-resolved font-style fixture, not parser SGR.
                 flags,
             }],
             cols: 1,
@@ -103,7 +104,11 @@ fn terminal_face_for_flags_and_font(
         },
     )]);
 
-    let (glyphs, faces) = RenderApp::expanded_terminal_glyphs_for_frame(&frame, &contents);
+    let (glyphs, faces) = RenderApp::expanded_terminal_glyphs_for_frame(
+        &frame,
+        &contents,
+        &RenderApp::terminal_frame_palette(&frame),
+    );
     let face_id = glyphs
         .iter()
         .find_map(|glyph| match glyph {
@@ -189,6 +194,7 @@ fn terminal_face_interning_keeps_distinct_opacity_faces_distinct() {
             c: 'x',
             fg: Color::WHITE,
             bg: Color::BLACK,
+            ansi: None,
             flags: CellFlags::empty(),
         }],
         cols: 1,
@@ -217,6 +223,10 @@ fn terminal_face_interning_keeps_distinct_opacity_faces_distinct() {
         1.0,
         &mut glyphs,
         &mut faces,
+        &neomacs_display_protocol::neo_term_palette::NeoTermPalette::fallback(
+            content.default_fg,
+            content.default_bg,
+        ),
     );
     RenderApp::expand_terminal_cells(
         &content,
@@ -231,6 +241,10 @@ fn terminal_face_interning_keeps_distinct_opacity_faces_distinct() {
         0.5,
         &mut glyphs,
         &mut faces,
+        &neomacs_display_protocol::neo_term_palette::NeoTermPalette::fallback(
+            content.default_fg,
+            content.default_bg,
+        ),
     );
 
     let face_ids: Vec<_> = glyphs

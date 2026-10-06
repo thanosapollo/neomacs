@@ -128,9 +128,20 @@ impl RenderApp {
     }
 
     #[cfg(feature = "neo-term")]
+    fn terminal_frame_palette(
+        frame: &FrameGlyphBuffer,
+    ) -> neomacs_display_protocol::neo_term_palette::NeoTermPalette {
+        neomacs_display_protocol::neo_term_palette::NeoTermPalette::fallback(
+            frame.resolved_face(FaceId::new(0)).fg,
+            frame.background,
+        )
+    }
+
+    #[cfg(feature = "neo-term")]
     fn expanded_terminal_glyphs_for_frame(
         frame: &FrameGlyphBuffer,
         terminal_contents: &HashMap<crate::terminal::TerminalId, crate::terminal::TerminalContent>,
+        palette: &neomacs_display_protocol::neo_term_palette::NeoTermPalette,
     ) -> (Vec<FrameGlyph>, FrameFaceMap) {
         let cell_w = frame.char_width;
         let cell_h = frame.char_height;
@@ -174,7 +185,7 @@ impl RenderApp {
                 y: *y,
                 width: *width,
                 height: *height,
-                bg: content.default_bg,
+                bg: palette.background,
                 face_id: FaceId::new(0),
                 box_vertical_edges: Default::default(),
             });
@@ -192,6 +203,7 @@ impl RenderApp {
                 1.0,
                 &mut extra_glyphs,
                 &mut extra_faces,
+                palette,
             );
         }
 
@@ -207,14 +219,16 @@ impl RenderApp {
             crate::terminal::TerminalId,
             crate::terminal::TerminalDisplayTarget,
         >,
+        palette: &neomacs_display_protocol::neo_term_palette::NeoTermPalette,
     ) -> TerminalExpansion {
         let (extra_glyphs, extra_faces) =
-            Self::expanded_terminal_glyphs_for_frame(frame, terminal_contents);
+            Self::expanded_terminal_glyphs_for_frame(frame, terminal_contents, palette);
         let (window_glyphs, window_faces) = Self::expanded_window_terminals_for_frame(
             frame,
             ordered_terminal_ids,
             terminal_contents,
             terminal_targets,
+            palette,
         );
         let mut expansion = TerminalExpansion::new(extra_glyphs, extra_faces);
         expansion.merge(TerminalExpansion::new(window_glyphs, window_faces));
@@ -249,6 +263,7 @@ impl RenderApp {
             crate::terminal::TerminalId,
             crate::terminal::TerminalDisplayTarget,
         >,
+        palette: &neomacs_display_protocol::neo_term_palette::NeoTermPalette,
     ) -> (Vec<FrameGlyph>, FrameFaceMap) {
         let mut glyphs = Vec::new();
         let mut faces = rustc_hash::FxHashMap::default();
@@ -294,7 +309,7 @@ impl RenderApp {
                     y: body.y,
                     width: body.width,
                     height: body.height,
-                    bg: content.default_bg,
+                    bg: palette.background,
                     face_id: FaceId::new(0),
                     box_vertical_edges: Default::default(),
                 });
@@ -311,6 +326,7 @@ impl RenderApp {
                     1.0,
                     &mut glyphs,
                     &mut faces,
+                    palette,
                 );
             }
         }
@@ -557,7 +573,10 @@ impl RenderApp {
     #[cfg(feature = "neo-term")]
     pub(super) fn has_terminal_activity(&self) -> bool {
         for view in self.terminal_manager.terminals.values() {
-            if view.event_proxy.peek_wakeup() || view.dirty {
+            if view.event_proxy.peek_wakeup()
+                || view.dirty
+                || (!view.exit_notified && view.event_proxy.completion().is_some())
+            {
                 return true;
             }
         }
@@ -718,11 +737,16 @@ impl RenderApp {
         // Check for exited terminals and notify Emacs
         for &id in &terminal_ids {
             if let Some(view) = self.terminal_manager.get_mut(id)
-                && view.event_proxy.is_exited()
                 && !view.exit_notified
             {
-                view.exit_notified = true;
-                self.comms.send_input(InputEvent::TerminalExited { id });
+                if let Some(completion) = view.event_proxy.completion() {
+                    view.exit_notified = true;
+                    self.comms
+                        .send_input(InputEvent::TerminalSettled { id, completion });
+                } else if view.event_proxy.is_exited() {
+                    view.exit_notified = true;
+                    self.comms.send_input(InputEvent::TerminalExited { id });
+                }
             }
         }
         for &id in &terminal_ids {
@@ -733,6 +757,18 @@ impl RenderApp {
             {
                 self.comms
                     .send_input(InputEvent::TerminalTitleChanged { id, title });
+            }
+        }
+
+        for &id in &terminal_ids {
+            if let Some(view) = self.terminal_manager.get(id)
+                && matches!(view.target, TerminalDisplayTarget::Window { .. })
+                && !view.event_proxy.is_exited()
+                && view.event_proxy.completion().is_none()
+                && let Some(directory) = view.event_proxy.take_directory()
+            {
+                self.comms
+                    .send_input(InputEvent::TerminalDirectoryChanged { id, directory });
             }
         }
 
@@ -751,6 +787,31 @@ impl RenderApp {
             .filter_map(|id| self.terminal_manager.get(id).map(|view| (id, view.target)))
             .collect();
 
+        let primary_palette = self
+            .frame_windows
+            .primary_frame_id()
+            .and_then(|id| {
+                self.terminal_manager
+                    .palettes
+                    .get(&neomacs_display_protocol::types::DisplayFrameId::new(id))
+                    .copied()
+            })
+            .unwrap_or_else(|| {
+                let frame = self
+                    .frame_windows
+                    .primary_frame_id()
+                    .and_then(|id| self.frame_windows.get(id))
+                    .and_then(|state| state.render.compositor.current_frame.as_ref());
+                frame.map_or_else(
+                    || {
+                        neomacs_display_protocol::neo_term_palette::NeoTermPalette::fallback(
+                            Color::WHITE,
+                            Color::BLACK,
+                        )
+                    },
+                    |frame| Self::terminal_frame_palette(frame),
+                )
+            });
         // Render floating terminals
         let mut float_glyphs = Vec::new();
         let mut float_faces = rustc_hash::FxHashMap::default();
@@ -765,7 +826,7 @@ impl RenderApp {
                     let width = content.cols as f32 * cell_w;
                     let height = content.rows as f32 * cell_h;
 
-                    let mut bg = content.default_bg;
+                    let mut bg = primary_palette.background;
                     bg.a = view.float_opacity;
                     float_glyphs.push(FrameGlyph::Stretch {
                         window_id: neomacs_display_protocol::types::DisplayWindowId::new(0),
@@ -801,11 +862,13 @@ impl RenderApp {
                         view.float_opacity,
                         &mut float_glyphs,
                         &mut float_faces,
+                        &primary_palette,
                     );
                 }
             }
         }
 
+        let palettes = &self.terminal_manager.palettes;
         let primary_frame_id = self.frame_windows.primary_frame_id();
         let mut floating_expansion = Some(TerminalExpansion::new(float_glyphs, float_faces));
         self.frame_windows
@@ -821,6 +884,12 @@ impl RenderApp {
                             &terminal_ids,
                             &terminal_contents,
                             &terminal_targets,
+                            &palettes
+                                .get(&neomacs_display_protocol::types::DisplayFrameId::new(
+                                    window_state.render.emacs_frame_id,
+                                ))
+                                .copied()
+                                .unwrap_or_else(|| Self::terminal_frame_palette(frame)),
                         )
                     })
                     .unwrap_or_default();
@@ -858,13 +927,29 @@ impl RenderApp {
         opacity: f32,
         out: &mut Vec<FrameGlyph>,
         faces: &mut FrameFaceMap,
+        palette: &neomacs_display_protocol::neo_term_palette::NeoTermPalette,
     ) {
         for cell in &content.cells {
             let cx = origin_x + cell.col as f32 * cell_w;
             let cy = origin_y + cell.row as f32 * cell_h;
 
-            if cell.bg != content.default_bg {
-                let mut bg = cell.bg;
+            let inverse = cell
+                .flags
+                .contains(rio_vt::crosswords::style::StyleFlags::INVERSE);
+            let (fg, bg) = match cell.ansi {
+                Some((fg, bg)) => crate::terminal::colors::palette_colors(
+                    &fg,
+                    &bg,
+                    palette,
+                    cell.flags
+                        .contains(rio_vt::crosswords::style::StyleFlags::BOLD),
+                    inverse,
+                ),
+                None if inverse => (cell.bg, cell.fg),
+                None => (cell.fg, cell.bg),
+            };
+            if bg != palette.background {
+                let mut bg = bg;
                 bg.a *= opacity;
                 out.push(FrameGlyph::Stretch {
                     window_id: paint.window_id,
@@ -889,7 +974,7 @@ impl RenderApp {
             }
 
             if cell.c != ' ' && cell.c != '\0' {
-                let mut fg = cell.fg;
+                let mut fg = fg;
                 fg.a *= opacity;
                 let style = TerminalCellStyle::from_flags(cell.flags);
                 let face_id = intern_terminal_cell_face(faces, fg, style, font_size, default_font);
@@ -923,7 +1008,7 @@ impl RenderApp {
         if content.cursor.visible {
             let cx = origin_x + content.cursor.col as f32 * cell_w;
             let cy = origin_y + content.cursor.row as f32 * cell_h;
-            let mut fg = content.default_fg;
+            let mut fg = palette.cursor;
             fg.a *= opacity;
             out.push(FrameGlyph::Border {
                 window_id: paint.window_id,
@@ -1129,8 +1214,11 @@ fn terminal_cell_face(
 #[path = "media/tests/image_cache_event_test.rs"]
 mod image_cache_event_tests;
 
-#[cfg(test)]
-#[cfg(feature = "neo-term")]
+#[cfg(all(test, feature = "neo-term"))]
+#[path = "media/tests/palette_test.rs"]
+mod palette_tests;
+
+#[cfg(all(test, feature = "neo-term"))]
 #[path = "media/tests/media_test.rs"]
 mod tests;
 

@@ -206,6 +206,14 @@ pub fn run_tty_layout_tree(
         .frame_manager()
         .root_frame_id(selected)
         .unwrap_or(selected);
+    run_tty_layout_tree_for_root(evaluator, root_id)
+}
+
+/// Lay out one terminal's displayed root without changing process-wide selection.
+pub fn run_tty_layout_tree_for_root(
+    evaluator: &mut Context,
+    root_id: FrameId,
+) -> Option<(SealedFramePresentation, Vec<SealedFramePresentation>)> {
     let frame_order = evaluator
         .frame_manager()
         .frames_in_reverse_z_order(root_id, RenderFrameVisibility::VisibleOnly);

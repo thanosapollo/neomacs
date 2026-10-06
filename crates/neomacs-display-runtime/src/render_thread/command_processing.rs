@@ -2,8 +2,72 @@ use super::RenderApp;
 use crate::thread_comm::{ClipboardCommand, LifecycleCommand, RenderCommand, WindowCommand};
 
 impl RenderApp {
+    /// During connection-only/GPU startup, configuration and frame lifecycle
+    /// live in CPU state. Other commands retain order in bounded staging. When
+    /// staging is full, extract only the same CPU commands from the transport;
+    /// GPU assets remain in place and both queue capacities stay unchanged.
+    pub(super) fn process_startup_commands(&mut self) -> bool {
+        self.retire_cancelled_frames();
+        // A finite pass cannot be monopolized by a concurrent producer.
+        for _ in 0..64 {
+            let command = if self.startup_commands.len() < 64 {
+                self.comms.cmd_rx.try_recv()
+            } else if self.comms.keep_alive_without_frames {
+                self.comms.cmd_rx.try_recv_startup()
+            } else {
+                break;
+            };
+            let Ok(command) = command else {
+                break;
+            };
+            if !self.comms.keep_alive_without_frames {
+                if matches!(
+                    command,
+                    RenderCommand::Lifecycle(LifecycleCommand::Shutdown)
+                ) {
+                    self.lifecycle_flags
+                        .request_shutdown(super::state::RenderShutdownReason::EvaluatorShutdown);
+                    return true;
+                }
+                self.startup_commands.push_back(command);
+                continue;
+            }
+            match command {
+                RenderCommand::Lifecycle(LifecycleCommand::Shutdown) => {
+                    self.lifecycle_flags
+                        .request_shutdown(super::state::RenderShutdownReason::EvaluatorShutdown);
+                    return true;
+                }
+                RenderCommand::Config(command) => self.handle_config(command),
+                RenderCommand::Window(command) => self.handle_window(command),
+                RenderCommand::Clipboard(command) => self.handle_clipboard(command),
+                other => self.startup_commands.push_back(other),
+            }
+        }
+        false
+    }
+
+    pub(super) fn startup_control_flow(&self) -> winit::event_loop::ControlFlow {
+        if (self.startup_commands.len() < 64 && !self.comms.cmd_rx.is_empty())
+            || (self.comms.keep_alive_without_frames && self.comms.cmd_rx.has_startup_command())
+        {
+            winit::event_loop::ControlFlow::Poll
+        } else {
+            winit::event_loop::ControlFlow::Wait
+        }
+    }
+
     /// Process pending commands from Emacs.
+    #[cfg(test)]
     pub(super) fn process_commands(&mut self) -> bool {
+        self.process_commands_with_waker(None)
+    }
+
+    pub(super) fn process_commands_with_waker(
+        &mut self,
+        _waker: Option<winit::event_loop::EventLoopProxy>,
+    ) -> bool {
+        self.retire_cancelled_frames();
         let mut should_exit = false;
 
         while let Some(cmd) = self
@@ -31,7 +95,7 @@ impl RenderApp {
                 }
                 RenderCommand::Asset(c) => self.handle_asset(c),
                 #[cfg(feature = "neo-term")]
-                RenderCommand::Terminal(c) => self.handle_terminal(c),
+                RenderCommand::Terminal(c) => self.handle_terminal_with_waker(c, _waker.clone()),
                 RenderCommand::Ui(c) => self.handle_ui(c),
                 RenderCommand::Config(c) => self.handle_config(c),
                 RenderCommand::Clipboard(c) => self.handle_clipboard(c),

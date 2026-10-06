@@ -27,6 +27,7 @@ fn terminal_glyph_expansion_uses_frame_metrics() {
                 c: 'x',
                 fg: Color::WHITE,
                 bg: Color::BLACK,
+                ansi: None,
                 flags: CellFlags::empty(),
             }],
             cols: 2,
@@ -41,7 +42,11 @@ fn terminal_glyph_expansion_uses_frame_metrics() {
         },
     );
 
-    let (glyphs, faces) = RenderApp::expanded_terminal_glyphs_for_frame(&frame, &contents);
+    let (glyphs, faces) = RenderApp::expanded_terminal_glyphs_for_frame(
+        &frame,
+        &contents,
+        &RenderApp::terminal_frame_palette(&frame),
+    );
 
     assert!(matches!(
         glyphs.first(),
@@ -87,7 +92,11 @@ fn terminal_glyph_expansion_ignores_missing_terminal_content() {
     });
     let contents = HashMap::new();
 
-    let (glyphs, faces) = RenderApp::expanded_terminal_glyphs_for_frame(&frame, &contents);
+    let (glyphs, faces) = RenderApp::expanded_terminal_glyphs_for_frame(
+        &frame,
+        &contents,
+        &RenderApp::terminal_frame_palette(&frame),
+    );
 
     assert!(glyphs.is_empty());
     assert!(faces.is_empty());
@@ -164,8 +173,13 @@ fn window_terminal_is_clipped_to_windows_displaying_its_owner_buffer() {
         },
     )]);
 
-    let (glyphs, _) =
-        RenderApp::expanded_window_terminals_for_frame(&frame, &[id], &contents, &targets);
+    let (glyphs, _) = RenderApp::expanded_window_terminals_for_frame(
+        &frame,
+        &[id],
+        &contents,
+        &targets,
+        &RenderApp::terminal_frame_palette(&frame),
+    );
 
     assert_eq!(glyphs.len(), 1);
     assert!(matches!(

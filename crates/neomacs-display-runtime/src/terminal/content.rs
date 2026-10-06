@@ -26,6 +26,9 @@ pub struct RenderCell {
     pub fg: Color,
     /// Background color.
     pub bg: Color,
+    /// Parser-owned semantic colours, resolved against each displaying frame.
+    /// None is reserved for legacy pre-resolved native callers/test fixtures.
+    pub ansi: Option<(AnsiColor, AnsiColor)>,
     /// Cell flags (bold, italic, underline, etc.).
     pub flags: CellFlags,
 }
@@ -119,6 +122,7 @@ impl TerminalContent {
                     c,
                     fg,
                     bg,
+                    ansi: Some((sq_fg, sq_bg)),
                     flags,
                 });
             }

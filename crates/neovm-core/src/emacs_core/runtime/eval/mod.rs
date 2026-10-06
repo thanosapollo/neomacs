@@ -2076,6 +2076,7 @@ fn install_core_eval_symbols(obarray: &mut Obarray, reset_runtime_values: bool) 
         print_symbols_bare_symbol,
         max_lisp_eval_depth_symbol(),
         buffer_undo_list_symbol(),
+        intern("frame-alpha-lower-limit"),
     ] {
         obarray.mark_runtime_projected_id(projected);
     }
@@ -2832,6 +2833,9 @@ enum CommandLoopExit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum ResumeTarget {
+    /// GNU's CATCHER_ALL_DEBUGGABLE at an env->funcall boundary. Unlike a
+    /// Lisp condition-case, this also intercepts every non-nil throw tag.
+    ModuleCallback,
     CommandLoopExit,
     CommandLoopTopLevel,
     InterpreterCatch,
@@ -3015,6 +3019,10 @@ pub(crate) struct DaemonState {
     pub(crate) initialized: bool,
     pub(crate) notify: Option<DaemonNotifier>,
 }
+
+/// Display opener invoked only on the owning evaluator thread.
+pub type GuiDisplayInitializer =
+    Box<dyn FnMut(&mut Context, Option<&str>) -> Result<(), EvalError>>;
 
 pub struct Context {
     pub(crate) owned_roots: crate::emacs_core::owned_roots::OwnedRootRegistry,
@@ -3376,6 +3384,9 @@ pub struct Context {
     /// `make-terminal-frame`. The VM owns identities; platform code owns the
     /// device, raw-mode, input, renderer, and lifecycle resources.
     pub(crate) tty_frame_host_factory: Option<Box<dyn TtyFrameHostFactory>>,
+    /// Installed by a display-free frontend. Invoked on this evaluator's
+    /// owning thread; neither the Context nor loaded modules migrate.
+    pub(crate) gui_display_initializer: Option<GuiDisplayInitializer>,
     /// Desired visual configuration.  Lisp updates this snapshot atomically;
     /// attaching or rebuilding a display replays it as authoritative state.
     pub(crate) visual_config: neomacs_display_protocol::VisualConfig,
@@ -4576,6 +4587,11 @@ impl Context {
             self.symbols_with_pos_enabled = value.is_truthy();
         } else if sym_id == self.print_symbols_bare_symbol {
             self.print_symbols_bare = value.is_truthy();
+        } else if sym_id == intern("frame-alpha-lower-limit") {
+            let limit = crate::window::frame_alpha::lower_limit(value);
+            if let Some(host) = self.display_host.as_mut() {
+                host.set_gui_frame_alpha_lower_limit(limit);
+            }
         } else if sym_id == max_lisp_eval_depth_symbol()
             && let Some(depth) = value.as_fixnum()
         {

@@ -1,5 +1,9 @@
 use super::*;
 
+mod backpressure_test;
+mod cwd_test;
+mod invocation_test;
+
 #[test]
 fn test_portable_pty_explicit_cmd() {
     use std::io::Read;
@@ -40,6 +44,10 @@ fn process_exists(pid: u32) -> bool {
 
 #[cfg(target_os = "linux")]
 fn reader_thread_exists(name: &str) -> bool {
+    // Linux task comm is at most 15 BYTES, irrespective of the Rust name.
+    // These generated terminal worker names are ASCII; compare the real prefix.
+    assert!(name.is_ascii(), "thread oracle requires ASCII names");
+    let name = &name[..name.len().min(15)];
     std::fs::read_dir("/proc/self/task")
         .expect("read process task directory")
         .filter_map(Result::ok)

@@ -9,6 +9,23 @@ use winit::keyboard::PhysicalKey;
 use winit::window::WindowId;
 
 impl RenderApp {
+    fn send_native_key(
+        &mut self,
+        window: WindowId,
+        key: PhysicalKey,
+        event: InputEvent,
+    ) -> (
+        Option<neomacs_display_protocol::input_progress::InputReceipt>,
+        Option<neomacs_display_protocol::input_latency::InputToken>,
+    ) {
+        let pressed = matches!(&event, InputEvent::Key { pressed: true, .. });
+        let result = self.comms.send_key_input_with_receipt(event);
+        if pressed {
+            self.key_repeats.queued(window, key, result.0.clone());
+        }
+        (result.1, result.2)
+    }
+
     /// Record the physical modifier keys' own press and release.
     ///
     /// winit's `ModifiersState` aggregates the sides away, and GNU's
@@ -138,6 +155,17 @@ impl RenderApp {
         ) {
             return;
         }
+        // Retirement precedes menus, tooltips and IME interception: a
+        // release/focus loss cannot leave repeat authority behind there.
+        match &event {
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
+                self.key_repeats.release(window_id, event.physical_key);
+            }
+            WindowEvent::Focused(false) | WindowEvent::Destroyed => {
+                self.key_repeats.retire_window(window_id);
+            }
+            _ => {}
+        }
         if let (Some(gpu), Some(renderer)) = (&self.gpu, &mut self.renderer)
             && self
                 .tooltips
@@ -222,7 +250,17 @@ impl RenderApp {
                     emacs_fid,
                     is_primary
                 );
-                if is_primary {
+                if self.comms.keep_alive_without_frames {
+                    if is_primary {
+                        self.frame_windows.take_primary_window();
+                        self.frame_windows.clear_primary_mapping();
+                    } else {
+                        self.frame_windows.request_destroy(emacs_fid);
+                    }
+                    self.comms.send_input(InputEvent::WindowClose {
+                        emacs_frame_id: emacs_fid,
+                    });
+                } else if is_primary {
                     self.lifecycle_flags.request_shutdown(
                         super::state::RenderShutdownReason::NativeWindowDestroyed,
                     );
@@ -276,6 +314,14 @@ impl RenderApp {
                         })
                         .unwrap_or_default()
                 };
+                // GNU whole-frame active/inactive alpha follows native focus,
+                // including a loss with no evaluator content change.
+                self.comms
+                    .frame_opacity
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .focus(emacs_fid, focused);
+                self.refresh_frame_opacity();
                 self.comms.send_input(InputEvent::WindowFocus {
                     focused,
                     emacs_frame_id: emacs_fid,
@@ -309,6 +355,7 @@ impl RenderApp {
                     state,
                     text,
                     physical_key,
+                    repeat,
                     ..
                 } = event;
                 // Side facts first: the modifier keys' own events are the
@@ -336,6 +383,11 @@ impl RenderApp {
                             tracing::warn!(view = %target.view(), %error, "dropping WebView keyboard input");
                         }
                     }
+                }
+                if state == ElementState::Pressed
+                    && !self.key_repeats.admit(window_id, physical_key, repeat)
+                {
+                    return;
                 }
                 if state == ElementState::Pressed {
                     tracing::debug!(
@@ -385,12 +437,16 @@ impl RenderApp {
                                 control_keysym,
                                 ordinary_modifiers
                             );
-                            self.comms.send_input(InputEvent::Key {
-                                keysym: control_keysym,
-                                modifiers: ordinary_modifiers,
-                                pressed: true,
-                                emacs_frame_id: self.emacs_frame_for_window_event(window_id),
-                            });
+                            self.send_native_key(
+                                window_id,
+                                physical_key,
+                                InputEvent::Key {
+                                    keysym: control_keysym,
+                                    modifiers: ordinary_modifiers,
+                                    pressed: true,
+                                    emacs_frame_id: self.emacs_frame_for_window_event(window_id),
+                                },
+                            );
                             self.record_idle_dim_activity(window_id);
                             self.record_typing_speed_keypress(window_id);
                             handled_via_text = true;
@@ -409,12 +465,17 @@ impl RenderApp {
                                     keysym,
                                     ordinary_modifiers
                                 );
-                                self.comms.send_input(InputEvent::Key {
-                                    keysym,
-                                    modifiers: ordinary_modifiers,
-                                    pressed: true,
-                                    emacs_frame_id: self.emacs_frame_for_window_event(window_id),
-                                });
+                                self.send_native_key(
+                                    window_id,
+                                    physical_key,
+                                    InputEvent::Key {
+                                        keysym,
+                                        modifiers: ordinary_modifiers,
+                                        pressed: true,
+                                        emacs_frame_id: self
+                                            .emacs_frame_for_window_event(window_id),
+                                    },
+                                );
                                 self.record_idle_dim_activity(window_id);
                                 self.record_typing_speed_keypress(window_id);
                             }
@@ -470,14 +531,19 @@ impl RenderApp {
                             if self.effects.idle_dim.enabled {
                                 self.record_idle_dim_activity(window_id);
                             }
-                            let (receipt, token) =
-                                self.comms.send_input_with_receipt(InputEvent::Key {
+                            let (receipt, token) = self.send_native_key(
+                                window_id,
+                                physical_key,
+                                InputEvent::Key {
                                     keysym,
                                     modifiers: key_modifiers,
                                     pressed: state == ElementState::Pressed,
                                     emacs_frame_id: self.emacs_frame_for_window_event(window_id),
-                                });
-                            if let Some(receipt) = receipt
+                                },
+                            );
+                            if state == ElementState::Pressed
+                                && matches!(keysym, 0xff55 | 0xff56)
+                                && let Some(receipt) = receipt
                                 && let Some(window) = self.frame_windows.get_by_winit_mut(window_id)
                             {
                                 window

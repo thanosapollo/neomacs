@@ -16,7 +16,7 @@ use std::sync::{Mutex, PoisonError};
 use libloading::Library;
 
 use super::error::{EvalResult, Flow, FlowKind, signal};
-use super::eval::Context;
+use super::eval::{ConditionFrame, Context, ResumeTarget};
 use super::intern::{intern, intern_lisp_string, resolve_sym};
 use super::timefns::{LispTimeOutput, make_lisp_time};
 use super::value::Value;
@@ -1165,7 +1165,11 @@ unsafe extern "C" fn module_copy_string_contents(
         let val = value_to_lisp(value);
         let bytes = match val.as_lisp_string() {
             Some(ls) => {
-                if !ls.is_multibyte() && !ls.as_bytes().is_ascii() {
+                // GNU encode_string_utf_8(..., nocopy=true) returns
+                // unibyte strings unchanged, including arbitrary binary octets.
+                // Only multibyte strings must contain Unicode characters:
+                // Emacs byte8 / over-Unicode encodings are not valid UTF-8.
+                if ls.is_multibyte() && std::str::from_utf8(ls.as_bytes()).is_err() {
                     unsafe {
                         set_pending_signal(
                             env,
@@ -1175,19 +1179,7 @@ unsafe extern "C" fn module_copy_string_contents(
                     }
                     return false;
                 }
-                match std::str::from_utf8(ls.as_bytes()) {
-                    Ok(s) => s.as_bytes().to_vec(),
-                    Err(_) => {
-                        unsafe {
-                            set_pending_signal(
-                                env,
-                                "wrong-type-argument",
-                                Value::list(vec![Value::symbol("unicode-string-p"), val]),
-                            );
-                        }
-                        return false;
-                    }
-                }
+                ls.as_bytes().to_vec()
             }
             None => {
                 unsafe {
@@ -2054,7 +2046,22 @@ unsafe extern "C" fn module_funcall(
             // SAFETY: MODULE_CTX holds the live evaluator installed by the
             // enclosing trampoline (see ModuleContextGuard).
             let ctx = unsafe { &mut *ctx_ptr };
-            contain_lisp_panics(ctx, |ctx| ctx.funcall_general_untraced(func_val, lisp_args))
+            // GNU MODULE_HANDLE_NONLOCAL_EXIT pushes CATCHER_ALL_DEBUGGABLE:
+            // inner Lisp handlers/catches retain priority, but caller handlers
+            // must not run until the module actually propagates the exit.
+            // Use the shared condition stack, including its existing GC roots
+            // and unwind selection, rather than globally muting dispatch.
+            let condition_base = ctx.condition_stack_len();
+            ctx.push_condition_frame(ConditionFrame::ConditionCase {
+                conditions: Value::list(vec![Value::T, Value::symbol("debug")]),
+                resume: ResumeTarget::ModuleCallback,
+            });
+            // Snapshot AFTER installing the boundary so contained panics
+            // restore it too; ordinary Lisp unwinding runs while it is live.
+            let result =
+                contain_lisp_panics(ctx, |ctx| ctx.funcall_general_untraced(func_val, lisp_args));
+            ctx.truncate_condition_stack(condition_base);
+            result
         });
 
         match result {

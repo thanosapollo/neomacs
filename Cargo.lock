@@ -1687,7 +1687,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 [[package]]
 name = "dpi"
 version = "0.1.2"
-source = "git+https://github.com/eval-exec/winit?rev=2290f91c602f8efdf102972457a25e8b6e36f90c#2290f91c602f8efdf102972457a25e8b6e36f90c"
+source = "git+https://github.com/thanosapollo/winit?rev=6884804b87b93c228b97ba683ddcc7d0acb4d023#6884804b87b93c228b97ba683ddcc7d0acb4d023"
 
 [[package]]
 name = "dwrote"
@@ -3793,6 +3793,7 @@ dependencies = [
  "crossterm",
  "fontdb",
  "gio",
+ "hostname",
  "image",
  "libc",
  "neomacs-display-protocol",
@@ -3807,6 +3808,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "parking_lot",
+ "percent-encoding",
  "pollster",
  "portable-pty",
  "raw-window-handle",
@@ -3822,6 +3824,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ttf-parser",
+ "url",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
@@ -3910,6 +3913,10 @@ dependencies = [
  "wio",
  "yeslogic-fontconfig-sys",
 ]
+
+[[package]]
+name = "neomacs-mcp"
+version = "0.0.19"
 
 [[package]]
 name = "neomacs-melpa-test-support"
@@ -5893,8 +5900,6 @@ dependencies = [
 [[package]]
 name = "rio-vt"
 version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2774f471f1b614bb2ba64808c5fb3d00a00e5031109f5a3eb3ba4f8deb9d40e"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.1",
@@ -8715,7 +8720,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 [[package]]
 name = "winit"
 version = "0.31.0-beta.3"
-source = "git+https://github.com/eval-exec/winit?rev=2290f91c602f8efdf102972457a25e8b6e36f90c#2290f91c602f8efdf102972457a25e8b6e36f90c"
+source = "git+https://github.com/thanosapollo/winit?rev=6884804b87b93c228b97ba683ddcc7d0acb4d023#6884804b87b93c228b97ba683ddcc7d0acb4d023"
 dependencies = [
  "bitflags 2.13.1",
  "cfg_aliases 0.2.2",
@@ -8741,7 +8746,7 @@ dependencies = [
 [[package]]
 name = "winit-android"
 version = "0.31.0-beta.3"
-source = "git+https://github.com/eval-exec/winit?rev=2290f91c602f8efdf102972457a25e8b6e36f90c#2290f91c602f8efdf102972457a25e8b6e36f90c"
+source = "git+https://github.com/thanosapollo/winit?rev=6884804b87b93c228b97ba683ddcc7d0acb4d023#6884804b87b93c228b97ba683ddcc7d0acb4d023"
 dependencies = [
  "android-activity",
  "bitflags 2.13.1",
@@ -8756,7 +8761,7 @@ dependencies = [
 [[package]]
 name = "winit-appkit"
 version = "0.31.0-beta.3"
-source = "git+https://github.com/eval-exec/winit?rev=2290f91c602f8efdf102972457a25e8b6e36f90c#2290f91c602f8efdf102972457a25e8b6e36f90c"
+source = "git+https://github.com/thanosapollo/winit?rev=6884804b87b93c228b97ba683ddcc7d0acb4d023#6884804b87b93c228b97ba683ddcc7d0acb4d023"
 dependencies = [
  "bitflags 2.13.1",
  "block2",
@@ -8778,7 +8783,7 @@ dependencies = [
 [[package]]
 name = "winit-common"
 version = "0.31.0-beta.3"
-source = "git+https://github.com/eval-exec/winit?rev=2290f91c602f8efdf102972457a25e8b6e36f90c#2290f91c602f8efdf102972457a25e8b6e36f90c"
+source = "git+https://github.com/thanosapollo/winit?rev=6884804b87b93c228b97ba683ddcc7d0acb4d023#6884804b87b93c228b97ba683ddcc7d0acb4d023"
 dependencies = [
  "block2",
  "dpi",
@@ -8796,7 +8801,7 @@ dependencies = [
 [[package]]
 name = "winit-core"
 version = "0.31.0-beta.3"
-source = "git+https://github.com/eval-exec/winit?rev=2290f91c602f8efdf102972457a25e8b6e36f90c#2290f91c602f8efdf102972457a25e8b6e36f90c"
+source = "git+https://github.com/thanosapollo/winit?rev=6884804b87b93c228b97ba683ddcc7d0acb4d023#6884804b87b93c228b97ba683ddcc7d0acb4d023"
 dependencies = [
  "bitflags 2.13.1",
  "cursor-icon",
@@ -8811,7 +8816,7 @@ dependencies = [
 [[package]]
 name = "winit-orbital"
 version = "0.31.0-beta.3"
-source = "git+https://github.com/eval-exec/winit?rev=2290f91c602f8efdf102972457a25e8b6e36f90c#2290f91c602f8efdf102972457a25e8b6e36f90c"
+source = "git+https://github.com/thanosapollo/winit?rev=6884804b87b93c228b97ba683ddcc7d0acb4d023#6884804b87b93c228b97ba683ddcc7d0acb4d023"
 dependencies = [
  "bitflags 2.13.1",
  "dpi",
@@ -8827,7 +8832,7 @@ dependencies = [
 [[package]]
 name = "winit-uikit"
 version = "0.31.0-beta.3"
-source = "git+https://github.com/eval-exec/winit?rev=2290f91c602f8efdf102972457a25e8b6e36f90c#2290f91c602f8efdf102972457a25e8b6e36f90c"
+source = "git+https://github.com/thanosapollo/winit?rev=6884804b87b93c228b97ba683ddcc7d0acb4d023#6884804b87b93c228b97ba683ddcc7d0acb4d023"
 dependencies = [
  "bitflags 2.13.1",
  "block2",
@@ -8847,7 +8852,7 @@ dependencies = [
 [[package]]
 name = "winit-wayland"
 version = "0.31.0-beta.3"
-source = "git+https://github.com/eval-exec/winit?rev=2290f91c602f8efdf102972457a25e8b6e36f90c#2290f91c602f8efdf102972457a25e8b6e36f90c"
+source = "git+https://github.com/thanosapollo/winit?rev=6884804b87b93c228b97ba683ddcc7d0acb4d023#6884804b87b93c228b97ba683ddcc7d0acb4d023"
 dependencies = [
  "bitflags 2.13.1",
  "calloop",
@@ -8874,7 +8879,7 @@ dependencies = [
 [[package]]
 name = "winit-web"
 version = "0.31.0-beta.3"
-source = "git+https://github.com/eval-exec/winit?rev=2290f91c602f8efdf102972457a25e8b6e36f90c#2290f91c602f8efdf102972457a25e8b6e36f90c"
+source = "git+https://github.com/thanosapollo/winit?rev=6884804b87b93c228b97ba683ddcc7d0acb4d023#6884804b87b93c228b97ba683ddcc7d0acb4d023"
 dependencies = [
  "atomic-waker",
  "bitflags 2.13.1",
@@ -8896,7 +8901,7 @@ dependencies = [
 [[package]]
 name = "winit-win32"
 version = "0.31.0-beta.3"
-source = "git+https://github.com/eval-exec/winit?rev=2290f91c602f8efdf102972457a25e8b6e36f90c#2290f91c602f8efdf102972457a25e8b6e36f90c"
+source = "git+https://github.com/thanosapollo/winit?rev=6884804b87b93c228b97ba683ddcc7d0acb4d023#6884804b87b93c228b97ba683ddcc7d0acb4d023"
 dependencies = [
  "bitflags 2.13.1",
  "cursor-icon",
@@ -8916,7 +8921,7 @@ dependencies = [
 [[package]]
 name = "winit-x11"
 version = "0.31.0-beta.3"
-source = "git+https://github.com/eval-exec/winit?rev=2290f91c602f8efdf102972457a25e8b6e36f90c#2290f91c602f8efdf102972457a25e8b6e36f90c"
+source = "git+https://github.com/thanosapollo/winit?rev=6884804b87b93c228b97ba683ddcc7d0acb4d023#6884804b87b93c228b97ba683ddcc7d0acb4d023"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",

@@ -11,6 +11,8 @@ build = "build.rs"
 [features]
 # Windows distribution helpers; enabled by xtask on Windows only.
 windows-tools = []
+# Explicit fault regressions only; never enabled by default/shipping recipes.
+gui-test-hooks = ["neomacs-display-runtime/gui-test-hooks"]
 # Linux production builds enable `video` through `cargo xtask fresh-build`.
 # Keep it out of Cargo defaults so this Linux packaging concern does not change
 # the established macOS/Windows feature surface.

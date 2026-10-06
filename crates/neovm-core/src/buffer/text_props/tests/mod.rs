@@ -1,5 +1,7 @@
 use super::*;
 
+mod retention;
+
 fn char_pos(pos: usize) -> CharPos0 {
     CharPos0::new(pos)
 }

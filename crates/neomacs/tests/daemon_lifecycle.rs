@@ -63,6 +63,12 @@ fn ensure_bootstrap_runtime_image() {
             editor,
             runtime_root: neomacs_infra::workspace_root(),
             role_binary_name: TEMACS_ROLE_BINARY_NAME.to_string(),
+            terminal_layer: Some(neomacs_infra::runtime_image::BootstrapTerminalLayer {
+                source: neomacs_infra::workspace_root().join("lisp/term/neo-win.el"),
+                bootstrap_role_binary_name: RuntimeImageRole::Bootstrap
+                    .canonical_image_stem()
+                    .to_string(),
+            }),
         };
         neomacs_infra::runtime_image::provision_bootstrap_image(&plan).map(|_| ())
     });
@@ -698,6 +704,7 @@ fn signals_inside_explicit_exit_hooks_finish_once_and_preserve_original_request(
                         break;
                     }
                     assert!(Instant::now() < deadline, "restart did not become ready");
+                    std::thread::sleep(Duration::from_millis(25));
                 }
                 fixture.eval("hook-signal", "(kill-emacs 8)");
             }
@@ -1886,6 +1893,44 @@ fn daemon_graphical_request_fails_without_creating_a_phantom_frame() {
     assert!(!output.status.success(), "{output:?}");
     assert_eq!(fixture.eval("graphical", "(length (frame-list))"), "1");
     assert_eq!(fixture.eval("graphical", "(+ 3 4)"), "7");
+}
+
+#[test]
+fn deferred_gui_failed_attach_preserves_daemon_state_and_shutdown() {
+    let mut fixture = Fixture::new();
+    fixture.foreground("deferred", &["-Q"]);
+    let pid = fixture.eval("deferred", "(emacs-pid)");
+    assert_eq!(fixture.eval("deferred", "(progn (setq gui-preserved (list 7 11)) (setq gui-preserved-alias gui-preserved) (get-buffer-create \"gui-preserved\") (with-current-buffer \"gui-preserved\" (insert \"before-attach\")) t)"), "t");
+    for expression in [
+        "(x-open-connection \"wayland-no-such-display\")",
+        "(make-frame '((window-system . neo) (display . \"wayland-no-such-display\")))",
+        "(x-open-connection 42)",
+    ] {
+        assert_eq!(
+            fixture.eval(
+                "deferred",
+                &format!("(condition-case nil (progn {expression} nil) (error t))")
+            ),
+            "t"
+        );
+        assert_eq!(fixture.eval("deferred", "(length (frame-list))"), "1");
+        assert_eq!(fixture.eval("deferred", "(emacs-pid)"), pid);
+        assert_eq!(fixture.eval("deferred", "(progn (garbage-collect) (list (eq gui-preserved gui-preserved-alias) gui-preserved (with-current-buffer \"gui-preserved\" (buffer-string)) (x-display-list)))"), "(t (7 11) \"before-attach\" nil)");
+    }
+    fixture.eval("deferred", "(kill-emacs)");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = fixture.daemon.as_mut().unwrap().try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "deferred display owner prevented root shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success());
+    assert!(!fixture.socket("deferred").exists());
 }
 
 #[test]

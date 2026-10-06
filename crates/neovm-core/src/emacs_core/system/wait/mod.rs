@@ -1169,7 +1169,11 @@ impl super::eval::Context {
         let activity = if self.processes.has_wait_notification_backend() {
             let events = self
                 .processes
-                .wait_for_backend_events(Duration::ZERO, ProcessWaitBackendInterest::ProcessesOnly)
+                .wait_for_backend_events_for_service(
+                    Duration::ZERO,
+                    ProcessWaitBackendInterest::ProcessesOnly,
+                    request.process_output_service_request(),
+                )
                 .unwrap_or_default();
             WaitBlockActivity::from_source_events(events)
         } else {
@@ -1391,7 +1395,11 @@ impl super::eval::Context {
                 let restore = self.begin_waiting_for_user_input_if_requested(request);
                 let events = self
                     .processes
-                    .wait_for_backend_events(wait_time, interest)
+                    .wait_for_backend_events_for_service(
+                        wait_time,
+                        interest,
+                        request.process_output_service_request(),
+                    )
                     .unwrap_or_default();
                 self.end_waiting_for_user_input(restore);
                 Ok(WaitBlockActivity::from_source_events(events))

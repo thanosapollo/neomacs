@@ -894,6 +894,7 @@ pub(crate) fn unwind_minibuffer_session(
             window_restore: MinibufferWindowRestoreEffect::NoBufferRestored,
         }
     };
+    let redirect_result = super::frame::sync_gui_frame_focus_redirects(shared);
     teardown_outcome.window_restore.apply(shared);
     let inactive_mode_result = teardown_outcome.inactive_mode_result;
 
@@ -902,9 +903,13 @@ pub(crate) fn unwind_minibuffer_session(
     {
         shared.buffers.switch_current(buffer_id);
     }
-    let selection_record_result = restored_calling_selection
-        .map(|active| record_restored_calling_window_selection(shared, active))
-        .unwrap_or(Ok(Value::NIL));
+    let selection_record_result = if redirect_result.is_ok() {
+        restored_calling_selection
+            .map(|active| record_restored_calling_window_selection(shared, active))
+            .unwrap_or(Ok(Value::NIL))
+    } else {
+        Ok(Value::NIL)
+    };
     shared.obarray.set_symbol_value(
         "minibuffer-depth",
         Value::fixnum(shared.minibuffers.depth() as i64),
@@ -935,6 +940,7 @@ pub(crate) fn unwind_minibuffer_session(
 
     exit_hook_result?;
     inactive_mode_result?;
+    redirect_result?;
     selection_record_result?;
     Ok(Value::NIL)
 }
@@ -1265,6 +1271,10 @@ pub(crate) fn builtin_read_from_string(
     Ok(result)
 }
 
+#[cfg(test)]
+#[path = "tests/read_from_string_work.rs"]
+mod read_from_string_work_tests;
+
 pub(crate) fn read_from_string_impl(
     obarray: &crate::emacs_core::symbol::Obarray,
     args: Vec<Value>,
@@ -1289,8 +1299,13 @@ fn read_from_string_impl_inner(
         ));
     }
 
-    let full_string = expect_lisp_string(&args[0])?;
-    let read_source = super::value_reader::LispReadSource::new(&full_string);
+    let source = args[0];
+    let char_count = source.as_lisp_string().map(|s| s.schars()).ok_or_else(|| {
+        signal(
+            LispCondition::WrongTypeArgument,
+            vec![Value::symbol("stringp"), source],
+        )
+    })?;
 
     // GNU Emacs `Fread_from_string` (`src/lread.c:2514`) treats START and
     // END as character indices into STRING (validated via
@@ -1300,8 +1315,6 @@ fn read_from_string_impl_inner(
     // UTF-8 byte length here was a long-standing bug (audit §11.6) that
     // would either panic on multibyte input (slicing mid-codepoint) or
     // return a byte offset where elisp expected a character count.
-    let full_string_bytes = full_string.as_bytes();
-    let char_count = full_string.schars();
 
     let start_arg = args.get(1).cloned().unwrap_or(Value::NIL);
     let end_arg = args.get(2).cloned().unwrap_or(Value::NIL);
@@ -1342,35 +1355,40 @@ fn read_from_string_impl_inner(
         ));
     }
 
-    let start_byte = if full_string.is_multibyte() {
-        crate::emacs_core::emacs_char::char_to_byte_pos(full_string_bytes, start_char)
-    } else {
-        start_char
+    let saved_roots = super::eval::save_scratch_gc_roots();
+    super::eval::push_scratch_gc_root(source);
+    let read_result = {
+        // Borrow the original rooted payload only across the value reader,
+        // whose allocations do not collect or call Lisp. No source reference
+        // escapes this scope into error signaling or symbol materialization.
+        let full_string = source.as_lisp_string().expect("validated string");
+        #[cfg(test)]
+        read_from_string_work_tests::observe_source(source, full_string);
+        let read_source = super::value_reader::LispReadSource::new(full_string);
+        let end_byte =
+            crate::emacs_core::string_pos_cache::string_char_to_byte(source, full_string, end_char);
+        let start_byte = crate::emacs_core::string_pos_cache::string_char_to_byte(
+            source,
+            full_string,
+            start_char,
+        );
+        read_source
+            .read_one_range_with_locate_syms(start_byte, end_byte, locate_syms, obarray, shorthands)
+            .map(|pair| {
+                pair.map(|(value, end_byte)| {
+                    let end_char = crate::emacs_core::string_pos_cache::string_byte_to_char(
+                        source,
+                        full_string,
+                        end_byte,
+                    );
+                    (value, end_char)
+                })
+            })
     };
-    let end_byte = if full_string.is_multibyte() {
-        crate::emacs_core::emacs_char::char_to_byte_pos(full_string_bytes, end_char)
-    } else {
-        end_char
-    };
-
-    let read_result = read_source.read_one_range_with_locate_syms(
-        start_byte,
-        end_byte,
-        locate_syms,
-        obarray,
-        shorthands,
-    );
-
-    let (value, absolute_end_byte) = read_result
+    super::eval::restore_scratch_gc_roots(saved_roots);
+    let (value, absolute_end_char) = read_result
         .map_err(signal_reader_error_from_string)?
         .ok_or_else(|| signal(LispCondition::EndOfFile, vec![]))?;
-
-    let absolute_end_char = if full_string.is_multibyte() {
-        crate::emacs_core::emacs_char::byte_to_char_pos(full_string_bytes, absolute_end_byte)
-    } else {
-        absolute_end_byte
-    };
-
     Ok(Value::cons(value, Value::fixnum(absolute_end_char as i64)))
 }
 
@@ -1782,7 +1800,7 @@ impl MinibufferInvocationRestoration {
         self.windows.record(eval);
     }
 
-    fn select_calling_frame(&self, eval: &mut super::eval::Context) {
+    fn select_calling_frame(&self, eval: &mut super::eval::Context) -> EvalResult {
         // GNU `read_minibuf` explicitly reselects the invoking frame after
         // `unbind_to` has restored the owner/caller configuration stack.  The
         // restore options intentionally keep the then-current selected frame,
@@ -1792,6 +1810,7 @@ impl MinibufferInvocationRestoration {
         {
             let _ = eval.frames.select_frame(calling_frame.0);
         }
+        super::frame::sync_gui_frame_focus_redirects(eval)
     }
 }
 
@@ -2186,6 +2205,7 @@ fn finish_read_from_minibuffer_in_vm_runtime_interactive(
             state: Box::new(session_unwind),
         },
     );
+    super::frame::sync_gui_frame_focus_redirects(shared)?;
     if let Some(active_window_state) = active_window_state {
         record_active_minibuffer_selection(shared, active_window_state, minibuf_id)?;
     }
@@ -2305,11 +2325,12 @@ fn finish_read_from_minibuffer_in_vm_runtime_interactive(
         // This is deliberately between the inner lifecycle scope and history:
         // GNU restores both configurations, then reselects the caller, then
         // calls `add-to-history` in the restored buffer-local environment.
-        restoration.select_calling_frame(shared);
+        let redirect_result = restoration.select_calling_frame(shared);
         // `with_unwind_scope` roots the tagged result while exit hooks and
         // window restoration allocate, so string properties cannot retain
         // otherwise-unreachable Lisp objects through an untraced Rust value.
         let result_value = lifecycle_result?;
+        redirect_result?;
         let result_text = result_value
             .as_lisp_string()
             .expect("an accepted minibuffer command must return its contents")

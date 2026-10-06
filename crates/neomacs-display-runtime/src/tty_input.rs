@@ -321,9 +321,11 @@ impl TtyInputReader {
                 // shutdown commands.
                 loop {
                     crossbeam_channel::select! {
-                        recv(comms.cmd_rx) -> msg => {
-                            match msg {
-                                Ok(RenderCommand::Lifecycle(LifecycleCommand::Shutdown)) | Err(_) => break,
+                        recv(comms.cmd_rx.available()) -> _wake => {
+                            match comms.cmd_rx.try_recv() {
+                                Ok(RenderCommand::Lifecycle(LifecycleCommand::Shutdown))
+                                | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                                Err(crossbeam_channel::TryRecvError::Empty) => {},
                                 Ok(_) => {}
                             }
                         }

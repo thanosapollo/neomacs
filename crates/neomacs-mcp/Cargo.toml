@@ -1,0 +1,13 @@
+[package]
+name = "neomacs-mcp"
+version = "0.0.19"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Protocol-blind stdio to explicitly selected Unix socket relay"
+
+[[bin]]
+name = "neomacs-mcp"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"

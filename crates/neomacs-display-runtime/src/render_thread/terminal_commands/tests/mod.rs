@@ -1,4 +1,5 @@
 use super::*;
+mod palette;
 use crate::core::frame_glyphs::{FrameGlyph, FrameGlyphBuffer, GlyphRowRole};
 use crate::core::types::{Color, DisplayWindowId};
 use crate::render_thread::terminal_expansion::TerminalExpansion;
@@ -7,6 +8,9 @@ use crate::terminal::{
 };
 use crate::thread_comm::ThreadComms;
 use std::sync::{Arc, Mutex};
+
+#[cfg(target_os = "linux")]
+mod backpressure;
 
 fn make_test_app() -> RenderApp {
     let comms = ThreadComms::new();

@@ -501,6 +501,18 @@ fn convert_single_display_event(event: &DisplayEvent) -> Option<KbInputEvent> {
         #[cfg(feature = "neo-term")]
         DisplayEvent::TerminalExited { id } => Some(KbInputEvent::TerminalExited { id: *id }),
         #[cfg(feature = "neo-term")]
+        DisplayEvent::TerminalSettled { id, completion } => Some(KbInputEvent::TerminalSettled {
+            id: *id,
+            completion: completion.clone(),
+        }),
+        #[cfg(feature = "neo-term")]
+        DisplayEvent::TerminalDirectoryChanged { id, directory } => {
+            Some(KbInputEvent::TerminalDirectoryChanged {
+                id: *id,
+                directory: directory.clone(),
+            })
+        }
+        #[cfg(feature = "neo-term")]
         DisplayEvent::TerminalTitleChanged { id, title } => {
             Some(KbInputEvent::TerminalTitleChanged {
                 id: *id,

@@ -10,6 +10,9 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod service_fairness;
+mod tls_readiness;
+
 #[test]
 fn process_finite_domains_match_gnu_symbols() {
     assert_eq!(ProcessKind::Real.name(), "real");

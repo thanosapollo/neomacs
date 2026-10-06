@@ -9,8 +9,12 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+mod command_channel;
 mod frame_mailbox;
+pub use command_channel::{CommandReceiver, CommandSender, command_channel};
+mod frame_opacity;
 pub use frame_mailbox::{FrameReceiver, FrameSender, QueuedPresentation, SupersededPresentation};
+pub use frame_opacity::FrameOpacityState;
 use neomacs_display_protocol::{
     ImageColorContext, ImageId, ImageLoadToken, ImageMaskPolicy, ImageRealization, ImageRotation,
     ImageSizeSpec, SelectionOwner, VideoId,
@@ -196,11 +200,22 @@ pub enum InputEvent {
     TerminalExited {
         id: crate::terminal::TerminalId,
     },
+    #[cfg(feature = "neo-term")]
+    TerminalSettled {
+        id: crate::terminal::TerminalId,
+        completion: neovm_core::emacs_core::display_host::TerminalCompletion,
+    },
     /// Terminal title changed
     #[cfg(feature = "neo-term")]
     TerminalTitleChanged {
         id: crate::terminal::TerminalId,
         title: String,
+    },
+    /// Admitted local cwd metadata from a compositor-owned terminal.
+    #[cfg(feature = "neo-term")]
+    TerminalDirectoryChanged {
+        id: crate::terminal::TerminalId,
+        directory: String,
     },
     /// Popup menu selection made (index into menu items, -1 = cancelled)
     MenuSelection {
@@ -329,6 +344,8 @@ pub enum LifecycleCommand {
 /// Window and chrome management commands.
 #[derive(Debug)]
 pub enum WindowCommand {
+    /// Wake presentation after a synchronous CPU opacity control operation.
+    RefreshFrameOpacity,
     /// Paint an evaluator-resolved viewport while canonical layout is pending.
     ScrollPreview(neomacs_display_protocol::scroll_coverage::ResolvedScrollIntent),
     /// Scroll blit pixels within pixel buffer
@@ -394,8 +411,27 @@ pub enum WindowCommand {
         title: String,
         geometry_hints: GuiFrameGeometryHints,
     },
+    /// One bounded admission owns creation, readiness and independent rollback.
+    RealizeFrame {
+        frame: FrameRef,
+        width: u32,
+        height: u32,
+        title: String,
+        geometry_hints: GuiFrameGeometryHints,
+        fullscreen: Option<WindowFullscreenMode>,
+        visual: Option<VisualConfig>,
+        adopt_primary: bool,
+        reply: Sender<Result<(), String>>,
+        live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: std::time::Instant,
+    },
     /// Associate the already-created primary OS window with its real Emacs frame ID.
     AdoptPrimaryFrame { frame: FrameRef },
+    /// Acknowledge actual native window/surface realization, not queue admission.
+    AwaitFrameReady {
+        frame: FrameRef,
+        reply: Sender<Result<(), String>>,
+    },
     /// Destroy an OS window for a top-level Emacs frame
     DestroyWindow { frame: FrameRef },
     /// Mark a child frame visible again.
@@ -584,12 +620,18 @@ pub enum AssetCommand {
 #[cfg(feature = "neo-term")]
 #[derive(Debug)]
 pub enum TerminalCommand {
+    /// Replace or retire the resolved GNU face palette for one display frame.
+    TerminalSetPalette {
+        frame: neomacs_display_protocol::types::DisplayFrameId,
+        palette: Option<neomacs_display_protocol::neo_term_palette::NeoTermPalette>,
+    },
     /// Create a terminal
     TerminalCreate {
         id: crate::terminal::TerminalId,
         size: crate::terminal::TerminalGridSize,
         target: crate::terminal::TerminalDisplayTarget,
         shell: Option<String>,
+        invocation: Option<neovm_core::emacs_core::display_host::TerminalInvocation>,
     },
     /// Write input to a terminal
     TerminalWrite {
@@ -970,8 +1012,8 @@ pub struct ThreadComms {
     pub frame_rx: FrameReceiver,
 
     /// Commands: Emacs → Render
-    pub cmd_tx: Sender<RenderCommand>,
-    pub cmd_rx: Receiver<RenderCommand>,
+    pub cmd_tx: CommandSender,
+    pub cmd_rx: CommandReceiver,
 
     /// Input events: Render → Emacs
     pub input_tx: Sender<InputEvent>,
@@ -979,13 +1021,14 @@ pub struct ThreadComms {
 
     pub capabilities: Arc<SharedRenderCapabilities>,
     pub tooltip_context: Arc<neomacs_display_protocol::tooltip::TooltipContext>,
+    pub frame_opacity: Arc<Mutex<FrameOpacityState>>,
 }
 
 impl ThreadComms {
     /// Create new thread communication channels
     pub fn new() -> Self {
         let (frame_tx, frame_rx) = frame_mailbox::channel();
-        let (cmd_tx, cmd_rx) = bounded(COMMAND_CHANNEL_CAPACITY);
+        let (cmd_tx, cmd_rx) = command_channel(COMMAND_CHANNEL_CAPACITY);
         let (input_tx, input_rx) = bounded(INPUT_CHANNEL_CAPACITY);
         let capabilities = Arc::new(SharedRenderCapabilities::default());
         Self {
@@ -997,6 +1040,7 @@ impl ThreadComms {
             input_rx,
             capabilities,
             tooltip_context: Arc::default(),
+            frame_opacity: Arc::default(),
         }
     }
 
@@ -1004,6 +1048,7 @@ impl ThreadComms {
     pub fn split(self) -> (EmacsComms, RenderComms) {
         let emacs = EmacsComms {
             tooltip_context: self.tooltip_context.clone(),
+            frame_opacity: Arc::clone(&self.frame_opacity),
             frame_tx: self.frame_tx,
             cmd_tx: self.cmd_tx,
             input_rx: self.input_rx,
@@ -1011,8 +1056,11 @@ impl ThreadComms {
         };
 
         let render = RenderComms {
+            keep_alive_without_frames: false,
+            native_window_waits: None,
             input_stream: Default::default(),
             tooltip_context: self.tooltip_context,
+            frame_opacity: self.frame_opacity,
             frame_rx: self.frame_rx,
             cmd_rx: self.cmd_rx,
             input_tx: self.input_tx,
@@ -1032,23 +1080,44 @@ impl Default for ThreadComms {
 /// Emacs thread communication handle
 pub struct EmacsComms {
     pub frame_tx: FrameSender,
-    pub cmd_tx: Sender<RenderCommand>,
+    pub cmd_tx: CommandSender,
     pub input_rx: Receiver<InputEvent>,
     pub capabilities: Arc<SharedRenderCapabilities>,
     pub tooltip_context: Arc<neomacs_display_protocol::tooltip::TooltipContext>,
+    pub frame_opacity: Arc<Mutex<FrameOpacityState>>,
 }
 
 /// Render thread communication handle
 pub struct RenderComms {
+    /// Daemon root, rather than the primary native frame, owns display lifetime.
+    pub keep_alive_without_frames: bool,
+    pub native_window_waits: Option<Arc<crate::native_window_wait::NativeWindowWaits>>,
     input_stream: neomacs_display_protocol::input_progress::InputStream,
     pub frame_rx: FrameReceiver,
-    pub cmd_rx: Receiver<RenderCommand>,
+    pub cmd_rx: CommandReceiver,
     pub input_tx: Sender<InputEvent>,
     pub capabilities: Arc<SharedRenderCapabilities>,
     pub tooltip_context: Arc<neomacs_display_protocol::tooltip::TooltipContext>,
+    pub frame_opacity: Arc<Mutex<FrameOpacityState>>,
 }
 
 impl RenderComms {
+    pub(crate) fn create_window(
+        &self,
+        event_loop: &dyn winit::event_loop::ActiveEventLoop,
+        attrs: winit::window::WindowAttributes,
+        frame: u64,
+    ) -> Result<Box<dyn winit::window::Window>, String> {
+        let create = || {
+            event_loop
+                .create_window(attrs)
+                .map_err(|error| error.to_string())
+        };
+        match &self.native_window_waits {
+            Some(waits) => waits.run(frame, create),
+            None => create(),
+        }
+    }
     fn observe_scroll_input(event: InputEvent) -> InputEvent {
         #[cfg(target_os = "linux")]
         if neomacs_display_protocol::input_latency::enabled() {
@@ -1170,7 +1239,11 @@ impl RenderComms {
             #[cfg(feature = "neo-term")]
             InputEvent::TerminalExited { .. } => "terminal-exited",
             #[cfg(feature = "neo-term")]
+            InputEvent::TerminalSettled { .. } => "terminal-settled",
+            #[cfg(feature = "neo-term")]
             InputEvent::TerminalTitleChanged { .. } => "terminal-title-changed",
+            #[cfg(feature = "neo-term")]
+            InputEvent::TerminalDirectoryChanged { .. } => "terminal-directory-changed",
         }
     }
 
@@ -1185,6 +1258,34 @@ impl RenderComms {
     pub fn send_input_with_receipt(
         &self,
         event: InputEvent,
+    ) -> (
+        Option<neomacs_display_protocol::input_progress::InputReceipt>,
+        Option<neomacs_display_protocol::input_latency::InputToken>,
+    ) {
+        self.send_input_with_tracking(event, None)
+    }
+
+    /// Native key repeats use evaluator consumption, not bridge dequeueing,
+    /// to bound their backlog. Physical presses still use lossless delivery.
+    pub(super) fn send_key_input_with_receipt(
+        &self,
+        event: InputEvent,
+    ) -> (
+        Option<neomacs_display_protocol::input_progress::InputReceipt>,
+        Option<neomacs_display_protocol::input_progress::InputReceipt>,
+        Option<neomacs_display_protocol::input_latency::InputToken>,
+    ) {
+        let delivery = matches!(&event, InputEvent::Key { pressed: true, .. })
+            .then(neomacs_display_protocol::input_progress::InputDelivery::for_read);
+        let read = delivery.as_ref().map(|delivery| delivery.receipt());
+        let (completion, token) = self.send_input_with_tracking(event, delivery);
+        (read, completion, token)
+    }
+
+    fn send_input_with_tracking(
+        &self,
+        event: InputEvent,
+        read: Option<neomacs_display_protocol::input_progress::InputDelivery>,
     ) -> (
         Option<neomacs_display_protocol::input_progress::InputReceipt>,
         Option<neomacs_display_protocol::input_latency::InputToken>,
@@ -1211,6 +1312,14 @@ impl RenderComms {
             _ => None,
         };
         let event = if let Some(receipt) = receipt {
+            InputEvent::Tracked {
+                receipt,
+                event: Box::new(event),
+            }
+        } else {
+            event
+        };
+        let event = if let Some(receipt) = read {
             InputEvent::Tracked {
                 receipt,
                 event: Box::new(event),

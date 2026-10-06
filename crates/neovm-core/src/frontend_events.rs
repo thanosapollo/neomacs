@@ -251,7 +251,9 @@ fn semantics(event: &InputEvent) -> FrontendEventSemantics {
         | InputEvent::FrameShaderFailed { .. }
         | InputEvent::TerminalCreateFailed { .. }
         | InputEvent::TerminalExited { .. }
+        | InputEvent::TerminalSettled { .. }
         | InputEvent::TerminalTitleChanged { .. }
+        | InputEvent::TerminalDirectoryChanged { .. }
         | InputEvent::SystemFontsChanged { .. } => ServiceDuringWait,
         InputEvent::Focus { focused, .. } => special_input(
             PendingInputPolicy::Focus { focused: *focused },

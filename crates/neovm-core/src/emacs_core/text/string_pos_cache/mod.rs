@@ -23,6 +23,10 @@ use crate::emacs_core::emacs_char;
 use crate::emacs_core::value::Value;
 use crate::heap_types::LispString;
 
+#[cfg(test)]
+#[path = "tests/work.rs"]
+pub(crate) mod work;
+
 #[derive(Clone, Copy)]
 struct Entry {
     string: Value,
@@ -142,15 +146,24 @@ fn remember(string: Value, s: &LispString, char_pos: usize, byte_pos: usize) {
 /// The byte offset of character `char_index` of `string` (`s` is its
 /// payload), clamped to the end.  GNU `string_char_to_byte`.
 pub(crate) fn string_char_to_byte(string: Value, s: &LispString, char_index: usize) -> usize {
+    #[cfg(test)]
+    work::conversion();
     let schars = s.schars();
     let sbytes = s.sbytes();
     let char_index = char_index.min(schars);
-    if !s.is_multibyte() || schars == sbytes {
+    if !s.is_multibyte() || schars == sbytes || char_index == 0 {
         return char_index;
+    }
+    // Known endpoints must not evict a useful interior pair. In particular,
+    // read-from-string checks END on every sequential read.
+    if char_index == schars {
+        return sbytes;
     }
     let bytes = s.as_bytes();
     let (mut below, mut below_byte, mut above, mut above_byte) = (0, 0, schars, sbytes);
     if let Some((char_pos, byte_pos)) = cached_pair(string, s) {
+        #[cfg(test)]
+        work::cache_hit();
         if char_pos < char_index {
             (below, below_byte) = (char_pos, byte_pos);
         } else {
@@ -158,9 +171,17 @@ pub(crate) fn string_char_to_byte(string: Value, s: &LispString, char_index: usi
         }
     }
     let byte_index = if char_index - below < above - char_index {
-        below_byte + emacs_char::char_to_byte_pos(&bytes[below_byte..], char_index - below)
+        let byte_index =
+            below_byte + emacs_char::char_to_byte_pos(&bytes[below_byte..], char_index - below);
+        #[cfg(test)]
+        work::walk(byte_index - below_byte);
+        byte_index
     } else {
-        emacs_char::char_to_byte_pos_from_end(&bytes[..above_byte], above - char_index)
+        let byte_index =
+            emacs_char::char_to_byte_pos_from_end(&bytes[..above_byte], above - char_index);
+        #[cfg(test)]
+        work::walk(above_byte - byte_index);
+        byte_index
     };
     remember(string, s, char_index, byte_index);
     byte_index
@@ -169,15 +190,22 @@ pub(crate) fn string_char_to_byte(string: Value, s: &LispString, char_index: usi
 /// The number of characters of `string` that start before byte offset
 /// `byte_index` (clamped to the end).  GNU `string_byte_to_char`.
 pub(crate) fn string_byte_to_char(string: Value, s: &LispString, byte_index: usize) -> usize {
+    #[cfg(test)]
+    work::conversion();
     let schars = s.schars();
     let sbytes = s.sbytes();
     let byte_index = byte_index.min(sbytes);
-    if !s.is_multibyte() || schars == sbytes {
+    if !s.is_multibyte() || schars == sbytes || byte_index == 0 {
         return byte_index;
+    }
+    if byte_index == sbytes {
+        return schars;
     }
     let bytes = s.as_bytes();
     let (mut below, mut below_byte, mut above, mut above_byte) = (0, 0, schars, sbytes);
     if let Some((char_pos, byte_pos)) = cached_pair(string, s) {
+        #[cfg(test)]
+        work::cache_hit();
         if byte_pos < byte_index {
             (below, below_byte) = (char_pos, byte_pos);
         } else {
@@ -185,9 +213,13 @@ pub(crate) fn string_byte_to_char(string: Value, s: &LispString, byte_index: usi
         }
     }
     let char_index = if byte_index - below_byte < above_byte - byte_index {
+        #[cfg(test)]
+        work::walk(byte_index - below_byte);
         below
             + emacs_char::byte_to_char_pos(&bytes[below_byte..byte_index], byte_index - below_byte)
     } else {
+        #[cfg(test)]
+        work::walk(above_byte - byte_index);
         above
             - emacs_char::byte_to_char_pos(&bytes[byte_index..above_byte], above_byte - byte_index)
     };
