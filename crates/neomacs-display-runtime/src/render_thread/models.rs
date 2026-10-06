@@ -9,10 +9,23 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use neomacs_display_protocol::FrameGlyph;
 use neomacs_renderer_wgpu::model::store::ModelGpuHost;
 
 use super::RenderApp;
+
+/// The models a picture holds, each with the snapshot its pixels show.
+pub(super) type ModelPicture =
+    std::collections::BTreeMap<u32, neomacs_renderer_wgpu::model::store::Snapshot>;
+
+/// The models among the composited surfaces `drawn`, each at the snapshot
+/// `current` says its texture shows (other surfaces are not models).
+pub(super) fn picture_of(drawn: Option<HashSet<u32>>, current: &ModelPicture) -> ModelPicture {
+    drawn
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|id| Some((id, *current.get(&id)?)))
+        .collect()
+}
 
 impl RenderApp {
     fn model_host(&mut self) -> Option<&mut dyn ModelGpuHost> {
@@ -70,32 +83,19 @@ impl RenderApp {
         self.flush_model_events();
     }
 
-    /// Top-level window `emacs_frame_id` presented `frame`: update the
-    /// showing sets from what the composite drew.
-    pub(super) fn note_models_presented(
-        &mut self,
-        emacs_frame_id: u64,
-        frame: &crate::core::frame_glyphs::FrameGlyphBuffer,
-    ) {
-        let Some(drawn) = self
-            .renderer
-            .as_mut()
-            .and_then(|renderer| renderer.take_drawn_surfaces())
-        else {
-            return;
-        };
+    /// What every model's texture shows now: taken once a frame has drawn
+    /// its dirty models and before it composites them.
+    pub(super) fn model_picture(&self) -> ModelPicture {
+        self.models.rendered_snapshots()
+    }
+
+    /// Top-level window `emacs_frame_id` presented a frame whose whole
+    /// picture (root and child frames, fresh or retained) holds `picture`.
+    pub(super) fn note_models_presented(&mut self, emacs_frame_id: u64, picture: &ModelPicture) {
         if self.models.is_empty() {
             return;
         }
-        let in_frame: HashSet<u32> = frame
-            .glyphs
-            .iter()
-            .filter_map(|glyph| match glyph {
-                FrameGlyph::Surface { surface_id, .. } => Some(surface_id.get()),
-                _ => None,
-            })
-            .collect();
-        self.models.presented(emacs_frame_id, &drawn, &in_frame);
+        self.models.presented(emacs_frame_id, picture);
         self.flush_model_events();
     }
 
@@ -106,6 +106,19 @@ impl RenderApp {
         }
         self.models.window_gone(emacs_frame_id);
         self.flush_model_events();
+    }
+
+    /// Window `emacs_frame_id` is hidden, iconified or occluded: it leaves
+    /// now (its capture ends) and stays out until shown and presented.
+    pub(super) fn note_models_window_hidden(&mut self, emacs_frame_id: u64) {
+        self.models.window_hidden(emacs_frame_id);
+        self.flush_model_events();
+    }
+
+    /// Window `emacs_frame_id` is shown again: its next presentation
+    /// rejoins the showing sets.
+    pub(super) fn note_models_window_shown(&mut self, emacs_frame_id: u64) {
+        self.models.window_shown(emacs_frame_id);
     }
 
     /// The renderer went away (device loss or teardown). The invalidation

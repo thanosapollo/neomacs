@@ -46,7 +46,7 @@ mod composition_targets;
 mod full_render;
 mod present;
 mod retained_scroll;
-mod retained_static;
+pub(in crate::render_thread) mod retained_static;
 pub(super) use retained_scroll::RetainedScroll;
 mod scene;
 pub(in crate::render_thread) mod surface;
@@ -73,6 +73,8 @@ struct RenderedFrameSurface {
     output: wgpu::SurfaceTexture,
     frame: crate::core::frame_glyphs::FrameGlyphBuffer,
     projection: Option<neomacs_display_protocol::InteractionProjection>,
+    /// What the composed picture holds of the native models (design §6.2).
+    models: super::models::ModelPicture,
 }
 
 /// The inputs one frame's content draw needs that are fixed for the whole
@@ -94,6 +96,8 @@ struct FrameDrawInputs<'a> {
     scroll_indicators_enabled: bool,
     retain_scroll_body: bool,
     toolbar: &'a ToolbarResources,
+    /// What every native model's texture shows for this frame.
+    models: &'a super::models::ModelPicture,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -155,6 +159,7 @@ fn render_frame_window_contents_to_surface(
     compositor_only_hint: bool,
     render_policy: &crate::render_thread::render_quality::RenderQualityPolicy,
     device_lost: &mut crate::render_thread::device_loss::DeviceLossDetector,
+    models: &super::models::ModelPicture,
 ) -> Result<RenderedFrameSurface, FrameRenderFailure> {
     let render = &mut window_state.render;
     let native = match &mut window_state.lifecycle {
@@ -339,6 +344,7 @@ fn render_frame_window_contents_to_surface(
         scroll_indicators_enabled,
         retain_scroll_body: extra_line_spacing == 0.0 && extra_letter_spacing == 0.0,
         toolbar,
+        models,
     };
 
     // The retained-static fast path is a whole composition strategy; it
@@ -353,7 +359,7 @@ fn render_frame_window_contents_to_surface(
         .unwrap_or((-1.0, -1.0));
     if retained_static::is_eligible(compositor_only_hint, &pane_blits, render) {
         let hovered_scroll_bar = render.hovered_scroll_bar(&frame);
-        retained_static::draw(
+        let models = retained_static::draw(
             renderer,
             native,
             render,
@@ -390,6 +396,7 @@ fn render_frame_window_contents_to_surface(
             output,
             frame,
             projection: pane_projection,
+            models,
         });
     }
 
@@ -426,6 +433,11 @@ fn render_frame_window_contents_to_surface(
         ),
     }
 
+    // A full composition replaces the whole picture: it holds exactly the
+    // models its glyph passes (root and child frames) composited now, so a
+    // fully clipped glyph pictures nothing.
+    let models = super::models::picture_of(renderer.take_drawn_surfaces(), models);
+
     if frame_post_active {
         renderer.frame_post_to_view(
             &composition_view,
@@ -445,5 +457,6 @@ fn render_frame_window_contents_to_surface(
         output,
         frame,
         projection: pane_projection,
+        models,
     })
 }

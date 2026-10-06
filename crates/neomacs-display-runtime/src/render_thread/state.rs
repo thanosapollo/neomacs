@@ -987,6 +987,8 @@ pub(super) struct RenderApp {
     pub(super) frame_coordinator: super::frame_sched::FrameCoordinator,
     /// Native models (design §4.1): survives renderer loss.
     pub(super) models: neomacs_renderer_wgpu::model::ModelStore,
+    /// Fractional wheel input over a model (design §5.1).
+    pub(super) model_wheel: super::pointer_events::ModelWheel,
 }
 
 /// Only terminal causes may authorize display teardown. A native close
@@ -1202,6 +1204,7 @@ impl RenderApp {
             lifecycle_flags: RenderLifecycle::new(poll_when_idle),
             frame_coordinator: super::frame_sched::FrameCoordinator::new(),
             models: neomacs_renderer_wgpu::model::ModelStore::new(),
+            model_wheel: Default::default(),
         }
     }
 }

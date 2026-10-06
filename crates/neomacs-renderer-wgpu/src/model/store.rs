@@ -141,6 +141,9 @@ pub struct ModelStore {
     capture: Option<Capture>,
     /// Device scale models are rendered at (the largest of the windows).
     scale: f32,
+    /// Windows hidden, iconified or occluded: their presentations are not
+    /// showings until the window system shows them again.
+    hidden: HashSet<WindowKey>,
 }
 
 impl Default for ModelStore {
@@ -158,6 +161,7 @@ impl ModelStore {
             events: Vec::new(),
             capture: None,
             scale: 1.0,
+            hidden: HashSet::new(),
         }
     }
 
@@ -678,33 +682,57 @@ impl ModelStore {
         }
     }
 
-    /// `window` presented a frame. `drawn` are the surfaces composited in it
-    /// (root and child frames); `in_frame` the surface glyphs it carries.
-    /// A model drawn joins (or stays) at the rev its texture showed; one in
-    /// the frame but not composited (fully clipped, or a retained frame)
-    /// keeps its entry; one absent leaves.
-    pub fn presented(&mut self, window: WindowKey, drawn: &HashSet<u32>, in_frame: &HashSet<u32>) {
+    /// What model `id`'s texture shows now, if it can be composited.
+    pub fn rendered(&self, id: u32) -> Option<Snapshot> {
+        self.entries
+            .get(&id)
+            .filter(|e| e.status == ModelStatus::Ready && e.uploaded)
+            .and_then(|e| e.rendered)
+    }
+
+    /// [`Self::rendered`] for every model that has one: what a composite
+    /// drawing now would picture of each.
+    pub fn rendered_snapshots(&self) -> BTreeMap<u32, Snapshot> {
+        self.entries
+            .keys()
+            .filter_map(|id| Some((*id, self.rendered(*id)?)))
+            .collect()
+    }
+
+    /// `window` presented a frame whose whole picture (root and child
+    /// frames, freshly composited or retained) holds exactly the models in
+    /// `shown`, each at the snapshot its pixels came from. Those join (or
+    /// stay) at that snapshot's rev, which is also what a click there
+    /// picks; every other model leaves, including one whose glyph the
+    /// frame carries fully clipped.
+    pub fn presented(&mut self, window: WindowKey, shown: &BTreeMap<u32, Snapshot>) {
+        if self.hidden.contains(&window) {
+            return;
+        }
         let ids: Vec<u32> = self.entries.keys().copied().collect();
         for id in ids {
             let entry = self.entries.get_mut(&id).expect("live");
             if entry.status != ModelStatus::Ready {
                 continue;
             }
-            if drawn.contains(&id) {
-                if let Some(snapshot) = entry.rendered {
+            match shown.get(&id) {
+                Some(snapshot) => {
                     entry.readiness.presented(window, snapshot.rev);
-                    entry.presented.insert(window, snapshot);
+                    entry.presented.insert(window, *snapshot);
                 }
-            } else if !in_frame.contains(&id) {
-                entry.readiness.left(window);
-                entry.presented.remove(&window);
+                None => {
+                    entry.readiness.left(window);
+                    entry.presented.remove(&window);
+                }
             }
             self.evaluate(id);
         }
     }
 
-    /// `window` is hidden, iconified or deleted: it shows nothing.
+    /// `window` is deleted, or showed nothing in its last attempt: it
+    /// leaves every showing set and its capture ends.
     pub fn window_gone(&mut self, window: WindowKey) {
+        self.hidden.remove(&window);
         if self.capture.is_some_and(|c| c.window == window) {
             let id = self.capture.expect("captured").id;
             self.end_capture(id);
@@ -716,6 +744,19 @@ impl ModelStore {
             entry.presented.remove(&window);
             self.evaluate(id);
         }
+    }
+
+    /// `window` is hidden, iconified or occluded: it leaves at once (as
+    /// [`Self::window_gone`]) and its presentations are ignored until
+    /// [`Self::window_shown`], so it rejoins only by presenting after that.
+    pub fn window_hidden(&mut self, window: WindowKey) {
+        self.window_gone(window);
+        self.hidden.insert(window);
+    }
+
+    /// `window` is shown (exposed) again; its next presentation rejoins.
+    pub fn window_shown(&mut self, window: WindowKey) {
+        self.hidden.remove(&window);
     }
 
     // ------------------------------------------------------------------

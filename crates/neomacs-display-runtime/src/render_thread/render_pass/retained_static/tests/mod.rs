@@ -94,3 +94,54 @@ fn a_retained_filled_box_cursor_cell_resolves_the_same_local_effect_profile_as_a
         );
     }
 }
+
+fn snapshot(rev: u64, yaw: f64) -> neomacs_renderer_wgpu::model::store::Snapshot {
+    neomacs_renderer_wgpu::model::store::Snapshot {
+        rev,
+        req: 0,
+        view: neomacs_display_protocol::model::ModelView {
+            yaw,
+            pitch: 0.0,
+            zoom: 1.0,
+        },
+        logical: (64, 32),
+        size_px: (64, 32),
+    }
+}
+
+// Review MUST 5: a retained scene pictures each model it composited at the
+// snapshot its texture showed then. Once any of them is redrawn (an orbit,
+// a zoom, a Lisp request), blitting the retained raster would put the old
+// camera back on screen with no editor scene change, so it must rebuild.
+#[test]
+fn a_retained_scene_is_stale_once_a_model_it_pictures_is_redrawn() {
+    use crate::render_thread::models::ModelPicture;
+    let size = neomacs_renderer_wgpu::SnapshotSize::new(800, 600).unwrap();
+    let built = ModelPicture::from([(5, snapshot(1, 0.0)), (7, snapshot(4, 10.0))]);
+    assert!(super::retained_scene_is_current(
+        (3, size, &built),
+        (3, size, &built.clone())
+    ));
+    // Model 7 orbited and redrew: same scene generation, same size.
+    let now = ModelPicture::from([(5, snapshot(1, 0.0)), (7, snapshot(5, 30.0))]);
+    assert!(
+        !super::retained_scene_is_current((3, size, &built), (3, size, &now)),
+        "the retained raster still shows model 7's old camera"
+    );
+    // Model 7 was freed: its pixels are still in the raster.
+    let freed = ModelPicture::from([(5, snapshot(1, 0.0))]);
+    assert!(!super::retained_scene_is_current(
+        (3, size, &built),
+        (3, size, &freed)
+    ));
+    // A model the raster does not picture is irrelevant to it.
+    let other = ModelPicture::from([
+        (5, snapshot(1, 0.0)),
+        (7, snapshot(4, 10.0)),
+        (9, snapshot(2, 0.0)),
+    ]);
+    assert!(super::retained_scene_is_current(
+        (3, size, &built),
+        (3, size, &other)
+    ));
+}
