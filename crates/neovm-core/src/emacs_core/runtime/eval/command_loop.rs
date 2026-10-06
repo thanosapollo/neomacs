@@ -2273,6 +2273,7 @@ impl Context {
         // single drain point for `TaggedHeap::pending_surface_destroys`.
         self.drain_pending_surface_destroys();
         self.drain_pending_video_destroys();
+        self.drain_pending_buffer_reclaims();
         // GNU `garbage_collect` runs the doomed finalizers before
         // `post-gc-hook`.  A collection that completes while the cconv memo
         // observes a Lisp run leaves both to the end of that run.
@@ -2716,6 +2717,17 @@ impl Context {
         for id in ids {
             if let Err(err) = host.destroy_video(id) {
                 tracing::debug!(video_id = id.get(), "gc video destroy failed: {err}");
+            }
+        }
+    }
+
+    /// Drop the killed-buffer records whose buffer object this cycle freed.
+    /// An id whose object was made again since (a Rust-held id turned back
+    /// into a Lisp value) keeps its record until that object goes too.
+    pub(super) fn drain_pending_buffer_reclaims(&mut self) {
+        for id in self.tagged_heap.take_pending_buffer_reclaims() {
+            if self.tagged_heap.buffer_object_reclaimed(id) {
+                self.buffers.reclaim_dead_buffer(id);
             }
         }
     }

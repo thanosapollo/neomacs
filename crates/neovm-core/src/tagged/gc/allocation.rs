@@ -579,6 +579,12 @@ impl TaggedHeap {
         std::mem::take(&mut self.pending_video_destroys)
     }
 
+    /// Take the ids of killed buffers whose buffer object the sweep freed
+    /// since the last drain; the evaluator drops their killed records.
+    pub fn take_pending_buffer_reclaims(&mut self) -> Vec<crate::buffer::BufferId> {
+        std::mem::take(&mut self.pending_buffer_reclaims)
+    }
+
     /// Allocate an xwidget view object.
     pub fn alloc_xwidget_view(&mut self, model: TaggedValue, window: TaggedValue) -> TaggedValue {
         let obj = Box::new(XwidgetViewObj {

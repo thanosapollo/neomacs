@@ -1081,7 +1081,7 @@ fn write_value_stateful_inner(
             if let Some(buffers) = state.buffers {
                 if let Some(buf) = buffers.get(bid) {
                     write!(out, "#<buffer {}>", buf.name_runtime_string_owned()).unwrap();
-                } else if buffers.dead_buffer_last_name_value(bid).is_some() {
+                } else if buffers.is_killed(bid) {
                     out.push_str("#<killed buffer>");
                 } else {
                     write!(out, "#<buffer {}>", bid.0).unwrap();

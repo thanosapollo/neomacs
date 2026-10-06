@@ -54,6 +54,28 @@ pub(crate) enum CacheRootScan {
     },
 }
 
+/// The heap's buffer object for one `BufferId`.
+///
+/// GNU keeps every buffer object on `all_buffers` but marks only what Lisp
+/// can reach: live buffers through `Vbuffer_alist`, killed ones only through
+/// ordinary references, so the vector sweep frees a killed buffer nothing
+/// refers to (`kill-buffer` in buffer.c, `mark_buffer` in alloc.c). The
+/// registry mirrors that: a `Live` object is a runtime root, a `Killed` one
+/// is not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RegistrySlot {
+    /// No object was ever made for this id.
+    #[default]
+    Vacant,
+    /// The object of a live buffer: rooted every cycle.
+    Live(TaggedValue),
+    /// The object of a killed buffer: survives only while referenced.
+    Killed(TaggedValue),
+    /// A killed buffer with no object: never made, or freed by the sweep.
+    /// An object made for it later (a Rust-held id) is `Killed` too.
+    Reclaimed,
+}
+
 /// Optional heap-write observation, used by tests/introspection to inspect which
 /// owners (and optionally which individual writes) were mutated since the last
 /// reset. This is NOT a GC marking barrier — the concurrent collector's barrier
@@ -518,6 +540,12 @@ pub struct TaggedHeap {
     /// Stable video ids of `VideoObj` handles reclaimed by the sweep. The
     /// evaluator drains these after collection through `DisplayHost`.
     pending_video_destroys: Vec<neomacs_display_protocol::VideoId>,
+    /// Ids of killed buffers whose buffer object this cycle's mark left
+    /// unmarked (queued at termination, freed by the sweep). The evaluator's
+    /// cycle-completed block drains them and drops the killed buffer's record
+    /// (`BufferManager::reclaim_dead_buffer`), GNU's sweep of an unreachable
+    /// dead `struct buffer`. Plain data, never marked.
+    pending_buffer_reclaims: Vec<crate::buffer::BufferId>,
 
     /// Reclaimed cons cells threaded through the dead cells themselves,
     /// matching GNU alloc.c's `cons_free_list`.
@@ -596,8 +624,13 @@ pub struct TaggedHeap {
     /// Canonical runtime handle wrappers keyed by their underlying object id.
     /// Buffer object per `BufferId`, indexed by the id (ids are small slab
     /// indices): `Value::make_buffer` runs ~9K times per org font-lock op
-    /// and paid a hash probe per call.
-    buffer_registry: Vec<Option<TaggedValue>>,
+    /// and paid a hash probe per call. Only live buffers' objects are roots;
+    /// a killed buffer's object lives exactly as long as Lisp references it
+    /// (see [`RegistrySlot`]).
+    buffer_registry: Vec<RegistrySlot>,
+    /// Ids whose registry slot is `Killed`, so the termination's prune
+    /// visits only killed objects still referenced, not every id ever made.
+    killed_buffer_ids: Vec<crate::buffer::BufferId>,
     window_registry: FxHashMap<u64, TaggedValue>,
     frame_registry: FxHashMap<u64, TaggedValue>,
     timer_registry: FxHashMap<u64, TaggedValue>,
@@ -991,6 +1024,7 @@ impl TaggedHeap {
             doomed_finalizer_functions: Vec::new(),
             pending_surface_destroys: Vec::new(),
             pending_video_destroys: Vec::new(),
+            pending_buffer_reclaims: Vec::new(),
             cons_free_list: std::ptr::null_mut(),
             float_arena: ObjectArena::new(chunk_map.clone()),
             string_arena: ObjectArena::new(chunk_map.clone()),
@@ -1012,6 +1046,7 @@ impl TaggedHeap {
             cons_live_count: 0,
             marker_chain_head_slots: Vec::new(),
             buffer_registry: Vec::new(),
+            killed_buffer_ids: Vec::new(),
             window_registry: FxHashMap::default(),
             frame_registry: FxHashMap::default(),
             timer_registry: FxHashMap::default(),
@@ -1358,16 +1393,113 @@ impl TaggedHeap {
         self.live_bytes
     }
 
-    pub fn buffer_value(&self, id: crate::buffer::BufferId) -> Option<TaggedValue> {
-        self.buffer_registry.get(id.0 as usize).copied().flatten()
+    /// The buffer object of `id`, if one exists.
+    ///
+    /// A killed buffer's object is not a root, so handing it out while a
+    /// mark runs is a weak read: the object may be unreachable in the
+    /// mark's snapshot, and storing it somewhere the marker already passed
+    /// would leave it unmarked and swept while referenced. Such a read grays
+    /// it first. Between termination and the end of the sweep no condemned
+    /// object can be returned: the termination already turned every unmarked
+    /// killed object's slot into `Reclaimed`.
+    pub fn buffer_value(&mut self, id: crate::buffer::BufferId) -> Option<TaggedValue> {
+        match self.buffer_registry.get(id.0 as usize).copied()? {
+            RegistrySlot::Live(value) => Some(value),
+            RegistrySlot::Killed(value) => {
+                self.shade_weak_read(value);
+                Some(value)
+            }
+            RegistrySlot::Vacant | RegistrySlot::Reclaimed => None,
+        }
     }
 
+    fn shade_weak_read(&mut self, value: TaggedValue) {
+        if !self.mark_in_progress {
+            return;
+        }
+        if self.concurrent_mark_running {
+            self.feed_satb_roots(&[value]);
+        } else {
+            self.push_gray(value, "killed-buffer-read");
+        }
+    }
+
+    /// Record `value` as the object of `id`; rooted unless the buffer was
+    /// already killed.
     pub fn register_buffer_value(&mut self, id: crate::buffer::BufferId, value: TaggedValue) {
+        let slot = self.buffer_registry_slot_mut(id);
+        let killed = matches!(*slot, RegistrySlot::Killed(_) | RegistrySlot::Reclaimed);
+        *slot = if killed {
+            RegistrySlot::Killed(value)
+        } else {
+            RegistrySlot::Live(value)
+        };
+        if killed {
+            self.killed_buffer_ids.push(id);
+        }
+    }
+
+    /// `kill-buffer`: stop rooting the object of each id in `ids`. Like GNU,
+    /// whose killed `struct buffer` leaves `Vbuffer_alist` and is then freed
+    /// by the vector sweep once nothing refers to it (buffer.c, alloc.c).
+    /// A buffer killed before any object was made for it (a Rust-only
+    /// buffer) has no handle to wait for: its record goes after the next
+    /// cycle.
+    pub fn note_buffers_killed(&mut self, ids: &[crate::buffer::BufferId]) {
+        for &id in ids {
+            let slot = self.buffer_registry_slot_mut(id);
+            *slot = match *slot {
+                RegistrySlot::Live(value) | RegistrySlot::Killed(value) => {
+                    RegistrySlot::Killed(value)
+                }
+                RegistrySlot::Vacant | RegistrySlot::Reclaimed => RegistrySlot::Reclaimed,
+            };
+            if matches!(*slot, RegistrySlot::Killed(_)) {
+                self.killed_buffer_ids.push(id);
+            } else {
+                self.pending_buffer_reclaims.push(id);
+            }
+        }
+    }
+
+    /// Whether `id` names a killed buffer that has no object (the record
+    /// behind it can go: no Lisp value can name the buffer).
+    pub fn buffer_object_reclaimed(&self, id: crate::buffer::BufferId) -> bool {
+        matches!(
+            self.buffer_registry.get(id.0 as usize),
+            Some(RegistrySlot::Reclaimed)
+        )
+    }
+
+    fn buffer_registry_slot_mut(&mut self, id: crate::buffer::BufferId) -> &mut RegistrySlot {
         let idx = id.0 as usize;
         if self.buffer_registry.len() <= idx {
-            self.buffer_registry.resize(idx + 1, None);
+            self.buffer_registry.resize(idx + 1, RegistrySlot::Vacant);
         }
-        self.buffer_registry[idx] = Some(value);
+        &mut self.buffer_registry[idx]
+    }
+
+    /// Between mark termination and the sweep: forget every killed buffer
+    /// object the mark left unmarked and queue its id, so the evaluator drops
+    /// the killed record after the cycle (GNU frees the dead `struct buffer`
+    /// in the same sweep). Reads marks, which are intact until the sweep.
+    pub(super) fn prune_unmarked_killed_buffers(&mut self) {
+        let mut ids = std::mem::take(&mut self.killed_buffer_ids);
+        ids.retain(|&id| {
+            let idx = id.0 as usize;
+            let RegistrySlot::Killed(value) = self.buffer_registry[idx] else {
+                return false; // a stale duplicate
+            };
+            if self.is_value_marked(value) {
+                return true;
+            }
+            self.buffer_registry[idx] = RegistrySlot::Reclaimed;
+            self.pending_buffer_reclaims.push(id);
+            false
+        });
+        ids.sort_unstable_by_key(|id| id.0);
+        ids.dedup();
+        self.killed_buffer_ids = ids;
     }
 
     pub fn window_value(&self, id: u64) -> Option<TaggedValue> {

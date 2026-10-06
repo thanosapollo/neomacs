@@ -119,6 +119,7 @@ impl TaggedHeap {
         memory_telemetry::observe(self, memory_telemetry::Phase::FinalMark);
         self.promote_survivors_world_stopped();
         self.unchain_dead_markers();
+        self.prune_unmarked_killed_buffers();
         self.reset_generational_remembered_world_stopped();
         self.handshake.last_term_unchain_us = unchain_t0.elapsed().as_micros() as u64;
 

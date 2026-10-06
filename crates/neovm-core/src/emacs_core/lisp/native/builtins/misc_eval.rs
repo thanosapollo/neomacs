@@ -1736,7 +1736,7 @@ fn print_value_princ_bytes_inner(
             if let Some(buf) = ctx.buffers.get(id) {
                 return buf.name_runtime_string_owned().into_bytes();
             }
-            if ctx.buffers.dead_buffer_last_name_value(id).is_some() {
+            if ctx.buffers.is_killed(id) {
                 return b"#<killed buffer>".to_vec();
             }
             prin1_bytes(value)
