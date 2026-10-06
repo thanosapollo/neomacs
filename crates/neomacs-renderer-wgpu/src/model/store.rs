@@ -137,6 +137,9 @@ pub struct ModelStore {
     capture: Option<Capture>,
     /// Device scale models are rendered at (the largest of the windows).
     scale: f32,
+    /// Windows hidden, iconified or occluded: their presentations are not
+    /// showings until the window system shows them again.
+    hidden: HashSet<WindowKey>,
 }
 
 impl Default for ModelStore {
@@ -154,6 +157,7 @@ impl ModelStore {
             events: Vec::new(),
             capture: None,
             scale: 1.0,
+            hidden: HashSet::new(),
         }
     }
 
@@ -618,6 +622,9 @@ impl ModelStore {
     /// the frame but not composited (fully clipped, or a retained frame)
     /// keeps its entry; one absent leaves.
     pub fn presented(&mut self, window: WindowKey, drawn: &HashSet<u32>, in_frame: &HashSet<u32>) {
+        if self.hidden.contains(&window) {
+            return;
+        }
         let ids: Vec<u32> = self.entries.keys().copied().collect();
         for id in ids {
             let entry = self.entries.get_mut(&id).expect("live");
@@ -637,8 +644,10 @@ impl ModelStore {
         }
     }
 
-    /// `window` is hidden, iconified or deleted: it shows nothing.
+    /// `window` is deleted, or showed nothing in its last attempt: it
+    /// leaves every showing set and its capture ends.
     pub fn window_gone(&mut self, window: WindowKey) {
+        self.hidden.remove(&window);
         if self.capture.is_some_and(|c| c.window == window) {
             let id = self.capture.expect("captured").id;
             self.end_capture(id);
@@ -650,6 +659,19 @@ impl ModelStore {
             entry.presented.remove(&window);
             self.evaluate(id);
         }
+    }
+
+    /// `window` is hidden, iconified or occluded: it leaves at once (as
+    /// [`Self::window_gone`]) and its presentations are ignored until
+    /// [`Self::window_shown`], so it rejoins only by presenting after that.
+    pub fn window_hidden(&mut self, window: WindowKey) {
+        self.window_gone(window);
+        self.hidden.insert(window);
+    }
+
+    /// `window` is shown (exposed) again; its next presentation rejoins.
+    pub fn window_shown(&mut self, window: WindowKey) {
+        self.hidden.remove(&window);
     }
 
     // ------------------------------------------------------------------

@@ -122,6 +122,19 @@ impl RenderApp {
         self.flush_model_events();
     }
 
+    /// Window `emacs_frame_id` is hidden, iconified or occluded: it leaves
+    /// now (its capture ends) and stays out until shown and presented.
+    pub(super) fn note_models_window_hidden(&mut self, emacs_frame_id: u64) {
+        self.models.window_hidden(emacs_frame_id);
+        self.flush_model_events();
+    }
+
+    /// Window `emacs_frame_id` is shown again: its next presentation
+    /// rejoins the showing sets.
+    pub(super) fn note_models_window_shown(&mut self, emacs_frame_id: u64) {
+        self.models.window_shown(emacs_frame_id);
+    }
+
     /// The renderer went away (device loss or teardown).
     pub(super) fn note_models_renderer_lost(&mut self) {
         self.comms.capabilities.set_model_renderer_live(false);
