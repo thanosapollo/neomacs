@@ -1,16 +1,12 @@
 # Nonblocking GUI diagnostics
 
-Native Rust panics have a separate, synchronous [private crash report](crash-reports.md)
-with instance identity and a backtrace. They do not depend on this lossy queue.
-
 The final GUI frontend routes tracing stdout through a lossy bounded queue:
 256 records, at most 64 KiB per record, plus one in-flight record. Oversized or
 full-queue records are rejected whole and counted; the worker reports the
-cumulative loss on subsequent successful writes and checks once more before the
-worker's final flush. Rejections after that final sample can still be unreported.
-Guard drop requests a bounded best-effort drain without joining or writing to
-the blocked sink. Process exit may discard accepted diagnostics. This is not a
-durable delivery receipt.
+cumulative loss on a subsequent successful write and once more when it stops,
+unless the sink has already failed. Guard drop requests a bounded
+best-effort drain without joining or writing to the blocked sink. Process exit
+may discard accepted diagnostics. This is not a durable delivery receipt.
 
 `RUST_LOG` filtering, including INFO, and additive `NEOMACS_LOG_FILE` output
 remain available. Build/bootstrap synchronous stdout and final TTY/batch file
