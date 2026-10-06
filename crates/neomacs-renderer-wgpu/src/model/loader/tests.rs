@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::scene::{ModelScene, remaining_limits};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -172,4 +173,114 @@ fn drop_cancels_and_joins_promptly() {
     let start = Instant::now();
     drop(loader);
     assert!(start.elapsed() < Duration::from_secs(2));
+}
+
+// ----------------------------------------------------------------------
+// Review MUST 2: dropping a loader that is genuinely mid-parse or
+// mid-scene returns within one cancellation step.
+
+/// 2,000,000 one-triangle face lines (about 16 MB).
+fn heavy_body() -> Vec<u8> {
+    let mut body = b"v 0 0 0\nv 1 0 0\nv 0 1 0\n".to_vec();
+    for _ in 0..crate::model::scene::MAX_MODEL_TRIANGLES {
+        body.extend_from_slice(b"f 1 2 3\n");
+    }
+    body
+}
+
+fn drop_while_in(phase: &'static str) {
+    let dir = scratch_dir(&format!("mid-{phase}"));
+    let body = heavy_body();
+    let path = obj_file(dir.as_path(), "heavy.obj", &body);
+    // How long the phase alone takes in this build, uncancelled.
+    let start = Instant::now();
+    let mesh = crate::model::obj::parse_obj(&body, remaining_limits(&[])).unwrap();
+    let parse_time = start.elapsed();
+    let start = Instant::now();
+    ModelScene::new(vec![mesh]).unwrap();
+    let scene_time = start.elapsed();
+    let phase_time = if phase == "parse" {
+        parse_time
+    } else {
+        scene_time
+    };
+    drop(body);
+
+    let (entered, inbox) = mpsc::channel();
+    let wanted = path.clone();
+    *PROBE.lock().unwrap() = Some(Box::new(move |at, file: &std::path::Path| {
+        if at == phase && file == wanted {
+            let _ = entered.send(());
+        }
+    }));
+    let mut loader = ModelLoader::spawn().unwrap();
+    loader
+        .submit(LoadRequest {
+            id: 1,
+            token: 1,
+            meshes: vec![spec(path)],
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+    inbox
+        .recv_timeout(Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("the load never entered its {phase} phase"));
+    let start = Instant::now();
+    drop(loader);
+    let stopped = start.elapsed();
+    *PROBE.lock().unwrap() = None;
+    assert!(
+        stopped * 4 < phase_time,
+        "dropping the loader mid-{phase} waited {stopped:?}; the {phase} alone takes {phase_time:?}"
+    );
+}
+
+#[test]
+fn dropping_a_loader_mid_parse_returns_within_one_step() {
+    drop_while_in("parse");
+}
+
+#[test]
+fn dropping_a_loader_mid_scene_returns_within_one_step() {
+    drop_while_in("scene");
+}
+
+// ----------------------------------------------------------------------
+// Review MUST 1: completed results awaiting admission are bounded.
+
+/// Results the render thread has not drained count against the loader's
+/// capacity, so a stalled render thread cannot accumulate scenes.
+#[test]
+fn completed_results_awaiting_admission_are_bounded() {
+    let dir = scratch_dir("bounded-results");
+    let a = obj_file(dir.as_path(), "a.obj", TRIANGLE);
+    let mut loader = ModelLoader::spawn().unwrap();
+    let request = |id| LoadRequest {
+        id,
+        token: 1,
+        meshes: vec![spec(a.clone())],
+        cancel: Arc::new(AtomicBool::new(false)),
+    };
+    let capacity = MAX_QUEUED_LOADS + 1;
+    for id in 0..capacity as u32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while loader.submit(request(id)).is_err() {
+            assert!(Instant::now() < deadline, "request {id} never accepted");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    // Every accepted load completes; none is drained.
+    std::thread::sleep(Duration::from_millis(300));
+    for _ in 0..3 {
+        assert_eq!(
+            loader.submit(request(99)).err().as_deref(),
+            Some("model loader busy"),
+            "{capacity} undrained results already wait for admission"
+        );
+    }
+    assert_eq!(wait_for(&mut loader, capacity).len(), capacity);
+    assert!(
+        loader.submit(request(100)).is_ok(),
+        "draining frees capacity"
+    );
 }

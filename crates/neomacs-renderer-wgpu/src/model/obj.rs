@@ -169,67 +169,219 @@ fn parse_index(word: &str, count: usize, line: usize) -> Result<u32, ObjError> {
 
 /// Parse OBJ `bytes` within `limits`.
 pub fn parse_obj(bytes: &[u8], limits: ObjLimits) -> Result<ObjMesh, ObjError> {
-    let mut vertices: Vec<[f64; 3]> = Vec::new();
-    let mut triangles: Vec<[u32; 3]> = Vec::new();
-    let mut polygon: Vec<u32> = Vec::new();
-    for (index, raw) in bytes.split(|b| *b == b'\n').enumerate() {
-        let line = index + 1;
-        let text = std::str::from_utf8(raw).map_err(|_| ObjError::NotUtf8 { line })?;
-        let code = text.split('#').next().unwrap_or("");
-        let mut words = code.split([' ', '\t', '\r']).filter(|w| !w.is_empty());
-        match words.next() {
-            Some("v") => {
+    parse_obj_cancellable(bytes, limits, &|| false)
+}
+
+/// [`parse_obj`], polling `cancelled` at bounded intervals.
+pub fn parse_obj_cancellable(
+    bytes: &[u8],
+    limits: ObjLimits,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ObjMesh, ObjError> {
+    let mut parser = ObjParser::new(limits);
+    parser.feed(bytes, cancelled)?;
+    parser.finish(cancelled)
+}
+
+/// A word already known to be UTF-8 (its line was validated) as text.
+fn utf8(word: &[u8], line: usize) -> Result<&str, ObjError> {
+    std::str::from_utf8(word).map_err(|_| ObjError::NotUtf8 { line })
+}
+
+/// Bytes of one line validated (and searched for a comment) between two
+/// cancellation polls.
+const SCAN_WINDOW: usize = READ_CHUNK;
+
+/// Lines, references or triangles handled between two cancellation polls.
+const CHECK_EVERY: usize = 1 << 16;
+
+/// Incremental OBJ parser: fed the file in chunks as it is read, it keeps
+/// only the unfinished last line, enforces the caps as it goes and polls
+/// the cancel flag at bounded intervals, also inside one long line.
+pub struct ObjParser {
+    limits: ObjLimits,
+    vertices: Vec<[f64; 3]>,
+    triangles: Vec<[u32; 3]>,
+    polygon: Vec<u32>,
+    /// The current, not yet terminated line.
+    pending: Vec<u8>,
+    /// Number of the next line to complete (1-based).
+    line: usize,
+    /// Work units since the last cancellation poll.
+    work: usize,
+}
+
+impl ObjParser {
+    pub fn new(limits: ObjLimits) -> Self {
+        Self {
+            limits,
+            vertices: Vec::new(),
+            triangles: Vec::new(),
+            polygon: Vec::new(),
+            pending: Vec::new(),
+            line: 1,
+            work: 0,
+        }
+    }
+
+    /// Count `units` of work; poll `cancelled` once enough accumulated.
+    fn tick(&mut self, units: usize, cancelled: &dyn Fn() -> bool) -> Result<(), ObjError> {
+        self.work += units;
+        if self.work >= CHECK_EVERY {
+            self.work = 0;
+            if cancelled() {
+                return Err(ObjError::Cancelled);
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse the complete lines of `chunk`; keep its unterminated tail.
+    pub fn feed(&mut self, chunk: &[u8], cancelled: &dyn Fn() -> bool) -> Result<(), ObjError> {
+        let mut rest = chunk;
+        while let Some(end) = rest.iter().position(|b| *b == b'\n') {
+            if self.pending.is_empty() {
+                self.parse_line(&rest[..end], cancelled)?;
+            } else {
+                self.pending.extend_from_slice(&rest[..end]);
+                let line = std::mem::take(&mut self.pending);
+                self.parse_line(&line, cancelled)?;
+            }
+            rest = &rest[end + 1..];
+        }
+        self.pending.extend_from_slice(rest);
+        Ok(())
+    }
+
+    /// The last (possibly empty) line, then the mesh.
+    pub fn finish(mut self, cancelled: &dyn Fn() -> bool) -> Result<ObjMesh, ObjError> {
+        let line = std::mem::take(&mut self.pending);
+        self.parse_line(&line, cancelled)?;
+        if self.triangles.is_empty() {
+            return Err(ObjError::NoTriangles);
+        }
+        Ok(ObjMesh {
+            vertices: self.vertices,
+            triangles: self.triangles,
+        })
+    }
+
+    fn parse_line(&mut self, raw: &[u8], cancelled: &dyn Fn() -> bool) -> Result<(), ObjError> {
+        let line = self.line;
+        self.line += 1;
+        self.tick(1, cancelled)?;
+        let code_end = self.scan_line(raw, line, cancelled)?;
+        let mut words = raw[..code_end].split(|b| matches!(b, b' ' | b'\t' | b'\r'));
+        match self.next_word(&mut words, cancelled)? {
+            Some(b"v") => {
                 let mut point = [0.0; 3];
                 for slot in &mut point {
-                    let word = words.next().ok_or(ObjError::ShortVertex { line })?;
-                    *slot = parse_number(word, line)?;
+                    let word = self
+                        .next_word(&mut words, cancelled)?
+                        .ok_or(ObjError::ShortVertex { line })?;
+                    *slot = parse_number(utf8(word, line)?, line)?;
                 }
-                if vertices.len() >= limits.max_vertices {
+                if self.vertices.len() >= self.limits.max_vertices {
                     return Err(ObjError::TooManyVertices {
-                        max: limits.max_vertices,
+                        max: self.limits.max_vertices,
                     });
                 }
-                vertices.push(point);
+                self.vertices.push(point);
             }
-            Some("f") => {
-                polygon.clear();
+            Some(b"f") => {
+                self.polygon.clear();
                 // A polygon of k references is k - 2 triangles: stop as soon
                 // as it alone exceeds the remaining allowance.
-                let max_refs = limits.max_triangles.saturating_sub(triangles.len()) + 2;
-                for word in words {
-                    if polygon.len() == max_refs {
+                let max_refs = self
+                    .limits
+                    .max_triangles
+                    .saturating_sub(self.triangles.len())
+                    + 2;
+                while let Some(word) = self.next_word(&mut words, cancelled)? {
+                    if self.polygon.len() == max_refs {
                         return Err(ObjError::TooManyTriangles {
-                            max: limits.max_triangles,
+                            max: self.limits.max_triangles,
                         });
                     }
-                    polygon.push(parse_index(word, vertices.len(), line)?);
+                    let index = parse_index(utf8(word, line)?, self.vertices.len(), line)?;
+                    self.polygon.push(index);
                 }
-                if polygon.len() < 3 {
+                if self.polygon.len() < 3 {
                     return Err(ObjError::ShortFace { line });
                 }
-                for i in 1..polygon.len() - 1 {
-                    triangles.push([polygon[0], polygon[i], polygon[i + 1]]);
+                for i in 1..self.polygon.len() - 1 {
+                    self.triangles
+                        .push([self.polygon[0], self.polygon[i], self.polygon[i + 1]]);
+                    self.tick(1, cancelled)?;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
-    if triangles.is_empty() {
-        return Err(ObjError::NoTriangles);
+
+    /// The next non-empty word, polling `cancelled` across long runs of
+    /// separators or words.
+    fn next_word<'a>(
+        &mut self,
+        words: &mut impl Iterator<Item = &'a [u8]>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<&'a [u8]>, ObjError> {
+        for word in words {
+            self.tick(1, cancelled)?;
+            if !word.is_empty() {
+                return Ok(Some(word));
+            }
+        }
+        Ok(None)
     }
-    Ok(ObjMesh {
-        vertices,
-        triangles,
-    })
+
+    /// Validate `raw` as UTF-8 and find where its comment starts, one
+    /// window at a time with a cancellation poll between windows.
+    fn scan_line(
+        &mut self,
+        raw: &[u8],
+        line: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<usize, ObjError> {
+        let mut code_end = None;
+        let mut at = 0;
+        while at < raw.len() {
+            let end = (at + SCAN_WINDOW).min(raw.len());
+            let valid = match std::str::from_utf8(&raw[at..end]) {
+                Ok(text) => text,
+                // A character split by the window edge: validate up to it
+                // and start the next window there.
+                Err(e) if e.error_len().is_none() && end < raw.len() && e.valid_up_to() > 0 => {
+                    std::str::from_utf8(&raw[at..at + e.valid_up_to()]).expect("validated prefix")
+                }
+                Err(_) => return Err(ObjError::NotUtf8 { line }),
+            };
+            if code_end.is_none()
+                && let Some(hash) = valid.find('#')
+            {
+                code_end = Some(at + hash);
+            }
+            at += valid.len();
+            // A long line polls between windows.
+            if at < raw.len() && cancelled() {
+                return Err(ObjError::Cancelled);
+            }
+        }
+        Ok(code_end.unwrap_or(raw.len()))
+    }
 }
 
 /// Read and parse the OBJ file at `path`.
 ///
 /// Only a regular file is read (others are [`ObjError::NotRegular`], found
 /// without blocking). It is read once, in 1 MB steps, never beyond
-/// [`MAX_OBJ_FILE_BYTES`]; `cancelled` is polled between steps. When
-/// `sha256` is given, the exact bytes read are hashed and must match, so the
-/// caller's verification and this parse see the same content.
+/// [`MAX_OBJ_FILE_BYTES`], each step hashed and parsed incrementally
+/// ([`ObjParser`]); `cancelled` is polled between steps and inside the
+/// parse. When `sha256` is given, the exact bytes read are hashed and must
+/// match before the mesh is returned, so the caller's verification and this
+/// parse see the same content. (A file that is both malformed and of the
+/// wrong digest reports the parse error found first.)
 pub fn read_obj_file(
     path: &Path,
     sha256: Option<&[u8; 32]>,
@@ -268,8 +420,13 @@ pub fn read_obj_file_within(
         return Err(ObjError::TooLarge);
     }
     let mut reader = file.take(max_bytes + 1);
-    let mut bytes = Vec::new();
+    // One pass: each 1 MB step is read, hashed and parsed before the next,
+    // so cancellation, the caps and the size bound all act as it goes.
+    let mut hasher = sha256.map(|_| sha2::Sha256::new());
+    let mut parser = ObjParser::new(limits);
+    let mut read = 0u64;
     let mut chunk = vec![0u8; READ_CHUNK];
+    super::loader::probe("parse", path);
     loop {
         if cancelled() {
             return Err(ObjError::Cancelled);
@@ -280,21 +437,24 @@ pub fn read_obj_file_within(
         if n == 0 {
             break;
         }
-        bytes.extend_from_slice(&chunk[..n]);
-        if bytes.len() as u64 > max_bytes {
+        read += n as u64;
+        if read > max_bytes {
             return Err(ObjError::TooLarge);
         }
+        if let Some(hasher) = hasher.as_mut() {
+            hasher.update(&chunk[..n]);
+        }
+        parser.feed(&chunk[..n], cancelled)?;
     }
-    if let Some(expected) = sha256
-        && sha2::Sha256::digest(&bytes).as_slice() != expected.as_slice()
+    if let (Some(expected), Some(hasher)) = (sha256, hasher)
+        && hasher.finalize().as_slice() != expected.as_slice()
     {
         return Err(ObjError::DigestMismatch);
     }
     if cancelled() {
         return Err(ObjError::Cancelled);
     }
-    let read = bytes.len() as u64;
-    parse_obj(&bytes, limits).map(|mesh| (mesh, read))
+    parser.finish(cancelled).map(|mesh| (mesh, read))
 }
 
 #[cfg(test)]

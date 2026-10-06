@@ -6,9 +6,10 @@
 //! is pending the render loop polls (the `has_pending_images` pattern), so
 //! an idle editor still completes a load.
 //!
-//! Cancellation is a flag per request, checked between 1 MB reads. Dropping
-//! the loader cancels everything queued or running and closes the channel,
-//! so the thread exits within one read step.
+//! Cancellation is a flag per request, polled between 1 MB reads, inside the
+//! incremental parse (also within one long line) and through scene
+//! validation and framing. Dropping the loader cancels everything queued or
+//! running and closes the channel, so the thread exits within one step.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,7 +43,8 @@ pub struct LoadResult {
 }
 
 /// Load `meshes` into a scene, within the model caps and the aggregate
-/// input-byte allowance, checking `cancel` between reads.
+/// input-byte allowance, polling `cancel` through reading, parsing and
+/// scene construction.
 pub fn load_scene(meshes: &[ModelMeshSpec], cancel: &AtomicBool) -> Result<ModelScene, String> {
     if meshes.is_empty() || meshes.len() > super::scene::MAX_MODEL_MESHES {
         return Err(format!(
@@ -65,8 +67,28 @@ pub fn load_scene(meshes: &[ModelMeshSpec], cancel: &AtomicBool) -> Result<Model
         allowance = allowance.saturating_sub(read);
         parsed.push(mesh);
     }
-    ModelScene::new(parsed).map_err(|e| e.to_string())
+    probe("scene", &meshes[0].path);
+    ModelScene::new_cancellable(parsed, &cancelled).map_err(|e| e.to_string())
 }
+
+/// Test-only observer of the phase a load enters ("parse", "scene"), so a
+/// test can act while a load is genuinely inside that phase.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) static PROBE: std::sync::Mutex<
+    Option<Box<dyn Fn(&'static str, &std::path::Path) + Send>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn probe(phase: &'static str, path: &std::path::Path) {
+    if let Some(observer) = PROBE.lock().unwrap().as_ref() {
+        observer(phase, path);
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn probe(_phase: &'static str, _path: &std::path::Path) {}
 
 /// Handle to the loader thread, owned by the render thread.
 pub struct ModelLoader {
@@ -108,10 +130,16 @@ impl ModelLoader {
         })
     }
 
-    /// Queue a load. Errors when [`MAX_QUEUED_LOADS`] are already waiting
-    /// ("loader busy") or the thread is gone.
+    /// Queue a load. Errors ("loader busy") when [`MAX_QUEUED_LOADS`] are
+    /// already waiting, or when as many loads as the loader holds at once
+    /// (queued, running, or finished and not yet drained) are outstanding:
+    /// completed scenes awaiting admission are bounded too. Errors also
+    /// when the thread is gone.
     pub fn submit(&mut self, request: LoadRequest) -> Result<(), String> {
         let sender = self.requests.as_ref().ok_or("model loader stopped")?;
+        if self.live.len() > MAX_QUEUED_LOADS {
+            return Err("model loader busy".to_owned());
+        }
         let entry = (request.id, request.token, request.cancel.clone());
         match sender.try_send(request) {
             Ok(()) => {
@@ -157,8 +185,9 @@ impl Drop for ModelLoader {
         }
         self.requests = None;
         if let Some(thread) = self.thread.take() {
-            // Exits within one 1 MB read: every request is cancelled and the
-            // request channel is closed.
+            // Exits within one cancellation step (a 1 MB read, a bounded run
+            // of parsing, or of scene work): every request is cancelled and
+            // the request channel is closed.
             let _ = thread.join();
         }
     }
