@@ -387,3 +387,94 @@ fn a_cursor_frame_after_a_model_change_shows_and_picks_the_new_camera() {
     assert_eq!(pick.view.yaw, 30.0);
     assert_ne!(pick.view, before.view);
 }
+
+// ----------------------------------------------------------------------
+// Review SHOULD 3: fractional wheel input over a model accumulates.
+
+fn pixels(y: f64) -> winit::event::MouseScrollDelta {
+    winit::event::MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, y))
+}
+
+fn zoom(app: &RenderApp) -> f64 {
+    app.models.view(MODEL).unwrap().zoom
+}
+
+/// Touchpad deltas too small to be a notch each add up: the event that
+/// crosses a notch zooms once, and the burst settles with one View 150 ms
+/// after its last event, not before.
+#[test]
+fn sub_notch_touchpad_events_add_up_to_a_zoom_that_settles_after_the_quiet_period() {
+    use neomacs_renderer_wgpu::model::store::WHEEL_QUIET;
+    use winit::event::{DeviceId, TouchPhase};
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    present(&mut app, A);
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+    let pad = Some(DeviceId::from_raw(1));
+    let t0 = Instant::now();
+    let ms = |n: u64| t0 + Duration::from_millis(n);
+    // 20 px is 0.4 notch: alone it rounds to nothing.
+    app.wheel_over_model(pad, MODEL, pixels(20.0), TouchPhase::Started, ms(0));
+    app.wheel_over_model(pad, MODEL, pixels(20.0), TouchPhase::Moved, ms(10));
+    assert_eq!(zoom(&app), 1.0, "0.8 notch is not yet a notch");
+    app.wheel_over_model(pad, MODEL, pixels(20.0), TouchPhase::Moved, ms(20));
+    assert!((zoom(&app) - 1.1).abs() < 1e-9, "1.2 notches zoom once");
+    let events = delivered(&emacs);
+    assert!(!events.iter().any(|e| e.starts_with("View")), "{events:?}");
+
+    app.models.tick(ms(20) + WHEEL_QUIET - Duration::from_millis(1), None);
+    app.flush_model_events();
+    assert!(delivered(&emacs).is_empty(), "the burst is not quiet yet");
+    app.models.tick(ms(20) + WHEEL_QUIET, None);
+    app.flush_model_events();
+    assert_eq!(delivered(&emacs), ["View{2}"]);
+}
+
+/// A remainder belongs to one device, one model and one gesture: it does
+/// not carry across a quiet period, a new gesture, another device or
+/// another model.
+#[test]
+fn a_wheel_remainder_resets_on_quiet_gesture_device_and_model_changes() {
+    use neomacs_renderer_wgpu::model::store::WHEEL_QUIET;
+    use winit::event::{DeviceId, TouchPhase};
+    let (mut app, _emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    let pad = Some(DeviceId::from_raw(1));
+    let other = Some(DeviceId::from_raw(2));
+    let t0 = Instant::now();
+    let ms = |n: u64| t0 + Duration::from_millis(n);
+    let wheel = |app: &mut RenderApp, device, id, y, phase, at| {
+        app.model_wheel.notches(device, id, pixels(y), phase, at)
+    };
+    // 0.6 then 0.6 within one gesture: one notch.
+    assert_eq!(wheel(&mut app, pad, MODEL, 30.0, TouchPhase::Started, ms(0)), 0);
+    assert_eq!(wheel(&mut app, pad, MODEL, 30.0, TouchPhase::Moved, ms(10)), 1);
+    // 0.2 carried; after a quiet period it is gone.
+    assert_eq!(
+        wheel(&mut app, pad, MODEL, 40.0, TouchPhase::Moved, ms(10) + WHEEL_QUIET),
+        0,
+        "a stale remainder joined a later burst"
+    );
+    // 0.8 carried; a new gesture starts from zero.
+    assert_eq!(wheel(&mut app, pad, MODEL, 30.0, TouchPhase::Started, ms(200)), 0);
+    // 0.6 carried; another device does not inherit it.
+    assert_eq!(wheel(&mut app, other, MODEL, 30.0, TouchPhase::Moved, ms(210)), 0);
+    // 0.6 carried for `other`; another model does not inherit it.
+    assert_eq!(wheel(&mut app, other, MODEL + 1, 30.0, TouchPhase::Moved, ms(220)), 0);
+    // Negative deltas accumulate the same way, toward zoom-out.
+    assert_eq!(wheel(&mut app, pad, MODEL, -30.0, TouchPhase::Started, ms(300)), 0);
+    assert_eq!(wheel(&mut app, pad, MODEL, -30.0, TouchPhase::Moved, ms(310)), -1);
+    // A whole notch from a mouse wheel is still exactly one notch.
+    assert_eq!(
+        app.model_wheel.notches(
+            None,
+            MODEL,
+            winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
+            TouchPhase::Moved,
+            ms(400)
+        ),
+        1
+    );
+}
