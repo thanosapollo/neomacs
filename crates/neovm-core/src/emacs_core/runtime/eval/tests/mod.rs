@@ -23453,6 +23453,36 @@ fn command_loop_error_uses_buffer_local_command_error_function() {
     );
 }
 
+/// GNU `cmd_error' sets `print-level' and `print-length' to 10 around the
+/// report ("Avoid unquittable loop if data contains a circular list") and
+/// restores them once `command-error-function' returns.
+#[test]
+fn command_loop_error_report_bounds_printing_like_gnu_cmd_error() {
+    crate::test_utils::init_test_tracing();
+    let (mut ev, global_map) = command_loop_error_test_context();
+    ev.eval_str(
+        r#"(progn
+             (setq neo-command-error-observation nil)
+             (set (make-local-variable 'command-error-function)
+                  (lambda (_data _context _caller)
+                    (setq neo-command-error-observation
+                          (list print-level print-length))))
+             (fset 'neo-signaling-command
+                   (lambda () (interactive) (signal 'error '("boom")))))"#,
+    )
+    .expect("install command-error print-bound probe");
+
+    run_command_loop_error_commands(&mut ev, global_map, &[("f9", "neo-signaling-command")]);
+
+    assert_eq!(
+        ev.eval_symbol("neo-command-error-observation")
+            .expect("command error observation"),
+        Value::list(vec![Value::fixnum(10), Value::fixnum(10)]),
+    );
+    assert!(ev.eval_symbol("print-level").expect("print-level").is_nil());
+    assert!(ev.eval_symbol("print-length").expect("print-length").is_nil());
+}
+
 /// GNU decides whether an error is ignored while dispatching the signal, before
 /// `cmd_error_internal' invokes the buffer-local `command-error-function'.  A
 /// presentation callback may mutate `debug-ignored-errors', but that mutation

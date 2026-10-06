@@ -2235,6 +2235,25 @@ impl super::eval::Context {
         }
     }
 
+    /// GNU `cmd_error`'s report of an error that reached the command loop.
+    ///
+    /// GNU sets `print-level` and `print-length` to 10 around
+    /// `cmd_error_internal` ("Avoid unquittable loop if data contains a
+    /// circular list") and restores them only after a normal return, as it
+    /// does for `inhibit-quit`.  Process filter and sentinel errors call
+    /// [`Self::report_command_error`] directly, without these bounds, as GNU
+    /// calls `cmd_error_internal`.
+    pub(crate) fn report_command_loop_error(&mut self, data: Value) -> Result<(), Flow> {
+        let old_level = self.visible_variable_value_or_nil("print-level");
+        let old_length = self.visible_variable_value_or_nil("print-length");
+        self.assign("print-level", Value::fixnum(10));
+        self.assign("print-length", Value::fixnum(10));
+        self.report_command_error(data, "")?;
+        self.assign("print-level", old_level);
+        self.assign("print-length", old_length);
+        Ok(())
+    }
+
     /// GNU `command-error-default-function` (keyboard.c:1049-1101). Batch and
     /// pre-display sessions write the diagnostic to stderr and exit -1 (status
     /// 255); a live session messages it and carries on.
