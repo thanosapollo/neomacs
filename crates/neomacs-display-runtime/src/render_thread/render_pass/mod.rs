@@ -160,10 +160,6 @@ fn composition_surface(
         .ok_or(FrameRenderFailure::AwaitingContent)
 }
 
-#[cfg(test)]
-#[path = "tests/mod.rs"]
-mod tests;
-
 #[allow(clippy::too_many_arguments)]
 fn render_frame_window_contents_to_surface(
     renderer: &mut WgpuRenderer,
@@ -518,3 +514,7 @@ fn render_frame_window_contents_reserved(
         projection: pane_projection,
     })
 }
+
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+mod tests;

@@ -763,3 +763,104 @@ fn mandatory_child_picture_refusal_is_typed_and_recovers_after_lease_release() {
     draw(&mut h, &child).unwrap();
     assert_eq!(read_back(&h), normal);
 }
+
+#[test]
+fn source_over_transitions_fill_uncovered_geometry_with_the_background() {
+    use neomacs_display_protocol::{
+        HorizontalTransitionEffect, ResolvedTransitionEffect, TransitionAxis, TransitionDirection,
+        TransitionEasing, VerticalTransitionEffect,
+    };
+    let mut h = try_harness().expect("GPU required for transition coverage regression");
+    let size = SnapshotSize::new(W, H).unwrap();
+    let old = h.renderer.acquire_snapshot(size).unwrap();
+    let new = h.renderer.acquire_snapshot(size).unwrap();
+    let bounds = neomacs_display_protocol::types::Rect::new(8.0, 8.0, 80.0, 48.0);
+    let effects = [
+        // Mid-flip the picture spans only x in roughly 36..60.
+        (
+            ResolvedTransitionEffect::CardFlip {
+                axis: TransitionAxis::Horizontal,
+            },
+            0.4,
+        ),
+        // Halfway through a scroll twice the region's height, both tilted
+        // pictures sit wholly outside it.
+        (
+            ResolvedTransitionEffect::Vertical {
+                effect: VerticalTransitionEffect::Tilt,
+                direction: TransitionDirection::Forward,
+                distance: 96.0,
+            },
+            0.5,
+        ),
+        // Past halfway the old picture has faded out entirely while the
+        // last lines have not begun their reveal.
+        (
+            ResolvedTransitionEffect::Horizontal {
+                effect: HorizontalTransitionEffect::TypewriterReveal,
+                direction: TransitionDirection::Forward,
+            },
+            0.6,
+        ),
+    ];
+    for alpha in [1.0, 0.5] {
+        let mut frame = picture();
+        frame.background = Color::GREEN;
+        frame.background_alpha = alpha;
+        render(&mut h, &frame, old.view());
+        render(&mut h, &frame, new.view());
+        let expected = (255.0_f32 * alpha).round() as u8;
+        for (effect, progress) in effects {
+            let view = h.view.clone();
+            render(&mut h, &frame, &view);
+            let before = read_back(&h);
+            h.renderer.render_transition_effect(
+                &h.view,
+                old.bind_group(),
+                new.bind_group(),
+                progress,
+                0.0,
+                &bounds,
+                effect,
+                TransitionEasing::Linear,
+                W,
+                H,
+                frame.background,
+                frame.background_alpha,
+            );
+            let pixels = read_back(&h);
+            if matches!(effect, ResolvedTransitionEffect::Horizontal { .. }) {
+                let p = px(&pixels, 86, 54);
+                assert!(
+                    p[3].abs_diff(expected) <= 1,
+                    "unrevealed typewriter line at alpha {alpha}: {p:?}"
+                );
+                continue;
+            }
+            // No pixel of the transitioned region is left more transparent
+            // than the frame background, wherever the pictures moved.
+            let thinnest = (8..56)
+                .flat_map(|y| (8..88).map(move |x| (x, y)))
+                .min_by_key(|&(x, y)| px(&pixels, x, y)[3])
+                .unwrap();
+            let p = px(&pixels, thinnest.0, thinnest.1);
+            eprintln!("{effect:?} {alpha}: thinnest {thinnest:?} {p:?}");
+            assert!(
+                p[3] >= expected.saturating_sub(1),
+                "{effect:?} uncovered pixel {thinnest:?} at alpha {alpha}: {p:?}"
+            );
+            if matches!(effect, ResolvedTransitionEffect::CardFlip { .. }) {
+                // Mid-flip the corners are background only, at exactly its alpha.
+                for (x, y) in [(9, 9), (9, 32), (86, 54)] {
+                    let p = px(&pixels, x, y);
+                    assert!(
+                        p[3].abs_diff(expected) <= 1,
+                        "CardFlip uncovered pixel ({x},{y}) at alpha {alpha}: {p:?}"
+                    );
+                }
+            }
+            assert_eq!(px(&pixels, 2, 2), px(&before, 2, 2));
+            assert_eq!(px(&pixels, 94, 62), px(&before, 94, 62));
+        }
+    }
+}

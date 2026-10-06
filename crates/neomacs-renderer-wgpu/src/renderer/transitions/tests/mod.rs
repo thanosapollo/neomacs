@@ -62,7 +62,11 @@ fn geometric_background_complements_preserve_weight_and_fractional_alpha() {
     for alpha in [0.0, 0.5, 1.0] {
         let background = Color::new(0.2, 0.4, 0.6, 0.5);
         let a = alpha * background.a;
-        let vertices = transition_background_vertices(&bounds, &[&old, &new], background, alpha);
+        let vertices = transition_background_vertices(
+            &bounds,
+            &[&old, &new],
+            TransitionBackground::new(background, alpha),
+        );
         for (x, y, missing) in [
             (8.5, 58.0, 1.0),
             (10.0, 58.0, 0.25),
@@ -92,7 +96,11 @@ fn card_flip_complement_never_fills_beneath_the_picture() {
         quad(57.0, 8.0, 59.0, 108.0, 1.0),
         quad(8.0, 57.0, 108.0, 59.0, 1.0),
     ] {
-        let vertices = transition_background_vertices(&bounds, &[&picture], Color::BLACK, 0.5);
+        let vertices = transition_background_vertices(
+            &bounds,
+            &[&picture],
+            TransitionBackground::new(Color::BLACK, 0.5),
+        );
         assert_eq!(background_sample(&vertices, 8.5, 8.5), [0.0, 0.0, 0.0, 0.5]);
         assert_eq!(background_sample(&vertices, 58.0, 58.0), [0.0; 4]);
         assert_eq!(background_sample(&vertices, 2.0, 2.0), [0.0; 4]);
@@ -104,6 +112,33 @@ fn full_size_endpoints_need_no_weighted_background() {
     let bounds = neomacs_display_protocol::types::Rect::new(8.0, 8.0, 100.0, 100.0);
     let full = quad(8.0, 8.0, 108.0, 108.0, 1.0);
     let invisible = quad(12.0, 12.0, 104.0, 104.0, 0.0);
-    let vertices = transition_background_vertices(&bounds, &[&full, &invisible], Color::BLACK, 1.0);
+    let vertices = transition_background_vertices(
+        &bounds,
+        &[&full, &invisible],
+        TransitionBackground::new(Color::BLACK, 1.0),
+    );
     assert!(vertices.iter().all(|v| v.color == [0.0; 4]));
+}
+
+#[test]
+fn parallax_complements_fill_each_vacated_band_by_its_picture_weight() {
+    let bounds = neomacs_display_protocol::types::Rect::new(8.0, 8.0, 100.0, 100.0);
+    // Old picture moved up by 30 (weight 0.75), new still 70 below (0.25).
+    let old = quad(8.0, -22.0, 108.0, 78.0, 0.75);
+    let new = quad(8.0, 78.0, 108.0, 178.0, 0.25);
+    let vertices = transition_background_vertices(
+        &bounds,
+        &[&old, &new],
+        TransitionBackground::new(Color::BLACK, 1.0),
+    );
+    // Each pixel's picture weights plus its background weight sum to one.
+    assert_eq!(
+        background_sample(&vertices, 58.0, 50.0),
+        [0.0, 0.0, 0.0, 0.25]
+    );
+    assert_eq!(
+        background_sample(&vertices, 58.0, 90.0),
+        [0.0, 0.0, 0.0, 0.75]
+    );
+    assert_eq!(background_sample(&vertices, 2.0, 50.0), [0.0; 4]);
 }
