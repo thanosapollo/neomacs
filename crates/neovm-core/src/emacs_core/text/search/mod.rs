@@ -848,11 +848,11 @@ pub(crate) fn builtin_replace_regexp_in_string(
     // The saved match data's searched string is a heap object held only in
     // this Rust local while REP runs arbitrary Lisp; a new string-match in
     // REP replaces its previous root and a GC frees it before the restore.
-    if let Some(crate::emacs_core::regex::SearchedString::Heap(searched)) = saved_match_data
+    if let Some(saved) = saved_match_data
         .as_ref()
-        .and_then(super::regex::MatchData::searched_string)
+        .and_then(super::regex::MatchData::gc_root)
     {
-        eval.push_specpdl_root(*searched);
+        eval.push_specpdl_root(saved);
     }
 
     let result = replace_regexp_in_string_lisp(&args, case_fold, |match_span, translated_md| {

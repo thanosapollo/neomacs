@@ -585,6 +585,11 @@ impl TaggedHeap {
         std::mem::take(&mut self.pending_buffer_reclaims)
     }
 
+    /// Hand a taken id back to be considered again after the next cycle.
+    pub fn requeue_buffer_reclaim(&mut self, id: crate::buffer::BufferId) {
+        self.pending_buffer_reclaims.push(id);
+    }
+
     /// Take the ids of deleted processes whose process object the sweep
     /// freed since the last drain; the evaluator drops their records.
     pub fn take_pending_process_reclaims(&mut self) -> Vec<crate::emacs_core::process::ProcessId> {

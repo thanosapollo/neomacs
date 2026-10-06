@@ -2725,9 +2725,23 @@ impl Context {
     /// Drop the killed-buffer records whose buffer object this cycle freed.
     /// An id whose object was made again since (a Rust-held id turned back
     /// into a Lisp value) keeps its record until that object goes too.
+    ///
+    /// The match data names its buffer by id, where GNU's
+    /// `last_thing_searched` holds the buffer object: `(match-data t)` can
+    /// still return that killed buffer. Its record waits, checked again
+    /// after each cycle, until the match data moves on.
     pub(super) fn drain_pending_buffer_reclaims(&mut self) {
+        let searched = match self.match_data.as_ref().map(|md| md.source()) {
+            Some(crate::emacs_core::regex::MatchDataSource::Buffer(id)) => Some(id),
+            _ => None,
+        };
         for id in self.tagged_heap.take_pending_buffer_reclaims() {
-            if self.tagged_heap.buffer_object_reclaimed(id) {
+            if !self.tagged_heap.buffer_object_reclaimed(id) {
+                continue;
+            }
+            if Some(id) == searched {
+                self.tagged_heap.requeue_buffer_reclaim(id);
+            } else {
                 self.buffers.reclaim_dead_buffer(id);
             }
         }

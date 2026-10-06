@@ -8131,11 +8131,11 @@ impl super::super::eval::Context {
         // Root them for the callback span; unbind_to pops these with the
         // specbinds. GNU parks the same state on its specpdl
         // (record_unwind_protect restore_match_data, keyboard.c/process.c).
-        if let Some(crate::emacs_core::regex::SearchedString::Heap(searched)) = saved_match_data
+        if let Some(saved) = saved_match_data
             .as_ref()
-            .and_then(crate::emacs_core::regex::MatchData::searched_string)
+            .and_then(crate::emacs_core::regex::MatchData::gc_root)
         {
-            self.push_specpdl_root(*searched);
+            self.push_specpdl_root(saved);
         }
         self.push_specpdl_root(saved_deactivate_mark);
 
@@ -8509,6 +8509,14 @@ impl super::super::eval::Context {
         } = run;
         let saved_match_data = self.match_data.clone();
         let specpdl_count = self.specpdl.len();
+        // A `:post-read-conversion` is arbitrary Lisp: keep what the saved
+        // match data names alive until it is restored (the unbind pops it).
+        if let Some(saved) = saved_match_data
+            .as_ref()
+            .and_then(crate::emacs_core::regex::MatchData::gc_root)
+        {
+            self.push_specpdl_root(saved);
+        }
         let decoded = (|| {
             self.try_specbind_or_unwind_to(specpdl_count, intern("inhibit-quit"), Value::T)?;
             self.try_specbind_or_unwind_to(specpdl_count, intern("last-nonmenu-event"), Value::T)?;

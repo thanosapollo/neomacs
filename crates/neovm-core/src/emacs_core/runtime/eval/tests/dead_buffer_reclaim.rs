@@ -63,11 +63,16 @@ fn eval_ok(ev: &mut Context, form: &str) -> String {
 }
 
 /// A context whose collector runs generational minor and major cycles.
-/// Nextest runs each test in its own process, so the knob is set before
-/// the first `Context` reads it.
+/// The heap reads the knob once, when it is made, so the variable is set
+/// only around that and put back before any other test can see it.
 fn generational_context() -> Context {
+    let saved = std::env::var_os("NEOVM_GC_GENERATIONAL");
     unsafe { std::env::set_var("NEOVM_GC_GENERATIONAL", "1") };
     let ev = Context::new();
+    match saved {
+        Some(value) => unsafe { std::env::set_var("NEOVM_GC_GENERATIONAL", value) },
+        None => unsafe { std::env::remove_var("NEOVM_GC_GENERATIONAL") },
+    }
     assert!(ev.tagged_heap.generational_enabled());
     ev
 }
@@ -260,6 +265,10 @@ fn a_killed_buffer_fetched_during_a_mark_survives_it() {
     {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    assert!(
+        ev.tagged_heap.concurrent_mark_running() && ev.tagged_heap.concurrent_mark_done(),
+        "the concurrent marker did not drain before the read"
+    );
     let cell = Value::cons(Value::make_buffer(id), Value::NIL);
     ev.set_variable("held-dead-cell", cell);
     for _ in 0..10_000 {
@@ -317,9 +326,18 @@ fn a_killed_buffer_fetched_during_a_sweep_survives_it() {
         }
     }
     assert!(sweeping, "no incremental sweep started");
+    assert!(
+        ev.tagged_heap.buffer_object_reclaimed(id),
+        "the unreferenced object was not condemned"
+    );
     ev.set_variable("held-dead", Value::make_buffer(id));
+    assert!(!ev.tagged_heap.buffer_object_reclaimed(id));
     ev.tagged_heap.finish_incremental_sweep_now();
     assert_held_dead_buffer(&mut ev, "mid-sweep");
+    assert!(
+        ev.buffers.get_dead(id).is_some(),
+        "the drain dropped the record of the object made during the sweep"
+    );
 }
 
 /// GNU `mark_buffer` marks `base_buffer`: a referenced killed indirect
@@ -369,5 +387,163 @@ fn a_buffer_killed_without_an_object_drops_its_record() {
             "(list (bufferp stale) (buffer-live-p stale) (prin1-to-string stale))"
         ),
         "OK (t nil \"#<killed buffer>\")"
+    );
+}
+
+/// GNU's match data holds the searched buffer object (`last_thing_searched`
+/// in search.c), so `(match-data t)` still returns the killed buffer, name
+/// and all, after any number of collections.
+#[test]
+fn match_data_keeps_the_killed_buffer_it_searched() {
+    let mut ev = Context::new();
+    search_in_a_killed_buffer(&mut ev);
+    for _ in 0..2 {
+        churn_strings(&mut ev);
+        collect_twice(&mut ev);
+    }
+    // GNU 32.0.50 prints exactly this for the same forms.
+    assert_eq!(
+        eval_ok(
+            &mut ev,
+            "(let ((buf (nth 2 (match-data t))))
+               (list (bufferp buf) (buffer-live-p buf) (buffer-last-name buf)))"
+        ),
+        "OK (t nil \"srch\")"
+    );
+}
+
+/// Once the match data moves on, nothing names the killed buffer and it
+/// goes.  (No `(match-data t)` read here: that makes an object the test
+/// itself could keep reachable.)
+#[test]
+fn a_killed_buffer_goes_once_the_match_data_moves_on() {
+    let mut ev = Context::new();
+    let id = search_in_a_killed_buffer(&mut ev);
+    collect_twice(&mut ev);
+    assert!(
+        ev.buffers.get_dead(id).is_some(),
+        "the match data still names the killed buffer"
+    );
+    ev.eval_str("(string-match \"x\" \"x\")").unwrap();
+    collect_twice(&mut ev);
+    collect_twice(&mut ev);
+    assert!(
+        ev.buffers.get_dead(id).is_none(),
+        "the record outlived the match data naming it"
+    );
+}
+
+fn search_in_a_killed_buffer(ev: &mut Context) -> crate::buffer::BufferId {
+    ev.eval_str(
+        "(save-current-buffer
+           (set-buffer (get-buffer-create \"srch\"))
+           (insert \"abc\")
+           (goto-char 1)
+           (re-search-forward \"b\"))",
+    )
+    .unwrap();
+    ev.eval_str("(kill-buffer \"srch\")").unwrap();
+    ev.buffers.find_dead_buffer_by_name("srch").unwrap()
+}
+
+/// A weak-key table entry whose key is an unreferenced killed buffer goes,
+/// one keyed by a live buffer stays. GNU 32.0.50 counts 1 here too.
+#[test]
+fn a_weak_table_drops_an_unreferenced_killed_buffer_key() {
+    let mut ev = Context::new();
+    ev.eval_str(
+        "(progn
+           (setq wt (make-hash-table :weakness 'key))
+           (let ((b (get-buffer-create \"wk\"))) (puthash b t wt) (kill-buffer b))
+           (puthash (get-buffer-create \"wl\") t wt))",
+    )
+    .unwrap();
+    churn_strings(&mut ev);
+    collect_twice(&mut ev);
+    assert_eq!(eval_ok(&mut ev, "(hash-table-count wt)"), "OK 1");
+}
+
+/// A minor collection does not trace the old generation, so it cannot tell
+/// whether an old killed buffer is still referenced: its record must wait
+/// for a major collection, which frees it if nothing refers to it.
+#[test]
+fn an_old_killed_buffer_waits_for_a_major_collection() {
+    unsafe { std::env::set_var("NEOVM_GC_GENERATIONAL", "1") };
+    let mut ev = Context::new();
+    ev.gc_stress = false;
+    assert!(ev.tagged_heap.generational_enabled());
+    ev.tagged_heap.set_gc_threshold(usize::MAX);
+    ev.eval_str(
+        "(setq old-held (list (get-buffer-create \"old-held\"))
+               old-free (get-buffer-create \"old-free\"))",
+    )
+    .unwrap();
+    ev.gc_collect_exact();
+    ev.eval_str("(progn (kill-buffer (car old-held)) (kill-buffer old-free) (setq old-free nil))")
+        .unwrap();
+    let held = ev.buffers.find_dead_buffer_by_name("old-held").unwrap();
+    let free = ev.buffers.find_dead_buffer_by_name("old-free").unwrap();
+    assert!(ev.tagged_heap.should_run_minor(false, false));
+    let completed = ev.gc_count;
+    ev.gc_collect_from_current_roots_impl(false);
+    for _ in 0..10_000 {
+        if !ev.tagged_heap.sweep_in_progress() {
+            break;
+        }
+        ev.gc_collect_from_current_roots_impl(false);
+    }
+    assert_eq!(ev.gc_count, completed + 1, "no minor collection completed");
+    assert!(ev.buffers.get_dead(held).is_some());
+    assert!(
+        ev.buffers.get_dead(free).is_some(),
+        "a minor collection dropped an old object's record"
+    );
+    collect_twice(&mut ev);
+    assert!(
+        ev.buffers.get_dead(free).is_none(),
+        "a major collection kept it"
+    );
+    assert_eq!(
+        eval_ok(
+            &mut ev,
+            "(list (buffer-live-p (car old-held)) (buffer-last-name (car old-held)))"
+        ),
+        "OK (nil \"old-held\")"
+    );
+}
+
+/// The dump keeps live buffers only, while a dumped value can still name a
+/// buffer killed before the dump. After loading, that buffer's object must
+/// not be a root: it goes once the value naming it does.
+#[test]
+fn a_killed_buffer_named_by_a_dump_is_not_a_root_after_loading() {
+    let dir = tempfile::tempdir().expect("dump fixture directory");
+    let path = dir.path().join("killed-buffer.pdump");
+    {
+        let mut ev = Context::new();
+        ev.eval_str(
+            "(progn (setq held-dead (get-buffer-create \"dumped\")) (kill-buffer held-dead))",
+        )
+        .unwrap();
+        crate::emacs_core::pdump::dump_to_file(&ev, &path).expect("dump");
+    }
+    let mut ev = crate::emacs_core::pdump::load_from_dump(&path).expect("load");
+    let id = ev
+        .eval_str("held-dead")
+        .unwrap()
+        .as_buffer_id()
+        .expect("a buffer object");
+    assert_eq!(
+        eval_ok(
+            &mut ev,
+            "(list (bufferp held-dead) (buffer-live-p held-dead))"
+        ),
+        "OK (t nil)"
+    );
+    ev.eval_str("(setq held-dead nil)").unwrap();
+    collect_twice(&mut ev);
+    assert!(
+        ev.tagged_heap.buffer_object_reclaimed(id),
+        "the loaded object of a killed buffer stayed rooted"
     );
 }

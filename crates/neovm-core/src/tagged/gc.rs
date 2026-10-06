@@ -2842,6 +2842,8 @@ use mutator_gc::MutatorGcState;
 
 mod knobs;
 
+mod buffer_registry;
+
 mod process_registry;
 
 mod chunk_map;

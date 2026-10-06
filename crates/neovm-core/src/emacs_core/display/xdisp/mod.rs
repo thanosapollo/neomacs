@@ -2146,12 +2146,12 @@ fn try_format_mode_line_display(
     let saved_match_data =
         (save_match_data && mode_line_flow_policy::enabled()).then(|| eval.match_data.clone());
     let match_roots = mode_line_gc::ScratchRoots::new();
-    if let Some(crate::emacs_core::regex::SearchedString::Heap(searched)) = saved_match_data
+    if let Some(saved) = saved_match_data
         .as_ref()
         .and_then(Option::as_ref)
-        .and_then(crate::emacs_core::regex::MatchData::searched_string)
+        .and_then(crate::emacs_core::regex::MatchData::gc_root)
     {
-        match_roots.pin(*searched);
+        match_roots.pin(saved);
     }
 
     // GNU `display_mode_lines` (xdisp.c) makes the window being redisplayed the

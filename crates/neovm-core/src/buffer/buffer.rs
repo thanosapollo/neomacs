@@ -6272,6 +6272,11 @@ impl BufferManager {
         self.dead_indirect_bases.remove(&id);
     }
 
+    /// One past the highest buffer id issued so far.
+    pub(crate) fn next_buffer_id(&self) -> u64 {
+        self.next_id
+    }
+
     /// Whether `id` was issued and its buffer has since been killed. Ids
     /// are never reused, so this holds even after the record is gone.
     pub fn is_killed(&self, id: BufferId) -> bool {
