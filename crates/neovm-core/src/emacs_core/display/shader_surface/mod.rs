@@ -71,69 +71,6 @@ fn dimension(value: Option<Value>, key: &str) -> Result<u32, super::error::Flow>
     Ok(px.round() as u32)
 }
 
-/// Parse `:model (PATH ...)`, `:view (YAW PITCH ZOOM)` and `:background
-/// [R G B]` (sRGB 0..1, like a face colour) for the native model view slice.
-/// Paths must be absolute `.obj` files; file contents are validated by the
-/// renderer, whose failures arrive as `SurfaceCreateFailed`.
-fn parse_model_content(
-    meshes: Value,
-    args: &[Value],
-) -> Result<ShaderSurfaceContent, super::error::Flow> {
-    let bad = |what: &str| surface_error(format!("neomacs-surface-create: {what}"));
-    let entries = list_to_vec(&meshes).ok_or_else(|| bad(":model must be a list of paths"))?;
-    if entries.is_empty() || entries.len() > 255 {
-        return Err(bad(":model needs 1..255 paths"));
-    }
-    let mut paths = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let path = entry
-            .as_lisp_string()
-            .and_then(|s| s.as_utf8_str().map(str::to_owned))
-            .ok_or_else(|| bad(":model paths must be strings"))?;
-        let p = std::path::Path::new(&path);
-        if !p.is_absolute() || p.extension().is_none_or(|e| e != "obj") {
-            return Err(bad(":model paths must be absolute .obj files"));
-        }
-        paths.push(path);
-    }
-    let numbers = |key: &str, count: usize| -> Result<Option<Vec<f64>>, super::error::Flow> {
-        let Some(value) = plist_get(args, key).filter(|v| !v.is_nil()) else {
-            return Ok(None);
-        };
-        let items = list_to_vec(&value)
-            .or_else(|| value.as_vector_data().map(|v| v.as_slice().to_vec()))
-            .ok_or_else(|| bad(&format!("{key} must be a list of {count} numbers")))?;
-        let parsed: Option<Vec<f64>> = items
-            .iter()
-            .map(|v| v.as_int().map(|i| i as f64).or_else(|| v.as_float()))
-            .collect();
-        match parsed {
-            Some(values) if values.len() == count && values.iter().all(|v| v.is_finite()) => {
-                Ok(Some(values))
-            }
-            _ => Err(bad(&format!("{key} must be a list of {count} numbers"))),
-        }
-    };
-    let view = numbers(":view", 3)?.unwrap_or_else(|| vec![0.0, 0.0, 1.0]);
-    if view[0].abs() > 1e6 || view[1].abs() > 1e6 || !(0.25..=4.0).contains(&view[2]) {
-        return Err(bad(":view needs |angles| <= 1e6 and zoom 0.25..4"));
-    }
-    let background = numbers(":background", 3)?.unwrap_or_else(|| vec![0.0, 0.0, 0.0]);
-    if background.iter().any(|c| !(0.0..=1.0).contains(c)) {
-        return Err(bad(":background components must be in 0..1"));
-    }
-    Ok(ShaderSurfaceContent::Model {
-        meshes: paths,
-        view: [view[0], view[1], view[2]],
-        background: [
-            background[0] as f32,
-            background[1] as f32,
-            background[2] as f32,
-            1.0,
-        ],
-    })
-}
-
 /// Parse a `(name . VALUE)` uniform entry: VALUE is a number (one component)
 /// or a vector of 1..=4 numbers.
 fn parse_uniform_entry(entry: Value) -> Result<ShaderSurfaceUniformInit, super::error::Flow> {
@@ -278,26 +215,6 @@ fn create(eval: &mut Context, args: Vec<Value>) -> EvalResult {
     let wgsl = plist_get(&args, ":shader").filter(|value| !value.is_nil());
     let glsl = plist_get(&args, ":glsl").filter(|value| !value.is_nil());
     let pixels = plist_get(&args, ":pixels").filter(|value| !value.is_nil());
-    if let Some(meshes) = plist_get(&args, ":model").filter(|value| !value.is_nil()) {
-        if wgsl.is_some() || pixels.is_some() || plist_get(&args, ":glsl").is_some() {
-            return Err(surface_error(
-                "neomacs-surface-create: :model excludes :shader, :glsl and :pixels",
-            ));
-        }
-        let content = parse_model_content(meshes, &args)?;
-        let request = ShaderSurfaceCreateRequest {
-            content,
-            width,
-            height,
-            animate: false,
-            fps: None,
-        };
-        let host = eval.display_host.as_ref().ok_or_else(|| {
-            surface_error("neomacs-surface-create: no GUI display host in this session")
-        })?;
-        let id = host.create_shader_surface(request).map_err(surface_error)?;
-        return Ok(Value::make_surface_handle(id));
-    }
     let animate = plist_get(&args, ":animate")
         .map(|value| !value.is_nil())
         .unwrap_or(true);
@@ -420,6 +337,8 @@ fn destroy(eval: &mut Context, args: Vec<Value>) -> EvalResult {
     let id = surface_id_from_value(args[0]).ok_or_else(|| {
         surface_error("neomacs-surface-destroy: ID must be a surface handle or id")
     })?;
+    // A destroyed model accepts no further requests (`model::live_model_id`).
+    eval.live_models.remove(&id);
     if let Some(host) = eval.display_host.as_ref() {
         host.destroy_shader_surface(id).map_err(surface_error)?;
     }

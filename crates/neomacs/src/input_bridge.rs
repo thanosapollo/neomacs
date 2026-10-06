@@ -488,6 +488,12 @@ fn convert_single_display_event(event: &DisplayEvent) -> Option<KbInputEvent> {
                 error: error.clone(),
             })
         }
+        // A native model's load outcome, settlement, readiness, camera or
+        // pick: the evaluator runs `neomacs-model-event-functions`.
+        DisplayEvent::Model { id, event } => Some(KbInputEvent::Model {
+            id: *id,
+            event: event.clone(),
+        }),
         DisplayEvent::FrameShaderFailed { error } => Some(KbInputEvent::FrameShaderFailed {
             error: error.clone(),
         }),

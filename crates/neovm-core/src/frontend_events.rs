@@ -248,6 +248,7 @@ fn semantics(event: &InputEvent) -> FrontendEventSemantics {
         | InputEvent::DisplayReset
         | InputEvent::WebView(..)
         | InputEvent::SurfaceCreateFailed { .. }
+        | InputEvent::Model { .. }
         | InputEvent::FrameShaderFailed { .. }
         | InputEvent::TerminalCreateFailed { .. }
         | InputEvent::TerminalExited { .. }

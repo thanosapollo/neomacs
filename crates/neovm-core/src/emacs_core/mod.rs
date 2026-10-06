@@ -69,6 +69,8 @@ pub mod image_path;
 pub mod invisibility;
 #[path = "display/menu/mod.rs"]
 pub(crate) mod menu;
+#[path = "display/model/mod.rs"]
+pub(crate) mod model;
 #[path = "display/neo/mod.rs"]
 pub(crate) mod neo;
 #[path = "display/shader_surface/mod.rs"]
@@ -406,6 +408,9 @@ mod quit_regression_test;
 #[path = "tests/architecture/runtime_string_guard.rs"]
 mod runtime_string_guard_test;
 
+#[cfg(test)]
+#[path = "display/model/tests/runtime.rs"]
+mod model_test;
 #[cfg(test)]
 #[path = "display/shader_surface/tests/runtime.rs"]
 mod shader_surface_test;

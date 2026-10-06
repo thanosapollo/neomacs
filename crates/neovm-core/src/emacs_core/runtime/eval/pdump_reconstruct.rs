@@ -158,6 +158,7 @@ impl Context {
             window_layout_query_adapter: WindowLayoutQueryAdapter::Unavailable,
             scroll_goal: None,
             display_host: None,
+            live_models: std::collections::HashSet::new(),
             tty_frame_host_factory: None,
             visual_config: neomacs_display_protocol::VisualConfig::default(),
             pending_menu_bar_popup_anchor: None,

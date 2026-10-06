@@ -1430,6 +1430,13 @@ pub enum InputEvent {
     /// pre-validation accepted it. Runs `neomacs-surface-error-functions`
     /// with the surface id and the renderer's error string.
     SurfaceCreateFailed { id: u32, error: String },
+    /// Something the renderer reports about native model `id` (load
+    /// outcome, request settlement, readiness, camera, pick). Runs
+    /// `neomacs-model-event-functions` with `(ID TYPE PLIST)`.
+    Model {
+        id: u32,
+        event: neomacs_display_protocol::model::ModelEvent,
+    },
     /// A full-frame shader failed to build on the render thread after
     /// evaluator-side validation accepted it.
     FrameShaderFailed { error: String },
@@ -4214,6 +4221,12 @@ impl crate::emacs_core::eval::Context {
                     // hook (mirrors MonitorsChanged running its hook here).
                     self.handle_surface_create_failed_input_event(id, &error)?;
                 }
+                InputEvent::Model { id, event } => {
+                    // Callbacks may change buffers (status lines, highlights),
+                    // so redisplay after servicing like the WebView arm.
+                    self.handle_model_input_event(id, &event)?;
+                    outcome = outcome.merge(SpecialInputServiceOutcome::resize_with_redisplay());
+                }
                 InputEvent::FrameShaderFailed { error } => {
                     let effects =
                         crate::frontend_events::report_frame_shader_failure(self, &error)?;
@@ -4315,6 +4328,20 @@ impl crate::emacs_core::eval::Context {
             Value::fixnum(i64::from(id)),
             Value::string(error),
         ];
+        crate::emacs_core::hook_runtime::run_named_hook_with_args(self, &args)
+    }
+
+    /// Deliver one native model event to Lisp: run
+    /// `neomacs-model-event-functions` with `(ID TYPE PLIST)`
+    /// (`model::model_event_hook_args`). Queueing, reentrancy and callback
+    /// error isolation are `neomacs-model.el`'s job; an unbound hook (the
+    /// library not loaded) runs nothing.
+    pub(crate) fn handle_model_input_event(
+        &mut self,
+        id: u32,
+        event: &neomacs_display_protocol::model::ModelEvent,
+    ) -> crate::emacs_core::error::EvalResult {
+        let args = crate::emacs_core::model::model_event_hook_args(id, event);
         crate::emacs_core::hook_runtime::run_named_hook_with_args(self, &args)
     }
 
@@ -5260,6 +5287,11 @@ impl crate::emacs_core::eval::Context {
             }
             InputEvent::SurfaceCreateFailed { id, error } => {
                 self.handle_surface_create_failed_input_event(id, &error)?;
+                Ok(None)
+            }
+            InputEvent::Model { id, event } => {
+                self.handle_model_input_event(id, &event)?;
+                self.redisplay()?;
                 Ok(None)
             }
             InputEvent::FrameShaderFailed { error } => {

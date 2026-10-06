@@ -1,0 +1,305 @@
+//! Elisp primitives for native 3D model views (campaign design §2, §3).
+//!
+//! A model is a shader surface whose texture the renderer fills from OBJ
+//! meshes. It shares the surface id space, the GC-managed surface handle,
+//! the `(surface :id HANDLE :width W :height H)` display spec and
+//! `neomacs-surface-destroy`. These primitives are internal (`--`): the
+//! public API, mesh names, callbacks and readiness live in
+//! `lisp/neomacs-model.el`, which maps mesh ID strings to the indices used
+//! here. Loading is asynchronous; its outcome and every later report arrive
+//! as `keyboard::InputEvent::Model` and reach Lisp through
+//! `neomacs-model-event-functions` (see [`model_event_hook_args`]).
+
+mod subrs;
+#[cfg(test)]
+pub(crate) use subrs::SUBRS;
+pub(crate) use subrs::register_subrs;
+
+use neomacs_display_protocol::model::{
+    MODEL_EDGE_RANGE, MODEL_MAX_MESHES, ModelEvent, ModelMeshSpec, ModelView,
+};
+
+use super::error::{EvalResult, Flow, signal};
+use super::eval::{Context, ShaderSurfaceContent, ShaderSurfaceCreateRequest};
+use super::value::{Value, list_to_vec};
+
+/// Largest OBJ file a model accepts (design §2), checked before loading.
+const MODEL_MAX_FILE_BYTES: u64 = 100_000_000;
+
+fn model_error(message: impl Into<String>) -> Flow {
+    signal("error", vec![Value::string(message.into())])
+}
+
+/// The elements of a proper list or a vector.
+fn sequence_items(value: Value) -> Option<Vec<Value>> {
+    list_to_vec(&value).or_else(|| value.as_vector_data().map(|v| v.as_slice().to_vec()))
+}
+
+/// Exactly `N` finite numbers from a list or vector.
+fn numbers<const N: usize>(value: Value) -> Option<[f64; N]> {
+    let items = sequence_items(value)?;
+    if items.len() != N {
+        return None;
+    }
+    let mut out = [0.0; N];
+    for (slot, item) in out.iter_mut().zip(items) {
+        *slot = item.as_number_f64().filter(|n| n.is_finite())?;
+    }
+    Some(out)
+}
+
+/// A model edge in logical pixels: an integer in `MODEL_EDGE_RANGE`.
+fn model_edge(value: Value, what: &str, caller: &str) -> Result<u32, Flow> {
+    value
+        .as_fixnum()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| MODEL_EDGE_RANGE.contains(n))
+        .ok_or_else(|| {
+            model_error(format!(
+                "{caller}: {what} must be an integer in {}..{}",
+                MODEL_EDGE_RANGE.start(),
+                MODEL_EDGE_RANGE.end()
+            ))
+        })
+}
+
+/// `(YAW PITCH ZOOM)`, validated as `gnosis-model--view`.
+fn model_view(value: Value, caller: &str) -> Result<ModelView, Flow> {
+    let [yaw, pitch, zoom] = numbers::<3>(value)
+        .ok_or_else(|| model_error(format!("{caller}: VIEW must be (YAW PITCH ZOOM)")))?;
+    ModelView { yaw, pitch, zoom }
+        .validated()
+        .map_err(|err| model_error(format!("{caller}: {err}")))
+}
+
+/// A lowercase hex SHA-256 digest.
+fn parse_sha256(text: &str) -> Option<[u8; 32]> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 64 || !bytes.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        *slot = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// One `(PATH SHA256-or-nil)` entry. The file must exist now as a regular
+/// file (symlinks followed) of at most 100 MB; the loader re-checks all of
+/// it, and the digest, against the bytes it actually parses.
+fn mesh_spec(entry: Value) -> Result<ModelMeshSpec, Flow> {
+    let bad = |what: String| model_error(format!("neomacs-model--create: {what}"));
+    let items = list_to_vec(&entry)
+        .filter(|items| (1..=2).contains(&items.len()))
+        .ok_or_else(|| bad("each mesh must be (PATH SHA256-OR-NIL)".to_owned()))?;
+    let path = items[0]
+        .as_lisp_string()
+        .and_then(|s| s.as_utf8_str().map(str::to_owned))
+        .ok_or_else(|| bad("mesh PATH must be a string".to_owned()))?;
+    let path = std::path::PathBuf::from(path);
+    if !path.is_absolute() || path.extension().is_none_or(|ext| ext != "obj") {
+        return Err(bad(format!(
+            "mesh {} must be an absolute .obj path",
+            path.display()
+        )));
+    }
+    let metadata =
+        std::fs::metadata(&path).map_err(|err| bad(format!("mesh {}: {err}", path.display())))?;
+    if !metadata.is_file() {
+        return Err(bad(format!(
+            "mesh {} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > MODEL_MAX_FILE_BYTES {
+        return Err(bad(format!(
+            "mesh {} is larger than {MODEL_MAX_FILE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    let sha256 = match items.get(1).copied().filter(|v| !v.is_nil()) {
+        None => None,
+        Some(digest) => Some(
+            digest
+                .as_lisp_string()
+                .and_then(|s| s.as_utf8_str())
+                .and_then(parse_sha256)
+                .ok_or_else(|| {
+                    bad("mesh SHA256 must be nil or 64 lowercase hex digits".to_owned())
+                })?,
+        ),
+    };
+    Ok(ModelMeshSpec { path, sha256 })
+}
+
+/// The host when a model renderer is live, else the user error every
+/// session without a graphical renderer gets (batch, TTY, headless).
+fn live_host(eval: &Context) -> Result<&dyn super::eval::DisplayHost, Flow> {
+    eval.display_host
+        .as_deref()
+        .filter(|host| host.model_renderer_available())
+        .ok_or_else(|| {
+            signal(
+                "user-error",
+                vec![Value::string("3D view needs a graphical Neomacs frame")],
+            )
+        })
+}
+
+/// (neomacs-model--available-p) — non-nil iff a model renderer is live now.
+fn available(eval: &mut Context, _args: Vec<Value>) -> EvalResult {
+    Ok(Value::bool_val(
+        eval.display_host
+            .as_ref()
+            .is_some_and(|host| host.model_renderer_available()),
+    ))
+}
+
+/// (neomacs-model--create MESHES VIEW BACKGROUND WIDTH HEIGHT)
+///
+/// MESHES is a list of 1..255 `(PATH SHA256-OR-NIL)`, VIEW `(YAW PITCH
+/// ZOOM)`, BACKGROUND three sRGB components in 0..1 (list or vector),
+/// WIDTH and HEIGHT logical pixels in 32..2048. Argument errors signal
+/// here; load failures arrive later as a `failed` event. Returns the
+/// GC-managed surface handle.
+fn create(eval: &mut Context, args: Vec<Value>) -> EvalResult {
+    const CALLER: &str = "neomacs-model--create";
+    let entries = list_to_vec(&args[0])
+        .filter(|entries| (1..=MODEL_MAX_MESHES).contains(&entries.len()))
+        .ok_or_else(|| {
+            model_error(format!(
+                "{CALLER}: MESHES must be a list of 1..{MODEL_MAX_MESHES} meshes"
+            ))
+        })?;
+    let meshes = entries
+        .into_iter()
+        .map(mesh_spec)
+        .collect::<Result<Vec<_>, _>>()?;
+    let view = model_view(args[1], CALLER)?;
+    let [r, g, b] = numbers::<3>(args[2])
+        .filter(|rgb| rgb.iter().all(|c| (0.0..=1.0).contains(c)))
+        .ok_or_else(|| {
+            model_error(format!(
+                "{CALLER}: BACKGROUND must be three numbers in 0..1"
+            ))
+        })?;
+    let width = model_edge(args[3], "WIDTH", CALLER)?;
+    let height = model_edge(args[4], "HEIGHT", CALLER)?;
+    let request = ShaderSurfaceCreateRequest {
+        content: ShaderSurfaceContent::Model {
+            meshes,
+            view,
+            background: [r as f32, g as f32, b as f32, 1.0],
+        },
+        width,
+        height,
+        animate: false,
+        fps: None,
+    };
+    let id = live_host(eval)?
+        .create_model(request)
+        .map_err(|err| model_error(format!("{CALLER}: {err}")))?;
+    eval.live_models.insert(id);
+    Ok(Value::make_surface_handle(id))
+}
+
+/// A renderer counter as a Lisp integer.
+fn integer(n: u64) -> Value {
+    Value::make_int(i64::try_from(n).unwrap_or(i64::MAX))
+}
+
+fn view_list(view: &ModelView) -> Value {
+    Value::list(vec![
+        Value::make_float(view.yaw),
+        Value::make_float(view.pitch),
+        Value::make_float(view.zoom),
+    ])
+}
+
+fn float_vector(values: &[f64; 3]) -> Value {
+    Value::vector(values.iter().map(|v| Value::make_float(*v)).collect())
+}
+
+/// The plist of one model event (design §6), as the hook receives it:
+///
+/// - ready: `(:triangles (N ...))`
+/// - failed: `(:error STR)`
+/// - error: `(:req REQ-OR-NIL :error STR)`
+/// - view: `(:view (Y P Z) :rev REV)`
+/// - readiness: `(:current BOOL :rev REV :req REQ)`
+/// - pick: `(:hit HIT :view (Y P Z) :rev REV :req REQ)`, HIT nil or
+///   `(:mesh INDEX :face F :barycentric [A B C] :point [X Y Z])`.
+pub(crate) fn model_event_plist(event: &ModelEvent) -> Value {
+    let kw = Value::keyword;
+    match event {
+        ModelEvent::Ready { triangles } => Value::list(vec![
+            kw(":triangles"),
+            Value::list(triangles.iter().map(|n| integer(u64::from(*n))).collect()),
+        ]),
+        ModelEvent::Failed { error } => Value::list(vec![kw(":error"), Value::string(error)]),
+        ModelEvent::Error { req, error } => Value::list(vec![
+            kw(":req"),
+            req.map_or(Value::NIL, integer),
+            kw(":error"),
+            Value::string(error),
+        ]),
+        ModelEvent::View { view, rev } => Value::list(vec![
+            kw(":view"),
+            view_list(view),
+            kw(":rev"),
+            integer(*rev),
+        ]),
+        ModelEvent::Readiness { current, rev, req } => Value::list(vec![
+            kw(":current"),
+            Value::bool_val(*current),
+            kw(":rev"),
+            integer(*rev),
+            kw(":req"),
+            integer(*req),
+        ]),
+        ModelEvent::Pick {
+            hit,
+            view,
+            rev,
+            req,
+        } => {
+            let hit = hit.map_or(Value::NIL, |hit| {
+                Value::list(vec![
+                    kw(":mesh"),
+                    integer(u64::from(hit.mesh)),
+                    kw(":face"),
+                    integer(u64::from(hit.face)),
+                    kw(":barycentric"),
+                    float_vector(&hit.barycentric),
+                    kw(":point"),
+                    float_vector(&hit.point),
+                ])
+            });
+            Value::list(vec![
+                kw(":hit"),
+                hit,
+                kw(":view"),
+                view_list(view),
+                kw(":rev"),
+                integer(*rev),
+                kw(":req"),
+                integer(*req),
+            ])
+        }
+    }
+}
+
+/// Arguments for `run_named_hook_with_args`: the hook
+/// `neomacs-model-event-functions` and `(ID TYPE PLIST)`. An unbound or
+/// nil hook runs nothing, so events before `neomacs-model.el` loads are
+/// dropped.
+pub(crate) fn model_event_hook_args(id: u32, event: &ModelEvent) -> [Value; 4] {
+    [
+        Value::symbol("neomacs-model-event-functions"),
+        Value::fixnum(i64::from(id)),
+        Value::symbol(event.kind()),
+        model_event_plist(event),
+    ]
+}
