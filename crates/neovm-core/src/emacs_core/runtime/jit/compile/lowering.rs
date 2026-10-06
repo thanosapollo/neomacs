@@ -3,7 +3,16 @@
 //! Moved out of `compile.rs` unchanged; a child module so it keeps the
 //! parent's view of its private items (`use super::*`).
 
+use super::boolean::{BoolResultMode, tagged_bool_view};
 use super::*;
+
+#[path = "opt_sink_deopt.rs"]
+mod opt_sink_deopt;
+pub(crate) use opt_sink_deopt::emit_pending_deopts_with_sink;
+
+#[path = "lowering/array_profile_selected.rs"]
+mod array_profile_selected;
+pub(crate) use array_profile_selected::lower_simple_op_with_array_profile;
 
 /// Emit a speculation guard.
 ///
@@ -294,6 +303,10 @@ pub(crate) fn stack_as_f64_or_promote(
     match reps[k] {
         SlotRep::RawFixnum => return fb.ins().fcvt_from_sint(types::F64, stack[k]),
         SlotRep::Flonum { f64, .. } => return f64,
+        SlotRep::Bool => {
+            let tagged = tagged_bool_view(fb, stack[k]);
+            return stack_as_f64_or_promote(fb, deopt, &[tagged], &[SlotRep::Tagged], 0);
+        }
         SlotRep::Tagged => {}
     }
     let v = stack[k];
@@ -342,6 +355,10 @@ pub(crate) fn stack_as_f64_and_int(
     k: usize,
 ) -> (ClifValue, ClifValue) {
     match reps[k] {
+        SlotRep::Bool => {
+            let tagged = tagged_bool_view(fb, stack[k]);
+            return stack_as_f64_and_int(fb, deopt, &[tagged], &[SlotRep::Tagged], 0);
+        }
         SlotRep::RawFixnum => {
             let f = fb.ins().fcvt_from_sint(types::F64, stack[k]);
             return (f, stack[k]);
@@ -445,6 +462,20 @@ pub(crate) fn emit_float_arith(
     }
 }
 
+/// Selected Sink's independently proven ready/Float arm. The caller proves
+/// normalized numeric operands and Float contagion; this changes no legacy
+/// dispatch path and records the same compiler-only result census once.
+pub(crate) fn emit_ready_float_result(
+    fb: &mut FunctionBuilder,
+    op: &Op,
+    left: ClifValue,
+    right: ClifValue,
+) -> ClifValue {
+    let result = emit_float_arith(fb, op, left, right);
+    flonum_census_note(|c| c.results += 1);
+    result
+}
+
 /// Run-time "both operands are floats" for model-stack slots `i` and `j`; a
 /// raw slot is a proven fixnum, so the test is constant false. Fused like
 /// [`both_fixnum_test`]. A flonum is tested on its tag word (the float
@@ -457,6 +488,9 @@ fn both_float_test(
     i: usize,
     j: usize,
 ) -> ClifValue {
+    if reps[i] == SlotRep::Bool || reps[j] == SlotRep::Bool {
+        return fb.ins().iconst(types::I8, 0);
+    }
     if reps[i] == SlotRep::RawFixnum || reps[j] == SlotRep::RawFixnum {
         return fb.ins().iconst(types::I8, 0);
     }
@@ -491,6 +525,9 @@ fn both_fixnum_test(
     j: usize,
 ) -> ClifValue {
     debug_assert!(!reps[i].is_static_float() && !reps[j].is_static_float());
+    if reps[i] == SlotRep::Bool || reps[j] == SlotRep::Bool {
+        return fb.ins().iconst(types::I8, 0);
+    }
     match (reps[i] == SlotRep::RawFixnum, reps[j] == SlotRep::RawFixnum) {
         (true, true) => fb.ins().iconst(types::I8, 1),
         (true, false) => fixnum_tag_test(fb, stack[j]),
@@ -528,6 +565,12 @@ fn float_payload(
 ) -> ClifValue {
     match reps[k] {
         SlotRep::Flonum { f64, .. } => f64,
+        SlotRep::Bool => {
+            // Its both-floats test is false: retain a semantic tagged word in
+            // this unreachable arm instead of treating the flag as a pointer.
+            let tagged = tagged_bool_view(fb, stack[k]);
+            unbox_float(fb, tagged)
+        }
         SlotRep::Tagged | SlotRep::RawFixnum => unbox_float(fb, stack[k]),
     }
 }
@@ -543,6 +586,9 @@ fn fixnum_payload(
 ) -> ClifValue {
     if reps[k] == SlotRep::RawFixnum {
         stack[k]
+    } else if reps[k] == SlotRep::Bool {
+        let tagged = tagged_bool_view(fb, stack[k]);
+        sshr_imm_p(fb, tagged, FIXNUM_SHIFT as i64)
     } else {
         sshr_imm_p(fb, stack[k], FIXNUM_SHIFT as i64)
     }
@@ -798,6 +844,34 @@ pub(crate) fn lower_predicate(fb: &mut FunctionBuilder, kind: PredKind, a: ClifV
     let t = fb.ins().iconst(types::I64, Value::T.bits() as i64);
     let nil = fb.ins().iconst(types::I64, Value::NIL.bits() as i64);
     fb.ins().select(cond, t, nil)
+}
+
+pub(crate) fn lower_predicate_flag(
+    fb: &mut FunctionBuilder,
+    kind: PredKind,
+    a: ClifValue,
+) -> ClifValue {
+    match kind {
+        PredKind::Null => fb
+            .ins()
+            .icmp_imm_u(IntCC::Equal, a, Value::NIL.bits() as i64),
+        PredKind::Consp => {
+            let tag = band_imm_p(fb, a, TAG_MASK as i64);
+            icmp_imm_p(fb, IntCC::Equal, tag, TAG_CONS as i64)
+        }
+        PredKind::Stringp => {
+            let tag = band_imm_p(fb, a, TAG_MASK as i64);
+            icmp_imm_p(fb, IntCC::Equal, tag, TAG_STRING as i64)
+        }
+        PredKind::Listp => {
+            let is_nil = fb
+                .ins()
+                .icmp_imm_u(IntCC::Equal, a, Value::NIL.bits() as i64);
+            let tag = band_imm_p(fb, a, TAG_MASK as i64);
+            let is_cons = icmp_imm_p(fb, IntCC::Equal, tag, TAG_CONS as i64);
+            fb.ins().bor(is_nil, is_cons)
+        }
+    }
 }
 
 /// Lower `car`/`cdr` (and the `-safe` variants) with exact interpreter parity:
@@ -1096,9 +1170,7 @@ fn emit_inline_string_aref(
 /// first), an in-range fixnum index, and a fixnum VALUE that is a byte
 /// (0..=255) for a normally allocated unibyte string or ASCII (0..=127) for
 /// an all-ASCII multibyte one. A non-string leaves after the tag test
-/// alone; a string is then guarded by the shim's own `aset` redefinition
-/// gate (`Context::aset_fast_path_epoch` equal to the obarray's function
-/// epoch): a miss calls the shim, which re-validates.
+/// alone. Like GNU `Baset`, it never consults `aset`'s function cell.
 /// No write barrier: string bytes hold no references. Branches to `slow`
 /// on any miss; on success defines `res` as VALUE and jumps to `merge`.
 fn emit_inline_string_aset(
@@ -1109,7 +1181,6 @@ fn emit_inline_string_aset(
     res: Variable,
     merge: Block,
 ) -> bool {
-    use super::jit_layout::OBARRAY_FUNCTION_EPOCH_OFFSET;
     use crate::heap_types::LispString;
     use crate::tagged::header::StringObj;
     let [array, index, value] = operands;
@@ -1125,27 +1196,11 @@ fn emit_inline_string_aset(
     fb.ins().brif(is_string, string_block, &[], slow, &[]);
     fb.switch_to_block(string_block);
     fb.seal_block(string_block);
-    let vmctx = fb.use_var(rt.vmctx_var);
-    let epoch = fb.ins().load(
-        types::I64,
-        flags,
-        vmctx,
-        (super::jit_layout::CONTEXT_OBARRAY_OFFSET + OBARRAY_FUNCTION_EPOCH_OFFSET) as i32,
-    );
-    // `Cell<u64>` is `repr(transparent)` over the word.
-    let gate = fb.ins().load(
-        types::I64,
-        flags,
-        vmctx,
-        core::mem::offset_of!(Context, aset_fast_path_epoch) as i32,
-    );
-    let gated = fb.ins().icmp(IntCC::Equal, epoch, gate);
     let index_tag = band_imm_p(fb, index, FIXNUM_CHECK_MASK as i64);
     let index_fixnum = icmp_imm_p(fb, IntCC::Equal, index_tag, FIXNUM_CHECK_VALUE as i64);
     let value_tag = band_imm_p(fb, value, FIXNUM_CHECK_MASK as i64);
     let value_fixnum = icmp_imm_p(fb, IntCC::Equal, value_tag, FIXNUM_CHECK_VALUE as i64);
     let shapes = fb.ins().band(index_fixnum, value_fixnum);
-    let shapes = fb.ins().band(shapes, gated);
     let typed = fb.create_block();
     fb.ins().brif(shapes, typed, &[], slow, &[]);
     fb.switch_to_block(typed);
@@ -1163,17 +1218,42 @@ fn emit_inline_string_aset(
         object,
         (base + LispString::JIT_SIZE_BYTE_OFFSET) as i32,
     );
-    let capacity = fb.ins().load(
-        types::I64,
-        flags,
-        object,
-        (base + LispString::JIT_STORAGE_CAPACITY_OFFSET) as i32,
-    );
+    let observed_gen0 = super::jit_gen0_collection_journal_on()
+        && !rt.generational_enabled()
+        && !super::jit_gen0_collection_journal_eager();
+    let capacity = if observed_gen0 {
+        let at = iadd_imm_p(
+            fb,
+            object,
+            (base + LispString::JIT_STORAGE_CAPACITY_OFFSET) as i64,
+        );
+        fb.ins().atomic_load(types::I64, flags, at)
+    } else {
+        // Preserve the original OFF/GEN1 load and ownership predicate.
+        fb.ins().load(
+            types::I64,
+            flags,
+            object,
+            (base + LispString::JIT_STORAGE_CAPACITY_OFFSET) as i32,
+        )
+    };
     let i = sshr_imm_p(fb, index, FIXNUM_SHIFT as i64);
     let code = sshr_imm_p(fb, value, FIXNUM_SHIFT as i64);
     // Unsigned: a negative index or code is out of range too.
     let in_range = fb.ins().icmp(IntCC::UnsignedLessThan, i, size);
-    let owned = icmp_imm_p(fb, IntCC::NotEqual, capacity, 0);
+    // Owned Vec<u8> capacities fit below the sign bit. The sticky observed
+    // mirror occupies that bit, folding its rejection into the existing
+    // ownership check without another hot-path load, test or branch.
+    let owned = icmp_imm_p(
+        fb,
+        if observed_gen0 {
+            IntCC::SignedGreaterThan
+        } else {
+            IntCC::NotEqual
+        },
+        capacity,
+        0,
+    );
     let unibyte = icmp_imm_p(
         fb,
         IntCC::Equal,
@@ -1199,6 +1279,15 @@ fn emit_inline_string_aset(
         (base + LispString::JIT_DATA_OFFSET) as i32,
     );
     let at = fb.ins().iadd(data, i);
+    if super::jit_gen0_collection_journal_on()
+        && (rt.generational_enabled() || super::jit_gen0_collection_journal_eager())
+    {
+        let record = rt
+            .refs
+            .try_get(fb.func, Shim::StringCollectionWrite)
+            .expect("string-collection-journal refs");
+        fb.ins().call(record, &[array]);
+    }
     fb.ins().istore8(flags, code, at, 0);
     fb.def_var(res, value);
     fb.ins().jump(merge, &[]);
@@ -2099,7 +2188,7 @@ pub(crate) fn lower_mir_inst_via_baseline(
 /// preceding callback or service poll. These loads are deliberately mutable:
 /// they cannot be forwarded across a call. Failure resumes the original call,
 /// where the interpreter handles redefinition, debugging, quit and depth.
-fn emit_mir_inline_entry_guard(
+pub(crate) fn emit_mir_inline_entry_guard(
     fb: &mut FunctionBuilder,
     rt: &RtCtx,
     epoch: u64,
@@ -3206,6 +3295,9 @@ pub(crate) fn build_mir_leaf_fn<S: LeafSink>(
                 direct_shapes: !aot && (shapes.optional || shapes.rest),
                 call_census: !aot && jit_call_census_on(),
                 direct_framed: !aot && shapes.framed,
+                collection_journal: !aot && jit_gen0_collection_journal_on(),
+                collection_observation_gate: !aot
+                    && super::shim_refs::collection_observation_gate_enabled(),
                 hof: false,
             };
             let refs = super::RtRefs::new(
@@ -4877,6 +4969,9 @@ pub(crate) struct ConsReconstruction {
 /// failing op itself.
 pub(crate) struct PendingDeopt {
     cons_rebuilds: Vec<ConsReconstruction>,
+    /// Frozen selected Opt reconstruction at one exact guard/source point.
+    /// Threading: compiler-local immutable SSA names, never runtime metadata.
+    pub(super) sink_cold: Option<super::sink_cold_snapshot::SinkColdSnapshot>,
     pub(crate) block: Block,
     pub(crate) pc: usize,
     pub(crate) handlers_len: usize,
@@ -4967,7 +5062,13 @@ pub(crate) fn emit_region_entry_guard(
     let dsite = deopt_site(fb, region.call_site_pc, handlers_len, stack, reps, pending);
     // A raw slot holds an untagged fixnum, which is never a bytecode object:
     // retagging makes the comparison false, so such a site simply deopts.
-    let v = if raw { retag_fixnum(fb, v) } else { v };
+    let v = if raw {
+        retag_fixnum(fb, v)
+    } else if reps[slot] == SlotRep::Bool {
+        tagged_bool_view(fb, v)
+    } else {
+        v
+    };
     let expected = fb.ins().iconst(types::I64, region.callee_bits as i64);
     let same = fb.ins().icmp(IntCC::Equal, v, expected);
     emit_guard(fb, dsite, same);
@@ -5005,6 +5106,7 @@ pub(crate) fn deopt_site(
     };
     pending.push(PendingDeopt {
         cons_rebuilds: Vec::new(),
+        sink_cold: None,
         block,
         pc,
         handlers_len,
@@ -5444,6 +5546,9 @@ pub(crate) enum SlotRep {
     /// (`Dup`, `StackRef`, `StackSet`) copies this rep, so two slots with
     /// equal reps are the same Lisp object and must share one box.
     Flonum { f64: ClifValue, kind: FlonumKind },
+    /// Normalized I8 NIL/T view, compilation-local. Never a numeric operand,
+    /// root, spill or shim argument; observations reconstruct its tagged view.
+    Bool,
 }
 
 /// What a [`SlotRep::Flonum`] can hold at run time.
@@ -5651,6 +5756,10 @@ pub(crate) fn materialize_model_stack(
     for k in 0..stack.len() {
         match reps[k] {
             SlotRep::Tagged => {}
+            SlotRep::Bool => {
+                stack[k] = tagged_bool_view(fb, stack[k]);
+                reps[k] = SlotRep::Tagged;
+            }
             SlotRep::RawFixnum => stack_force_tagged(fb, stack, reps, k),
             SlotRep::Flonum { .. } => {
                 let rt = rt.expect("a flonum implies the runtime refs (float sites declare them)");
@@ -5671,7 +5780,10 @@ pub(crate) fn emit_model_roots_pre(
     reps: &[SlotRep],
 ) -> CondRoots {
     let reps = &reps[..stack.len()];
-    if !reps.iter().any(|rep| rep.is_flonum()) {
+    if !reps
+        .iter()
+        .any(|rep| rep.is_flonum() || *rep == SlotRep::Bool)
+    {
         debug_assert!(
             !reps.contains(&SlotRep::RawFixnum),
             "rooting sites run after the raw retag"
@@ -5688,7 +5800,7 @@ pub(crate) fn emit_model_roots_pre(
                 debug_assert!(false, "rooting sites run after the raw retag");
                 None
             }
-            SlotRep::Flonum { .. } => None,
+            SlotRep::Bool | SlotRep::Flonum { .. } => None,
         })
         .collect();
     emit_cond_residual_roots_pre(fb, rt, &tagged)
@@ -5708,6 +5820,7 @@ fn snapshot_slot_tagged(
 ) -> ClifValue {
     match rep {
         SlotRep::Tagged => v,
+        SlotRep::Bool => tagged_bool_view(fb, v),
         SlotRep::RawFixnum => retag_fixnum(fb, v),
         SlotRep::Flonum { f64, kind } => {
             if let Some(&(_, b)) = boxed.iter().find(|&&(key, _)| key == f64) {
@@ -5741,6 +5854,14 @@ pub(crate) fn stack_as_raw(
 ) -> ClifValue {
     match reps[k] {
         SlotRep::RawFixnum => stack[k],
+        SlotRep::Bool => {
+            // A Lisp Boolean is a symbol, never the numeric integer 0 or 1.
+            // Guard the semantic view without consulting fixnum knowledge.
+            let tagged = tagged_bool_view(fb, stack[k]);
+            let is_fix = fixnum_tag_test(fb, tagged);
+            emit_guard(fb, deopt, is_fix);
+            sshr_imm_p(fb, tagged, FIXNUM_SHIFT as i64)
+        }
         SlotRep::Tagged => {
             guard_fixnum(fb, deopt, stack[k], known);
             sshr_imm_p(fb, stack[k], FIXNUM_SHIFT as i64)
@@ -5975,6 +6096,15 @@ fn lower_float_site_arith_boxed(
     reps: &mut Vec<SlotRep>,
 ) {
     let n = stack.len();
+    for k in n - 2..n {
+        if reps[k] == SlotRep::Bool {
+            // This boxed emitter directly reads I64 operand words in its dead
+            // fast arms too. Give it semantic T/NIL, retaining the original
+            // Bool snapshot captured before these consumed views were made.
+            stack[k] = tagged_bool_view(fb, stack[k]);
+            reps[k] = SlotRep::Tagged;
+        }
+    }
     let res_var = fb.declare_var(types::I64);
     let ff_b = fb.create_block();
     let slow_b = fb.create_block();
@@ -6058,7 +6188,7 @@ fn lower_float_site_arith_boxed(
 /// A flonum operand is read without boxing (its `f64`, or its tag word for
 /// the tag tests and the fixnum arm); the deopt snapshot `dsite` boxes it in
 /// the cold exit.
-fn lower_float_site_arith(
+pub(crate) fn lower_float_site_arith(
     fb: &mut FunctionBuilder,
     op: &Op,
     dsite: Block,
@@ -6232,6 +6362,75 @@ pub(crate) fn lower_simple_op(
     dynamic_prefix: usize,
     consts_base: Option<ClifValue>,
 ) -> Result<(), CompileError> {
+    lower_simple_op_with_cons_proof(
+        fb,
+        pc,
+        deopt_sites,
+        signal_exit,
+        constants,
+        stack,
+        reps,
+        rt,
+        handlers,
+        pending,
+        spec,
+        op,
+        known,
+        reloc_base,
+        reloc_index,
+        aot,
+        spec_slot_base,
+        spec_expected_base,
+        dynamic_prefix,
+        consts_base,
+        super::heap_inline::ConsStoreProof::Dynamic,
+    )
+}
+
+/// Shared per-op lowering with an explicit proof for a cons store operand.
+/// Baseline callers use [`lower_simple_op`] and retain their dynamic tag test.
+/// A proof never replaces the caller's explicit guard or the write barrier.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_simple_op_with_cons_proof(
+    fb: &mut FunctionBuilder,
+    pc: usize,
+    deopt_sites: &mut Vec<PendingDeopt>,
+    signal_exit: &mut Option<Block>,
+    constants: &[Value],
+    stack: &mut Vec<ClifValue>,
+    // Per-slot representations (cross-op unboxing), kept in lockstep with
+    // `stack`.
+    reps: &mut Vec<SlotRep>,
+    rt: Option<&RtCtx>,
+    handlers: &[HandlerStatic],
+    pending: &mut Vec<PendingDispatch>,
+    // R2 increment B2: an `Op::Call` spec site carries `(sym, expected, slot_ptr,
+    // slot_idx, kind)`. `slot_ptr` is the baked `SpecSlot*` (JIT); `slot_idx` indexes
+    // the AOT sidecar's `spec_slot_base`/`spec_expected_base` arrays.
+    spec: Option<(u32, u64, i64, usize, SpecCalleeKind)>,
+    op: &Op,
+    // Cross-block known-fixnum operand values at this block (seeded by
+    // `lower_leaf_full` from `compute_known_fixnum_slots`); `guard_fixnum` elides
+    // guards for members.
+    known: &HashSet<ClifValue>,
+    // R1a: heap-constant reloc vector base (baked in entry) + bits->index map, so
+    // `Op::Constant` loads a heap object from reloc_base[idx] instead of baking it.
+    reloc_base: Option<ClifValue>,
+    reloc_index: &std::collections::HashMap<usize, u32>,
+    // R2 increment B2: false → JIT (spec `expected`/`slot` baked as `iconst`,
+    // byte-identical); true → AOT (loaded from the sidecar's `spec_expected_base`/
+    // `spec_slot_base` at `slot_idx`). The two bases are `Some` only in AOT mode at a
+    // body with an `Op::Call` spec site (loaded once in the entry block).
+    aot: bool,
+    spec_slot_base: Option<ClifValue>,
+    spec_expected_base: Option<ClifValue>,
+    // `make-closure` patched prefix + the callee constant base bound in the entry
+    // block (JIT only, `None` when the prefix is 0): `Op::Constant(idx)` with
+    // `idx < dynamic_prefix` loads `consts_base[idx]` instead of baking.
+    dynamic_prefix: usize,
+    consts_base: Option<ClifValue>,
+    cons_proof: super::heap_inline::ConsStoreProof,
+) -> Result<(), CompileError> {
     // Non-unboxing ops must see only tagged Values: force-tag the whole stack so
     // their gc_push / signal snapshot / shim args never observe a raw slot (closes
     // the GC-root + dispatch-snapshot soundness holes in one place). A
@@ -6265,6 +6464,7 @@ pub(crate) fn lower_simple_op(
         spec_expected_base,
         dynamic_prefix,
         consts_base,
+        cons_proof,
     )?;
     // Re-sync the reps after a non-unboxing op: the slots below `keep` are
     // untouched (the audited-op invariant, checked in debug builds), and its
@@ -6321,13 +6521,40 @@ pub(crate) fn op_keeps_residual_flonums(op: &Op) -> bool {
 /// fixnums are always retagged. Under [`FlonumMode::Resident`] an audited op
 /// ([`op_keeps_residual_flonums`]) boxes only its own operands (and their
 /// aliases, which then share the box); every other op boxes every flonum.
-fn prepare_op_operands(
+pub(crate) fn prepare_op_operands(
     fb: &mut FunctionBuilder,
     rt: Option<&RtCtx>,
     op: &Op,
     stack: &mut [ClifValue],
     reps: &mut [SlotRep],
 ) -> Result<usize, CompileError> {
+    if reps.contains(&SlotRep::Bool) {
+        let (needs, _) = super::simple_effect(op)?;
+        let at = stack
+            .len()
+            .checked_sub(needs)
+            .ok_or(CompileError::StackUnderflow)?;
+        let resident = super::jit_flonum_mode() == super::FlonumMode::Resident
+            && op_keeps_residual_flonums(op);
+        // Preserve the old float alias policy. Boolean views are per consumed
+        // slot and never rewrite an untouched residual flag or its aliases.
+        for k in 0..stack.len() {
+            match reps[k] {
+                SlotRep::RawFixnum => stack_force_tagged(fb, stack, reps, k),
+                SlotRep::Bool if k >= at => {
+                    stack[k] = tagged_bool_view(fb, stack[k]);
+                    reps[k] = SlotRep::Tagged;
+                }
+                SlotRep::Flonum { .. } if !resident || k >= at => {
+                    let rt =
+                        rt.expect("a flonum implies the runtime refs (float sites declare them)");
+                    box_flonum_slot(fb, rt, stack, reps, k);
+                }
+                SlotRep::Tagged | SlotRep::Bool | SlotRep::Flonum { .. } => {}
+            }
+        }
+        return Ok(at);
+    }
     if super::jit_flonum_mode() == super::FlonumMode::Resident
         && op_keeps_residual_flonums(op)
         && let Ok((needs, _)) = super::simple_effect(op)
@@ -6390,6 +6617,7 @@ fn lower_simple_op_arms(
     // `idx < dynamic_prefix` loads `consts_base[idx]` instead of baking.
     dynamic_prefix: usize,
     consts_base: Option<ClifValue>,
+    cons_proof: super::heap_inline::ConsStoreProof,
 ) -> Result<(), CompileError> {
     if let Some(rt) = rt
         && !aot
@@ -7816,12 +8044,10 @@ fn lower_simple_op_arms(
         Op::Aset => {
             // `neovm_jit_aset` answers VALUE's bits for every `aset` it can run
             // itself — the vector, record and same-width string stores, and
-            // `builtin_aset_args` for the other shapes — or a `VALUE_SHIM_*`
-            // word (tag 0b001, never a Lisp value). None of that reaches a safe
-            // point, so the call roots nothing. A redefined or advised `aset`
-            // runs Lisp: the shim answers NEED_GENERIC before storing anything
-            // and the site takes the rooted general call (named builtin,
-            // variant 2).
+            // `builtin_aset_args` for the other shapes — or `VALUE_SHIM_SIGNAL`
+            // (tag 0b001, never a Lisp value). None of that reaches a safe
+            // point, so the call roots nothing. Like GNU `Baset`, this runs the
+            // primitive directly even when `aset` is redefined or advised.
             let rt = rt.ok_or(CompileError::UnsupportedOp("builtin"))?;
             if stack.len() < 3 {
                 return Err(CompileError::StackUnderflow);
@@ -7834,8 +8060,7 @@ fn lower_simple_op_arms(
             // need not see stores inline (`heap_inline::emit_inline_aset`)
             // and jumps to `cont`, created here for it (else below, where
             // the shim-only lowering creates it: the same CLIF with the knob
-            // off). The inline path stores nothing in the root window, so
-            // the general call's carry meet below stays exact.
+            // off). The inline path stores nothing in the root window.
             let early_cont = (!aot && jit_inline_heap_write_on()).then(|| fb.create_block());
             let inline_vector_slow = if let Some(cont) = early_cont {
                 let slow = fb.create_block();
@@ -7858,9 +8083,8 @@ fn lower_simple_op_arms(
                 None
             };
             // `NEOVM_JIT_LEAF=string` (I2): a same-width byte store into a
-            // string's owned storage, inline, behind the shim's own `aset`
-            // redefinition gate; everything else calls the shim. It runs
-            // where the vector store declined, so a vector store never pays
+            // string's owned storage, inline; everything else calls the shim.
+            // It runs where the vector store declined, so a vector store never pays
             // its string test.
             let inline_string = if !aot && super::jit_leaf_knob().string {
                 let merge = fb.create_block();
@@ -7888,62 +8112,9 @@ fn lower_simple_op_arms(
             let word = fb.inst_results(call)[0];
             fb.def_var(res, word);
             let cont = early_cont.unwrap_or_else(|| fb.create_block());
-            let sentinel = fb.create_block();
-            let tag = band_imm_p(fb, word, TAG_MASK as i64);
-            let is_sentinel = icmp_imm_p(
-                fb,
-                IntCC::Equal,
-                tag,
-                dispatch::VALUE_SHIM_SIGNAL & TAG_MASK as i64,
-            );
-            fb.ins().brif(is_sentinel, sentinel, &[], cont, &[]);
-
-            fb.switch_to_block(sentinel);
-            fb.seal_block(sentinel);
             let se = signal_target_for_site(fb, signal_exit, handlers, pending, stack, reps);
-            let gen_block = fb.create_block();
-            let need_gen = icmp_imm_p(fb, IntCC::Equal, word, dispatch::VALUE_SHIM_NEED_GENERIC);
-            fb.ins().brif(need_gen, gen_block, &[], se, &[]);
-
-            // The general call. The shim stored nothing on this edge, so the
-            // continuation meets the fast path's store record with this one.
-            fb.switch_to_block(gen_block);
-            fb.seal_block(gen_block);
-            let carry_fast = rootwin_carry_snapshot();
-            for (i, &v) in operands.iter().enumerate() {
-                fb.ins()
-                    .stack_store(rt.ptr_ty, v, rt.call_args_slot, (i * 8) as i32);
-            }
-            let saved_gen = if stack.is_empty() {
-                CondRoots::NONE
-            } else {
-                emit_model_roots_pre(fb, rt, stack, reps)
-            };
-            let vmctx_gen = fb.use_var(rt.vmctx_var);
-            let variant_gen = fb.ins().iconst(types::I64, 2);
-            let sym_gen = fb.ins().iconst(types::I64, 0);
-            let args_addr = fb.ins().stack_addr(rt.ptr_ty, rt.call_args_slot, 0);
-            let n_val = fb.ins().iconst(types::I64, 3);
-            let out_addr = fb.ins().stack_addr(rt.ptr_ty, rt.call_result_slot, 0);
-            let named_builtin = rt.refs.get(fb.func, Shim::NamedBuiltin);
-            let call_gen = fb.ins().call(
-                named_builtin,
-                &[vmctx_gen, variant_gen, sym_gen, args_addr, n_val, out_addr],
-            );
-            let status_gen = fb.inst_results(call_gen)[0];
-            emit_cond_residual_roots_post(fb, rt, saved_gen);
-            rootwin_carry_meet(&carry_fast);
-            let se_gen = signal_target_for_site(fb, signal_exit, handlers, pending, stack, reps);
-            let gen_ok = fb.create_block();
-            let ok_gen = icmp_imm_p(fb, IntCC::Equal, status_gen, STATUS_OK);
-            fb.ins().brif(ok_gen, gen_ok, &[], se_gen, &[]);
-            fb.switch_to_block(gen_ok);
-            fb.seal_block(gen_ok);
-            let gen_result = fb
-                .ins()
-                .stack_load(rt.ptr_ty, types::I64, rt.call_result_slot, 0);
-            fb.def_var(res, gen_result);
-            fb.ins().jump(cont, &[]);
+            let is_signal = icmp_imm_p(fb, IntCC::Equal, word, dispatch::VALUE_SHIM_SIGNAL);
+            fb.ins().brif(is_signal, se, &[], cont, &[]);
 
             fb.switch_to_block(cont);
             fb.seal_block(cont);
@@ -7958,9 +8129,8 @@ fn lower_simple_op_arms(
             stack.push(fb.use_var(res));
         }
         Op::CallBuiltin(..) | Op::CallBuiltinSym(..) => {
-            // Named-builtin escape hatch: route through the Vm::*_for_jit
-            // helpers mirroring the interpreter arms (override-aware /
-            // advice-bypassing / writeback / quit poll).
+            // Primitive opcode escape hatch: the Vm::*_for_jit helpers
+            // mirror GNU's direct primitive dispatch, writeback and quit poll.
             let rt = rt.ok_or(CompileError::UnsupportedOp("builtin"))?;
             let (variant, sym, nargs): (i64, u32, usize) = match op {
                 Op::CallBuiltin(name_idx, n) => {
@@ -8299,16 +8469,30 @@ fn lower_simple_op_arms(
                     let merge = fb.create_block();
                     let slow = fb.create_block();
                     let res = fb.declare_var(types::I64);
-                    super::heap_inline::emit_inline_cons_store(
-                        fb,
-                        rt,
-                        operands[0],
-                        operands[1],
-                        matches!(other, Op::Setcdr),
-                        slow,
-                        res,
-                        merge,
-                    );
+                    if matches!(cons_proof, super::heap_inline::ConsStoreProof::Dynamic) {
+                        super::heap_inline::emit_inline_cons_store(
+                            fb,
+                            rt,
+                            operands[0],
+                            operands[1],
+                            matches!(other, Op::Setcdr),
+                            slow,
+                            res,
+                            merge,
+                        );
+                    } else {
+                        super::heap_inline::emit_inline_cons_store_with_proof(
+                            fb,
+                            rt,
+                            operands[0],
+                            operands[1],
+                            matches!(other, Op::Setcdr),
+                            slow,
+                            res,
+                            merge,
+                            cons_proof,
+                        );
+                    }
                     fb.switch_to_block(slow);
                     fb.seal_block(slow);
                     fb.set_cold_block(slow);
@@ -8408,4 +8592,46 @@ fn lower_simple_op_arms(
         }
     }
     Ok(())
+}
+
+mod bool_lowering;
+pub(crate) use bool_lowering::lower_simple_op_with_cons_proof_and_result;
+
+/// Read one final-capability-certified plain array slot, with current backing.
+/// Threading: physical words belong to the current compiler/activation; this
+/// helper publishes no cache and holds no address across a safepoint or event.
+/// The caller proves successful type/index/current-length guards independently.
+pub(crate) fn emit_verified_plain_aref(
+    fb: &mut FunctionBuilder,
+    array: ClifValue,
+    index: ClifValue,
+    index_rep: SlotRep,
+) -> Result<(ClifValue, SlotRep), CompileError> {
+    if !jit_opt_passes().range
+        || !jit_inline_aref_on()
+        || jit_aref_slot0_on()
+        || fb.func.dfg.value_type(array) != types::I64
+        || fb.func.dfg.value_type(index) != types::I64
+        || !matches!(index_rep, SlotRep::Tagged | SlotRep::RawFixnum)
+    {
+        return Err(CompileError::UnsupportedOp("opt-array:plain-read-contract"));
+    }
+    let layout = super::jit_layout::heap::plain_array_offsets()
+        .ok_or(CompileError::UnsupportedOp("opt-array:layout"))?;
+    let object = band_imm_p(fb, array, !(TAG_MASK as i64));
+    // Fresh backing even when numerical bounds are eliminated. The mapped
+    // storage case reads its current slice; mutation/COW goes through the
+    // existing barrier path and invalidates layout epochs in the IR.
+    let slots = fb
+        .ins()
+        .load(types::I64, MemFlagsData::trusted(), object, layout.slots);
+    let raw_index = match index_rep {
+        SlotRep::Tagged => sshr_imm_p(fb, index, FIXNUM_SHIFT as i64),
+        SlotRep::RawFixnum => index,
+        _ => unreachable!("checked scalar representation"),
+    };
+    let byte_offset = ishl_imm_p(fb, raw_index, layout.element_shift);
+    let slot = fb.ins().iadd(slots, byte_offset);
+    let element = fb.ins().load(types::I64, MemFlagsData::trusted(), slot, 0);
+    Ok((element, SlotRep::Tagged))
 }

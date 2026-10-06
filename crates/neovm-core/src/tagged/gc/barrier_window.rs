@@ -19,7 +19,9 @@
 //! a cons outside the window is stored inline. Rust cons stores use a
 //! separate protocol mirror, equal to this window with generations disabled
 //! and ALL otherwise; the outlined filter then checks generation eligibility.
-//! Compiled stores keep the real window and test the cons bitmap inline.
+//! GEN1 compiled stores keep the ordinary window and test the cons bitmap
+//! inline. GEN0 observed mode widens only the compiled window with the
+//! mutator's collection-read envelope; exact object marks filter those hits.
 //!
 //! The window is PROTOCOL STATE, like `TAGGED_HEAP_CONCURRENT_ACTIVE`: it is
 //! recomputed and republished by [`TaggedHeap::publish_barrier_window`] at
@@ -31,12 +33,30 @@
 
 use super::*;
 
-/// A half-open owner-address range `[lo, lo + len)`, tested with one
-/// wrapping subtraction and one unsigned compare.
+/// An owner-address range tested with one wrapping subtraction and unsigned
+/// compare. A compiled observation range may wrap, excluding one empty gap.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct BarrierWindow {
     lo: usize,
     len: usize,
+}
+
+/// Prepared protocol geometry from the executing mutator's existing journal.
+/// The optional linear gap contains no locally observed owner and no mapped
+/// owner. Its complement fits the unchanged native wrapping window predicate.
+/// Contexts and certificates remain mutator-local; shared marks are atomic,
+/// while only the installed mutator publishes its JitHeapState Cells.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CompiledObservationGate {
+    pub(crate) observed: [BarrierWindow; 2],
+    pub(crate) excluded: Option<BarrierWindow>,
+}
+
+impl CompiledObservationGate {
+    pub(crate) const NONE: Self = Self {
+        observed: [BarrierWindow::NONE; 2],
+        excluded: None,
+    };
 }
 
 impl BarrierWindow {
@@ -56,6 +76,11 @@ impl BarrierWindow {
         } else {
             Self { lo, len: hi - lo }
         }
+    }
+
+    /// Preserve the raw native predicate, including a wraparound range.
+    pub(crate) const fn from_lo_len(lo: usize, len: usize) -> Self {
+        Self { lo, len }
     }
 
     /// Whether an owner at `addr` must take the out-of-line barrier.
@@ -115,6 +140,16 @@ impl TaggedHeap {
         }
     }
 
+    /// The actual dump span, even while ordinary GC tracking requires ALL.
+    /// Observation classification must not use an old TLS protocol mirror.
+    pub(crate) fn collection_dump_window(&self) -> BarrierWindow {
+        if self.partition_dump {
+            BarrierWindow::span(self.dump_addr_lo, self.dump_addr_hi)
+        } else {
+            BarrierWindow::NONE
+        }
+    }
+
     /// Derive the Rust cons protocol mirror once per publication. This carries
     /// no mutator log or cache; future parallel mutators need the same window
     /// publication handshake as the existing ordinary mirror.
@@ -126,13 +161,74 @@ impl TaggedHeap {
         }
     }
 
+    /// Native GEN0 stores share the existing window test with certificate
+    /// owners. The enclosing span is only a coarse rejection filter: its
+    /// outlined setter checks the exact sticky mark before journaling.
+    pub(super) fn compiled_barrier_window(
+        &self,
+        ordinary: BarrierWindow,
+        gate: CompiledObservationGate,
+    ) -> BarrierWindow {
+        let [below, above] = gate.observed;
+        if self.generational.enabled || (below.len == 0 && above.len == 0) {
+            return ordinary;
+        }
+        if ordinary == BarrierWindow::ALL {
+            return ordinary;
+        }
+        if let Some(gap) = gate.excluded {
+            debug_assert_ne!(gap.len, 0);
+            debug_assert!(ordinary.len == 0 || !gap.covers(ordinary.lo));
+            let hi = gap.lo + gap.len;
+            return BarrierWindow::from_lo_len(hi, gap.lo.wrapping_sub(hi));
+        }
+        if ordinary.len == 0 {
+            debug_assert_eq!(above.len, 0, "no dump uses one full observation hull");
+            return below;
+        }
+        let dump_hi = ordinary.lo + ordinary.len;
+        if below.len == 0 {
+            return BarrierWindow::span(ordinary.lo, dump_hi.max(above.lo + above.len));
+        }
+        let below_hi = below.lo + below.len;
+        debug_assert!(below_hi <= ordinary.lo);
+        if above.len == 0 {
+            // Retain the dump and lower heap observations, but exclude the
+            // growth gap above the last observed heap owner. The native test
+            // already wraps, so a never-read allocation in that gap keeps
+            // precisely the old outside-window instruction path.
+            return if below_hi == ordinary.lo {
+                BarrierWindow::span(below.lo, dump_hi)
+            } else {
+                BarrierWindow::from_lo_len(ordinary.lo, below_hi.wrapping_sub(ordinary.lo))
+            };
+        }
+        debug_assert!(dump_hi <= above.lo);
+        // Both sides contain required owners. Exclude the larger of the two
+        // actual empty inter-region gaps; no required interval is split.
+        // This deliberately keeps a growth gap, not the shortest usize arc.
+        let lower_gap = ordinary.lo - below_hi;
+        let upper_gap = above.lo - dump_hi;
+        if lower_gap == 0 && upper_gap == 0 {
+            BarrierWindow::span(below.lo, above.lo + above.len)
+        } else if lower_gap >= upper_gap {
+            BarrierWindow::from_lo_len(ordinary.lo, below_hi.wrapping_sub(ordinary.lo))
+        } else {
+            BarrierWindow::from_lo_len(above.lo, dump_hi.wrapping_sub(above.lo))
+        }
+    }
+
     /// THE publisher of the barrier window: recompute it from this heap's
     /// state and store it where the barriers read it — the thread-local
     /// mirror the Rust stores test and the heap field compiled code tests
     /// (`JitHeapState`). Called at every writer of an input.
     pub(super) fn publish_barrier_window(&mut self) {
         let window = self.barrier_window();
-        self.jit.set_barrier_window(window);
+        let observed = super::super::collection_reads::compiled_observation_gate(
+            self.collection_dump_window(),
+        );
+        self.jit
+            .set_barrier_window(self.compiled_barrier_window(window, observed));
         TAGGED_HEAP_BARRIER_WINDOW.with(|w| w.set(window));
         TAGGED_HEAP_CONS_BARRIER_WINDOW.with(|w| w.set(self.cons_barrier_window(window)));
     }
@@ -149,6 +245,74 @@ impl TaggedHeap {
         TAGGED_HEAP_CONCURRENT_ACTIVE.with(|c| c.set(on));
         self.publish_barrier_window();
     }
+}
+
+/// Publish the executing mutator's observation envelope before its revision
+/// snapshot and object read. This has no allocation, callback or safe point,
+/// and does not borrow collection history (its caller may already hold it).
+/// Certificates and Context execution remain mutator-local: another Lisp
+/// mutator needs shared revision/journal publication, not just this atomic mark.
+pub(crate) fn publish_collection_observation_window(observed: CompiledObservationGate) {
+    TAGGED_HEAP.with(|slot| {
+        let heap = slot.get();
+        if heap.is_null() {
+            return;
+        }
+        // SAFETY: installation retains this heap; only its executing mutator
+        // publishes JitHeapState Cells. The collector never reads that state.
+        let heap = unsafe { &*heap };
+        let ordinary = heap.barrier_window();
+        heap.jit
+            .set_barrier_window(heap.compiled_barrier_window(ordinary, observed));
+    });
+}
+
+/// Cold native refusal refinement. A certificate-free owner outside every
+/// ordinary GC obligation can be stored inline after excluding its empty
+/// local interval. This performs Rust bookkeeping only: no Lisp allocation,
+/// callback, collection or safe point. Another mutator's shared mark alone
+/// does not create a dependency in this mutator's private certificate journal.
+#[cfg(feature = "jit")]
+#[cold]
+#[inline(never)]
+pub(crate) extern "C" fn neovm_jit_unobserved_collection_owner(owner_bits: i64) -> i8 {
+    use super::super::collection_reads::{CompiledJournalMode, compiled_journal_mode};
+    if compiled_journal_mode() != CompiledJournalMode::Observed {
+        return 0;
+    }
+    let bits = owner_bits as usize;
+    let owner = TaggedValue::from_bits(bits);
+    if !owner.is_cons() {
+        return 0;
+    }
+    let address = bits & !super::super::value::TAG_MASK;
+    let eligible = TAGGED_HEAP.with(|slot| {
+        let heap = slot.get();
+        if heap.is_null() {
+            return false;
+        }
+        // SAFETY: this leaf executes under the installed Context's exclusive
+        // mutator scope. The collector does not change these heap protocol
+        // inputs; ordinary ALL preserves tracking and concurrent SATB writes.
+        let heap = unsafe { &*heap };
+        !heap.generational.enabled && !heap.barrier_window().covers(address)
+    });
+    i8::from(eligible && super::super::collection_reads::exclude_unobserved_compiled_cons(bits))
+}
+
+/// Classify this mutator's observations against the currently installed
+/// heap's real dump span. No journal borrow, callback or safe point occurs.
+pub(crate) fn current_collection_dump_window() -> BarrierWindow {
+    TAGGED_HEAP.with(|slot| {
+        let heap = slot.get();
+        if heap.is_null() {
+            BarrierWindow::NONE
+        } else {
+            // SAFETY: exclusive Context installation retains this heap for
+            // its executing mutator; only immutable dump bounds are read.
+            unsafe { &*heap }.collection_dump_window()
+        }
+    })
 }
 
 #[cfg(test)]

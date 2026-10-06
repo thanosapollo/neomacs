@@ -14,6 +14,12 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+mod core_hook_defaults;
+
+#[cfg(test)]
+mod core_hook_restore;
+
 mod body_geometry_test;
 mod frame_position_test;
 mod frame_resize_test;
@@ -8917,7 +8923,8 @@ fn set_frame_size_builtins_resize_live_gui_frames_and_notify_host() {
 
     drop(requests);
 
-    ev.apply_resize_input_event(824, 560, 1.0, fid.0, false);
+    ev.apply_resize_input_event(824, 560, 1.0, fid.0, false)
+        .expect("resize redisplay");
 
     let frame = ev
         .frames
@@ -9199,7 +9206,8 @@ fn resize_input_preserves_buffer_local_fixed_width_side_window() {
     )
     .expect("display fixed side window");
 
-    ev.apply_resize_input_event(800, 260, 1.0, fid.0, false);
+    ev.apply_resize_input_event(800, 260, 1.0, fid.0, false)
+        .expect("resize redisplay");
 
     let result = ev
         .eval_str(

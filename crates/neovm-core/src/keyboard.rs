@@ -1112,12 +1112,20 @@ pub fn render_modifiers_to_modifiers(bits: u32) -> Modifiers {
     }
 }
 
-/// Convert frontend key transport facts into the core input event model.
-///
-/// Key releases are ignored here so the command loop only sees the GNU-like
-/// cooked keypress stream.
+/// Toolkit input identity. Text and keysyms overlap numerically, so their
+/// provenance must survive transport (U+FF0D is text; XK_Return is a key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrontendKey {
+    /// A Unicode scalar supplied as text by the toolkit or input method.
+    Character(char),
+    /// A key identity in the X11/native keysym domain, not a code point.
+    Keysym(u32),
+}
+
+/// Cook frontend input without interpreting text as a keysym.
+/// Key releases are ignored; frame identity and command modifiers are retained.
 pub fn render_key_transport_to_input_event(
-    keysym: u32,
+    key: FrontendKey,
     modifiers: u32,
     pressed: bool,
     emacs_frame_id: u64,
@@ -1126,7 +1134,13 @@ pub fn render_key_transport_to_input_event(
         return None;
     }
 
-    let key_event = keysym_to_key_event(keysym, modifiers)?;
+    let key_event = match key {
+        FrontendKey::Character(character) => {
+            FrontendCharacterInput::classify(character, render_modifiers_to_modifiers(modifiers))
+                .into_key_event()
+        }
+        FrontendKey::Keysym(keysym) => keysym_to_key_event(keysym, modifiers)?,
+    };
     Some(InputEvent::key_press_in_frame(key_event, emacs_frame_id))
 }
 
@@ -2760,7 +2774,7 @@ fn apply_resize_input_event_in_keyboard_runtime(
     height: u32,
     scale_factor: f64,
     emacs_frame_id: u64,
-) {
+) -> Option<crate::window::FrameId> {
     let target_fid = if emacs_frame_id == 0 {
         frames.selected_frame().map(|frame| frame.id)
     } else {
@@ -2775,10 +2789,14 @@ fn apply_resize_input_event_in_keyboard_runtime(
         } else {
             1.0
         };
+        let old_root_bounds = *frame.root_window().bounds();
         let pending = frame.pending_gui_resize;
         frame.resize_pixelwise_with_buffer_constraints(buffers, width, height);
         frame.pending_gui_resize =
             pending.and_then(|pending| pending.after_native_observation(width, height));
+        (old_root_bounds != *frame.root_window().bounds()).then_some(fid)
+    } else {
+        None
     }
 }
 
@@ -2805,6 +2823,7 @@ fn sync_pending_resize_events_in_keyboard_runtime(
     buffers: &crate::buffer::BufferManager,
     input_rx: &mut Option<crossbeam_channel::Receiver<InputEvent>>,
     keyboard: &mut KeyboardRuntime,
+    publications: &mut Vec<crate::window::FrameId>,
 ) -> bool {
     let mut applied_resize = false;
     let mut deferred = VecDeque::new();
@@ -2829,14 +2848,17 @@ fn sync_pending_resize_events_in_keyboard_runtime(
                 let (width, height, scale_factor, emacs_frame_id) =
                     (*width, *height, *scale_factor, *emacs_frame_id);
                 pending_input_events.pop_visible_front();
-                apply_resize_input_event_in_keyboard_runtime(
+                if let Some(frame) = apply_resize_input_event_in_keyboard_runtime(
                     frames,
                     buffers,
                     width,
                     height,
                     scale_factor,
                     emacs_frame_id,
-                );
+                ) && crate::emacs_core::eval::gnu_redisplay_hooks_enabled()
+                {
+                    publications.push(frame);
+                }
                 applied_resize = true;
             }
             _ => break,
@@ -2876,14 +2898,17 @@ fn sync_pending_resize_events_in_keyboard_runtime(
                     });
                     break;
                 }
-                apply_resize_input_event_in_keyboard_runtime(
+                if let Some(frame) = apply_resize_input_event_in_keyboard_runtime(
                     frames,
                     buffers,
                     width,
                     height,
                     scale_factor,
                     emacs_frame_id,
-                );
+                ) && crate::emacs_core::eval::gnu_redisplay_hooks_enabled()
+                {
+                    publications.push(frame);
+                }
                 applied_resize = true;
             }
             Ok(event @ InputEvent::Focus { .. }) => {
@@ -2911,7 +2936,7 @@ fn sync_opening_gui_frame_size_from_host_in_keyboard_runtime(
     frames: &mut crate::window::FrameManager,
     buffers: &crate::buffer::BufferManager,
     display_host: Option<&dyn crate::emacs_core::eval::DisplayHost>,
-) {
+) -> Option<crate::window::FrameId> {
     let trace_host_sync = std::env::var("NEOMACS_TRACE_HOST_SYNC")
         .ok()
         .is_some_and(|value| value == "1");
@@ -2919,19 +2944,19 @@ fn sync_opening_gui_frame_size_from_host_in_keyboard_runtime(
         if trace_host_sync {
             tracing::debug!("sync_opening_gui_frame_size_from_host: no display host");
         }
-        return;
+        return None;
     };
     if !host.opening_gui_frame_pending() {
         if trace_host_sync {
             tracing::debug!("sync_opening_gui_frame_size_from_host: no opening gui frame pending");
         }
-        return;
+        return None;
     }
     let Some(size) = host.current_primary_window_size() else {
         if trace_host_sync {
             tracing::debug!("sync_opening_gui_frame_size_from_host: host size unavailable");
         }
-        return;
+        return None;
     };
     if size.width == 0 || size.height == 0 {
         if trace_host_sync {
@@ -2941,13 +2966,13 @@ fn sync_opening_gui_frame_size_from_host_in_keyboard_runtime(
                 size.height
             );
         }
-        return;
+        return None;
     }
     let Some(fid) = frames.selected_frame().map(|frame| frame.id) else {
         if trace_host_sync {
             tracing::debug!("sync_opening_gui_frame_size_from_host: no selected frame");
         }
-        return;
+        return None;
     };
     let Some(frame) = frames.get_mut(fid) else {
         if trace_host_sync {
@@ -2956,7 +2981,7 @@ fn sync_opening_gui_frame_size_from_host_in_keyboard_runtime(
                 fid
             );
         }
-        return;
+        return None;
     };
     if frame.effective_window_system().is_none() {
         if trace_host_sync {
@@ -2967,7 +2992,7 @@ fn sync_opening_gui_frame_size_from_host_in_keyboard_runtime(
                 frame.height
             );
         }
-        return;
+        return None;
     }
     if frame.width == size.width && frame.height == size.height {
         if trace_host_sync {
@@ -2978,7 +3003,7 @@ fn sync_opening_gui_frame_size_from_host_in_keyboard_runtime(
                 size.height
             );
         }
-        return;
+        return None;
     }
     tracing::debug!(
         "sync_opening_gui_frame_size_from_host: resizing selected frame {:?} from {}x{} to {}x{}",
@@ -2989,6 +3014,7 @@ fn sync_opening_gui_frame_size_from_host_in_keyboard_runtime(
         size.height
     );
     frame.resize_pixelwise_with_buffer_constraints(buffers, size.width, size.height);
+    Some(fid)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3840,7 +3866,7 @@ impl crate::emacs_core::eval::Context {
         scale_factor: f64,
         emacs_frame_id: u64,
         trigger_redisplay: bool,
-    ) {
+    ) -> Result<(), crate::emacs_core::error::Flow> {
         let trace_frame_geometry = std::env::var("NEOMACS_TRACE_FRAME_GEOMETRY")
             .ok()
             .is_some_and(|value| value == "1");
@@ -3869,14 +3895,17 @@ impl crate::emacs_core::eval::Context {
                     frame.parameter("window-system")
                 );
             }
-            apply_resize_input_event_in_keyboard_runtime(
+            if let Some(frame) = apply_resize_input_event_in_keyboard_runtime(
                 &mut self.frames,
                 &self.buffers,
                 width,
                 height,
                 scale_factor,
                 emacs_frame_id,
-            );
+            ) {
+                self.gnu_mark_frame_redisplay(frame);
+                self.gnu_mark_frame_window_change(frame);
+            }
             if let Some(frame) = self.frames.get(fid) {
                 tracing::debug!(
                     "apply_resize_input_event: resized frame {:?} to {}x{}",
@@ -3898,22 +3927,33 @@ impl crate::emacs_core::eval::Context {
             }
         }
         if trigger_redisplay {
-            self.redisplay();
+            self.redisplay()?;
         }
+        Ok(())
     }
 
     pub(crate) fn sync_pending_resize_events(&mut self) -> bool {
+        // Per-call Rust IDs only, owned through exclusive &mut Context.
+        let mut publications = Vec::new();
         let applied_resize = sync_pending_resize_events_in_keyboard_runtime(
             &mut self.frames,
             &self.buffers,
             &mut self.input_rx,
             &mut self.command_loop.keyboard,
+            &mut publications,
         );
-        sync_opening_gui_frame_size_from_host_in_keyboard_runtime(
+        if let Some(frame) = sync_opening_gui_frame_size_from_host_in_keyboard_runtime(
             &mut self.frames,
             &self.buffers,
             self.display_host.as_deref(),
-        );
+        ) && crate::emacs_core::eval::gnu_redisplay_hooks_enabled()
+        {
+            publications.push(frame);
+        }
+        for frame in publications {
+            self.gnu_mark_frame_redisplay(frame);
+            self.gnu_mark_frame_window_change(frame);
+        }
         applied_resize
     }
 
@@ -3921,11 +3961,14 @@ impl crate::emacs_core::eval::Context {
         let resize_acknowledged = self
             .wait_for_resize_ack_until(Instant::now() + timeout)
             .unwrap_or(false);
-        sync_opening_gui_frame_size_from_host_in_keyboard_runtime(
+        if let Some(frame) = sync_opening_gui_frame_size_from_host_in_keyboard_runtime(
             &mut self.frames,
             &self.buffers,
             self.display_host.as_deref(),
-        );
+        ) {
+            self.gnu_mark_frame_redisplay(frame);
+            self.gnu_mark_frame_window_change(frame);
+        }
         resize_acknowledged
     }
 
@@ -4142,7 +4185,7 @@ impl crate::emacs_core::eval::Context {
                         scale_factor,
                         emacs_frame_id,
                         false,
-                    );
+                    )?;
                 }
                 InputEvent::MonitorsChanged { monitors } => {
                     outcome = outcome.merge(SpecialInputServiceOutcome::any_activity());
@@ -5290,8 +5333,10 @@ impl crate::emacs_core::eval::Context {
                 scale_factor,
                 emacs_frame_id,
             } => {
-                self.apply_resize_input_event(width, height, scale_factor, emacs_frame_id, true);
-                self.redisplay();
+                self.apply_resize_input_event(width, height, scale_factor, emacs_frame_id, true)?;
+                if !crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
+                    self.redisplay()?;
+                }
                 self.timer_resume_idle();
                 Ok(None)
             }
@@ -5300,13 +5345,13 @@ impl crate::emacs_core::eval::Context {
                 // idle. The reset handler busts the redisplay signature
                 // itself since no buffer/geometry state changed.
                 self.handle_display_reset_input_event();
-                self.redisplay();
+                self.redisplay()?;
                 self.timer_resume_idle();
                 Ok(None)
             }
             InputEvent::WebView(event) => {
                 if self.apply_xwidget_frontend_event(&event)? {
-                    self.redisplay();
+                    self.redisplay()?;
                 }
                 Ok(None)
             }
@@ -5317,7 +5362,7 @@ impl crate::emacs_core::eval::Context {
             InputEvent::FrameShaderFailed { error } => {
                 let effects = crate::frontend_events::report_frame_shader_failure(self, &error)?;
                 if effects.redisplay_needed {
-                    self.redisplay();
+                    self.redisplay()?;
                 }
                 Ok(None)
             }
@@ -5386,7 +5431,7 @@ impl crate::emacs_core::eval::Context {
             }
             InputEvent::SystemFontsChanged { fonts, display } => {
                 if self.handle_system_fonts_input_event(fonts, display)? {
-                    self.redisplay();
+                    self.redisplay()?;
                 }
                 Ok(None)
             }
@@ -5773,7 +5818,7 @@ impl crate::emacs_core::eval::Context {
             }
 
             if self.sync_pending_resize_events() {
-                self.redisplay();
+                self.redisplay()?;
             }
             if let Some(event) = self.drain_ready_input_event_for_read_char() {
                 if let Some(value) = self.handle_read_char_input_event(event, tty_input_decoding)? {
@@ -5793,7 +5838,7 @@ impl crate::emacs_core::eval::Context {
                 return Ok(None);
             }
 
-            self.redisplay_for_input_wait();
+            self.redisplay_for_input_wait()?;
             self.service_input_wait_with_redisplay()?;
 
             // GNU read_char re-checks Vunread_command_events after idle
@@ -5812,7 +5857,7 @@ impl crate::emacs_core::eval::Context {
             );
 
             if self.sync_pending_resize_events() {
-                self.redisplay();
+                self.redisplay()?;
             }
 
             if let Some(event) = self.drain_ready_input_event_for_read_char() {
@@ -5892,7 +5937,7 @@ impl crate::emacs_core::eval::Context {
                     .and_then(|delay| std::time::Instant::now().checked_add(delay));
             }
             let display_idle_deadline =
-                self.display_idle_maintenance_deadline(command_input, timeout.is_some());
+                self.display_idle_maintenance_deadline(command_input, timeout.is_some())?;
             let wait_deadline = [
                 deadline,
                 idle_auto_save_deadline,
@@ -5926,14 +5971,14 @@ impl crate::emacs_core::eval::Context {
                             let events = self.command_loop.read_command_keys().to_vec();
                             if !events.is_empty() {
                                 self.publish_key_echo_message(&events, None);
-                                self.redisplay();
+                                self.redisplay()?;
                             }
                         }
                     }
                     if idle_auto_save_deadline.is_some_and(|deadline| now >= deadline) {
                         idle_auto_save_deadline = None;
                         self.run_command_loop_auto_save("idle timeout");
-                        self.redisplay();
+                        self.redisplay()?;
                     }
                     continue;
                 }
@@ -5953,25 +5998,27 @@ impl crate::emacs_core::eval::Context {
         &mut self,
         command_input: bool,
         timed_read: bool,
-    ) -> Option<std::time::Instant> {
+    ) -> Result<Option<std::time::Instant>, crate::emacs_core::error::Flow> {
         if !command_input
             || timed_read
             || self.command_loop.keyboard.has_pending_low_level_input()
             || self.has_pending_command_input_for_query()
             || self.input_rx.as_ref().is_some_and(|rx| !rx.is_empty())
         {
-            return None;
+            return Ok(None);
         }
-        let mut maintenance = self.display_idle_maintenance_fn.take()?;
+        let Some(mut maintenance) = self.display_idle_maintenance_fn.take() else {
+            return Ok(None);
+        };
         let (next, publish) = maintenance(self);
         self.display_idle_maintenance_fn = Some(maintenance);
         if publish {
             // Drop the engine borrow before redisplay re-enters layout. This
             // publishes newly available coverage without changing the buffer.
             self.invalidate_redisplay();
-            self.redisplay();
+            self.redisplay()?;
         }
-        next.and_then(|delay| std::time::Instant::now().checked_add(delay))
+        Ok(next.and_then(|delay| std::time::Instant::now().checked_add(delay)))
     }
 
     /// GNU's buffer-size-scaled delay for `auto-save-timeout`.
@@ -6324,7 +6371,7 @@ impl crate::emacs_core::eval::Context {
             let _ = self.funcall_general(show_help_function, vec![help])?;
         } else if let Some(message) = help.as_lisp_string() {
             self.set_current_message(Some(message.clone()));
-            self.redisplay();
+            self.redisplay()?;
         } else {
             self.clear_current_message();
         }
@@ -7067,6 +7114,20 @@ impl crate::emacs_core::eval::Context {
                 if let Some(snapshot) = frame.redisplay_snapshot(window_id)
                     && let Some(point) = snapshot.point_at_coords(at)
                 {
+                    let (object_width, object_height) = if part == crate::window::WindowPart::Text
+                        && frame.effective_window_system().is_none()
+                        && frame.posn_object_extent_mode().enabled()
+                    {
+                        crate::window::retained_posn_extent(
+                            Some(snapshot),
+                            point.row,
+                            point.col,
+                            neomacs_display_protocol::glyph_matrix::GlyphArea::Text,
+                        )
+                        .dimensions()
+                    } else {
+                        (point.width.max(1), point.height.max(1))
+                    };
                     return Self::mouse_posn_descriptor_value(MousePosnDescriptor {
                         window_or_frame: Value::make_window(window_id.0),
                         area: part.area_symbol(),
@@ -7083,8 +7144,8 @@ impl crate::emacs_core::eval::Context {
                             // two cannot drift apart.
                             col: Some(point.column_for_click(report_x, column_width)),
                             row: Some(point.row),
-                            width: Some(point.width.max(1)),
-                            height: Some(point.height.max(1)),
+                            width: Some(object_width),
+                            height: Some(object_height),
                             anchor_x: None,
                             anchor_y: None,
                         },
@@ -7217,12 +7278,80 @@ impl crate::emacs_core::eval::Context {
         ) {
             (crate::window::WindowPresentationSnapshot::LiveWindow(_), Some(point)) => {
                 let bounds = point.bounds();
+                let mut object_dimensions = (
+                    bounds.width().round().max(1.0) as i64,
+                    bounds.height().round().max(1.0) as i64,
+                );
+                if region.kind() == neomacs_display_protocol::PresentedRegionKind::TextBody
+                    && frame.effective_window_system().is_none()
+                    && frame.posn_object_extent_mode().enabled()
+                {
+                    let snapshot = frame
+                        .active_window_presentation(window_id)?
+                        .display_snapshot();
+                    let output_row = snapshot
+                        .body_rows
+                        .iter()
+                        .find(|row| row.body_row == point.row())
+                        .map(|row| row.output_row)
+                        .unwrap_or(point.row());
+                    let mut matrix_position = (output_row, point.column());
+                    if point.point_role() == neomacs_display_protocol::posn_object_extent::PosnPointRole::SyntheticBoundary {
+                        if let Some(at) = crate::window::WindowPart::Text.text_area_coordinate(
+                            (x - presented.regions().text_body().origin().x().get()).round() as i64,
+                            (y - outer.origin().y().get()).round() as i64,
+                            snapshot.header_line_height + snapshot.tab_line_height)
+                            && let Some(walked) = snapshot.point_at_coords(at)
+                        { matrix_position = (walked.row, walked.col); }
+                    }
+                    object_dimensions = crate::window::retained_posn_extent(
+                        Some(snapshot),
+                        matrix_position.0,
+                        matrix_position.1,
+                        neomacs_display_protocol::glyph_matrix::GlyphArea::Text,
+                    )
+                    .dimensions();
+                }
                 MousePosnMetrics {
                     point: Some(point.buffer_position()),
                     col: Some(point.column()),
                     row: Some(point.row()),
-                    width: Some(bounds.width().round().max(1.0) as i64),
-                    height: Some(bounds.height().round().max(1.0) as i64),
+                    width: Some(object_dimensions.0),
+                    height: Some(object_dimensions.1),
+                    anchor_x: None,
+                    anchor_y: None,
+                }
+            }
+            (crate::window::WindowPresentationSnapshot::LiveWindow(snapshot), None)
+                if region.kind() == neomacs_display_protocol::PresentedRegionKind::TextBody
+                    && frame.effective_window_system().is_none()
+                    && frame.posn_object_extent_mode().enabled() =>
+            {
+                let extent = crate::window::WindowPart::Text
+                    .text_area_coordinate(
+                        (x - presented.regions().text_body().origin().x().get()).round() as i64,
+                        (y - outer.origin().y().get()).round() as i64,
+                        snapshot.header_line_height + snapshot.tab_line_height,
+                    )
+                    .and_then(|at| snapshot.point_at_coords(at))
+                    .map_or(
+                        neomacs_display_protocol::posn_object_extent::PosnObjectExtent::Undrawn,
+                        |point| {
+                            crate::window::retained_posn_extent(
+                                Some(snapshot),
+                                point.row,
+                                point.col,
+                                neomacs_display_protocol::glyph_matrix::GlyphArea::Text,
+                            )
+                        },
+                    );
+                let (width, height) = extent.dimensions();
+                MousePosnMetrics {
+                    point: fallback_point,
+                    col: None,
+                    row: None,
+                    width: Some(width),
+                    height: Some(height),
                     anchor_x: None,
                     anchor_y: None,
                 }
@@ -7480,6 +7609,8 @@ impl crate::emacs_core::eval::Context {
         self.command_loop
             .start_kbd_macro_with_initial(initial_events, append);
         self.sync_keyboard_macro_runtime_vars();
+        // GNU macros.c raises update_mode_lines at successful recording entry.
+        self.request_mode_line_update(crate::emacs_core::eval::ModeLineUpdateTarget::AllBuffers);
         Ok(())
     }
 
@@ -7513,6 +7644,8 @@ impl crate::emacs_core::eval::Context {
             self.kmacro.macro_ring.push(previous);
         }
         self.sync_keyboard_macro_runtime_vars();
+        // GNU end_kbd_macro removes the recording indicator on the next display.
+        self.request_mode_line_update(crate::emacs_core::eval::ModeLineUpdateTarget::AllBuffers);
         Ok(recorded)
     }
 

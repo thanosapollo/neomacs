@@ -148,6 +148,8 @@ impl Context {
 
         if increment_depth {
             self.command_loop.recursive_depth += 1;
+            // GNU Frecursive_edit raises update_mode_lines after entering.
+            self.request_mode_line_update(ModeLineUpdateTarget::AllBuffers);
         }
 
         // GNU `recursive_edit_1` owns these bindings around the entire
@@ -215,6 +217,8 @@ impl Context {
         })();
         if increment_depth {
             self.command_loop.recursive_depth -= 1;
+            // The unwind boundary removes %[ / %] even after a non-local exit.
+            self.request_mode_line_update(ModeLineUpdateTarget::AllBuffers);
         }
         if !saved_running {
             self.command_loop.running = false;
@@ -1423,12 +1427,35 @@ impl Context {
     ///
     /// Mirrors GNU Emacs `redisplay()` (dispnew.c:5259).
     /// In batch mode (no callback), this is a no-op.
-    pub(crate) fn redisplay(&mut self) {
-        self.redisplay_with_force(false);
+    pub(crate) fn redisplay(&mut self) -> Result<(), Flow> {
+        self.redisplay_with_force(false)
     }
 
-    pub(crate) fn redisplay_for_input_wait(&mut self) {
-        self.redisplay_with_force(false);
+    pub(crate) fn redisplay_for_input_wait(&mut self) -> Result<(), Flow> {
+        self.redisplay_with_force(false)
+    }
+
+    /// Preserve the first mode-line non-local exit across a frontend callback.
+    /// This slot is Context-owned: one mutator uses a Context at a time, and
+    /// the Flow keeps its Lisp payload pinned until it is taken or dropped.
+    #[cold]
+    #[inline(never)]
+    pub fn defer_mode_line_display_flow(&mut self, flow: Flow) {
+        if self.mode_line_display_flow.is_none() {
+            self.mode_line_display_flow = Some(flow);
+        }
+    }
+
+    /// Whether layout must stop before evaluating or publishing another row.
+    #[inline]
+    pub fn has_mode_line_display_flow(&self) -> bool {
+        self.mode_line_display_flow.is_some()
+    }
+
+    /// Return the deferred mode-line exit after restoring redisplay state.
+    #[inline]
+    pub fn take_mode_line_display_flow(&mut self) -> Option<Flow> {
+        self.mode_line_display_flow.take()
     }
 
     /// Generation of asynchronously decoded media state; see
@@ -1515,6 +1542,60 @@ impl Context {
         self.last_redisplay_signature = None;
     }
 
+    /// Record an explicit body redisplay request (GNU `Fforce_window_update`,
+    /// `src/window.c:4492`).
+    ///
+    /// Unlike [`Self::invalidate_redisplay`] this only moves the scopes the
+    /// request names, so a chrome/mode-line invalidation cannot relayout body
+    /// text and a targeted force cannot rebuild unrelated windows:
+    ///
+    /// - `AllWindows` — every window (nil OBJECT).
+    /// - `Window(W)` — live window W, and (mirroring GNU's
+    ///   `prevent_redisplay_optimizations_p` on `w->contents`) the buffer it
+    ///   displays, so every other window showing that buffer also rebuilds.
+    /// - `Buffer(B)` — every window displaying B.
+    pub fn force_body_redisplay(&mut self, target: ForcedBodyRedisplay) {
+        match target {
+            ForcedBodyRedisplay::AllWindows => {
+                self.body_redisplay_all = self.body_redisplay_all.wrapping_add(1);
+            }
+            ForcedBodyRedisplay::Window(window) => {
+                let counter = self.body_redisplay_by_window.entry(window).or_insert(0);
+                *counter = counter.wrapping_add(1);
+                if let Some(buffer) = self.frames.window_buffer_id(window) {
+                    self.mark_buffer_body_redisplay(buffer);
+                }
+            }
+            ForcedBodyRedisplay::Buffer(buffer) => self.mark_buffer_body_redisplay(buffer),
+        }
+        self.invalidate_redisplay();
+    }
+
+    fn mark_buffer_body_redisplay(&mut self, buffer: BufferId) {
+        let counter = self.body_redisplay_by_buffer.entry(buffer).or_insert(0);
+        *counter = counter.wrapping_add(1);
+    }
+
+    /// The body-redisplay revision that any retained layout of BUFFER inside
+    /// WINDOW must satisfy; see [`BodyRedisplayRevision`].
+    pub fn body_redisplay_revision(
+        &self,
+        window: WindowId,
+        buffer: BufferId,
+    ) -> BodyRedisplayRevision {
+        BodyRedisplayRevision::new(
+            self.body_redisplay_all,
+            self.body_redisplay_by_window
+                .get(&window)
+                .copied()
+                .unwrap_or(0),
+            self.body_redisplay_by_buffer
+                .get(&buffer)
+                .copied()
+                .unwrap_or(0),
+        )
+    }
+
     /// Cross GNU `update_menu_bar`'s rebuild boundary and schedule redisplay.
     pub(crate) fn request_menu_bar_rebuild(&mut self, reason: MenuBarRebuildReason) {
         tracing::debug!(?reason, "request menu-bar rebuild");
@@ -1545,7 +1626,19 @@ impl Context {
             return;
         }
 
-        self.request_global_mode_line_update();
+        if gnu_redisplay_hooks_enabled() {
+            match target {
+                ModeLineUpdateTarget::CurrentBuffer(buffer) => {
+                    self.gnu_mark_buffer_mode_line(buffer)
+                }
+                ModeLineUpdateTarget::AllBuffers => {
+                    self.gnu_mark_mode_lines_all();
+                    self.request_global_mode_line_update();
+                }
+            }
+        } else {
+            self.request_global_mode_line_update();
+        }
     }
 
     /// Mark redisplay dirty when a display-affecting variable is set.
@@ -1600,7 +1693,13 @@ impl Context {
             // the same list by another name, so the chrome members of it get
             // the chrome flag too.
             if crate::buffer::buffer::variable_affects_chrome_by_sym_id(resolved) {
-                self.chrome_dirty.mark_all();
+                if gnu_redisplay_hooks_enabled() {
+                    if let Some(buffer) = self.buffers.current_buffer_id() {
+                        self.gnu_mark_buffer_chrome_cache(buffer);
+                    }
+                } else {
+                    self.chrome_dirty.mark_all();
+                }
             }
             // A display-affecting variable changed: the incremental fast paths
             // key on this counter so they re-lay instead of reusing rows shaped
@@ -1609,19 +1708,28 @@ impl Context {
         }
     }
 
-    pub(crate) fn redisplay_with_force(&mut self, force: bool) {
+    pub(crate) fn redisplay_with_force(&mut self, force: bool) -> Result<(), Flow> {
+        self.redisplay_with_force_flow(force).map(|_| ())
+    }
+
+    pub(super) fn redisplay_with_force_legacy(&mut self, force: bool) -> Result<(), Flow> {
+        if let Some(flow) = self.take_mode_line_display_flow() {
+            return Err(flow);
+        }
         // Mirrors GNU `redisplay_internal` (xdisp.c:17242-17245): bail out
         // when `inhibit-redisplay` is non-nil. `run_window_change_functions`
         // (window.c:4116) specbinds this to t so any nested redisplay
         // triggered by a window-change hook is a no-op. Without this check
         // a hook that indirectly calls `redisplay` infinitely recurses.
         let inhibit_redisplay = self.obarray.symbol_value("inhibit-redisplay");
-        if !force && inhibit_redisplay.as_ref().is_some_and(|v| v.is_truthy()) {
+        if (!force || crate::emacs_core::xdisp::mode_line_flow_enabled())
+            && inhibit_redisplay.as_ref().is_some_and(|v| v.is_truthy())
+        {
             tracing::debug!(
                 "redisplay inhibited by inhibit-redisplay={}",
                 inhibit_redisplay.as_ref().unwrap()
             );
-            return;
+            return Ok(());
         }
         self.sync_pending_resize_events();
         // Sync window position caches from markers.  After text edits,
@@ -1712,7 +1820,7 @@ impl Context {
             && !(force && self.displayed_buffer_changes_unacknowledged())
         {
             tracing::debug!("redisplay skipped: visible state unchanged");
-            return;
+            return Ok(());
         }
         self.resize_minibuffer_only_frames();
         // GNU `redisplay_internal` calls `hscroll_window_tree` (src/xdisp.c)
@@ -1733,6 +1841,11 @@ impl Context {
             // shrinking a freshly grown message — GNU only resizes exactly at
             // the command boundary, not on every `redisplay_window`.
             self.echo_area_resize_exact_pending = false;
+            if let Some(flow) = self.take_mode_line_display_flow() {
+                self.buffers.restore_outermost_restrictions(saved);
+                self.redisplay_fn = Some(f);
+                return Err(flow);
+            }
             let _ = super::super::builtins::run_redisplay_window_change_hooks(self);
             self.buffers.restore_outermost_restrictions(saved);
             self.redisplay_fn = Some(f);
@@ -1741,6 +1854,7 @@ impl Context {
             let _ = super::super::builtins::run_redisplay_window_change_hooks(self);
         }
         self.last_redisplay_signature = Some(self.redisplay_signature());
+        Ok(())
     }
 
     /// Run `pre-redisplay-function` (the driver of the `pre-redisplay-functions`
@@ -3237,3 +3351,7 @@ impl Context {
 #[cfg(debug_assertions)]
 #[path = "tests/gc_heap_mut_closure.rs"]
 mod gc_heap_mut_closure_tests;
+
+#[cfg(test)]
+#[path = "tests/chrome_transitions.rs"]
+mod chrome_transition_tests;

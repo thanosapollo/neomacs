@@ -39,6 +39,9 @@ mod bufferp_semantics;
 mod button_semantics;
 mod byte_operations_comprehensive;
 mod call_shell_region_semantics;
+#[cfg(test)]
+#[path = "tests/callback_redefinition.rs"]
+mod callback_redefinition;
 mod called_interactively_semantics;
 mod car_cdr_combinations;
 mod car_safe;
@@ -149,6 +152,7 @@ mod function;
 #[cfg(test)]
 mod gc_generational;
 mod gc_scan_strict_edge_semantics;
+mod gdh_strconv_semantics;
 mod generator_semantics;
 mod generic_function_comprehensive;
 mod get;
@@ -184,6 +188,9 @@ mod jit_call_frames;
 #[path = "tests/jit_direct_observables.rs"]
 mod jit_direct_observables;
 mod jit_flonum_semantics;
+#[cfg(test)]
+#[path = "tests/jit_opt_semantics.rs"]
+mod jit_opt_semantics;
 mod jit_source_slots;
 mod json_availability_semantics;
 mod json_semantics;

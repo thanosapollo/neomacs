@@ -31,7 +31,12 @@ use crate::emacs_core::subr::leaf::{
 /// A leaf trampoline's signal word: the flow is stashed.
 pub(crate) const LEAF_SIGNAL: i64 = VALUE_SHIM_SIGNAL;
 /// A leaf trampoline's decline word: run the reference for this shape.
-pub(crate) const LEAF_NEED_GENERIC: i64 = VALUE_SHIM_NEED_GENERIC;
+pub(crate) const LEAF_NEED_GENERIC: i64 = 0b1001;
+
+const _: () = {
+    assert!(LEAF_SIGNAL & TAG_MASK as i64 == LEAF_NEED_GENERIC & TAG_MASK as i64);
+    assert!(LEAF_SIGNAL != LEAF_NEED_GENERIC);
+};
 
 // ---------------------------------------------------------------------------
 // Counters.
@@ -126,6 +131,7 @@ pub(crate) fn render_leaf_stats() -> String {
     // Direct calls between compiled leaves (`direct_call`) and the CLIF
     // intrinsics' sites (`intrinsics`) share the line.
     out.extend(super::direct_call::render_direct_call_stats());
+    out.extend(super::direct_call::render_direct_profile_stats());
     out.extend(super::call_census::render_call_census());
     out.extend(super::intrinsics::render_intrinsic_stats());
     // The interpreter's leaf calls (`NEOVM_VM_LEAF`) too.

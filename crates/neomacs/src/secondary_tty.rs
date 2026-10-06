@@ -89,6 +89,19 @@ impl SecondaryTtyRegistry {
             if let Some(session) = sessions.get_mut(&terminal_id)
                 && session.device.is_active()
             {
+                // This terminal's session mutex protects only its native renderer;
+                // Lisp redraw obligations stay on the exclusively borrowed Context.
+                let mut full_redraw = eval.gnu_take_tty_frame_redraw(neovm_core::window::FrameId(
+                    root.frame_placement.frame().get(),
+                ));
+                for child in &children {
+                    full_redraw |= eval.gnu_take_tty_frame_redraw(neovm_core::window::FrameId(
+                        child.frame_placement.frame().get(),
+                    ));
+                }
+                if full_redraw {
+                    session.rif.force_redraw();
+                }
                 frame_layout::run_tty_rif_redisplay_to(
                     &mut session.rif,
                     &root,
@@ -140,6 +153,23 @@ impl SecondaryTtyRegistry {
 
     #[cfg(not(unix))]
     fn resume(&self, _terminal_id: u64) -> Result<(), String> {
+        Err("additional text terminals are not supported on this platform".to_string())
+    }
+
+    #[cfg(unix)]
+    fn write(&self, terminal_id: u64, bytes: &[u8]) -> Result<(), String> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "secondary TTY registry poisoned".to_string())?;
+        sessions
+            .get_mut(&terminal_id)
+            .ok_or_else(|| "TTY terminal host unavailable".to_string())?
+            .write(bytes)
+    }
+
+    #[cfg(not(unix))]
+    fn write(&self, _terminal_id: u64, _bytes: &[u8]) -> Result<(), String> {
         Err("additional text terminals are not supported on this platform".to_string())
     }
 
@@ -236,6 +266,10 @@ impl TerminalHost for SecondaryTtyHost {
 
     fn delete_terminal(&mut self) -> Result<(), String> {
         self.registry.remove(self.terminal_id)
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.registry.write(self.terminal_id, bytes)
     }
 }
 
@@ -467,6 +501,18 @@ impl SecondaryTtySession {
         self.rif.force_redraw();
         self.paused.store(false, Ordering::Release);
         Ok(())
+    }
+
+    /// Raw unbuffered terminal output, GNU's `fwrite`+`fflush` on
+    /// `tty->output' (src/dispnew.c:6838-6843): this terminal's own device,
+    /// never the primary stdout.
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write as _;
+        self.device
+            .file
+            .write_all(bytes)
+            .and_then(|()| self.device.file.flush())
+            .map_err(|error| format!("cannot write to the terminal: {error}"))
     }
 }
 

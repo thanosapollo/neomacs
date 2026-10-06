@@ -25,10 +25,12 @@ use super::*;
 ///
 /// **Barrier window** (`barrier_lo`, `barrier_len`): an owner at address `a`
 /// with `a - barrier_lo <u barrier_len` must take the out-of-line barrier
-/// (the shim). The heap-side twin of the thread-local
-/// `TAGGED_HEAP_BARRIER_WINDOW`, written by the same publisher
-/// (`TaggedHeap::publish_barrier_window`), so the two never disagree while
-/// the heap is installed.
+/// (the shim). With GEN0 observed journaling this encloses the ordinary GC
+/// window and the executing mutator's observed-owner envelope. Window hits
+/// still check the exact sticky mark before journaling. The Rust TLS window
+/// remains the ordinary GC window. GEN1 retains that ordinary native window.
+/// Only the executing mutator publishes these Cells; Context installation
+/// re-derives the window from that mutator's persistent collection history.
 #[repr(C)]
 pub(crate) struct JitHeapState {
     pub(crate) cons_cur: Cell<usize>,
@@ -65,10 +67,7 @@ impl JitHeapState {
     /// The window compiled code currently tests.
     #[cfg(test)]
     pub(crate) fn barrier_window(&self) -> BarrierWindow {
-        BarrierWindow::span(
-            self.barrier_lo.get(),
-            self.barrier_lo.get().wrapping_add(self.barrier_len.get()),
-        )
+        BarrierWindow::from_lo_len(self.barrier_lo.get(), self.barrier_len.get())
     }
 }
 

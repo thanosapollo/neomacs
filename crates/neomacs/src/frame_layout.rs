@@ -79,9 +79,14 @@ pub fn collect_snapshot_states(
         if !keep {
             continue;
         }
-        let Some(prepared) =
-            layout_frame_display_state(evaluator, node.frame_id, FrameLayoutPurpose::Snapshot)
-        else {
+        let prepared =
+            layout_frame_display_state(evaluator, node.frame_id, FrameLayoutPurpose::Snapshot);
+        if evaluator.has_mode_line_display_flow() {
+            // This callback carries String errors. Keep the original Flow in
+            // Context for run_frame_snapshot to return after reinstalling it.
+            return Err("frame snapshot: mode-line evaluation exited nonlocally".to_string());
+        }
+        let Some(prepared) = prepared else {
             continue;
         };
         states.push(prepared.discard(evaluator));
@@ -91,10 +96,16 @@ pub fn collect_snapshot_states(
     // frame): lay it out directly with its canonical root placement.
     if states.is_empty()
         && let SnapshotTarget::Frame(id) = target
-        && let Some(prepared) =
-            layout_frame_display_state(evaluator, FrameId(*id), FrameLayoutPurpose::Snapshot)
     {
-        states.push(prepared.discard(evaluator));
+        let prepared =
+            layout_frame_display_state(evaluator, FrameId(*id), FrameLayoutPurpose::Snapshot);
+        if evaluator.has_mode_line_display_flow() {
+            // The core drains the Context-owned Flow after this callback.
+            return Err("frame snapshot: mode-line evaluation exited nonlocally".to_string());
+        }
+        if let Some(prepared) = prepared {
+            states.push(prepared.discard(evaluator));
+        }
     }
 
     if states.is_empty() {
@@ -134,6 +145,9 @@ struct SnapshotGeometryDoc<'a> {
 /// Called by both frontends right where they install `redisplay_fn`; batch
 /// mode installs nothing, so the subr signals "no display attached" there.
 pub fn install_frame_snapshot_fn(evaluator: &mut Context) {
+    evaluator.redisplay_prepare_fn = Some(Box::new(|eval, request| {
+        REDISPLAY_RUNTIME.with(|runtime| runtime.prepare_minibuffer_geometry(eval, request))
+    }));
     use neovm_core::emacs_core::xdisp::SnapshotFormat;
 
     evaluator.frame_snapshot_fn = Some(Box::new(|eval, request| {
@@ -218,6 +232,10 @@ pub fn run_tty_layout_tree_for_root(
         .frame_manager()
         .frames_in_reverse_z_order(root_id, RenderFrameVisibility::VisibleOnly);
 
+    if neovm_core::emacs_core::xdisp::mode_line_flow_enabled() {
+        return prepare_tty_tree_before_activation(evaluator, root_id, frame_order);
+    }
+
     let root_state = layout_frame_display_state(evaluator, root_id, FrameLayoutPurpose::Redisplay)?
         .activate(evaluator)
         .ok()?;
@@ -227,9 +245,14 @@ pub fn run_tty_layout_tree_for_root(
         if frame_id == root_id {
             continue;
         }
-        let Some(prepared) =
-            layout_frame_display_state(evaluator, frame_id, FrameLayoutPurpose::Redisplay)
-        else {
+        let prepared =
+            layout_frame_display_state(evaluator, frame_id, FrameLayoutPurpose::Redisplay);
+        if evaluator.has_mode_line_display_flow() {
+            // The redisplay driver returns the Context-owned exit. Neither
+            // primary nor auxiliary TTY may rasterize a partial frame tree.
+            return None;
+        }
+        let Some(prepared) = prepared else {
             continue;
         };
         let Ok(state) = prepared.activate(evaluator) else {
@@ -239,6 +262,53 @@ pub fn run_tty_layout_tree_for_root(
     }
 
     Some((root_state, child_states))
+}
+
+/// A mode-line exit must leave every frame's previously active presentation
+/// intact. This call-local staging belongs to the Context's current mutator;
+/// no prepared ticket is activated until every child has finished evaluation.
+fn prepare_tty_tree_before_activation(
+    evaluator: &mut Context,
+    root_id: FrameId,
+    frame_order: Vec<FrameId>,
+) -> Option<(SealedFramePresentation, Vec<SealedFramePresentation>)> {
+    let root = layout_frame_display_state(evaluator, root_id, FrameLayoutPurpose::Redisplay)?;
+    let mut children: Vec<PreparedFrameDisplay> = Vec::new();
+    for frame_id in frame_order {
+        if frame_id == root_id {
+            continue;
+        }
+        let child = layout_frame_display_state(evaluator, frame_id, FrameLayoutPurpose::Redisplay);
+        if evaluator.has_mode_line_display_flow() {
+            // Discard all tickets before the driver returns the original Flow.
+            // Both primary and auxiliary TTYs use this tree producer.
+            root.discard(evaluator);
+            for prepared in children {
+                prepared.discard(evaluator);
+            }
+            if let Some(prepared) = child {
+                prepared.discard(evaluator);
+            }
+            return None;
+        }
+        if let Some(child) = child {
+            children.push(child);
+        }
+    }
+    let root = match root.activate(evaluator) {
+        Ok(root) => root,
+        Err(_) => {
+            for prepared in children {
+                prepared.discard(evaluator);
+            }
+            return None;
+        }
+    };
+    let children = children
+        .into_iter()
+        .filter_map(|prepared| prepared.activate(evaluator).ok())
+        .collect();
+    Some((root, children))
 }
 
 /// Rasterize the display state into a `TtyRif` and write ANSI output to stdout.
@@ -350,6 +420,18 @@ pub fn install_tty_redisplay_callback_with_popup_redraw(
             tty_rif.force_redraw();
         }
         if let Some((root, children)) = run_tty_layout_tree(eval) {
+            // Consume only physically prepared frames, after layout and just
+            // before repaint. Pending requests for unrendered devices remain
+            // Context-owned; no new frontend Lisp cache or TLS is introduced.
+            let mut full_redraw =
+                eval.gnu_take_tty_frame_redraw(FrameId(root.frame_placement.frame().get()));
+            for child in &children {
+                full_redraw |=
+                    eval.gnu_take_tty_frame_redraw(FrameId(child.frame_placement.frame().get()));
+            }
+            if full_redraw {
+                tty_rif.force_redraw();
+            }
             run_tty_rif_redisplay(&mut tty_rif, &root, &children);
         }
     }));
@@ -357,3 +439,7 @@ pub fn install_tty_redisplay_callback_with_popup_redraw(
     install_window_layout_query_fn(evaluator);
     install_font_shape_driver(evaluator);
 }
+
+#[cfg(test)]
+#[path = "tests/tty_mode_line_flow_test.rs"]
+mod tty_mode_line_flow_test;

@@ -408,7 +408,7 @@ pub(crate) fn set_chrome_position_source_for_test(source: Option<ChromePositionS
     CHROME_POSITION_SOURCE_OVERRIDE.with(|cell| cell.set(source));
 }
 
-/// The knob, read once per process: `rows` selects [`ChromePositionSource::Rows`];
+/// The knob, read once per process: `rows`/`on`/`1`/`true`/`yes` select rows;
 /// unset selects rows; explicit off or any other value keeps [`ChromePositionSource::Frame`].
 fn chrome_position_source() -> ChromePositionSource {
     #[cfg(test)]
@@ -417,16 +417,24 @@ fn chrome_position_source() -> ChromePositionSource {
     }
     static SOURCE: std::sync::OnceLock<ChromePositionSource> = std::sync::OnceLock::new();
     *SOURCE.get_or_init(|| {
-        match std::env::var("NEOMACS_PRESENT_CHROME_POS")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            None | Some("rows" | "on" | "1") => ChromePositionSource::Rows,
-            _ => ChromePositionSource::Frame,
-        }
+        parse_chrome_position_source(std::env::var("NEOMACS_PRESENT_CHROME_POS").ok().as_deref())
     })
 }
+
+/// Pure numeric policy; concurrent callers retain no Lisp or mutable state.
+fn parse_chrome_position_source(value: Option<&str>) -> ChromePositionSource {
+    match value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("rows" | "on" | "1" | "true" | "yes") => ChromePositionSource::Rows,
+        _ => ChromePositionSource::Frame,
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/spatial_boolean_policy_test.rs"]
+mod boolean_policy_tests;
 
 pub(crate) fn window_chrome_string_positions(
     state: &FrameDisplayState,
@@ -537,7 +545,7 @@ pub(crate) fn set_presented_text_positions_mode_for_test(mode: Option<PresentedT
     TEXT_POSITIONS_MODE_OVERRIDE.with(|cell| cell.set(mode));
 }
 
-/// The knob, read once per process: `lazy` selects
+/// The knob, read once per process: `lazy`/`rows`/`on`/`1`/`true`/`yes` select
 /// [`PresentedTextPositionsMode::Lazy`], as does unset; explicit off or any
 /// other value keeps [`PresentedTextPositionsMode::Eager`].
 fn presented_text_positions_mode() -> PresentedTextPositionsMode {
@@ -547,15 +555,21 @@ fn presented_text_positions_mode() -> PresentedTextPositionsMode {
     }
     static MODE: std::sync::OnceLock<PresentedTextPositionsMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
-        match std::env::var("NEOMACS_PRESENT_HIT")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            None | Some("lazy" | "rows" | "on" | "1") => PresentedTextPositionsMode::Lazy,
-            _ => PresentedTextPositionsMode::Eager,
-        }
+        parse_presented_text_positions_mode(std::env::var("NEOMACS_PRESENT_HIT").ok().as_deref())
     })
+}
+
+/// Pure numeric policy; concurrent callers retain no Lisp or mutable state.
+fn parse_presented_text_positions_mode(value: Option<&str>) -> PresentedTextPositionsMode {
+    match value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("lazy" | "rows" | "on" | "1" | "true" | "yes") => {
+            PresentedTextPositionsMode::Lazy
+        }
+        _ => PresentedTextPositionsMode::Eager,
+    }
 }
 
 /// One window's input to its text hit positions.
@@ -729,6 +743,8 @@ fn push_one_row_fallback_positions(
                 buffer_position,
                 body_row,
                 column,
+                #[cfg(any(test, feature = "redisplay-test-policy"))]
+                snapshot.posn_object_extent_mode(),
             )?;
         }
         covered_right = covered_right.max(point_right);
@@ -750,6 +766,8 @@ fn push_one_row_fallback_positions(
             buffer_position,
             body_row,
             column,
+            #[cfg(any(test, feature = "redisplay-test-policy"))]
+            snapshot.posn_object_extent_mode(),
         )?;
     }
     Ok(())
@@ -766,19 +784,33 @@ fn push_text_position_span(
     buffer_position: i64,
     row: i64,
     column: i64,
+    #[cfg(any(test, feature = "redisplay-test-policy"))]
+    test_mode: neovm_core::window::PosnObjectExtentMode,
 ) -> Result<(), PresentedHitError> {
     if width <= 0.0 || height <= 0.0 {
         return Ok(());
     }
     let bounds = FrameRect::new(x, y, width, height)
         .map_err(|_| PresentedHitError::InvalidTextPositionGeometry)?;
-    positions.push(PresentedTextPosition::new(
-        window,
-        bounds,
-        buffer_position,
-        row,
-        column,
-    ));
+    let mode = {
+        #[cfg(any(test, feature = "redisplay-test-policy"))]
+        {
+            test_mode
+        }
+        #[cfg(not(any(test, feature = "redisplay-test-policy")))]
+        {
+            neovm_core::window::posn_object_extent_mode()
+        }
+    };
+    positions.push(
+        PresentedTextPosition::new(window, bounds, buffer_position, row, column).with_point_role(
+            if mode.enabled() {
+                neomacs_display_protocol::posn_object_extent::PosnPointRole::SyntheticBoundary
+            } else {
+                neomacs_display_protocol::posn_object_extent::PosnPointRole::Glyph
+            },
+        ),
+    );
     Ok(())
 }
 
@@ -836,13 +868,20 @@ pub(crate) fn body_text_positions(
         }
         let bounds = FrameRect::new(left, top, right - left, bottom - top)
             .map_err(|_| PresentedHitError::InvalidTextPositionGeometry)?;
-        positions.push(PresentedTextPosition::new(
-            window,
-            bounds,
-            point.buffer_pos.as_i64(),
-            body_row.body_row,
-            point.col,
-        ));
+        positions.push(
+            PresentedTextPosition::new(
+                window,
+                bounds,
+                point.buffer_pos.as_i64(),
+                body_row.body_row,
+                point.col,
+            )
+            .with_point_role(if snapshot.posn_object_extent_mode().enabled() {
+                point.role
+            } else {
+                neomacs_display_protocol::posn_object_extent::PosnPointRole::Glyph
+            }),
+        );
     }
     push_row_fallback_positions(&mut positions, window, snapshot, text_body)?;
     Ok(positions)

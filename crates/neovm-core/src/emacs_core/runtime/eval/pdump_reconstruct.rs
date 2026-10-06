@@ -148,6 +148,8 @@ impl Context {
             eval_task_rx: None,
             quit_requested: QuitRequest::new(),
             redisplay_fn: None,
+            mode_line_display_flow: None,
+            redisplay_prepare_fn: None,
             font_shape_fn: None,
             gstring_shape_cache: HashMap::new(),
             display_idle_maintenance_fn: None,
@@ -169,8 +171,12 @@ impl Context {
             display_var_change_count: 0,
             input_progress: Default::default(),
             redisplay_generation: 0,
+            body_redisplay_all: 0,
+            body_redisplay_by_window: FxHashMap::default(),
+            body_redisplay_by_buffer: FxHashMap::default(),
             menu_bar_rebuild_generation: 0,
             chrome_dirty: Default::default(),
+            gnu_redisplay_hooks: redisplay_hooks::RedisplayHookOwnership::initial(),
             context_instance_id: next_context_instance_id(),
             media_generation: 0,
             last_redisplay_signature: None,
@@ -207,7 +213,7 @@ impl Context {
                 crate::emacs_core::bytecode::vm::SymbolByteCodeCallCache::new(),
             interpreter_stacks: crate::emacs_core::bytecode::vm::InterpreterStackPool::new(),
             jit_bind_stack: Vec::new(),
-            aset_fast_path_epoch: std::cell::Cell::new(u64::MAX),
+            _reserved_opcode_epoch: std::cell::Cell::new(u64::MAX),
             apply_fast_path_epoch: std::cell::Cell::new(u64::MAX),
             named_call_cache: FxHashMap::with_capacity_and_hasher(
                 NAMED_CALL_CACHE_CAPACITY,
@@ -272,6 +278,11 @@ impl Context {
         // bitmaps. The `'fringe` indices may already be set on the dumped
         // symbols; re-`put`ting the same value is idempotent.
         ev.pre_register_standard_fringe_bitmaps();
+
+        // An image stamped under the legacy policy can omit this C-owned
+        // hook entirely. Preserve every saved cell, then let the existing
+        // final activation adopt GNU forwarding/special metadata.
+        super::super::window_cmds::restore_gnu_configuration_hook_default(&mut ev.obarray);
 
         ev.finish_runtime_activation(true);
 

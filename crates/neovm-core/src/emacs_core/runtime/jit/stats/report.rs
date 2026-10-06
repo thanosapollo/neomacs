@@ -46,6 +46,16 @@ pub(crate) struct LeafReportRow {
     pub(crate) mir: Option<Box<str>>,
     /// The tier spine's view of the leaf (`tier2`).
     pub(crate) t2: crate::emacs_core::jit::tier2::T2Snapshot,
+    /// Compiler counters only; empty for baseline and passes-disabled opt.
+    pub(crate) opt_fold: Option<Box<crate::emacs_core::jit::opt::passes::fold::FoldStats>>,
+    pub(crate) opt_bool: Option<Box<crate::emacs_core::jit::opt::passes::bools::BoolStats>>,
+    pub(crate) opt_reps: Option<Box<crate::emacs_core::jit::opt::ir::RepsCensus>>,
+    pub(crate) opt_gvn: Option<Box<crate::emacs_core::jit::opt::passes::gvn::GvnStats>>,
+    pub(crate) opt_range: Option<Box<crate::emacs_core::jit::opt::passes::range::RangeStats>>,
+    pub(crate) opt_licm: Option<Box<crate::emacs_core::jit::opt::passes::licm::LicmStats>>,
+    pub(crate) opt_sink: Option<Box<crate::emacs_core::jit::opt::sink_recipes::SinkStats>>,
+    pub(crate) opt_arrays:
+        Option<Box<crate::emacs_core::jit::opt::passes::array_reads::ArrayLiftStats>>,
 }
 
 impl LeafReportRow {
@@ -475,7 +485,132 @@ impl FinalReport {
                 r.t2.polls_at_request,
             )
         });
-        leaf_rows.chain(t2_rows).collect()
+        // Twelve columns, distinct from compile rows and joined by source id,
+        // name and OSR entry. Missing rows mean the pass was not selected.
+        let opt_rows = self.leaves.iter().filter_map(|r| {
+            let c = r.opt_fold.as_ref()?;
+            let osr = r.osr_pc.map_or_else(|| "-".to_owned(), |pc| pc.to_string());
+            Some(format!(
+                "#opt-fold,{},{},{osr},{},{},{},{},{},{},{},{}\n",
+                r.id,
+                csv_field(r.name.as_deref().unwrap_or("-")),
+                c.guards_folded,
+                c.guards_narrowed,
+                c.constants_folded,
+                c.branches_folded,
+                c.threaded_edges,
+                c.cons_loads,
+                c.deopts,
+                usize::from(c.analysis_bailed),
+            ))
+        });
+        // Selected-pass census is immutable compiler metadata; no hot runtime
+        // updates or mutator-dependent state are introduced.
+        let bool_rows = self.leaves.iter().filter_map(|r| {
+            let c = r.opt_bool.as_ref()?;
+            let osr = r.osr_pc.map_or_else(|| "-".to_owned(), |pc| pc.to_string());
+            Some(format!(
+                "#opt-bool,{},{},{osr},{},{},{},{},{},{},{}\n",
+                r.id,
+                csv_field(r.name.as_deref().unwrap_or("-")),
+                c.opaque_producers,
+                c.constant_producers,
+                c.phi_params,
+                c.refinements,
+                c.selects,
+                c.nil_tests,
+                c.tagged_views
+            ))
+        });
+        let reps_rows = self.leaves.iter().filter_map(|r| {
+            let c = r.opt_reps.as_ref()?;
+            let osr = r.osr_pc.map_or_else(|| "-".to_owned(), |pc| pc.to_string());
+            Some(format!(
+                "#opt-reps,{},{},{osr},{},{},{},{},{},{},{},{}\n",
+                r.id,
+                csv_field(r.name.as_deref().unwrap_or("-")),
+                c.lift.lifted_arithmetic,
+                c.lift.lifted_comparisons,
+                c.lift.type_guards,
+                c.selection.raw_values,
+                c.selection.raw_phis,
+                c.selection.tagged_arithmetic,
+                c.selection.raw_arithmetic,
+                c.selection.tagged_views,
+            ))
+        });
+        let gvn_rows = self.leaves.iter().filter_map(|r| {
+            let c = r.opt_gvn.as_ref()?;
+            let osr = r.osr_pc.map_or_else(|| "-".to_owned(), |pc| pc.to_string());
+            Some(format!(
+                "#opt-gvn,{},{},{osr},{},{},{}\n",
+                r.id,
+                csv_field(r.name.as_deref().unwrap_or("-")),
+                c.pure_reuses,
+                c.load_reuses,
+                c.store_forwards,
+            ))
+        });
+        let range_rows = self.leaves.iter().filter_map(|r| {
+            let c = r.opt_range.as_ref()?;
+            let osr = r.osr_pc.map_or_else(|| "-".to_owned(), |pc| pc.to_string());
+            Some(format!(
+                "#opt-range,{},{},{osr},{},{},{},{}\n",
+                r.id,
+                csv_field(r.name.as_deref().unwrap_or("-")),
+                c.overflow_checks_elided,
+                c.bounds_checks_elided,
+                c.range_views,
+                c.analysis_bailed
+            ))
+        });
+        let licm_rows = self.leaves.iter().filter_map(|r| {
+            let c = r.opt_licm.as_ref()?;
+            let osr = r.osr_pc.map_or_else(|| "-".to_owned(), |pc| pc.to_string());
+            Some(format!(
+                "#opt-licm,{},{},{osr},{},{},{}\n",
+                r.id,
+                csv_field(r.name.as_deref().unwrap_or("-")),
+                c.pure_hoisted,
+                c.immutable_loads_hoisted,
+                c.guards_hoisted
+            ))
+        });
+        let sink_rows = self.leaves.iter().filter_map(|r| {
+            let c = r.opt_sink.as_ref()?;
+            let osr = r.osr_pc.map_or_else(|| "-".to_owned(), |pc| pc.to_string());
+            Some(format!(
+                "#opt-sink,{},{},{osr},{},{},{},{}\n",
+                r.id,
+                csv_field(r.name.as_deref().unwrap_or("-")),
+                c.numeric_sources,
+                c.cons_sources,
+                c.materializations,
+                c.analysis_bailed
+            ))
+        });
+        let array_rows = self.leaves.iter().filter_map(|r| {
+            let c = r.opt_arrays.as_ref()?;
+            let osr = r.osr_pc.map_or_else(|| "-".to_owned(), |pc| pc.to_string());
+            Some(format!(
+                "#opt-arrays,{},{},{osr},{},{}\n",
+                r.id,
+                csv_field(r.name.as_deref().unwrap_or("-")),
+                c.reads_lifted,
+                c.bounds_inserted
+            ))
+        });
+        leaf_rows
+            .chain(t2_rows)
+            .chain(opt_rows)
+            .chain(bool_rows)
+            .chain(reps_rows)
+            .chain(gvn_rows)
+            .chain(range_rows)
+            .chain(licm_rows)
+            .chain(array_rows)
+            .chain(sink_rows)
+            .collect()
     }
 }
 

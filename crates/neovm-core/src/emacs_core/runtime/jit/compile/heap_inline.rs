@@ -121,17 +121,32 @@ fn emit_barrier_window_check(
     let offset = fb.ins().isub(owner, lo);
     let inside = fb.ins().icmp(IntCC::UnsignedLessThan, offset, len);
     let outside = fb.create_block();
+    // Refine an unobserved hole in the completed-store shim, exactly as for
+    // BLVs. A returning helper before the native store changes register
+    // allocation even when never called; keep this original window CFG.
     fb.ins().brif(inside, slow, &[], outside, &[]);
     fb.switch_to_block(outside);
     fb.seal_block(outside);
 }
 
-/// Record the collection mutation on a generational inline-store path.
+/// Record an accepted Cons or VecLike store with the existing GEN1 helper.
 /// This has no Lisp allocation, callback or safe point; it runs the same
 /// projected recorder as the interpreter's setter before the actual store.
-/// The generation-disabled emitter never imports or calls it.
-fn emit_collection_write(fb: &mut FunctionBuilder, rt: &RtCtx, owner: ClifValue, tag: usize) {
-    let tagged = bor_imm_p(fb, owner, tag as i64);
+/// GEN0 calls it only under the collection-journal knob. Knob-off GEN1
+/// retains its original tag restoration, indirect call and generated CLIF.
+pub(crate) fn emit_collection_write(
+    fb: &mut FunctionBuilder,
+    rt: &RtCtx,
+    owner: ClifValue,
+    tag: usize,
+) {
+    let tagged = if jit_gen0_collection_journal_on() {
+        // Owners are aligned and already untagged. Addition restores the
+        // tag and lets Cranelift cancel the cons site's earlier subtraction.
+        iadd_imm_p(fb, owner, tag as i64)
+    } else {
+        bor_imm_p(fb, owner, tag as i64)
+    };
     let mut signature = Signature::new(rt.refs.call_conv);
     signature.params.push(AbiParam::new(rt.ptr_ty));
     let signature = fb.import_signature(signature);
@@ -161,6 +176,9 @@ pub(crate) fn emit_cons_store_barrier(
     let heap = heap_ptr(fb, rt);
     emit_barrier_window_check(fb, heap, owner, slow);
     if !rt.generational_enabled() {
+        if jit_gen0_collection_journal_eager() {
+            emit_collection_write(fb, rt, owner, TAG_CONS);
+        }
         return;
     }
     if super::lowering::is_known_fixnum(fb, value) {
@@ -250,9 +268,20 @@ fn emit_slot_store_barrier(
     fb.ins().brif(needs_remembering, slow, &[], store, &[]);
     fb.switch_to_block(store);
     fb.seal_block(store);
-    if rt.generational_enabled() {
+    if rt.generational_enabled() || jit_gen0_collection_journal_eager() {
         emit_collection_write(fb, rt, owner, crate::tagged::value::TAG_VECLIKE);
     }
+}
+
+/// Compile-owned proof that the immediately preceding explicit cons guard
+/// checked this exact tagged CLIF operand with the store's deopt frame. The
+/// guard, including forced deopt, remains the Opt caller's responsibility.
+/// Threading: one compilation owns this value; it contains no runtime state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ConsStoreProof {
+    #[default]
+    Dynamic,
+    GuardedCons(ClifValue),
 }
 
 /// `setcar` (`is_cdr == false`) or `setcdr` of `cell` to `value`, inline —
@@ -312,6 +341,30 @@ pub(crate) fn emit_inline_cons_store_known_cons(
     INLINE_HEAP_STORES_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Opt-only proof seam. Dynamic or mismatched proofs emit the original main
+/// helper; an exact guarded cons emits main's existing known-cons helper.
+/// Both routes preserve its window reload, GEN1 unlogged-bit store, collection
+/// revision mutation, output, slow shim and instrumentation unchanged.
+/// Threading: the proof is compiler-owned, with no shared mutator state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_inline_cons_store_with_proof(
+    fb: &mut FunctionBuilder,
+    rt: &RtCtx,
+    cell: ClifValue,
+    value: ClifValue,
+    is_cdr: bool,
+    slow: Block,
+    res: Variable,
+    merge: Block,
+    proof: ConsStoreProof,
+) {
+    if matches!(proof, ConsStoreProof::GuardedCons(checked) if checked == cell) {
+        emit_inline_cons_store_known_cons(fb, rt, cell, value, is_cdr, slow, res, merge);
+    } else {
+        emit_inline_cons_store(fb, rt, cell, value, is_cdr, slow, res, merge);
+    }
+}
+
 /// `aset` of a plain vector or record, inline — GNU `Baset`'s in-bytecode
 /// `ASET`: owned storage, an in-range fixnum index, an owner outside the
 /// barrier window that is not a tenured owner the remembered set still
@@ -320,11 +373,7 @@ pub(crate) fn emit_inline_cons_store_known_cons(
 /// `slow`, where the caller emits the unchanged shim call (strings, signals,
 /// mapped storage, the barrier's slow path).
 ///
-/// neomacs's `Op::Aset` honours a redefined or advised `aset` (GNU `Baset`
-/// never reads the function cell; a pre-existing deviation kept for tier
-/// parity), so the site first compares the context's `aset` epoch cell with
-/// the obarray's function epoch — the shim's own test, bit for bit — and a
-/// mismatch takes the shim, which re-validates and re-arms the cell.
+/// Like GNU `Baset`, this opcode never consults `aset`'s function cell.
 ///
 /// Returns `false`, emitting nothing, when a layout probe fails
 /// (`LispValueVec::jit_slice_offsets` / `jit_owned_probe`).
@@ -339,31 +388,12 @@ pub(crate) fn emit_inline_aset(
     cont: Block,
 ) -> bool {
     use super::jit_layout::heap::{value_vec_owned_probe, value_vec_slice_offsets};
-    use super::jit_layout::{CONTEXT_ASET_EPOCH_OFFSET, OBARRAY_FUNCTION_EPOCH_OFFSET};
     if value_vec_slice_offsets().is_none() {
         return false;
     }
     let Some(owned_probe) = value_vec_owned_probe() else {
         return false;
     };
-    let vmctx = fb.use_var(rt.vmctx_var);
-    let armed = fb.ins().load(
-        types::I64,
-        MemFlagsData::trusted(),
-        vmctx,
-        CONTEXT_ASET_EPOCH_OFFSET as i32,
-    );
-    let epoch = fb.ins().load(
-        types::I64,
-        MemFlagsData::trusted(),
-        vmctx,
-        (super::jit_layout::CONTEXT_OBARRAY_OFFSET + OBARRAY_FUNCTION_EPOCH_OFFSET) as i32,
-    );
-    let stale = fb.ins().icmp(IntCC::NotEqual, armed, epoch);
-    let armed_block = fb.create_block();
-    fb.ins().brif(stale, slow, &[], armed_block, &[]);
-    fb.switch_to_block(armed_block);
-    fb.seal_block(armed_block);
     let Some(super::lowering::PlainSlot { object, slot }) =
         emit_plain_slot_address(fb, array, index, slow, Some(owned_probe))
     else {

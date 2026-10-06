@@ -3,7 +3,7 @@
 //! first dirty row until the walk reaches the first unchanged row's start,
 //! with no prediction of how many rows the changed lines now take.
 //!
-//! The `prove` path (the default) reuses the rows below an edit only when it
+//! The `prove` path reuses the rows below an edit only when it
 //! can PROVE AHEAD that every changed line still occupies exactly one row:
 //! printable-ASCII text, no structure properties, monospace glyphs, a width
 //! that still fits. A tab, a CJK character, a `display` string or an
@@ -11,7 +11,7 @@
 //! below the edit is laid out again -- 20 rows per keystroke on the P3.5
 //! `typemid` fixture, the common case when editing tab-indented Lisp.
 //!
-//! The `sync` path ports GNU's synchronization instead (xdisp.c:22561-23300):
+//! The `sync` path (the unset default) ports GNU's synchronization instead (xdisp.c:22561-23300):
 //!
 //! 1. `first_unchanged_at_end` is the first old row that starts at or after
 //!    `Z - END_UNCHANGED + 1` in old coordinates (the `+ 1` keeps the
@@ -31,8 +31,21 @@
 //! joined line), which needs a second walk at the window bottom
 //! (xdisp.c:23237-23284). Such a walk simply does not stop at `stop_pos` and
 //! continues to the bottom -- exactly today's above-only replay.
+//!
+//! | Knob | Default | Values | Gate |
+//! | --- | --- | --- | --- |
+//! | `NEOMACS_LAYOUT_EDIT_SYNC` | `sync` | `prove`; `sync`/`on`/`1`/`true`/`yes` | Synchronize the edit walk with unchanged rows below it. |
+//! | `NEOMACS_EDIT_SYNC_DENSE_INDEX` | `on` | `off`, `on` | Use proved consecutive row indexes for edit-plan membership and surviving-row remapping; every unproved case keeps the original hash path. |
+//! | `NEOMACS_EDIT_SYNC_FONTIFY_COVERAGE` | `on` | `off`; `on`/`1`/`true`/`yes` | Prove that an admitted edit-Sync attempt has no uncovered point query using current immutable row extrema; unknown or intersecting ranges retain the full iterator. |
+//! | `NEOMACS_EDIT_SYNC_STILL` | `off` | `off`, `on` | Transfer synchronized geometry without remapping when its placement and visibility are unchanged. |
+//! | `NEOMACS_EDIT_SYNC_PROVE_FIRST` | `off` | `off`, `on` | Prefer a completely admitted bounded prove producer inside GNU sync; rejected proofs still use general sync. |
+//! | `NEOMACS_EDIT_SYNC_LAZY_PROOF` | `on` | `off`, `on` | Defer source proof until bounded fallback is possible in general Sync with ProveFirst off. |
+//! | `NEOMACS_EDIT_SYNC_SHIFT_SKIP` | `off` | `off`, `on` | Avoid synchronized-row shift provenance allocations when no row moved vertically. |
+//! | `NEOMACS_LAYOUT_SCROLL_BACK` | `on` | `off`, `on` | Synchronize backward scrolls with the retained body. |
 
-use super::{EditDamage, RetainedWindowMatrix};
+mod dense_index;
+
+use super::{EditDamage, EditReplayPositions, RetainedWindowMatrix};
 use crate::types::LayoutCharPos0;
 use neomacs_display_protocol::glyph_matrix::{
     GlyphPointerOccurrenceIdentity, GlyphPointerSourceKind, GlyphRow, MatrixRow,
@@ -40,11 +53,44 @@ use neomacs_display_protocol::glyph_matrix::{
 use neovm_core::buffer::position::LispCharPos1;
 use neovm_core::window::{DisplayPointSnapshot, DisplayRowSnapshot};
 
+/// Pure process-selector parser: absence selects ON; explicit empty, invalid
+/// and nonUnicode values select OFF. It reads no Lisp state and does not
+/// depend on an active mutator.
+#[inline]
+fn parse_lazy_proof(value: Option<&std::ffi::OsStr>) -> bool {
+    if value.is_none() {
+        return true;
+    }
+    value
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "on" | "true" | "yes"
+            )
+        })
+}
+
+/// Process-wide immutable selector, published after initialization by
+/// OnceLock. Independent Lisp mutators read the same initialized boolean;
+/// test overrides contain only thread-owned numeric policy, never Lisp state.
+#[inline]
+pub(crate) fn lazy_proof_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(value) = super::lazy_proof_test_support::forced() {
+        return value;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_lazy_proof(std::env::var_os("NEOMACS_EDIT_SYNC_LAZY_PROOF").as_deref())
+    })
+}
+
 /// `NEOMACS_LAYOUT_EDIT_SYNC`: how an edit replay may reuse the rows below
 /// the edit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EditSyncMode {
-    /// Prove ahead that each changed line stays one row (default).
+    /// Prove ahead that each changed line stays one row.
     Prove,
     /// Walk until the first unchanged row's start (GNU `try_window_id`).
     Sync,
@@ -62,7 +108,24 @@ pub(crate) fn set_edit_sync_mode_for_test(mode: Option<EditSyncMode>) {
     MODE_OVERRIDE.with(|cell| cell.set(mode));
 }
 
-/// The mode in effect. Read once per process; default `prove`.
+/// Pure numeric knob parser: absence alone selects the unset default.
+/// It retains no Lisp state, environment mutation or mutable cache. Independent
+/// mutators may call it concurrently; the existing OnceLock publishes policy.
+fn parse_edit_sync_mode(value: Option<&std::ffi::OsStr>) -> EditSyncMode {
+    let Some(value) = value else {
+        return EditSyncMode::Sync;
+    };
+    match value
+        .to_str()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("sync" | "on" | "1" | "true" | "yes") => EditSyncMode::Sync,
+        _ => EditSyncMode::Prove,
+    }
+}
+
+/// The mode in effect. Read once per process; unset default `sync`.
 pub(crate) fn edit_sync_mode() -> EditSyncMode {
     #[cfg(test)]
     if let Some(mode) = MODE_OVERRIDE.with(std::cell::Cell::get) {
@@ -70,14 +133,142 @@ pub(crate) fn edit_sync_mode() -> EditSyncMode {
     }
     static MODE: std::sync::OnceLock<EditSyncMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
-        match std::env::var("NEOMACS_LAYOUT_EDIT_SYNC")
+        parse_edit_sync_mode(std::env::var_os("NEOMACS_LAYOUT_EDIT_SYNC").as_deref())
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static STILL_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the unchanged-placement transfer on this thread (tests only).
+#[cfg(test)]
+fn set_edit_sync_still_for_test(enabled: Option<bool>) {
+    STILL_OVERRIDE.with(|cell| cell.set(enabled));
+}
+
+/// `NEOMACS_EDIT_SYNC_STILL=on`: avoid a second geometry pass after the
+/// synchronized rows keep their placement. Read once per process; default off.
+/// The shared flag has no Lisp state; OnceLock publishes it for concurrent
+/// readers. Each plan and its owned vectors belong to one layout attempt.
+#[inline]
+fn edit_sync_still_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = STILL_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEOMACS_EDIT_SYNC_STILL")
             .ok()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("sync" | "on" | "1") => EditSyncMode::Sync,
-            _ => EditSyncMode::Prove,
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "on" | "1" | "true" | "yes"
+                )
+            })
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROVE_FIRST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static PROVE_FIRST_COUNTS: std::cell::Cell<ProveFirstCounts> =
+        const { std::cell::Cell::new(ProveFirstCounts { preferred_prove: 0, sync_fallback: 0 }) };
+}
+
+/// Numeric test-only path witnesses; no Lisp state or cross-mutator cache.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProveFirstCounts {
+    pub(crate) preferred_prove: u64,
+    pub(crate) sync_fallback: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn set_prove_first_for_test(enabled: Option<bool>) {
+    PROVE_FIRST_OVERRIDE.with(|cell| cell.set(enabled));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_prove_first_counts_for_test() {
+    PROVE_FIRST_COUNTS.with(|cell| cell.set(ProveFirstCounts::default()));
+}
+
+#[cfg(test)]
+pub(crate) fn prove_first_counts_for_test() -> ProveFirstCounts {
+    PROVE_FIRST_COUNTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn note_prove_first_for_test(preferred: bool) {
+    PROVE_FIRST_COUNTS.with(|cell| {
+        let mut counts = cell.get();
+        if preferred {
+            counts.preferred_prove += 1;
+        } else {
+            counts.sync_fallback += 1;
         }
+        cell.set(counts);
+    });
+}
+
+/// Process-only numeric producer policy, default OFF. OnceLock publishes the
+/// flag for concurrent readers; replay rows and probes remain attempt-owned.
+/// No Lisp evaluation, TLS Lisp cache or published frame state lives here.
+#[inline]
+pub(crate) fn prove_first_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = PROVE_FIRST_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEOMACS_EDIT_SYNC_PROVE_FIRST")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "on" | "1" | "true" | "yes"
+                )
+            })
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static SHIFT_SKIP_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force zero-dy shift-ledger elision on this thread (tests only).
+#[cfg(test)]
+pub(crate) fn set_shift_skip_for_test(enabled: Option<bool>) {
+    SHIFT_SKIP_OVERRIDE.with(|cell| cell.set(enabled));
+}
+
+/// Process-wide numeric policy; concurrent readers share no Lisp or layout
+/// state. OnceLock publishes the flag; each placement and ledger is owned by
+/// its individual layout attempt.
+#[inline]
+fn shift_skip_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = SHIFT_SKIP_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEOMACS_EDIT_SYNC_SHIFT_SKIP")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "on" | "1" | "true" | "yes"
+                )
+            })
     })
 }
 
@@ -264,7 +455,65 @@ pub(crate) struct EditSyncInstall {
     pub(crate) dy: f32,
 }
 
+impl EditSyncInstall {
+    /// Numeric provenance for rows that moved vertically. GNU adjusts row y
+    /// only when dy is nonzero (xdisp.c:23218-23222). Successful synchronization
+    /// is recorded independently by the caller when this ledger is absent.
+    #[inline]
+    pub(crate) fn shift_ledger(&self) -> Option<(Vec<usize>, f32)> {
+        if shift_skip_enabled() && self.dy == 0.0 {
+            return None;
+        }
+        Some((self.rows.iter().map(|(index, _)| *index).collect(), self.dy))
+    }
+}
+
 impl EditSyncPlan {
+    /// Cost-only numeric indexing for edit synchronization. Off and every
+    /// unproved mapping call the original installer; backward scroll callers
+    /// retain `install`. Plans are attempt-owned, never shared mutable state.
+    #[inline]
+    pub(crate) fn install_edit(
+        self,
+        reached: EditSyncReached,
+        bottom_y: f32,
+        index_limit: usize,
+    ) -> EditSyncInstall {
+        if !dense_index::enabled() {
+            return self.install(reached, bottom_y, index_limit);
+        }
+        let Some(dvpos) = i64::try_from(reached.display_row_index)
+            .ok()
+            .and_then(|reached| {
+                i64::try_from(self.first_unchanged_index)
+                    .ok()
+                    .and_then(|first| reached.checked_sub(first))
+            })
+        else {
+            return self.install(reached, bottom_y, index_limit);
+        };
+        let dy = reached.y - self.first_unchanged_y;
+        let shift_y = dy.abs() >= 0.5;
+        // Existing Still transfer keeps precedence, including its original
+        // vector-storage/Arc identity and original visibility predicates.
+        if edit_sync_still_enabled()
+            && dvpos == 0
+            && !shift_y
+            && self
+                .rows
+                .iter()
+                .all(|(index, row)| row.pixel_y < bottom_y - 0.5 && *index < index_limit)
+        {
+            return self.install(reached, bottom_y, index_limit);
+        }
+        let Some(kept) =
+            dense_index::installation_map(&self.rows, dvpos, dy, shift_y, bottom_y, index_limit)
+        else {
+            return self.install(reached, bottom_y, index_limit);
+        };
+        dense_index::install(self, kept, dvpos, dy, shift_y, bottom_y, index_limit)
+    }
+
     /// Place the candidates after a walk that synchronized at `reached`:
     /// every row moves by the same `dvpos`/`dy`, and rows pushed to or past
     /// the window-relative `bottom_y`, or to a matrix index at or past
@@ -275,9 +524,31 @@ impl EditSyncPlan {
         bottom_y: f32,
         index_limit: usize,
     ) -> EditSyncInstall {
+        #[cfg(test)]
+        dense_index_test_support::note_legacy_install();
         let dvpos = reached.display_row_index as i64 - self.first_unchanged_index as i64;
         let dy = reached.y - self.first_unchanged_y;
         let shift_y = dy.abs() >= 0.5;
+        // plan() has already shifted the buffer positions and selected only
+        // snapshots belonging to these candidates. When GNU's dvpos/dy are
+        // zero and clipping removes nothing, their placement needs no second
+        // pass: keep the vectors and immutable point cells as they are.
+        if edit_sync_still_enabled()
+            && dvpos == 0
+            && !shift_y
+            && self
+                .rows
+                .iter()
+                .all(|(index, row)| row.pixel_y < bottom_y - 0.5 && *index < index_limit)
+        {
+            return EditSyncInstall {
+                rows: self.rows,
+                row_snapshots: self.row_snapshots,
+                points: self.points,
+                point_rows: self.point_rows,
+                dy: 0.0,
+            };
+        }
         let dy_px = dy.round() as i64;
         let mut kept = rustc_hash::FxHashMap::<i64, i64>::default();
         let mut rows = Vec::with_capacity(self.rows.len());
@@ -290,6 +561,8 @@ impl EditSyncPlan {
                 continue;
             }
             kept.insert(old_index as i64, new_index as i64);
+            #[cfg(test)]
+            dense_index_test_support::note_install_insertion();
             let row = if shift_y {
                 // A shift changes the row's placement, so the reuse is a copy
                 // (the scroll replay pays the same; `RowPlacement` removes it).
@@ -481,15 +754,20 @@ pub(crate) fn row_has_boxed_glyph(row: &GlyphRow) -> bool {
 /// (xdisp.c:22630-22700): `word-wrap` (21), bidi reordering with an
 /// automatic paragraph direction (22) -- an edit can flip the direction of
 /// the rest of its paragraph --, `line-spacing` (23), `show-trailing-whitespace`
-/// (11) and a horizontal scroll (7). A scroll margin is refused too: a row
-/// pushed into it would make the full layout scroll, which a replay never
-/// does.
+/// (11) and a horizontal scroll (7). Numbered gutters (24) are declined too:
+/// the retained key has no proof that normal/current-line faces are equal,
+/// and a position shift cannot regenerate absolute, relative or visual
+/// prefixes. The existing Prove path remains available where its newline-
+/// equality guard proves that these row positions have not changed. A scroll
+/// margin is refused too: a row pushed into it would make the full layout
+/// scroll, which a replay never does.
 pub(crate) fn sync_allowed(
     curr: &super::RetainedWindowKey,
     scroll_margin: i64,
     buffer: &neovm_core::buffer::Buffer,
 ) -> bool {
     !curr.word_wrap
+        && !curr.display_line_numbers.enabled()
         && curr.extra_line_spacing == 0.0
         && !curr.show_trailing_whitespace
         && curr.hscroll == 0
@@ -502,14 +780,52 @@ pub(crate) fn sync_allowed(
 ///
 /// `body` is the retained body rows in matrix order; rows `[..first_dirty]`
 /// are reused verbatim by the caller.
+#[inline]
 pub(crate) fn plan(
     prev: &RetainedWindowMatrix,
     body: &[(usize, &MatrixRow)],
     first_dirty: usize,
     damage: EditDamage,
 ) -> Option<EditSyncPlan> {
+    plan_positions(prev, body, first_dirty, damage.into())
+}
+
+/// Position-only synchronization. All borrowed rows belong to the caller's
+/// immutable retained matrix; no source proof or mutator state is consumed.
+pub(crate) fn plan_positions(
+    prev: &RetainedWindowMatrix,
+    body: &[(usize, &MatrixRow)],
+    first_dirty: usize,
+    damage: EditReplayPositions,
+) -> Option<EditSyncPlan> {
     let delta = damage.delta();
     let dirty_start = damage.start();
+    // GNU handles upward row shifts with a second walk at the window bottom
+    // (xdisp.c:23237-23284). We have no such walk: a capped Sync attempt after
+    // a proved removed line boundary ordinarily exhausts its horizon and
+    // retries. Decline that plan before allocating candidates/checkpoints;
+    // the existing newline proof then keeps the unchanged prefix and walks
+    // the rest once. Replacements and widened/unknown property damage retain
+    // the ordinary exact Sync/retry path: a negative net delta alone cannot
+    // prove that a line boundary was removed.
+    if delta < 0
+        && damage.end_old().checked_add(delta) == Some(dirty_start)
+        && prev.key.display_table.is_unset()
+        && body
+            .windows(2)
+            .skip(first_dirty)
+            .filter(|pair| {
+                !pair[0].1.continued
+                    && pair[0].1.string_sources().is_empty()
+                    && pair[0].1.pointer_appearances().is_empty()
+                    && pair[0].1.end_charpos.checked_add(1) == Some(pair[1].1.start_charpos)
+            })
+            .map(|pair| pair[0].1.end_charpos as i64)
+            .find(|end| *end >= dirty_start)
+            .is_some_and(|end| end < damage.end_old())
+    {
+        return None;
+    }
     // `last_unchanged_pos_old` in 0-based terms: the first old position whose
     // character AND predecessor are both outside the change.
     let min_start = damage.end_old() + 1;
@@ -547,11 +863,20 @@ pub(crate) fn plan(
     let (first_index, first_row) = candidates[0];
     let stop_charpos = first_row.start_charpos as i64 + delta;
     let stop_charpos = usize::try_from(stop_charpos).ok()?;
+    if dense_index::enabled()
+        && let Some(plan) = dense_index::plan(prev, candidates, dirty_start, delta, stop_charpos)
+    {
+        return Some(plan);
+    }
+    #[cfg(test)]
+    dense_index_test_support::note_legacy_plan();
     let mut indices = rustc_hash::FxHashSet::default();
     let rows = candidates
         .iter()
         .map(|&(index, row)| {
             indices.insert(index as i64);
+            #[cfg(test)]
+            dense_index_test_support::note_plan_insertion();
             (index, shift_row_positions(row, dirty_start, delta))
         })
         .collect();
@@ -568,5 +893,33 @@ pub(crate) fn plan(
 }
 
 #[cfg(test)]
+#[path = "tests/edit_sync_lazy_proof_policy_aliases.rs"]
+mod lazy_proof_policy_aliases;
+
+#[cfg(test)]
 #[path = "tests/edit_sync_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/edit_sync_lazy_proof_selector_test.rs"]
+mod lazy_proof_selector_tests;
+
+#[cfg(test)]
+#[path = "tests/edit_sync_policy_aliases.rs"]
+mod edit_sync_policy_aliases_tests;
+
+#[cfg(test)]
+#[path = "tests/edit_sync_default_policy.rs"]
+mod edit_sync_default_policy_tests;
+
+#[cfg(test)]
+#[path = "tests/edit_sync_lazy_proof_policy_absence.rs"]
+mod lazy_proof_policy_absence;
+
+#[cfg(test)]
+#[path = "tests/edit_sync_dense_index_support.rs"]
+pub(crate) mod dense_index_test_support;
+
+#[cfg(test)]
+#[path = "tests/edit_sync_fontify_coverage_support.rs"]
+pub(crate) mod fontify_coverage_test_support;
