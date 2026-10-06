@@ -98,7 +98,7 @@ fn eshell_settlement_keeps_following_page_key_read_and_completion_receipts_indep
         completion: settled.clone(),
     });
     let (read, completion, _) = render.send_key_input_with_receipt(InputEvent::Key {
-        keysym: 0xff55,
+        key: neovm_core::keyboard::FrontendKey::Keysym(0xff55),
         modifiers: 0,
         pressed: true,
         emacs_frame_id: 7,
@@ -122,7 +122,7 @@ fn eshell_settlement_keeps_following_page_key_read_and_completion_receipts_indep
     assert!(matches!(
         *event,
         InputEvent::Key {
-            keysym: 0xff55,
+            key: neovm_core::keyboard::FrontendKey::Keysym(0xff55),
             emacs_frame_id: 7,
             ..
         }

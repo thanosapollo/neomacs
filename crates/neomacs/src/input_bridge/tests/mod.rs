@@ -294,17 +294,25 @@ fn raw_tty_bytes_cross_the_bridge_without_interpretation() {
 #[test]
 fn tracked_key_transport_preserves_immediate_quit_without_reading() {
     use neomacs_display_protocol::input_progress::InputDelivery;
-    for (keysym, modifiers, expected) in [
-        ('g' as u32, keyboard::RENDER_CTRL_MASK, true),
-        ('g' as u32, 0, false),
-        ('p' as u32, keyboard::RENDER_CTRL_MASK, false),
+    for (key, modifiers, expected) in [
+        (
+            keyboard::FrontendKey::Character('g'),
+            keyboard::RENDER_CTRL_MASK,
+            true,
+        ),
+        (keyboard::FrontendKey::Character('g'), 0, false),
+        (
+            keyboard::FrontendKey::Character('p'),
+            keyboard::RENDER_CTRL_MASK,
+            false,
+        ),
     ] {
         let delivery = InputDelivery::for_read();
         let receipt = delivery.receipt();
         let display_event = DisplayEvent::Tracked {
             receipt: delivery,
             event: Box::new(DisplayEvent::Key {
-                keysym,
+                key,
                 modifiers,
                 pressed: true,
                 emacs_frame_id: 42,

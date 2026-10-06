@@ -28,7 +28,7 @@ fn native_repeat_tracking_does_not_fill_command_completion_ledger() {
     // A single interactive command may read held-key input indefinitely.
     for _ in 0..1300 {
         let (observer, _, _) = render.send_key_input_with_receipt(InputEvent::Key {
-            keysym: b'p' as u32,
+            key: neovm_core::keyboard::FrontendKey::Character('p'),
             modifiers: 0,
             pressed: true,
             emacs_frame_id: 1,
@@ -48,7 +48,7 @@ fn native_repeat_tracking_does_not_fill_command_completion_ledger() {
 fn native_page_keys_keep_read_and_scroll_completion_receipts_separate() {
     let (emacs, render) = ThreadComms::new().split();
     let (read, completion, _) = render.send_key_input_with_receipt(InputEvent::Key {
-        keysym: 0xff55,
+        key: neovm_core::keyboard::FrontendKey::Keysym(0xff55),
         modifiers: 0,
         pressed: true,
         emacs_frame_id: 1,

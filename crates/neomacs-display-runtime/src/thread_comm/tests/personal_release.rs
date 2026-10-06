@@ -69,7 +69,7 @@ fn terminal_cwd_delivery_does_not_consume_the_following_repeat_receipt() {
         directory: "/home/α b".to_owned(),
     });
     let (read, completion, _) = render.send_key_input_with_receipt(InputEvent::Key {
-        keysym: b'p' as u32,
+        key: neovm_core::keyboard::FrontendKey::Character('p'),
         modifiers: 0,
         pressed: true,
         emacs_frame_id: 7,
@@ -87,7 +87,11 @@ fn terminal_cwd_delivery_does_not_consume_the_following_repeat_receipt() {
     };
     assert!(matches!(
         *event,
-        InputEvent::Key { keysym, emacs_frame_id: 7, .. } if keysym == b'p' as u32
+        InputEvent::Key {
+            key: neovm_core::keyboard::FrontendKey::Character('p'),
+            emacs_frame_id: 7,
+            ..
+        }
     ));
     let mut progress = neomacs_display_protocol::input_progress::InputProgress::default();
     progress.consumed(receipt);
