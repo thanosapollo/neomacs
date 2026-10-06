@@ -67,22 +67,37 @@ pub fn load_scene(meshes: &[ModelMeshSpec], cancel: &AtomicBool) -> Result<Model
         allowance = allowance.saturating_sub(read);
         parsed.push(mesh);
     }
-    probe("scene", &meshes[0].path);
-    ModelScene::new_cancellable(parsed, &cancelled).map_err(|e| e.to_string())
+    // The scene's own polls report its phase to a test observer.
+    let scene_poll = || {
+        probe("scene", &meshes[0].path);
+        cancelled()
+    };
+    ModelScene::new_cancellable(parsed, &scene_poll).map_err(|e| e.to_string())
 }
 
-/// Test-only observer of the phase a load enters ("parse", "scene"), so a
-/// test can act while a load is genuinely inside that phase.
+/// Test-only observers of the phase a load is in, each for one file:
+/// called from the parser's and the scene's own cancellation polls
+/// ("parse", "scene"), so a test can act while a load is genuinely inside
+/// that phase. Keyed by path, so tests running in one process (plain
+/// `cargo test`) never see or replace each other's observers.
 #[cfg(test)]
 #[allow(clippy::type_complexity)]
-pub(crate) static PROBE: std::sync::Mutex<
-    Option<Box<dyn Fn(&'static str, &std::path::Path) + Send>>,
-> = std::sync::Mutex::new(None);
+pub(crate) static PROBES: std::sync::Mutex<
+    Vec<(std::path::PathBuf, Arc<dyn Fn(&'static str) + Send + Sync>)>,
+> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 pub(crate) fn probe(phase: &'static str, path: &std::path::Path) {
-    if let Some(observer) = PROBE.lock().unwrap().as_ref() {
-        observer(phase, path);
+    // Called outside the lock: an observer may block its own load.
+    let observers: Vec<_> = PROBES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(file, _)| file == path)
+        .map(|(_, observer)| observer.clone())
+        .collect();
+    for observer in observers {
+        observer(phase);
     }
 }
 
@@ -169,10 +184,21 @@ impl ModelLoader {
     /// Every result available now, without blocking.
     pub fn drain(&mut self) -> Vec<LoadResult> {
         let mut out = Vec::new();
-        while let Ok(result) = self.results.try_recv() {
-            self.live
-                .retain(|(id, token, _)| !(*id == result.id && *token == result.token));
-            out.push(result);
+        loop {
+            match self.results.try_recv() {
+                Ok(result) => {
+                    self.live
+                        .retain(|(id, token, _)| !(*id == result.id && *token == result.token));
+                    out.push(result);
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                // The thread is gone: nothing still pending will answer,
+                // so stop polling for it.
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.live.clear();
+                    break;
+                }
+            }
         }
         out
     }

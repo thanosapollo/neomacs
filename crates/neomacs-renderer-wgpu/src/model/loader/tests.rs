@@ -206,13 +206,20 @@ fn drop_while_in(phase: &'static str) {
     };
     drop(body);
 
+    // Handshake at the phase's first own cancellation poll, i.e. once its
+    // work is under way: the load waits there until the test is ready to
+    // drop the loader.
     let (entered, inbox) = mpsc::channel();
-    let wanted = path.clone();
-    *PROBE.lock().unwrap() = Some(Box::new(move |at, file: &std::path::Path| {
-        if at == phase && file == wanted {
+    let (go, resume) = mpsc::channel::<()>();
+    let resume = std::sync::Mutex::new(resume);
+    let signalled = AtomicBool::new(false);
+    let observer: Arc<dyn Fn(&'static str) + Send + Sync> = Arc::new(move |at| {
+        if at == phase && !signalled.swap(true, Ordering::SeqCst) {
             let _ = entered.send(());
+            let _ = resume.lock().unwrap().recv_timeout(Duration::from_secs(60));
         }
-    }));
+    });
+    let _registered = Probe::register(&path, observer);
     let mut loader = ModelLoader::spawn().unwrap();
     loader
         .submit(LoadRequest {
@@ -222,17 +229,38 @@ fn drop_while_in(phase: &'static str) {
             cancel: Arc::new(AtomicBool::new(false)),
         })
         .unwrap();
+    // Dropped before the loader if the test fails, releasing the load.
+    let go = go;
     inbox
         .recv_timeout(Duration::from_secs(60))
-        .unwrap_or_else(|_| panic!("the load never entered its {phase} phase"));
+        .unwrap_or_else(|_| panic!("the load never reached a {phase} checkpoint"));
     let start = Instant::now();
+    go.send(()).unwrap();
     drop(loader);
     let stopped = start.elapsed();
-    *PROBE.lock().unwrap() = None;
     assert!(
         stopped * 4 < phase_time,
         "dropping the loader mid-{phase} waited {stopped:?}; the {phase} alone takes {phase_time:?}"
     );
+}
+
+/// A registered [`PROBES`] observer for one file, removed on drop (also
+/// when the test fails).
+struct Probe(std::path::PathBuf);
+
+impl Probe {
+    fn register(path: &std::path::Path, observer: Arc<dyn Fn(&'static str) + Send + Sync>) -> Self {
+        PROBES.lock().unwrap().push((path.to_owned(), observer));
+        Self(path.to_owned())
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        if let Ok(mut probes) = PROBES.lock() {
+            probes.retain(|(file, _)| *file != self.0);
+        }
+    }
 }
 
 #[test]
@@ -283,4 +311,24 @@ fn completed_results_awaiting_admission_are_bounded() {
         loader.submit(request(100)).is_ok(),
         "draining frees capacity"
     );
+}
+
+// ----------------------------------------------------------------------
+// Round 3: OPUS-REVIEW NIT 6.
+
+/// A loader whose thread is gone stops reporting pending loads: nothing
+/// would ever answer them, and the render loop would poll forever.
+#[test]
+fn a_gone_loader_thread_leaves_nothing_pending() {
+    let (outbox, results) = mpsc::channel::<LoadResult>();
+    drop(outbox);
+    let mut loader = ModelLoader {
+        requests: None,
+        results,
+        thread: None,
+        live: vec![(1, 1, Arc::new(AtomicBool::new(false)))],
+    };
+    assert!(loader.has_pending());
+    assert!(loader.drain().is_empty());
+    assert!(!loader.has_pending(), "pending loads of a gone thread");
 }
