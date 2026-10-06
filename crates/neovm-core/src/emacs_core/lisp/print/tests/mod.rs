@@ -1189,6 +1189,154 @@ fn princ_with_print_circle_labels_shared_objects_like_gnu() {
     }
 }
 
+/// `nil' N times, space-separated, for char-table expectations.
+fn nils(n: usize) -> String {
+    vec!["nil"; n].join(" ")
+}
+
+/// GNU's `print_object' prints hash tables and char-tables itself, under the
+/// one `print-number-table' of the print: a table's label is consumed once
+/// and its contents are labelled with everything else.  Each case starting
+/// with `(prin1-to-string nil)' resets `print_number_index' as GNU's `print'
+/// does, since `print-continuous-numbering' keeps counting from there.
+#[test]
+fn princ_with_print_circle_labels_hash_and_char_tables_in_one_print() {
+    const PERSISTENT: &str = "(print-circle t) (print-continuous-numbering t)
+                              (print-number-table (make-hash-table :test 'eq))";
+    let ct = "(progn (put 'neo-ct 'char-table-extra-slots 1) (make-char-table 'neo-ct))";
+    for (src, expected) in [
+        (
+            format!(
+                r#"(progn (prin1-to-string nil)
+                   (let ({PERSISTENT} (h (make-hash-table :test 'eq)))
+                     (puthash 'a 1 h) (format "%s" (list h h))))"#
+            ),
+            r##"OK "(#1=#s(hash-table test eq data (a 1)) #1#)""##.to_string(),
+        ),
+        (
+            r#"(let ((print-circle t) (h (make-hash-table :test 'eq)))
+                 (puthash 'a h h) (format "%s" h))"#
+                .to_string(),
+            r##"OK "#1=#s(hash-table test eq data (a #1#))""##.to_string(),
+        ),
+        (
+            format!(
+                r#"(progn (prin1-to-string nil)
+                   (let ({PERSISTENT} (h (make-hash-table :test 'eq)))
+                     (puthash 'a h h) (format "%s" h)))"#
+            ),
+            r##"OK "#1=#s(hash-table test eq data (a #1#))""##.to_string(),
+        ),
+        (
+            r#"(let ((print-circle t) (h (make-hash-table :test 'eq)) (x (list 1)))
+                 (puthash 'a x h) (puthash 'b x h) (format "%s" (list x h)))"#
+                .to_string(),
+            r##"OK "(#1=(1) #s(hash-table test eq data (a #1# b #1#)))""##.to_string(),
+        ),
+        (
+            r#"(let ((print-circle t) (h (make-hash-table :test 'equal)) (s "str"))
+                 (puthash s s h) (format "%s" (list h s)))"#
+                .to_string(),
+            r##"OK "(#s(hash-table test equal data (#1=str #1#)) #1#)""##.to_string(),
+        ),
+        // GNU's `print_circle_candidate_p' excludes obarrays.
+        (
+            format!(
+                r#"(progn (prin1-to-string nil)
+                   (let ({PERSISTENT} (ob (obarray-make)))
+                     (list (format "%s" (list ob ob)) (prin1-to-string (list ob ob)))))"#
+            ),
+            r#"OK ("(#<obarray n=0> #<obarray n=0>)" "(#<obarray n=0> #<obarray n=0>)")"#
+                .to_string(),
+        ),
+        (
+            format!(
+                r#"(progn (prin1-to-string nil)
+                   (let ({PERSISTENT} (ct {ct})) (format "%s" (list ct ct))))"#
+            ),
+            format!(r##"OK "(#1=#^[nil nil neo-ct {}] #1#)""##, nils(66)),
+        ),
+        (
+            format!(
+                r#"(let ((print-circle t) (ct {ct}))
+                     (set-char-table-extra-slot ct 0 ct)
+                     (list (format "%s" ct) (prin1-to-string ct)))"#
+            ),
+            format!(
+                r##"OK ("#1=#^[nil nil neo-ct {0} #1#]" "#1=#^[nil nil neo-ct {0} #1#]")"##,
+                nils(65)
+            ),
+        ),
+        (
+            format!(
+                r#"(let ((print-circle t) (ct {ct}) (x (list "s")))
+                     (set-char-table-extra-slot ct 0 x) (format "%s" (list x ct)))"#
+            ),
+            format!(r##"OK "(#1=(s) #^[nil nil neo-ct {} #1#])""##, nils(65)),
+        ),
+        // The ASCII sub-char-table is shared by the `ascii' slot and the
+        // contents tree, and is labelled like any other shared object.
+        (
+            r#"(let ((print-circle t) (ct (make-char-table 'foo)) (x (list 1)))
+                 (aset ct ?a x) (aset ct ?b x) (format "%s" (list x ct)))"#
+                .to_string(),
+            format!(
+                r##"OK "(#1=(1) #^[nil nil foo #2=#^^[3 0 {} #1# #1# {}] #^^[1 0 #^^[2 0 #2# {}] {}] {}])""##,
+                nils(97),
+                nils(29),
+                nils(31),
+                nils(15),
+                nils(63)
+            ),
+        ),
+    ] {
+        assert_eq!(princ_eval(&src), expected, "{src}");
+    }
+}
+
+/// GNU `print_object' with `escapeflag' false: hash-table and char-table
+/// elements print as by `princ', count toward `print-level' and honor
+/// `print-length'.
+#[test]
+fn princ_prints_hash_and_char_table_elements_like_gnu() {
+    for (src, expected) in [
+        (
+            r#"(let ((h (make-hash-table :test 'equal))) (puthash "k" "v" h) (format "%s" h))"#,
+            r##"OK "#s(hash-table test equal data (k v))""##,
+        ),
+        (
+            r#"(let ((h (make-hash-table :test 'eq :weakness 'key)))
+                 (puthash 'a "x" h) (format "%s" h))"#,
+            r##"OK "#s(hash-table test eq weakness key data (a x))""##,
+        ),
+        (
+            r#"(format "%s" (list (make-hash-table :test 'eq) (make-hash-table)))"#,
+            r##"OK "(#s(hash-table test eq) #s(hash-table))""##,
+        ),
+        (
+            r#"(let ((print-level 1) (h (make-hash-table :test 'eq)))
+                 (puthash 'a (list 1) h) (format "%s" (list h)))"#,
+            r##"OK "(#s(hash-table test eq data (a ...)))""##,
+        ),
+        (
+            r#"(let ((print-length 1) (h (make-hash-table :test 'eq)))
+                 (puthash 'a 1 h) (puthash 'b 2 h) (format "%s" h))"#,
+            r##"OK "#s(hash-table test eq data (a 1 ...))""##,
+        ),
+        (
+            r#"(let ((h (make-hash-table :test 'eq))) (puthash 'a h h) (format "%s" h))"#,
+            r##"OK "#s(hash-table test eq data (a #0))""##,
+        ),
+        (
+            r#"(let ((ct (make-char-table 'foo)) (print-length 4))
+                 (aset ct ?a "x") (format "%s" ct))"#,
+            r##"OK "#^[nil nil foo #^^[3 0 nil nil nil ...] ...]""##,
+        ),
+    ] {
+        assert_eq!(princ_eval(src), expected, "{src}");
+    }
+}
+
 /// 60 levels of `(list x x)' are 120 conses but 2^60 leaves unshared; GNU
 /// prints them in 636 characters with `print-circle'.
 #[test]

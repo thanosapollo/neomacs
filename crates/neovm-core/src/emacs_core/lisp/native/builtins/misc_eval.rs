@@ -1752,13 +1752,19 @@ impl<'a> PrincPrinter<'a> {
         Ok(out)
     }
 
+    /// The types GNU's `print_object` prints alike with and without the
+    /// escape flag.  They are printed within this print: their label, if
+    /// any, is already written, so no second `print-circle` pass may run.
     fn prin1_bytes(&self, value: &Value) -> Vec<u8> {
-        super::error::print_value_bytes_in_state(
+        let mut options = super::error::print_options_from_state(&self.ctx.obarray, None);
+        options.print_circle = false;
+        super::error::format_value_bytes_in_state_with_options(
             &self.ctx.obarray,
             &self.ctx.buffers,
             &self.ctx.frames,
             &self.ctx.threads,
             value,
+            options,
         )
     }
 
@@ -1931,6 +1937,25 @@ impl<'a> PrincPrinter<'a> {
                     this.slots(b"#s(", &items, b")", out)
                 })
             }
+            ValueKind::Veclike(VecLikeType::HashTable) => {
+                self.enclosed(value, out, |this, out| this.hash_table(value, out))
+            }
+            ValueKind::Veclike(VecLikeType::CharTable) => {
+                let items = super::chartable::char_table_external_slots(&value).unwrap_or_default();
+                self.enclosed(value, out, |this, out| {
+                    this.slots(b"#^[", &items, b"]", out)
+                })
+            }
+            // GNU starts at `SUB_CHAR_TABLE_OFFSET`, the slot after the depth
+            // and minimum character, which `print-length` counts.
+            ValueKind::Veclike(VecLikeType::SubCharTable) => {
+                let (depth, min_char, items) =
+                    super::chartable::sub_char_table_external_slots(&value).unwrap();
+                out.extend_from_slice(format!("#^^[{depth} {min_char}").as_bytes());
+                self.enclosed(value, out, |this, out| {
+                    this.slots_from(b"", 1, &items, b"]", out)
+                })
+            }
             // Interpreted-function closures are PVEC_CLOSURE in GNU and use the
             // same readable `#[...]` traversal as vectors, with
             // `escapeflag=false` propagated to every slot (src/print.c).
@@ -1973,23 +1998,80 @@ impl<'a> PrincPrinter<'a> {
         close: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), Flow> {
+        self.slots_from(open, 0, items, close, out)
+    }
+
+    /// `slots` for a vector whose first START slots hold no Lisp objects:
+    /// ITEMS are the slots from START on.  Each slot but slot 0 follows a
+    /// space.
+    fn slots_from(
+        &mut self,
+        open: &[u8],
+        start: usize,
+        items: &[Value],
+        close: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), Flow> {
         out.extend_from_slice(open);
-        let shown = self
-            .print_length
-            .map_or(items.len(), |n| n.min(items.len()));
-        for (index, item) in items[..shown].iter().enumerate() {
+        let size = start + items.len();
+        let shown = self.print_length.map_or(size, |n| n.min(size));
+        let mut index = start;
+        while index < shown {
             if index > 0 {
                 out.push(b' ');
             }
-            self.object(*item, true, out)?;
+            self.object(items[index - start], true, out)?;
+            index += 1;
         }
-        if shown < items.len() {
-            if shown > 0 {
+        if shown < size {
+            if index > 0 {
                 out.push(b' ');
             }
             out.extend_from_slice(b"...");
         }
         out.extend_from_slice(close);
+        Ok(())
+    }
+
+    /// GNU's `PVEC_HASH_TABLE` arm and `PE_hash`: `print-length` limits the
+    /// entries printed.
+    fn hash_table(&mut self, value: Value, out: &mut Vec<u8>) -> Result<(), Flow> {
+        let table = value.as_hash_table().unwrap().clone();
+        out.extend_from_slice(b"#s(hash-table");
+        super::print::append_hash_table_test_bytes(&table, out);
+        if let Some(weakness) = &table.weakness {
+            out.extend_from_slice(b" weakness ");
+            out.extend_from_slice(weakness.name().as_bytes());
+        }
+        let entries: Vec<(Value, Value)> = table
+            .data
+            .keyed_entries_in_slot_order()
+            .into_iter()
+            .map(|(_, entry)| (entry.key, entry.value))
+            .collect();
+        if entries.is_empty() {
+            out.push(b')');
+            return Ok(());
+        }
+        out.extend_from_slice(b" data (");
+        let shown = self
+            .print_length
+            .map_or(entries.len(), |n| n.min(entries.len()));
+        for (index, (key, entry_value)) in entries[..shown].iter().enumerate() {
+            if index > 0 {
+                out.push(b' ');
+            }
+            self.object(*key, true, out)?;
+            out.push(b' ');
+            self.object(*entry_value, true, out)?;
+        }
+        if shown < entries.len() {
+            if shown > 0 {
+                out.push(b' ');
+            }
+            out.extend_from_slice(b"...");
+        }
+        out.extend_from_slice(b"))");
         Ok(())
     }
 

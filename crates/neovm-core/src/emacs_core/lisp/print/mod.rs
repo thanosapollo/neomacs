@@ -121,7 +121,7 @@ fn append_hash_table_test_string(table: &LispHashTable, out: &mut StatefulPrintO
     }
 }
 
-fn append_hash_table_test_bytes(table: &LispHashTable, out: &mut Vec<u8>) {
+pub(crate) fn append_hash_table_test_bytes(table: &LispHashTable, out: &mut Vec<u8>) {
     if let Some(name) = hash_table_printed_test_name(table) {
         out.extend_from_slice(b" test ");
         out.extend_from_slice(name.as_bytes());
@@ -334,7 +334,6 @@ fn is_print_circle_candidate(value: &Value, print_gensym: bool) -> bool {
         }
         ValueKind::Veclike(VecLikeType::Record) => true,
         ValueKind::Veclike(VecLikeType::HashTable) => true,
-        ValueKind::Veclike(VecLikeType::Obarray) => true,
         ValueKind::Veclike(VecLikeType::CharTable) => true,
         ValueKind::Veclike(VecLikeType::SubCharTable) => true,
         ValueKind::Veclike(VecLikeType::Lambda) => true,
@@ -586,9 +585,18 @@ fn push_print_preprocess_children(
                 stack.push(entry.key);
             }
         }
-        ValueKind::Veclike(VecLikeType::Obarray) => {
-            if let Some(obarray) = obj.as_obarray_obj() {
-                for item in obarray.buckets.iter().rev() {
+        ValueKind::Veclike(VecLikeType::CharTable) => {
+            for item in char_table_external_slots(&obj)
+                .unwrap_or_default()
+                .iter()
+                .rev()
+            {
+                stack.push(*item);
+            }
+        }
+        ValueKind::Veclike(VecLikeType::SubCharTable) => {
+            if let Some((_, _, items)) = super::chartable::sub_char_table_external_slots(&obj) {
+                for item in items.iter().rev() {
                     stack.push(*item);
                 }
             }
