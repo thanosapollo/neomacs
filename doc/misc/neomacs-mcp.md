@@ -196,8 +196,9 @@ whole-editor freeze immunity. A non-yielding Lisp loop prevents incoming
 cancellation from being observed until it yields or returns.
 
 There are at most eight peers, 64 queued requests globally, and 16 queued
-requests/frames per peer/filter turn. Input accumulation and individual output
-are limited to 131072 bytes per line. Saturation closes the offending
+requests/frames per peer/filter turn. Buffered input per connection (any
+incomplete message plus newly received data) is limited to 131072 bytes, and
+each response line to 131072 bytes. Saturation closes the offending
 connection. A request ID longer than 1024 bytes when encoded as JSON is not
 echoed: the request gets one `-32600` error with a null ID. A response that
 exceeds the limit or cannot be encoded as JSON (for example raw bytes) is
