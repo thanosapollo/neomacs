@@ -108,10 +108,13 @@ impl RenderApp {
         self.flush_model_events();
     }
 
-    /// The renderer went away (device loss or teardown).
+    /// The renderer went away (device loss or teardown). The invalidation
+    /// (a settling `View`, then `Readiness{current: nil}`) goes out on the
+    /// ordered input channel now, ahead of any later key.
     pub(super) fn note_models_renderer_lost(&mut self) {
         self.comms.capabilities.set_model_renderer_live(false);
         self.models.renderer_lost();
+        self.flush_model_events();
     }
 
     /// A renderer is live: publish it and upload what it lacks.
@@ -160,3 +163,7 @@ impl RenderApp {
         true
     }
 }
+
+#[cfg(test)]
+#[path = "models/tests.rs"]
+mod tests;
