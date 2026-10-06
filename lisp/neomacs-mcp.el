@@ -493,11 +493,57 @@ This is cooperative admission, not a handler, serialization or send deadline."
     (list (file-attribute-inode-number attributes)
           (file-attribute-device-number attributes))))
 
+(defun neomacs-mcp--node-snapshot (attributes)
+  "Return the node identity and status-change time in ATTRIBUTES.
+Unlike `neomacs-mcp--socket-id', this also distinguishes a new node that
+reuses a deleted node's inode number."
+  (and attributes
+       (list (file-attribute-inode-number attributes)
+             (file-attribute-device-number attributes)
+             (file-attribute-status-change-time attributes))))
+
+(defun neomacs-mcp--owned-socket-snapshot (socket)
+  "Return a snapshot of SOCKET if it is a socket the editor's owner owns.
+Type, owner and identity come from one `file-attributes' call, which
+does not follow symlinks, so they all describe the same node."
+  (let ((attributes (file-attributes socket 'integer)))
+    (and attributes
+         (eq ?s (aref (file-attribute-modes attributes) 0))
+         (eql (file-attribute-user-id attributes) (user-uid))
+         (neomacs-mcp--node-snapshot attributes))))
+
+(defun neomacs-mcp--stale-socket-id (socket)
+  "Return a snapshot of SOCKET if it is an owned socket with no listener.
+A symlink or any other node is never stale.  Like GNU `server-running-p',
+probe by connecting, but stricter: only a refused connection means the
+listener is gone; any other failure (such as permission denied on a live
+socket) leaves the node alone.  The node snapshot is taken before the
+probe, so the caller can check that the node it deletes is the one probed."
+  (let ((identity (neomacs-mcp--owned-socket-snapshot socket)))
+    (and identity
+         (condition-case err
+             (progn
+               (delete-process
+                (make-network-process :name "neomacs-mcp-probe" :family 'local
+                                      :service socket :noquery t))
+               nil)
+           (file-error
+            ;; ERR is (file-error CONTEXT REASON . CONTACT); the contact
+            ;; names the socket, so read only the reason.  A localized
+            ;; reason fails closed.
+            (let ((reason (nth 2 err)))
+              (and (eq (car err) 'file-error)
+                   (stringp reason)
+                   (string-match-p "refused" reason)
+                   identity)))))))
+
 ;;;###autoload
 (defun neomacs-mcp-start (socket)
   "Start an owner-controlled MCP listener at explicit absolute SOCKET.
-Require a private owner directory, refuse any existing node and do not change
-GNU server parsing.  Loading the library alone never starts a listener."
+Require a private owner directory and do not change GNU server parsing.
+Refuse any existing node except an owned socket that no listener accepts on,
+which a dead editor left behind; like GNU `server-start', delete that one.
+Loading the library alone never starts a listener."
   (interactive "FPrivate MCP socket: ")
   (unless (and (stringp socket) (file-name-absolute-p socket)
                (not (file-remote-p socket)))
@@ -505,7 +551,17 @@ GNU server parsing.  Loading the library alone never starts a listener."
   (when neomacs-mcp--listener (user-error "MCP is already started"))
   (server-ensure-safe-dir (file-name-directory socket))
   (when (or (file-exists-p socket) (file-symlink-p socket))
-    (user-error "MCP socket already exists"))
+    (let ((stale (neomacs-mcp--stale-socket-id socket)))
+      (unless stale
+        (user-error "MCP socket already exists"))
+      ;; Another editor may have replaced the stale node with its own live
+      ;; socket while this one probed; never delete a node other than the
+      ;; one probed.  A replacement between this check and the deletion
+      ;; is not excluded: no system call unlinks only a given node.
+      (unless (equal stale (neomacs-mcp--owned-socket-snapshot socket))
+        (user-error "MCP socket changed while starting"))
+      (let (delete-by-moving-to-trash)
+        (delete-file socket))))
   (cl-incf neomacs-mcp--generation)
   (let ((listener (make-network-process
                    :name "neomacs-mcp" :family 'local :service socket
