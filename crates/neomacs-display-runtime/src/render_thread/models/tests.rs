@@ -233,11 +233,12 @@ fn occluding_a_lagging_second_window_releases_the_fence() {
 }
 
 /// `make-frame-invisible` / `iconify-frame` hide the native window
-/// without any window-system occlusion event: the frame leaves at once,
+/// without any window-system occlusion event. Where the platform reports
+/// the window's visibility (X11, macOS, Windows), the frame leaves at once,
 /// keeps out while hidden, and rejoins by presenting once shown.
 #[test]
 fn hiding_or_iconifying_a_frame_leaves_until_shown_and_presented() {
-    use crate::thread_comm::{FrameRef, WindowCommand, WindowVisibility};
+    use crate::thread_comm::WindowVisibility;
     let (mut app, emacs) = app_with_channel();
     let mut host = FakeHost::default();
     with_ready_model(&mut app, &mut host);
@@ -245,28 +246,16 @@ fn hiding_or_iconifying_a_frame_leaves_until_shown_and_presented() {
     present(&mut app, B);
     assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
     for visibility in [WindowVisibility::Invisible, WindowVisibility::Iconified] {
-        app.handle_window(WindowCommand::SetWindowVisibility {
-            frame: FrameRef::Frame(A),
-            visibility,
-        });
-        app.handle_window(WindowCommand::SetWindowVisibility {
-            frame: FrameRef::Frame(B),
-            visibility,
-        });
+        app.note_models_visibility(A, visibility, true);
+        app.note_models_visibility(B, visibility, true);
         assert_eq!(delivered(&emacs), ["R{false,1,0}"]);
         present(&mut app, A);
         assert!(delivered(&emacs).is_empty(), "a hidden frame rejoined");
-        app.handle_window(WindowCommand::SetWindowVisibility {
-            frame: FrameRef::Frame(A),
-            visibility: WindowVisibility::Visible,
-        });
+        app.note_models_visibility(A, WindowVisibility::Visible, true);
         assert!(delivered(&emacs).is_empty());
         present(&mut app, A);
         assert_eq!(delivered(&emacs), ["R{true,1,0}"]);
-        app.handle_window(WindowCommand::SetWindowVisibility {
-            frame: FrameRef::Frame(B),
-            visibility: WindowVisibility::Visible,
-        });
+        app.note_models_visibility(B, WindowVisibility::Visible, true);
         present(&mut app, B);
     }
 }
@@ -283,12 +272,12 @@ fn hiding_or_iconifying_a_frame_leaves_until_shown_and_presented() {
 fn present_retained(
     app: &mut RenderApp,
     window: u64,
-    retained: &mut Option<super::ModelPicture>,
+    retained: &mut Option<crate::render_thread::render_pass::retained_static::RetainedModels>,
     scene: &[u32],
     overlay: &[u32],
 ) -> bool {
     use crate::render_thread::render_pass::retained_static::{
-        retained_frame_picture, retained_scene_is_current,
+        RetainedModels, retained_frame_picture, retained_scene_is_current,
     };
     let current = app.model_picture();
     let size = neomacs_renderer_wgpu::SnapshotSize::new(800, 600).unwrap();
@@ -297,13 +286,19 @@ fn present_retained(
         .as_ref()
         .is_some_and(|built| retained_scene_is_current((1, size, built), (1, size, &current)));
     if rebuild {
-        *retained = Some(super::picture_of(
-            Some(scene.iter().copied().collect()),
-            &current,
-        ));
+        // The scene's model glyphs are referenced; the composite draws
+        // those whose texture exists (the renderer's surface cache holds
+        // exactly the drawable models).
+        let referenced: std::collections::HashSet<u32> = scene.iter().copied().collect();
+        let drawn = referenced
+            .iter()
+            .copied()
+            .filter(|id| current.contains_key(id))
+            .collect();
+        *retained = Some(RetainedModels::record(Some(drawn), referenced, &current));
     }
     let picture = retained_frame_picture(
-        retained.as_ref(),
+        retained.as_ref().map(|r| &r.picture),
         super::picture_of(Some(overlay.iter().copied().collect()), &current),
     );
     app.note_models_presented(window, &picture);
@@ -404,7 +399,7 @@ fn a_cursor_frame_after_a_model_change_shows_and_picks_the_new_camera() {
         "the raster from before the change was blitted again"
     );
     assert!(delivered(&emacs).is_empty(), "A still shows rev 2");
-    assert_eq!(retained.as_ref().unwrap()[&MODEL].view.yaw, 30.0);
+    assert_eq!(retained.as_ref().unwrap().picture[&MODEL].view.yaw, 30.0);
 
     assert!(app.models.press(A, hit(), (10.0, 10.0)));
     app.models
@@ -717,6 +712,15 @@ fn a_hide_the_platform_cannot_confirm_leaves_only_until_the_next_presentation() 
         present(&mut app, A);
         assert_eq!(delivered(&emacs), ["R{true,1,0}"], "{visibility:?}");
     }
+    // The command handler: with no native window to ask, nothing confirms
+    // the hiding either.
+    app.handle_window(crate::thread_comm::WindowCommand::SetWindowVisibility {
+        frame: crate::thread_comm::FrameRef::Frame(A),
+        visibility: WindowVisibility::Invisible,
+    });
+    assert_eq!(delivered(&emacs), ["R{false,1,0}"]);
+    present(&mut app, A);
+    assert_eq!(delivered(&emacs), ["R{true,1,0}"]);
     // Where the platform does report hiding, the window stays out until
     // shown, as before.
     app.note_models_visibility(A, WindowVisibility::Iconified, true);
@@ -756,6 +760,20 @@ fn a_wheel_remainder_does_not_survive_leaving_the_window_or_losing_focus() {
         0,
         "the remainder survived focus loss"
     );
+    // 0.6 left; the pointer moves within the model's glyph: the gesture
+    // goes on.
+    assert_eq!(wheel(&mut app, 30.0, TouchPhase::Started, ms(40)), 0);
+    app.model_wheel.pointer_over(Some(MODEL));
+    assert_eq!(wheel(&mut app, 30.0, TouchPhase::Moved, ms(50)), 1);
+    // 0.2 left; the pointer moves off the model and back (what
+    // `handle_cursor_moved` reports through `pointer_over`).
+    app.model_wheel.pointer_over(None);
+    app.model_wheel.pointer_over(Some(MODEL));
+    assert_eq!(
+        wheel(&mut app, 40.0, TouchPhase::Moved, ms(60)),
+        0,
+        "the remainder survived the pointer leaving the model"
+    );
 }
 
 /// OPUS-REVIEW NIT 1: a window hidden while no model exists, then deleted,
@@ -790,4 +808,78 @@ fn focus_loss_ends_only_the_capture_of_that_window() {
     app.handle_window_focus_models(A, false);
     assert_eq!(delivered(&emacs), ["View{3}"]);
     assert!(!app.models.motion(A, (50.0, 10.0)), "the capture ended");
+}
+
+// SOL-REVIEW-2 MUST 2: a frame whose composition also shows an older
+// picture (pane morph, frame/theme transition, child resize crossfade).
+
+/// A presentation through a composition that blends an older picture in,
+/// whose fresh glyph passes composited the models in `scene`.
+fn present_blended(app: &mut RenderApp, window: u64, scene: &[u32]) {
+    let picture = super::picture_of(Some(scene.iter().copied().collect()), &app.model_picture());
+    app.note_models_presented_blended(window, &picture);
+}
+
+/// A theme crossfade starting in the frame where the camera moves from X
+/// to Y shows X (and later a blend of both) while the fresh passes draw Y:
+/// neither the fence nor a pick may treat the window as showing Y until a
+/// frame without the older picture presents.
+#[test]
+fn a_transition_blending_an_older_camera_neither_raises_the_fence_nor_picks() {
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    present(&mut app, A);
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+    update(&mut app, &mut host, 1, yaw(30.0));
+    app.models.render_dirty(&mut host);
+    app.flush_model_events();
+    assert_eq!(delivered(&emacs), ["R{false,2,1}"]);
+
+    present_blended(&mut app, A, &[MODEL]);
+    assert!(
+        delivered(&emacs).is_empty(),
+        "the fence rose for Y while the crossfade shows X"
+    );
+    assert!(app.models.press(A, hit(), (10.0, 10.0)));
+    app.models
+        .release(A, Some(hit()), Instant::now(), &mut host);
+    assert!(host.picks.is_empty(), "a pick resolved against Y over X");
+
+    // The transition ends: the window shows Y alone.
+    present(&mut app, A);
+    assert_eq!(delivered(&emacs), ["R{true,2,1}"]);
+    assert!(app.models.press(A, hit(), (10.0, 10.0)));
+    app.models
+        .release(A, Some(hit()), Instant::now(), &mut host);
+    assert_eq!(host.picks.last().expect("picks again").view.yaw, 30.0);
+}
+
+/// Switching a window away from a model under a crossfade: the fresh
+/// passes no longer draw it but the outgoing picture still shows it, so
+/// the window stays a member (holding the fence down, since the blend is
+/// no one snapshot) until a frame without the older picture presents.
+#[test]
+fn an_outgoing_crossfade_keeps_the_window_a_member_until_it_ends() {
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    present(&mut app, A);
+    present(&mut app, B);
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+
+    present_blended(&mut app, A, &[]);
+    assert_eq!(
+        delivered(&emacs),
+        ["R{false,1,0}"],
+        "A left while its crossfade still shows the model"
+    );
+    assert!(app.models.press(A, hit(), (10.0, 10.0)));
+    app.models
+        .release(A, Some(hit()), Instant::now(), &mut host);
+    assert!(host.picks.is_empty(), "a pick resolved against a blend");
+
+    // The crossfade ends without the model: A leaves, B alone counts.
+    app.note_models_presented(A, &super::ModelPicture::new());
+    assert_eq!(delivered(&emacs), ["R{true,1,0}"]);
 }

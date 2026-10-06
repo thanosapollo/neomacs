@@ -44,6 +44,7 @@
 pub(in crate::render_thread) mod chrome;
 mod composition_targets;
 mod full_render;
+pub(in crate::render_thread) mod model_provenance;
 mod present;
 mod retained_scroll;
 pub(in crate::render_thread) mod retained_static;
@@ -75,6 +76,10 @@ struct RenderedFrameSurface {
     projection: Option<neomacs_display_protocol::InteractionProjection>,
     /// What the composed picture holds of the native models (design §6.2).
     models: super::models::ModelPicture,
+    /// Whether the composition also shows an older picture than its fresh
+    /// glyph passes, which `models` cannot describe
+    /// ([`model_provenance::blends_older_pictures`]).
+    blends_older: bool,
 }
 
 /// The inputs one frame's content draw needs that are fixed for the whole
@@ -392,11 +397,15 @@ fn render_frame_window_contents_to_surface(
         // so hit testing went on using the morph's last mid-motion transform
         // for every frame afterwards, until some later morph happened to
         // publish again.
+        // Eligibility excludes every composition that shows an older
+        // picture (pane placement, transitions, child crossfades): the
+        // raster's own provenance is the whole picture.
         return Ok(RenderedFrameSurface {
             output,
             frame,
             projection: pane_projection,
             models,
+            blends_older: false,
         });
     }
 
@@ -437,6 +446,13 @@ fn render_frame_window_contents_to_surface(
     // models its glyph passes (root and child frames) composited now, so a
     // fully clipped glyph pictures nothing.
     let models = super::models::picture_of(renderer.take_drawn_surfaces(), models);
+    // Asked after the composition, so a transition or child crossfade that
+    // finished this frame (showing the new picture alone) no longer counts.
+    let blends_older = model_provenance::blends_older_pictures(
+        render,
+        !pane_blits.is_empty(),
+        renderer.frame_sample(),
+    );
 
     if frame_post_active {
         renderer.frame_post_to_view(
@@ -458,5 +474,6 @@ fn render_frame_window_contents_to_surface(
         frame,
         projection: pane_projection,
         models,
+        blends_older,
     })
 }

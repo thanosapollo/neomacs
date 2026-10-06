@@ -117,9 +117,12 @@ impl RenderApp {
     /// `WindowEvent::Occluded` for native frame `emacs_frame_id`.
     ///
     /// Occlusion is scheduling input: an occluded window presents nothing;
-    /// exposure issues exactly one recovery frame. On Wayland this event
-    /// also stands in for hidden/minimized, where frame callbacks would
-    /// otherwise stop delivering.
+    /// exposure issues exactly one recovery frame. winit sends it on X11,
+    /// macOS, iOS and the web; on Wayland it is never sent (a hidden or
+    /// minimized Wayland window just stops receiving frame callbacks), so
+    /// there the models learn of hiding only from Lisp's visibility
+    /// requests, which leave until the next presentation
+    /// ([`Self::note_models_visibility`]).
     ///
     /// An occluded window shows no model: it leaves the showing sets and
     /// its capture ends at once (both reported before any later input),
@@ -147,8 +150,11 @@ impl RenderApp {
             // system reported its exposure (Wayland reports none).
             self.note_models_window_shown(emacs_frame_id);
         } else {
-            // A model orbit ends with focus (design §4.6).
-            self.models.cancel_capture();
+            // A model orbit held in this window ends with its focus
+            // (design §4.6); one held in another window does not.
+            self.models.cancel_capture_in(emacs_frame_id);
+            // Wheel input after focus returns starts a new gesture.
+            self.model_wheel.reset();
             self.flush_model_events();
         }
     }

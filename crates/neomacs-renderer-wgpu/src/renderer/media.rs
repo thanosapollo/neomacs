@@ -605,6 +605,13 @@ impl WgpuRenderer {
         self.caches.surface.take_drawn()
     }
 
+    /// The surfaces whose glyphs a composite reached since the last call,
+    /// drawn or not (a superset of the drawn ones): what a retained raster
+    /// depends on, including models not yet drawable.
+    pub fn take_referenced_surfaces(&mut self) -> std::collections::HashSet<u32> {
+        self.caches.surface.take_referenced()
+    }
+
     /// Free a shader surface's GPU objects.
     pub fn free_surface(&mut self, id: u32) {
         self.caches.surface.free(id);

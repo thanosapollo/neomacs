@@ -109,6 +109,20 @@ impl ModelWheel {
     pub(super) fn reset(&mut self) {
         self.remainder = None;
     }
+
+    /// The model a remainder is waiting over, if any.
+    pub(super) fn pending_model(&self) -> Option<u32> {
+        self.remainder.as_ref().map(|r| r.id)
+    }
+
+    /// The pointer moved and is now over model `over` (or none): a
+    /// remainder left over another model belongs to a gesture that has
+    /// moved on, even if the pointer comes back within the quiet period.
+    pub(super) fn pointer_over(&mut self, over: Option<u32>) {
+        if self.pending_model().is_some_and(|id| Some(id) != over) {
+            self.reset();
+        }
+    }
 }
 
 impl RenderApp {
@@ -1736,6 +1750,19 @@ impl RenderApp {
                 window_state.render.emacs_frame_id,
                 (f64::from(lx), f64::from(ly)),
             );
+            // A wheel fraction left over a model ends when the pointer
+            // leaves that model's glyph. Asked only while one is pending,
+            // since the surface search reads every glyph in the frame.
+            if self.model_wheel.pending_model().is_some() {
+                let over = Self::surface_target_for_frame_window(
+                    &window_state.render,
+                    target_fid,
+                    ev_x,
+                    ev_y,
+                )
+                .map(|(id, _, _)| id);
+                self.model_wheel.pointer_over(over);
+            }
             // iMouse hover state (docs/display-engine/SHADER_SURFACES.md):
             // resolved here rather than while drawing, because which surface
             // the pointer is over is a question about the composition, and the
@@ -1848,6 +1875,9 @@ impl RenderApp {
     }
 
     pub(super) fn handle_cursor_left(&mut self, window_id: WindowId) {
+        // The pointer left the window: a wheel fraction left over a model
+        // does not wait for its return.
+        self.model_wheel.reset();
         if let Some(window_state) = self.frame_windows.get_by_winit_mut(window_id) {
             window_state.render.clear_pointer_hover();
             window_state.render.scroll_input.reset();

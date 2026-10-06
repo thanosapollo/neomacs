@@ -104,11 +104,22 @@ impl RenderApp {
         self.flush_model_events();
     }
 
-    /// Window `emacs_frame_id` is hidden or gone: it shows no model.
+    /// [`Self::note_models_presented`] for a frame whose composition also
+    /// shows pixels of an older picture than its fresh glyph passes
+    /// ([`super::render_pass::model_provenance::blends_older_pictures`]):
+    /// `picture` is what those passes composited.
+    pub(super) fn note_models_presented_blended(
+        &mut self,
+        emacs_frame_id: u64,
+        picture: &ModelPicture,
+    ) {
+        self.note_models_presented(emacs_frame_id, picture);
+    }
+
+    /// Window `emacs_frame_id` is gone, or showed nothing in its last
+    /// attempt: it shows no model. Runs on an empty store too, so a hidden
+    /// mark set while no model existed does not outlive the window.
     pub(super) fn note_models_window_gone(&mut self, emacs_frame_id: u64) {
-        if self.models.is_empty() {
-            return;
-        }
         self.models.window_gone(emacs_frame_id);
         self.flush_model_events();
     }
@@ -121,25 +132,37 @@ impl RenderApp {
     }
 
     /// Lisp asked to show, hide or iconify window `emacs_frame_id`.
-    /// `platform_reports_hiding`: whether the window system can tell us
-    /// the window's visibility.
+    ///
+    /// Hidden and iconified frames show no model (design §6.2), and the
+    /// window leaves at once on the request itself. Whether it then stays
+    /// out depends on `platform_reports_hiding`: whether the window system
+    /// can tell us the window's visibility (winit's `is_visible` or
+    /// `is_minimized` answers). Where it can (X11, macOS, Windows), the
+    /// window stays out until it is shown, exposed or focused again. Where
+    /// it cannot (Wayland: no `Occluded`, `set_visible` is a no-op, and a
+    /// compositor may ignore the minimize request), a window still on
+    /// screen would otherwise stay out forever; it rejoins at its next
+    /// successful presentation instead. A minimized window whose compositor
+    /// withholds frame callbacks presents nothing more and stays out; one
+    /// that keeps presenting is counted at the revision it presents, so
+    /// the fence still never claims pixels it did not present.
     pub(super) fn note_models_visibility(
         &mut self,
         emacs_frame_id: u64,
         visibility: crate::thread_comm::WindowVisibility,
         platform_reports_hiding: bool,
     ) {
-        let _ = platform_reports_hiding;
-        // Hidden and iconified frames show no model (design §6.2).
-        // The window system may report neither, so act on the
-        // request itself.
         match visibility {
             crate::thread_comm::WindowVisibility::Visible => {
                 self.note_models_window_shown(emacs_frame_id);
             }
             crate::thread_comm::WindowVisibility::Iconified
             | crate::thread_comm::WindowVisibility::Invisible => {
-                self.note_models_window_hidden(emacs_frame_id);
+                if platform_reports_hiding {
+                    self.note_models_window_hidden(emacs_frame_id);
+                } else {
+                    self.note_models_window_gone(emacs_frame_id);
+                }
             }
         }
     }

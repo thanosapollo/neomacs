@@ -866,6 +866,14 @@ impl ModelStore {
         }
     }
 
+    /// Window `window` lost focus: the capture it holds, if any, ends (as
+    /// [`Self::cancel_capture`]); a capture held in another window stays.
+    pub fn cancel_capture_in(&mut self, window: WindowKey) {
+        if self.capture.is_some_and(|c| c.window == window) {
+            self.cancel_capture();
+        }
+    }
+
     fn end_capture(&mut self, id: u32) {
         let Some(capture) = self.capture.take() else {
             return;

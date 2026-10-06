@@ -142,6 +142,43 @@ impl TransitionState {
         self.policy = policy;
     }
 
+    /// A theme crossfade from `old`, as `start_theme_transition` starts one
+    /// once a previous composition exists (tests).
+    #[cfg(test)]
+    pub(in crate::render_thread) fn start_theme_crossfade_for_test(
+        &mut self,
+        old: neomacs_renderer_wgpu::SnapshotLease,
+        spec: neomacs_display_protocol::motion_spec::MotionSpec,
+        now: neomacs_display_protocol::frame_time::EventTime,
+    ) {
+        let neomacs_display_protocol::motion_spec::MotionSpec::Tween(tween) = spec else {
+            panic!("a tween");
+        };
+        let plan = TransitionPlan {
+            duration: tween.duration.get(),
+            easing: tween.easing,
+            bounds: neomacs_display_protocol::Rect::new(0.0, 0.0, 80.0, 40.0),
+            effect: ResolvedTransitionEffect::Directionless(
+                DirectionlessTransitionEffect::Crossfade,
+            ),
+        };
+        self.active.insert(
+            TransitionKey::Theme,
+            ActiveTransition {
+                source: TransitionSource::Theme,
+                started: now,
+                plan: SynchronizedTransitionPlan::from_single(plan),
+                old,
+            },
+        );
+    }
+
+    /// Drop every active transition (tests).
+    #[cfg(test)]
+    pub(in crate::render_thread) fn clear_active_for_test(&mut self) {
+        self.active.clear();
+    }
+
     /// Check if any transitions are currently active
     pub(super) fn has_active(&self) -> bool {
         !self.active.is_empty()
