@@ -6243,8 +6243,7 @@ fn try_convert_hash_table_literal(val: Value) -> Option<Value> {
                 while idx + 1 < data.len() {
                     let key_value = try_convert_nested_compiled_literal(data[idx]);
                     let val_value = try_convert_nested_compiled_literal(data[idx + 1]);
-                    let key = key_value.to_hash_key(&table.test);
-                    table.insert(key, key_value, val_value);
+                    table.insert_literal_entry(key_value, val_value);
                     idx += 2;
                 }
             }

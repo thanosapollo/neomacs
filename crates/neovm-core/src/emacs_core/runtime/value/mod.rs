@@ -2126,6 +2126,35 @@ impl LispHashTable {
         self.data.insert(hash_key, key, value)
     }
 
+    /// File a hash-table literal's entry the way `puthash` would: an `equal`
+    /// table finds an existing entry by the live key, since a large key's
+    /// materialized description is its identity, not its structure.  As in
+    /// GNU's reader, a repeated key keeps its first object and takes the
+    /// later value.
+    pub fn insert_literal_entry(&mut self, key: Value, value: Value) {
+        if matches!(self.test, HashTableTest::Equal) {
+            if let Ok(probe) = self
+                .data
+                .try_probe_for_insert(key, HashTableTest::Equal, false)
+            {
+                match probe {
+                    HashProbe::Found(slot) => {
+                        if let Some(stored) = self.data.slot_value_mut(slot) {
+                            *stored = value;
+                        }
+                    }
+                    HashProbe::Absent(hash) => {
+                        let hash_key = key.to_hash_key(&self.test);
+                        self.data.insert_absent(hash, hash_key, key, value);
+                    }
+                }
+                return;
+            }
+        }
+        let hash_key = key.to_hash_key(&self.test);
+        self.data.insert(hash_key, key, value);
+    }
+
     /// Insert or update an entry while replacing its original-key snapshot.
     /// Used by internal caches whose key value is already canonical.
     pub fn upsert_iterable(&mut self, hash_key: HashKey, key_value: Value, value: Value) {
@@ -2246,8 +2275,7 @@ pub(crate) fn build_hash_table_literal_value(
         table.user_cmp_function = None;
         table.user_hash_function = None;
         for (key_value, val_value) in entries {
-            let key = key_value.to_hash_key(&table.test);
-            table.insert(key, key_value, val_value);
+            table.insert_literal_entry(key_value, val_value);
         }
     });
     table_value
@@ -4037,26 +4065,46 @@ impl TaggedValue {
     }
 
     fn to_equal_key(self) -> HashKey {
-        let mut seen = Vec::new();
-        self.to_equal_key_depth_swp(0, &mut seen, false)
+        self.to_equal_key_swp(false)
     }
 
+    /// The `equal` key of `self`, materialized within
+    /// [`EQUAL_KEY_NODE_BUDGET`] nodes (a string or bool-vector leaf copies
+    /// its contents but counts as one node).
+    ///
+    /// An `equal` table no longer decides membership by this key: it hashes
+    /// the live key object with GNU's bounds and compares candidates with
+    /// `equal` (see [`hash_index`]). The key is a description kept beside the
+    /// entry for iteration, dumping and lookups that only have a key at hand.
+    /// Materializing it is a tree walk, though, and one node shared along
+    /// 2^N paths would be copied 2^N times (a closure backtrace in the
+    /// profiler's log, whose closures share their captured environments,
+    /// exhausted memory). A value that does not fit the budget is described
+    /// by its identity instead: the same object always gets the same key, and
+    /// no other object can.
     fn to_equal_key_swp(self, symbols_with_pos_enabled: bool) -> HashKey {
-        let mut seen = Vec::new();
-        self.to_equal_key_depth_swp(0, &mut seen, symbols_with_pos_enabled)
+        let mut walk = EqualKeyWalk::default();
+        let key = self.to_equal_key_depth_swp(0, &mut walk, symbols_with_pos_enabled);
+        if walk.exhausted {
+            return HashKey::EqualVec(Box::new([
+                HashKey::Text(BOUNDED_EQUAL_KEY_TAG.into()),
+                self.to_eq_key(),
+            ]));
+        }
+        key
     }
 
-    fn to_equal_key_depth(self, depth: usize, seen: &mut Vec<usize>) -> HashKey {
+    fn to_equal_key_depth(self, depth: usize, seen: &mut EqualKeyWalk) -> HashKey {
         self.to_equal_key_depth_swp(depth, seen, false)
     }
 
     fn to_equal_key_depth_swp(
         self,
         depth: usize,
-        seen: &mut Vec<usize>,
+        seen: &mut EqualKeyWalk,
         symbols_with_pos_enabled: bool,
     ) -> HashKey {
-        if depth > 200 {
+        if depth > 200 || seen.over_budget() {
             return self.to_eq_key();
         }
         match self.kind() {
@@ -4123,10 +4171,15 @@ impl TaggedValue {
                 seen.push(ptr);
                 let view = StructuralPseudovectorView::from_value(self, kind)
                     .expect("structural pseudovector kind must expose its storage");
-                let mut keys = Vec::with_capacity(view.len() + 3);
+                // The key of an over-budget value is discarded, so a wide
+                // vector stops being described once the budget is spent.
+                let mut keys = Vec::with_capacity(view.len().min(EQUAL_KEY_NODE_BUDGET) + 3);
                 keys.push(HashKey::Text(view.hash_tag().into()));
                 view.append_shape_hash_keys(&mut keys);
                 for index in 0..view.len() {
+                    if seen.exhausted {
+                        break;
+                    }
                     keys.push(view.slot(index).to_equal_key_depth_swp(
                         depth + 1,
                         seen,
@@ -4972,6 +5025,53 @@ fn closure_params_to_equal_key(params: &LambdaParams) -> HashKey {
     HashKey::EqualVec(values.into_boxed_slice())
 }
 
+/// Nodes [`Value::to_equal_key_swp`] materializes before it describes the
+/// value by identity instead. Small keys (a face's attribute vector, a list
+/// of a few strings) stay structural, so lookups by a freshly built equal key
+/// keep working for them.
+const EQUAL_KEY_NODE_BUDGET: usize = 256;
+
+/// First element of the key that describes an over-budget value by
+/// identity. No structural key starts with it: their tags name a type.
+const BOUNDED_EQUAL_KEY_TAG: &str = "#<bounded-equal-key>";
+
+/// State of one `equal`-key materialization: the ancestors being walked (for
+/// cycle back-references) and the nodes spent against
+/// [`EQUAL_KEY_NODE_BUDGET`].
+#[derive(Default)]
+struct EqualKeyWalk {
+    ancestors: Vec<usize>,
+    nodes: usize,
+    exhausted: bool,
+}
+
+impl EqualKeyWalk {
+    /// Charge one node; true once the budget is spent, after which every
+    /// remaining node returns at once without being walked.
+    #[inline]
+    fn over_budget(&mut self) -> bool {
+        if !self.exhausted {
+            self.nodes += 1;
+            self.exhausted = self.nodes > EQUAL_KEY_NODE_BUDGET;
+        }
+        self.exhausted
+    }
+}
+
+impl std::ops::Deref for EqualKeyWalk {
+    type Target = Vec<usize>;
+
+    fn deref(&self) -> &Vec<usize> {
+        &self.ancestors
+    }
+}
+
+impl std::ops::DerefMut for EqualKeyWalk {
+    fn deref_mut(&mut self) -> &mut Vec<usize> {
+        &mut self.ancestors
+    }
+}
+
 /// `equal`-table key for a byte-code object, derived from
 /// [`ByteCodeFunction::structural_parts`] so it agrees with [`bytecode_equal`]
 /// by construction: equal objects produce equal keys, and every difference
@@ -4982,7 +5082,7 @@ fn closure_params_to_equal_key(params: &LambdaParams) -> HashKey {
 fn bytecode_to_equal_key(
     value: Value,
     depth: usize,
-    seen: &mut Vec<usize>,
+    seen: &mut EqualKeyWalk,
     symbols_with_pos_enabled: bool,
 ) -> HashKey {
     use super::bytecode::ByteCodeStructuralPart as Part;
@@ -5018,7 +5118,7 @@ fn bytecode_to_equal_key(
     HashKey::ByteCode(keys.into_boxed_slice())
 }
 
-fn closure_to_equal_key(value: Value, depth: usize, seen: &mut Vec<usize>) -> HashKey {
+fn closure_to_equal_key(value: Value, depth: usize, seen: &mut EqualKeyWalk) -> HashKey {
     if depth > 200 {
         return HashKey::Text("#<lambda-depth-limit>".into());
     }
@@ -5032,9 +5132,9 @@ fn closure_to_equal_key(value: Value, depth: usize, seen: &mut Vec<usize>) -> Ha
         closure_params_to_equal_key(params),
         value
             .closure_body_value()
-            .map_or(HashKey::Nil, |body| body.to_equal_key_depth(0, seen)),
+            .map_or(HashKey::Nil, |body| body.to_equal_key_depth(depth, seen)),
         match value.closure_env().unwrap_or(None) {
-            Some(env) => env.to_equal_key_depth(0, seen),
+            Some(env) => env.to_equal_key_depth(depth, seen),
             None => HashKey::Text("dynamic".into()),
         },
     ];
@@ -5047,7 +5147,7 @@ fn closure_to_equal_key(value: Value, depth: usize, seen: &mut Vec<usize>) -> Ha
         // string value (valid UTF-8 -> text key, eight-bit -> eq key) instead of
         // the retired storage form, whose in-Unicode sentinels would collide a
         // real Private-Use glyph with a raw byte in the equal hash key.
-        let doc = doc_value.to_equal_key_depth(0, seen);
+        let doc = doc_value.to_equal_key_depth(depth, seen);
         slots.push(doc);
     }
 

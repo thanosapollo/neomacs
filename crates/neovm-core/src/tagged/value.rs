@@ -174,10 +174,13 @@ impl PartialEq for TaggedValue {
 
 impl Eq for TaggedValue {}
 
+/// The bounded GNU `sxhash-equal` hash, consistent with the `equal`
+/// `PartialEq` above: `equal` values hash alike, and hashing never walks more
+/// than a bounded prefix of the value (a value with shared substructure would
+/// otherwise cost time exponential in its sharing).
 impl Hash for TaggedValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.to_hash_key(&crate::emacs_core::value::HashTableTest::Equal)
-            .hash(state);
+        crate::emacs_core::value::equal_value_hash(*self).hash(state);
     }
 }
 

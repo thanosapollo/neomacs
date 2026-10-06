@@ -5,9 +5,7 @@ use smallvec::SmallVec;
 
 use super::eval::{ASYNC_ATTENTION, AsyncSource, Context, SpecBinding};
 use super::intern::resolve_sym;
-use super::value::{
-    FunctionSourceIdentity, HashKey, HashTableTest, Value, build_hash_table_literal_value,
-};
+use super::value::{FunctionSourceIdentity, HashTableTest, Value, build_hash_table_literal_value};
 
 const DEFAULT_MAX_STACK_DEPTH: usize = 16;
 const DEFAULT_LOG_SIZE: usize = 10_000;
@@ -139,12 +137,13 @@ impl ProfilerLog {
     }
 
     fn to_value(&self) -> Value {
-        let mut normal_entries: FxHashMap<HashKey, (Value, u64)> = FxHashMap::default();
+        // `Value` hashes and compares as `equal`, so `equal` backtraces share
+        // one entry and their counts add up, as GNU's export does.
+        let mut normal_entries: FxHashMap<Value, (Value, u64)> = FxHashMap::default();
         for sample in self.entries.values() {
             let frames = Value::vector(sample.frames.iter().copied().collect());
-            let key = frames.to_hash_key(&HashTableTest::Equal);
             normal_entries
-                .entry(key)
+                .entry(frames)
                 .and_modify(|(_, count)| *count = count.saturating_add(sample.count))
                 .or_insert((frames, sample.count));
         }
