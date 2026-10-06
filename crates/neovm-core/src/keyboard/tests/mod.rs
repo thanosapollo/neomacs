@@ -1023,13 +1023,16 @@ fn retirement_before_pointer_rejects_stale_hit_without_reordering_key() {
 
 #[test]
 fn layout_invalidation_forces_redisplay_when_evaluator_signature_is_unchanged() {
+    // This callback-count spy publishes no GNU accepted frame. Keep its
+    // legacy signature contract; live frontend tests cover accepted ownership.
+    let _policy = crate::emacs_core::eval::RedisplayHookPolicyGuard::legacy();
     let redisplays = std::rc::Rc::new(std::cell::Cell::new(0));
     let observed = std::rc::Rc::clone(&redisplays);
     let mut eval = crate::emacs_core::Context::new();
     eval.redisplay_fn = Some(Box::new(move |_| observed.set(observed.get() + 1)));
 
-    eval.redisplay();
-    eval.redisplay();
+    eval.redisplay().expect("redisplay");
+    eval.redisplay().expect("redisplay");
     assert_eq!(redisplays.get(), 1, "unchanged redisplay should be skipped");
 
     eval.command_loop
@@ -1038,7 +1041,7 @@ fn layout_invalidation_forces_redisplay_when_evaluator_signature_is_unchanged() 
         .push_back(InputEvent::LayoutInvalidated);
     let effects = eval.service_leading_internal_frontend_events();
     assert!(effects.redisplay_needed);
-    eval.redisplay();
+    eval.redisplay().expect("redisplay");
     assert_eq!(redisplays.get(), 2);
 }
 
@@ -1810,7 +1813,9 @@ fn render_modifiers_helper_matches_transport_bit_layout() {
 #[test]
 fn render_key_transport_drops_key_releases() {
     crate::test_utils::init_test_tracing();
-    assert!(render_key_transport_to_input_event(XK_RETURN, 0, false, 0).is_none());
+    assert!(
+        render_key_transport_to_input_event(FrontendKey::Keysym(XK_RETURN), 0, false, 0).is_none()
+    );
 }
 
 #[test]
@@ -2313,12 +2318,18 @@ fn display_idle_maintenance_yields_to_input_and_avoids_nested_or_timed_reads() {
     }));
     assert!(
         eval.display_idle_maintenance_deadline(false, false)
+            .expect("untimed nested read")
             .is_none()
     );
-    assert!(eval.display_idle_maintenance_deadline(true, true).is_none());
+    assert!(
+        eval.display_idle_maintenance_deadline(true, true)
+            .expect("timed command read")
+            .is_none()
+    );
     assert_eq!(calls.get(), 0);
     assert!(
         eval.display_idle_maintenance_deadline(true, false)
+            .expect("idle command read")
             .is_some()
     );
     assert_eq!(calls.get(), 1);
@@ -2332,8 +2343,48 @@ fn display_idle_maintenance_yields_to_input_and_avoids_nested_or_timed_reads() {
         .unwrap();
     assert!(
         eval.display_idle_maintenance_deadline(true, false)
+            .expect("command read with pending input")
             .is_none()
     );
     assert_eq!(calls.get(), 1);
     assert!(eval.display_idle_maintenance_fn.is_some());
+}
+
+/// Issue #458: text retains its domain even where its number names a key.
+#[test]
+fn character_transport_preserves_fullwidth_and_halfwidth_text() {
+    for character in "，（）；－ｦￊ\u{fd0e}中あ한😀".chars() {
+        let event =
+            render_key_transport_to_input_event(FrontendKey::Character(character), 0, true, 42)
+                .unwrap();
+        assert!(
+            matches!(event, InputEvent::KeyPress { key, emacs_frame_id: 42 }
+            if key == KeyEvent::char(character)),
+            "{character:?}"
+        );
+    }
+    assert!(
+        render_key_transport_to_input_event(FrontendKey::Character('，'), 0, false, 42,).is_none()
+    );
+}
+
+#[test]
+fn character_and_keysym_transport_keep_colliding_values_distinct() {
+    for (character, keysym, expected) in [
+        ('（', XK_BACKSPACE, Key::Named(NamedKey::Backspace)),
+        ('）', XK_TAB, Key::Named(NamedKey::Tab)),
+        ('－', XK_RETURN, Key::Named(NamedKey::Return)),
+        ('；', XK_ESCAPE, Key::Named(NamedKey::Escape)),
+        ('ￊ', 0xffca, Key::Named(NamedKey::F(13))),
+        ('ｦ', 0xff66, Key::Function("redo".into())),
+        ('\u{fd0e}', 0xfd0e, Key::Function("3270_Attn".into())),
+    ] {
+        assert!(matches!(render_key_transport_to_input_event(
+            FrontendKey::Keysym(keysym), 0, true, 7,
+        ), Some(InputEvent::KeyPress { key, emacs_frame_id: 7 }) if key.key == expected));
+        assert!(matches!(render_key_transport_to_input_event(
+            FrontendKey::Character(character), RENDER_META_MASK, true, 7,
+        ), Some(InputEvent::KeyPress { key, emacs_frame_id: 7 })
+            if key == KeyEvent::char_with_mods(character, Modifiers::meta())));
+    }
 }

@@ -42,11 +42,18 @@ use crate::display_text_window_row_lifecycle::{
 use crate::font::metrics::FontMetricsService;
 use crate::frame_face_arena::FrameFaceAttempt;
 use crate::neovm_bridge::{FaceResolver, LayoutBufferView, RustBufferAccess};
-use crate::types::{LineWrapMode, WindowParams};
+use crate::types::{LineWrapMode, MiniWindowMeasurement, WindowParams};
 use crate::window_output::{
     TextWindowOutputTarget, TextWindowRedisplayPositions, WindowOutputEmitter,
 };
 use neovm_core::emacs_core::image_catalog::ImageScaleEnvironment;
+
+/// Owned by one exclusively borrowed window-render attempt. This result
+/// retains no live Lisp cache or state shared between independent mutators.
+pub(crate) enum BufferSourceBodyRenderOutcome {
+    Complete(BufferSourcePostLoopRenderOutcome),
+    SyncHorizonExhausted,
+}
 
 pub(crate) struct BufferSourceWalkSetupRequest<'a> {
     window_start: i64,
@@ -57,6 +64,7 @@ pub(crate) struct BufferSourceWalkSetupRequest<'a> {
     window_top: f32,
     line_number_pixel_width: f32,
     max_rows: usize,
+    mini_measurement: MiniWindowMeasurement,
     metrics: DisplayRowFallbackMetrics,
     measurement_mode: DisplayRowMeasurementMode,
     wrap_mode: LineWrapMode,
@@ -163,6 +171,7 @@ impl<'a> BufferSourceWalkSetupRequest<'a> {
             window_top,
             line_number_pixel_width,
             max_rows,
+            mini_measurement: MiniWindowMeasurement::Presentation,
             metrics,
             measurement_mode,
             wrap_mode,
@@ -215,7 +224,7 @@ impl<'a> BufferSourceWalkSetupRequest<'a> {
         reserve_right_border_col: bool,
         reserve_right_special_col: bool,
     ) -> Self {
-        Self::new(
+        let mut request = Self::new(
             source.window_start(),
             geometry.content_x,
             geometry.text_x,
@@ -248,7 +257,9 @@ impl<'a> BufferSourceWalkSetupRequest<'a> {
             params.right_margin_columns.max(0) as usize,
             params.right_margin_width,
         )
-        .with_image_scale_environment(params.image_scale_environment)
+        .with_image_scale_environment(params.image_scale_environment);
+        request.mini_measurement = params.mini_measurement;
+        request
     }
 
     pub(crate) fn into_setup(self) -> BufferSourceWalkSetup {
@@ -259,6 +270,16 @@ impl<'a> BufferSourceWalkSetupRequest<'a> {
             self.measurement_mode,
         );
 
+        // GNU mini resizing measures through ZV before clipping the result.
+        // Its logical row limit is not an allocation count. Both stores are
+        // numeric state exclusively owned by this window-render attempt.
+        let (row_flags, row_y_capacity) = match self.mini_measurement {
+            MiniWindowMeasurement::Presentation => {
+                (DisplayRowFlags::new(self.max_rows), self.max_rows)
+            }
+            MiniWindowMeasurement::ToEnd => (DisplayRowFlags::growing(), 1),
+        };
+
         BufferSourceWalkSetup {
             x: self.content_x,
             col: 0,
@@ -267,7 +288,7 @@ impl<'a> BufferSourceWalkSetupRequest<'a> {
             text_area_left: self.text_x,
             window_top: self.window_top,
             invisible_text_checkpoint: InvisibleTextScanCheckpoint::new(self.window_start),
-            row_flags: DisplayRowFlags::new(self.max_rows),
+            row_flags,
             hscroll_skip: HorizontalScrollSkipState::new(
                 self.wrap_mode,
                 self.hscroll,
@@ -310,7 +331,7 @@ impl<'a> BufferSourceWalkSetupRequest<'a> {
             row_geometry_defaults,
             row_geometry: row_geometry_defaults.initial_state(),
             row_y_positions: DisplayRowYPositions::with_capacity_and_first_row(
-                self.max_rows,
+                row_y_capacity,
                 self.text_y,
             ),
             trailing_whitespace: TrailingWhitespaceRenderState::new(
@@ -338,7 +359,7 @@ impl BufferSourceWalkSetup {
         params: &WindowParams,
         overlay_text_row_context: BufferOverlayStringTextRowRenderContext<'request>,
         buffer: &B,
-    ) {
+    ) -> crate::buffer_source::loop_render::BufferSourceVisibleLoopOutcome {
         let mut source_walk = BufferSourceWalk::new_for_window(
             loop_context.buffer_id(),
             buffer,
@@ -387,7 +408,7 @@ impl BufferSourceWalkSetup {
             params,
             state.active_face_state,
             buffer,
-        );
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -404,6 +425,7 @@ impl BufferSourceWalkSetup {
         active_face_state: &'request DisplayRowActiveFaceState,
         buffer: &B,
         buf_access: &RustBufferAccess<'buf, B>,
+        source_stop: crate::buffer_source::loop_render::BufferSourceVisibleLoopOutcome,
     ) -> BufferSourcePostLoopRenderOutcome {
         render_buffer_source_tail_and_decide_retry(
             loop_context,
@@ -424,6 +446,7 @@ impl BufferSourceWalkSetup {
             active_face_state,
             buffer,
             buf_access,
+            source_stop,
         )
     }
 
@@ -456,8 +479,8 @@ impl BufferSourceWalkSetup {
         overlay_text_row_context: BufferOverlayStringTextRowRenderContext<'request>,
         buffer: &B,
         buf_access: &RustBufferAccess<'buf, B>,
-    ) -> BufferSourcePostLoopRenderOutcome {
-        self.render_visible_steps(
+    ) -> BufferSourceBodyRenderOutcome {
+        let loop_outcome = self.render_visible_steps(
             state,
             row_prelude_context,
             loop_context,
@@ -468,7 +491,11 @@ impl BufferSourceWalkSetup {
             buffer,
         );
 
-        self.render_tail_and_decide_retry(
+        if loop_outcome == crate::buffer_source::loop_render::BufferSourceVisibleLoopOutcome::SyncHorizonExhausted {
+            return BufferSourceBodyRenderOutcome::SyncHorizonExhausted;
+        }
+
+        BufferSourceBodyRenderOutcome::Complete(self.render_tail_and_decide_retry(
             state.source_render.reborrow(),
             state.face_ids,
             state.line_numbers,
@@ -480,7 +507,8 @@ impl BufferSourceWalkSetup {
             state.active_face_state,
             buffer,
             buf_access,
-        )
+            loop_outcome,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -503,7 +531,7 @@ impl BufferSourceWalkSetup {
         overlay_text_row_context: BufferOverlayStringTextRowRenderContext<'request>,
         buffer: &B,
         buf_access: &RustBufferAccess<'buf, B>,
-    ) -> (WindowOutputEmitter, BufferSourcePostLoopRenderOutcome) {
+    ) -> (WindowOutputEmitter, BufferSourceBodyRenderOutcome) {
         let mut output_emitter = output.begin_text_window_output(begin_request);
         output_emitter.set_query_target(params.query_target);
         output_emitter.set_collect_query_restarts(
@@ -537,3 +565,7 @@ impl BufferSourceWalkSetup {
         (output_emitter, post_loop)
     }
 }
+
+#[cfg(test)]
+#[path = "body_render/tests/mini_row_storage.rs"]
+mod mini_row_storage_tests;

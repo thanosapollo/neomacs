@@ -244,7 +244,7 @@ fn presentation_lifecycle_events_reach_the_evaluator_losslessly() {
 #[test]
 fn key_release_is_dropped_by_core_transport_owner() {
     let display_event = DisplayEvent::Key {
-        keysym: keyboard::XK_RETURN,
+        key: keyboard::FrontendKey::Keysym(keyboard::XK_RETURN),
         modifiers: 0,
         pressed: false,
         emacs_frame_id: 0,
@@ -329,7 +329,7 @@ fn tracked_key_transport_preserves_immediate_quit_without_reading() {
 #[test]
 fn key_transport_preserves_source_frame_identity() {
     let display_event = DisplayEvent::Key {
-        keysym: 'a' as u32,
+        key: keyboard::FrontendKey::Character('a'),
         modifiers: keyboard::RENDER_CTRL_MASK,
         pressed: true,
         emacs_frame_id: 42,

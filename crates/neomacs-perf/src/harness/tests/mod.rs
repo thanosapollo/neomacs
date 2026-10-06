@@ -1074,6 +1074,8 @@ fn benchmark_environment_forwards_the_allowlist_and_jit_knobs_only() {
         (os("NEOVM_AOT_UNRELATED"), os("1")),
         (os("NEOMACS_OSR_DEBUG"), os("1")),
         (os("NEOMACS_OSR_UNRELATED"), os("1")),
+        (os("NEOMACS_PERF_SUSTAINED_VISIBLE"), os("on")),
+        (os("NEOMACS_PERF_SUSTAINED_VISIBLE_TRACE"), os("unrelated")),
         (os("NEOVM_GC_TRACE"), os("1")),
         (os("NEOVM_GC_CHUNK_MAP"), os("1")),
         (os("NEOVM_GC_CENSUS"), os("1")),
@@ -1087,6 +1089,29 @@ fn benchmark_environment_forwards_the_allowlist_and_jit_knobs_only() {
         (os("NEOVM_TEXT_LINE_INDEX_BUILD_LINES"), os("512")),
         (os("NEOVM_TEXT_LINE_INDEX_STATS"), os("1")),
         (os("NEOVM_TEXT_LINE_INDEXING"), os("unrelated")),
+        (os("NEOMACS_EDIT_SYNC_STILL"), os("on")),
+        (os("NEOMACS_EDIT_SYNC_LAZY_PROOF"), os("on")),
+        (os("NEOMACS_EDIT_SYNC_LAZY_PROOF_TRACE"), os("unrelated")),
+        (os("NEOMACS_EDIT_SYNC_PROVE_FIRST"), os("on")),
+        (os("NEOMACS_EDIT_SYNC_PROVE_FIRST_TRACE"), os("unrelated")),
+        (os("NEOMACS_EDIT_SYNC_SHIFT_SKIP"), os("on")),
+        (os("NEOMACS_EDIT_SYNC_SHIFT_SKIP_TRACE"), os("unrelated")),
+        (os("NEOMACS_EDIT_SYNC_SOURCE_BUDGET"), os("on")),
+        (os("NEOMACS_EDIT_SYNC_SOURCE_BUDGET_TRACE"), os("unrelated")),
+        (os("NEOMACS_MODE_LINE_PROP_BORROW"), os("on")),
+        (os("NEOMACS_MODE_LINE_PROP_SLICE"), os("on")),
+        (os("NEOMACS_MODE_LINE_PLAIN_FIELD"), os("on")),
+        (os("NEOMACS_MODE_LINE_NUMERIC_PADDING"), os("on")),
+        (
+            os("NEOMACS_MODE_LINE_NUMERIC_PADDING_TRACE"),
+            os("unrelated"),
+        ),
+        (os("NEOMACS_POSN_OBJECT_EXTENT"), os("on")),
+        (os("NEOMACS_POSN_OBJECT_EXTENT_TRACE"), os("unrelated")),
+        (os("NEOMACS_REDISPLAY_GNU_HOOKS"), os("on")),
+        (os("NEOMACS_REDISPLAY_GNU_HOOKS_TRACE"), os("unrelated")),
+        (os("NEOMACS_WATCHED_PROP_DEMAND"), os("on")),
+        (os("NEOMACS_WATCHED_PROP_DEMAND_TRACE"), os("unrelated")),
         (os("NEOVM_PPS_PROPERTIZE"), os("0")),
         (os("NEOVM_SYNTAX_PARSE_CACHE"), os("verify")),
         (os("NEOVM_SYNTAX_PARSE_CACHE_L2"), os("verify")),
@@ -1101,7 +1126,20 @@ fn benchmark_environment_forwards_the_allowlist_and_jit_knobs_only() {
     assert_eq!(
         forwarded,
         [
+            "NEOMACS_EDIT_SYNC_LAZY_PROOF",
+            "NEOMACS_EDIT_SYNC_PROVE_FIRST",
+            "NEOMACS_EDIT_SYNC_SHIFT_SKIP",
+            "NEOMACS_EDIT_SYNC_SOURCE_BUDGET",
+            "NEOMACS_EDIT_SYNC_STILL",
+            "NEOMACS_MODE_LINE_NUMERIC_PADDING",
+            "NEOMACS_MODE_LINE_PLAIN_FIELD",
+            "NEOMACS_MODE_LINE_PROP_BORROW",
+            "NEOMACS_MODE_LINE_PROP_SLICE",
             "NEOMACS_OSR_DEBUG",
+            "NEOMACS_PERF_SUSTAINED_VISIBLE",
+            "NEOMACS_POSN_OBJECT_EXTENT",
+            "NEOMACS_REDISPLAY_GNU_HOOKS",
+            "NEOMACS_WATCHED_PROP_DEMAND",
             "NEOVM_AOT",
             "NEOVM_AOT_PREWARM",
             "NEOVM_AOT_RETIER",
@@ -1529,3 +1567,16 @@ fn scrolling_row_validates_phases_checksums_and_restoration() {
         verdict => panic!("mis-accounted scroll commands were accepted: {verdict:?}"),
     }
 }
+
+#[cfg(test)]
+mod gc_window_test;
+mod retained_face_gather_environment_test;
+
+#[cfg(test)]
+mod property_keys_environment_test;
+
+#[cfg(test)]
+mod edit_sync_dense_index_environment_test;
+
+#[cfg(test)]
+mod edit_sync_fontify_coverage_environment_test;

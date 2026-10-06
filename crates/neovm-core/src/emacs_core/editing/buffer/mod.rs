@@ -1487,6 +1487,13 @@ pub(crate) fn builtin_kill_all_local_variables(
     // buffer's local variables and local hook value still in effect, and with
     // `major-mode' still naming the *previous* mode -- matches GNU exactly.
     run_buffer_change_major_mode_hook(eval)?;
+    let current_id = if crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
+        eval.buffers
+            .current_buffer_id()
+            .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?
+    } else {
+        current_id
+    };
 
     // GNU buffer.c reset_buffer_local_variables:
     // - preserves most always-local slots
@@ -1500,7 +1507,14 @@ pub(crate) fn builtin_kill_all_local_variables(
     // raises global `update_mode_lines` even for an offscreen buffer, ensuring
     // the menu and mode line are rebuilt if this major-mode transition is
     // immediately followed by displaying that buffer.
-    eval.request_global_mode_line_update();
+    if crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
+        // GNU bset_update_mode_line is SOME. The typed helper marks only
+        // windows sharing this buffer's text and requests the menu rebuild.
+        // Broad chrome cache dirtiness would evaluate unrelated :eval forms.
+        eval.gnu_mark_buffer_mode_line(current_id);
+    } else {
+        eval.request_global_mode_line_update();
+    }
     Ok(Value::NIL)
 }
 
@@ -2254,6 +2268,15 @@ pub(crate) fn builtin_set_buffer_multibyte(
         eval.sync_window_positions(snapshot.id);
     }
 
+    // GNU buffer.c:2985-2989: a real displayed-buffer conversion raises
+    // windows_or_buffers_changed ALL after remapping text and overlays.
+    if crate::emacs_core::eval::gnu_redisplay_hooks_enabled()
+        && eval.frames.buffer_window_count(&eval.buffers, current_id) > 0
+    {
+        eval.gnu_mark_windows_all();
+        eval.request_menu_bar_rebuild(super::eval::MenuBarRebuildReason::WindowsOrBuffersChanged);
+    }
+
     if !old_undo_list.is_t() {
         let restore_flag = if flag.is_nil() { Value::T } else { Value::NIL };
         let undo_entry = Value::list(vec![
@@ -2348,6 +2371,18 @@ pub(crate) fn builtin_split_window_internal(
         args[3],
         combination_limit,
     )?;
+    if crate::emacs_core::eval::gnu_redisplay_hooks_enabled()
+        && let Some(window) = result.as_window_id().map(crate::window::WindowId)
+        && let Some(frame) = eval.frames.find_window_frame_id(window)
+    {
+        // No arbitrary Lisp occurs between the structural commit above and
+        // these publications. GNU has FRAME_WINDOW_CHANGE already set by
+        // window_resize_apply before set_window_buffer's eager scroll hook.
+        eval.gnu_mark_frame_redisplay(frame);
+        eval.gnu_mark_frame_window_change(frame);
+        eval.gnu_mark_window_mode_line(window);
+        super::window_cmds::builtin_run_window_scroll_functions(eval, vec![result])?;
+    }
     // GNU does NOT run `window-configuration-change-hook' eagerly from
     // `split-window-internal'.  It is deferred to `run_window_change_functions'
     // during redisplay (window.c:4308-4312); neomacs mirrors this in
@@ -3299,20 +3334,27 @@ fn convert_buffer_string_for_multibyte(
     source: Value,
     flag: Value,
 ) -> Result<(Value, BufferMultibyteConversionMode), Flow> {
+    // GNU `Fset_buffer_multibyte` (`buffer.c:2881-2884`) keeps a valid
+    // multibyte sequence only when FLAG is exactly Qt, and even then
+    // `multibyte_length` is called with `allow_8bit` false. Every other
+    // non-nil value — the symbol `to`, any other symbol, a number, a
+    // string — expands each high byte the way `string-to-multibyte` does.
+    // Whether the buffer's multibyteness changes at all is decided by the
+    // caller, matching `NILP (flag) == NILP (enable-multibyte-characters)`.
     let (converted, mode) = if flag.is_nil() {
         (
             misc::builtin_string_as_unibyte(vec![source])?,
             BufferMultibyteConversionMode::AsUnibyte,
         )
-    } else if flag.as_symbol_name() == Some("to") {
-        (
-            misc::builtin_string_to_multibyte(vec![source])?,
-            BufferMultibyteConversionMode::ToMultibyte,
-        )
-    } else {
+    } else if flag.is_t() {
         (
             misc::builtin_string_as_multibyte(vec![source])?,
             BufferMultibyteConversionMode::AsMultibyte,
+        )
+    } else {
+        (
+            misc::builtin_string_to_multibyte(vec![source])?,
+            BufferMultibyteConversionMode::ToMultibyte,
         )
     };
     if converted != source {
@@ -3332,29 +3374,32 @@ fn build_multibyte_conversion_byte_map(
     old_bytes: &[u8],
     mode: BufferMultibyteConversionMode,
 ) -> Vec<usize> {
-    use crate::emacs_core::emacs_char::{bytes_by_char_head, char_byte8_head_p, multibyte_length};
+    use crate::emacs_core::emacs_char::{
+        bytes_by_char_head, char_byte8_head_p, str_as_multibyte_span,
+    };
     let mut map = Vec::with_capacity(old_bytes.len() + 1);
     let mut new_pos = 0usize;
     let mut p = 0usize;
     match mode {
-        // string-as-multibyte: a valid multibyte sequence is kept as-is (N bytes
-        // -> N bytes); an invalid (eight-bit) byte becomes a 2-byte char.
+        // string-as-multibyte (`character.c:543`): a valid non-eight-bit
+        // sequence is kept byte-for-byte. `allow_8bit` is false, so a
+        // `C0`/`C1` raw-byte pair is two eight-bit characters, not one.
+        // The same span drives the converted text (`str_as_multibyte`);
+        // point, markers, overlays and text properties must follow it.
         BufferMultibyteConversionMode::AsMultibyte => {
             while p < old_bytes.len() {
-                match multibyte_length(&old_bytes[p..], true) {
-                    Some(n) if n > 0 => {
-                        for i in 0..n {
-                            map.push(new_pos + i);
-                        }
-                        new_pos += n;
-                        p += n;
+                let (input_bytes, output_bytes) = str_as_multibyte_span(&old_bytes[p..]);
+                debug_assert!(input_bytes > 0);
+                if output_bytes == input_bytes {
+                    for i in 0..input_bytes {
+                        map.push(new_pos + i);
                     }
-                    _ => {
-                        map.push(new_pos);
-                        new_pos += 2;
-                        p += 1;
-                    }
+                    new_pos += input_bytes;
+                } else {
+                    map.push(new_pos);
+                    new_pos += output_bytes;
                 }
+                p += input_bytes;
             }
         }
         // string-to-multibyte: every byte becomes a character (1 byte ASCII, a
@@ -5212,9 +5257,20 @@ pub(crate) fn builtin_delete_overlay(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
-    builtin_delete_overlay_in_buffers(&mut eval.buffers, args)
+    if !crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
+        return builtin_delete_overlay_in_buffers(&mut eval.buffers, args);
+    }
+    expect_args("delete-overlay", &args, 1)?;
+    let overlay = expect_overlay(&args[0])?;
+    let buffer = resolve_overlay_buffer_id(overlay);
+    let result = builtin_delete_overlay_in_buffers(&mut eval.buffers, args)?;
+    if let Some(buffer) = buffer {
+        eval.gnu_mark_buffer_redisplay(buffer);
+    }
+    Ok(result)
 }
 
+#[inline(always)]
 pub(crate) fn builtin_delete_overlay_in_buffers(
     buffers: &mut BufferManager,
     args: Vec<Value>,
@@ -5229,9 +5285,29 @@ pub(crate) fn builtin_delete_overlay_in_buffers(
 
 /// (overlay-put OVERLAY PROP VAL)
 pub(crate) fn builtin_overlay_put(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
-    builtin_overlay_put_in_buffers(&mut eval.buffers, args)
+    if !crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
+        return builtin_overlay_put_in_buffers(&mut eval.buffers, args);
+    }
+    expect_args("overlay-put", &args, 3)?;
+    let overlay = expect_overlay(&args[0])?;
+    let before = resolve_overlay_buffer_id(overlay).and_then(|buffer| {
+        eval.buffers
+            .get(buffer)
+            .map(|value| (buffer, value.overlay_modified_tick()))
+    });
+    let result = builtin_overlay_put_in_buffers(&mut eval.buffers, args)?;
+    if let Some((buffer, tick)) = before
+        && eval
+            .buffers
+            .get(buffer)
+            .is_some_and(|value| value.overlay_modified_tick() != tick)
+    {
+        eval.gnu_mark_buffer_redisplay(buffer);
+    }
+    Ok(result)
 }
 
+#[inline(always)]
 pub(crate) fn builtin_overlay_put_in_buffers(
     buffers: &mut BufferManager,
     args: Vec<Value>,
@@ -5257,9 +5333,7 @@ pub(crate) fn builtin_overlay_put_in_buffers(
     if let Some(buf_id) = resolve_overlay_buffer_id(overlay)
         && changed
     {
-        if let Some(buf) = buffers.get_mut(buf_id) {
-            buf.increment_overlay_modified_tick();
-        }
+        let _ = buffers.note_overlay_modification(buf_id);
         let evaporate = args[1].is_symbol_named("evaporate") && val.is_truthy();
         let is_empty = buffers
             .get(buf_id)
@@ -5423,9 +5497,31 @@ pub(crate) fn builtin_move_overlay(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
-    builtin_move_overlay_in_buffers(&mut eval.buffers, args)
+    if !crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
+        return builtin_move_overlay_in_buffers(&mut eval.buffers, args);
+    }
+    expect_min_args("move-overlay", &args, 3)?;
+    expect_max_args("move-overlay", &args, 4)?;
+    let overlay = expect_overlay(&args[0])?;
+    let old_buffer = resolve_overlay_buffer_id(overlay);
+    let new_buffer = if args.get(3).is_some_and(|value| value.is_truthy()) {
+        resolve_buffer_id_in_buffers(&eval.buffers, args.get(3))?
+    } else {
+        old_buffer
+            .or_else(|| eval.buffers.current_buffer_id())
+            .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?
+    };
+    let result = builtin_move_overlay_in_buffers(&mut eval.buffers, args)?;
+    if let Some(buffer) = old_buffer.filter(|buffer| *buffer != new_buffer) {
+        eval.gnu_mark_buffer_redisplay(buffer);
+    }
+    // GNU modify_overlay runs even when endpoints are unchanged; also retain
+    // the destination publication if the empty overlay evaporated there.
+    eval.gnu_mark_buffer_redisplay(new_buffer);
+    Ok(result)
 }
 
+#[inline(always)]
 pub(crate) fn builtin_move_overlay_in_buffers(
     buffers: &mut BufferManager,
     args: Vec<Value>,
@@ -5452,42 +5548,50 @@ pub(crate) fn builtin_move_overlay_in_buffers(
     let end = expect_integer_or_marker_in_buffers(buffers, &args[2])?;
 
     if old_buf_id == Some(new_buf_id) {
-        // Same buffer: just move within the buffer.
-        let buf = buffers
-            .get_mut(new_buf_id)
-            .ok_or_else(|| signal("error", vec![Value::string("Buffer does not exist")]))?;
-        let byte_range = elisp_range_to_byte_clipped_full(buf, beg, end);
-        buf.overlays
-            .move_overlay_to_emacs_byte_range(overlay, byte_range);
-        buf.increment_overlay_modified_tick();
+        // Same buffer: release the owner borrow before publishing to siblings.
+        {
+            let buf = buffers
+                .get_mut(new_buf_id)
+                .ok_or_else(|| signal("error", vec![Value::string("Buffer does not exist")]))?;
+            let byte_range = elisp_range_to_byte_clipped_full(buf, beg, end);
+            buf.overlays
+                .move_overlay_to_emacs_byte_range(overlay, byte_range);
+        }
+        let _ = buffers.note_overlay_modification(new_buf_id);
         Ok(args[0])
     } else {
-        if let Some(old_buf_id) = old_buf_id
-            && let Some(buf) = buffers.get_mut(old_buf_id)
-            && buf.overlays.detach_overlay(overlay)
-        {
-            buf.increment_overlay_modified_tick();
+        if let Some(old_buf_id) = old_buf_id {
+            let detached = buffers
+                .get_mut(old_buf_id)
+                .is_some_and(|buf| buf.overlays.detach_overlay(overlay));
+            if detached {
+                let _ = buffers.note_overlay_modification(old_buf_id);
+            }
         }
 
-        let new_buf = buffers
-            .get_mut(new_buf_id)
-            .ok_or_else(|| signal("error", vec![Value::string("Buffer does not exist")]))?;
-        let byte_range = elisp_range_to_byte_clipped_full(new_buf, beg, end);
-        let _ = overlay.with_overlay_data_mut(|object| {
-            object.buffer = Some(new_buf_id);
-            object.start = byte_range.start().get();
-            object.end = byte_range.end().get();
-        });
-        new_buf.overlays.insert_overlay(overlay);
-        new_buf.increment_overlay_modified_tick();
-        if byte_range.is_empty()
-            && new_buf
-                .overlays
-                .overlay_get_named(overlay, Value::symbol("evaporate"))
-                .is_some_and(|value| value.is_truthy())
-            && new_buf.overlays.delete_overlay(overlay)
-        {
-            new_buf.increment_overlay_modified_tick();
+        let evaporated = {
+            let new_buf = buffers
+                .get_mut(new_buf_id)
+                .ok_or_else(|| signal("error", vec![Value::string("Buffer does not exist")]))?;
+            let byte_range = elisp_range_to_byte_clipped_full(new_buf, beg, end);
+            let _ = overlay.with_overlay_data_mut(|object| {
+                object.buffer = Some(new_buf_id);
+                object.start = byte_range.start().get();
+                object.end = byte_range.end().get();
+            });
+            new_buf.overlays.insert_overlay(overlay);
+            byte_range.is_empty()
+                && new_buf
+                    .overlays
+                    .overlay_get_named(overlay, Value::symbol("evaporate"))
+                    .is_some_and(|value| value.is_truthy())
+                && new_buf.overlays.delete_overlay(overlay)
+        };
+        // No Lisp code runs between insertion and evaporation. Publish their
+        // original separate modification events after releasing the owner.
+        let _ = buffers.note_overlay_modification(new_buf_id);
+        if evaporated {
+            let _ = buffers.note_overlay_modification(new_buf_id);
         }
         Ok(args[0])
     }

@@ -59,7 +59,7 @@ fn runtime_shims_link_without_dynamic_exports_and_preserve_host_fallback() {
 /// call — or callable by the JIT but silently unexported for AOT.
 #[test]
 fn the_shim_table_and_the_exported_name_list_are_the_same_set() {
-    let names: std::collections::BTreeSet<&str> = crate::emacs_core::jit::aot::MIR_SHIM_NAMES
+    let names: std::collections::BTreeSet<&str> = crate::emacs_core::jit::aot::JIT_SHIM_NAMES
         .iter()
         .copied()
         .collect();
@@ -75,4 +75,19 @@ fn the_shim_table_and_the_exported_name_list_are_the_same_set() {
         only_names.is_empty() && only_table.is_empty(),
         "shim sets drifted: in shim_names.rs only {only_names:?}; in JIT_SHIM_TABLE only {only_table:?}"
     );
+}
+
+#[test]
+fn aot_import_prefix_preserves_main_names_without_the_journal_shim() {
+    use crate::emacs_core::jit::aot::{JIT_SHIM_NAMES, MIR_SHIM_NAMES};
+
+    // The collection shim is JIT-only. Prepending it to the exported set
+    // would displace direct_framed from main's frozen AOT import prefix.
+    assert_eq!(MIR_SHIM_NAMES.len(), 70);
+    assert_eq!(MIR_SHIM_NAMES.first(), Some(&"neovm_jit_hof_length"));
+    assert_eq!(MIR_SHIM_NAMES.last(), Some(&"neovm_jit_direct_framed"));
+    assert!(!MIR_SHIM_NAMES.contains(&"neovm_jit_string_collection_write"));
+    assert!(!MIR_SHIM_NAMES.contains(&"neovm_jit_t2_record_array_use"));
+    assert!(!MIR_SHIM_NAMES.contains(&"neovm_jit_sqrt_binding_valid"));
+    assert!(JIT_SHIM_NAMES.contains(&"neovm_jit_string_collection_write"));
 }

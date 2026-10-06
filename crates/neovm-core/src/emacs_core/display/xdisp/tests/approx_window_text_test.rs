@@ -1,5 +1,5 @@
-//! The approximate window geometry (`posn-at-point`, `pos-visible-in-window-p`
-//! and `posn-at-x-y` without a presented layout) reads only the text the
+//! The approximate window geometry (`pos-visible-in-window-p`
+//! and `posn-at-x-y` without canonical geometry) reads only the text the
 //! window can show instead of copying the whole buffer (P3.5 H,
 //! `NEOMACS_POSN_BOUNDED_TEXT=on`). These pins
 //! compare every answer with the whole-text algorithm it replaced, over short
@@ -7,6 +7,41 @@
 //! window, a window start mid-buffer, and coordinates below the window.
 
 use super::*;
+
+#[test]
+fn bounded_window_text_knob_defaults_on_and_keeps_explicit_baseline_values() {
+    assert!(parse_bounded_window_text_knob(None));
+    for value in ["on", "1", "true", "yes", " On "] {
+        assert!(parse_bounded_window_text_knob(Some(value)));
+    }
+    for value in ["off", "0", "", "unknown", "false"] {
+        assert!(!parse_bounded_window_text_knob(Some(value)));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_window_text_os_knob_distinguishes_absent_from_non_unicode_settings() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    assert!(parse_bounded_window_text_os_knob(None));
+    for value in ["on", "1", "true", "yes", " On "] {
+        assert!(parse_bounded_window_text_os_knob(Some(OsStr::new(value))));
+    }
+    for value in ["off", "0", "", "unknown", "false", "été"] {
+        assert!(!parse_bounded_window_text_os_knob(Some(OsStr::new(value))));
+    }
+    for value in [
+        b"\xff".as_slice(),
+        b"on\xff".as_slice(),
+        b"\xc3(".as_slice(),
+    ] {
+        assert!(!parse_bounded_window_text_os_knob(Some(OsStr::from_bytes(
+            value
+        ))));
+    }
+}
 
 /// The approximations as they were, over the WHOLE buffer text.
 mod whole_text {
@@ -147,7 +182,7 @@ fn check(text: &str, window_start: usize) {
             let x = query_col * ctx.char_width;
             let y = query_row * ctx.char_height;
             let answer = match approximate_point_at_coords(&ctx, x, y) {
-                Some(ApproxPointAtCoords::Point(metrics)) => Some(metrics),
+                Some(ApproxPointAtCoords::Point(metrics, _)) => Some(metrics),
                 Some(ApproxPointAtCoords::NeedsAllText) => {
                     let whole = live_window_display_context_with_all_text(
                         &eval.frames,
@@ -158,7 +193,7 @@ fn check(text: &str, window_start: usize) {
                     .expect("context")
                     .expect("a live window");
                     match approximate_point_at_coords(&whole, x, y) {
-                        Some(ApproxPointAtCoords::Point(metrics)) => Some(metrics),
+                        Some(ApproxPointAtCoords::Point(metrics, _)) => Some(metrics),
                         _ => None,
                     }
                 }

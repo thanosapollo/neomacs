@@ -279,6 +279,33 @@ pub(crate) fn jit_inline_heap_write_on() -> bool {
     })
 }
 
+/// Retain collection-write history for observed native GEN0 owners by default.
+/// The eager comparison mode retains it on every native store.
+/// Read once at compile time (the vector fallback reads the same process knob).
+/// Threading: immutable process configuration; the test override is scalar only.
+/// Journal state remains owned by the executing mutator, as in the interpreter.
+pub(crate) fn jit_gen0_collection_journal_on() -> bool {
+    crate::tagged::collection_reads::compiled_journal_mode()
+        != crate::tagged::collection_reads::CompiledJournalMode::Off
+}
+
+pub(crate) fn jit_gen0_collection_journal_eager() -> bool {
+    crate::tagged::collection_reads::compiled_journal_mode()
+        == crate::tagged::collection_reads::CompiledJournalMode::Eager
+}
+
+#[cfg(test)]
+pub(crate) fn force_gen0_collection_journal_for_test(on: Option<bool>) {
+    use crate::tagged::collection_reads::{CompiledJournalMode, force_compiled_journal_for_test};
+    force_compiled_journal_for_test(on.map(|on| {
+        if on {
+            CompiledJournalMode::Observed
+        } else {
+            CompiledJournalMode::Off
+        }
+    }));
+}
+
 /// Allocate conses and box floats inline at JIT sites, bumping the heap's
 /// open allocation region (`heap_inline::emit_inline_cons` /
 /// `emit_inline_box_float`). Default on; `NEOVM_JIT_INLINE_ALLOC=off` calls
@@ -959,8 +986,9 @@ fn knob_on(name: &str) -> bool {
 /// turns it on, and [`jit_direct_call_on`] implies it unless
 /// [`jit_direct_memory_on`] opts into the existing memory entry or the
 /// self-only site policy admits only individually proven self bodies. An
-/// explicit register knob keeps its existing global reach in either mode. Off,
-/// every entry keeps the memory ABI,
+/// explicit register knob keeps its existing global reach in either mode.
+/// With direct calls and the explicit register knob off, every entry keeps
+/// the memory ABI,
 /// CLIF-identical to the lowering before the register ABI existed: the
 /// single-build A/B. Read at compile time only.
 pub(crate) fn jit_register_abi_on() -> bool {
@@ -982,8 +1010,9 @@ pub(crate) fn jit_register_abi_on() -> bool {
 /// Speculated calls to compiled byte-code leaves call their register-ABI
 /// entry directly from the site (`lowering::emit_direct_bytecode_call`,
 /// design `p1-1-direct-native-calls` §3.4), with `neovm_jit_call_spec` as
-/// the slow path. Default OFF; `NEOVM_JIT_DIRECT_CALL=on` turns it on (and
-/// with it the register ABI unless `NEOVM_JIT_DIRECT_MEMORY=on`). Off,
+/// the slow path. Default on with the profitable self-only policy;
+/// `NEOVM_JIT_DIRECT_CALL=off` disables it. Other site policies imply the
+/// register ABI unless `NEOVM_JIT_DIRECT_MEMORY=on`. Off,
 /// no spec slot arms a direct entry and no
 /// site emits a direct call: the lowering is CLIF-identical to the one
 /// before direct calls, for the single-build A/B. Read when a spec slot is
@@ -995,7 +1024,75 @@ pub(crate) fn jit_direct_call_on() -> bool {
     }
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| knob_on("NEOVM_JIT_DIRECT_CALL"))
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("NEOVM_JIT_DIRECT_CALL").ok().as_deref(),
+            Some("0" | "off" | "false" | "no")
+        )
+    })
+}
+
+/// Per-emitted-site atomic attempt/hit diagnostics. Default off; read only
+/// while compiling or arming a cold slot. Threading: immutable process
+/// configuration, with no Lisp state or mutator-local cache.
+pub(crate) fn jit_direct_profile_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| knob_on("NEOVM_JIT_DIRECT_PROFILE"))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    // Compiler configuration only; no Lisp values or mutator runtime state.
+    static DIRECT_SELF_HEAT_TEST_OVERRIDE: std::cell::Cell<Option<super::direct_call::DirectSelfHeat>> = const { std::cell::Cell::new(None) };
+    static DIRECT_SELF_KERNEL_TEST_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_direct_self_kernel_for_test(on: Option<bool>) {
+    DIRECT_SELF_KERNEL_TEST_OVERRIDE.with(|current| current.set(on));
+}
+
+/// Admit self sites and their implicit register entry only when the existing
+/// profitability classifier does not find more calls than arithmetic.
+/// Default on; `NEOVM_JIT_DIRECT_SELF_KERNEL=off` restores unrestricted
+/// self admission. Threading: immutable process configuration, compiler-only;
+/// the test override is a scalar and never holds Lisp or mutator state.
+pub(crate) fn jit_direct_self_kernel_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = DIRECT_SELF_KERNEL_TEST_OVERRIDE.with(core::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("NEOVM_JIT_DIRECT_SELF_KERNEL")
+                .ok()
+                .as_deref(),
+            Some("0" | "off" | "false" | "no")
+        )
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn force_direct_self_heat_for_test(mode: Option<super::direct_call::DirectSelfHeat>) {
+    DIRECT_SELF_HEAT_TEST_OVERRIDE.with(|current| current.set(mode));
+}
+
+/// Existing source heat required before a self body gains direct sites and
+/// an implicit register entry. Default off retains the original policy.
+/// Threading: immutable process configuration, read only by the compiler.
+pub(crate) fn jit_direct_self_heat() -> super::direct_call::DirectSelfHeat {
+    #[cfg(test)]
+    if let Some(mode) = DIRECT_SELF_HEAT_TEST_OVERRIDE.with(core::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<super::direct_call::DirectSelfHeat> =
+        std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        super::direct_call::DirectSelfHeat::parse(
+            std::env::var("NEOVM_JIT_DIRECT_SELF_HEAT").ok().as_deref(),
+        )
+    })
 }
 
 /// Which variable ops `NEOVM_JIT_INLINE_VARS` inlines in JIT code (design
@@ -1297,7 +1394,7 @@ pub(crate) fn jit_tier2_policy() -> Tier2PolicyKnob {
 }
 
 /// Which bodies emit direct call sites (`direct_call`), when direct calls
-/// are on: `NEOVM_JIT_DIRECT_SITES=all`, `self`, or `unbounded` (default).
+/// are on: `NEOVM_JIT_DIRECT_SITES=self` (default), `all`, or `unbounded`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DirectSitesMode {
     /// Every body.
@@ -1340,8 +1437,8 @@ pub(crate) fn jit_direct_sites() -> DirectSitesMode {
     *MODE.get_or_init(
         || match std::env::var("NEOVM_JIT_DIRECT_SITES").ok().as_deref() {
             Some("all") => DirectSitesMode::All,
-            Some("self") => DirectSitesMode::SelfOnly,
-            _ => DirectSitesMode::Unbounded,
+            Some("unbounded") => DirectSitesMode::Unbounded,
+            _ => DirectSitesMode::SelfOnly,
         },
     )
 }
@@ -1468,4 +1565,173 @@ pub(crate) fn jit_call_census_on() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| knob_on("NEOVM_JIT_CALL_CENSUS"))
+}
+
+/// Mid-end selection, independent of the T2 countdown trigger. Threading:
+/// immutable process configuration; test overrides contain configuration only.
+/// Legacy is the default, so the new backend is off and existing CLIF is kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum OptMode {
+    #[default]
+    Legacy,
+    Off,
+    Opt,
+}
+impl OptMode {
+    pub(crate) fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("off") => Self::Off,
+            Some("opt") => Self::Opt,
+            _ => Self::Legacy,
+        }
+    }
+}
+pub(crate) fn jit_opt_mode() -> OptMode {
+    #[cfg(test)]
+    if let Some(mode) = OPT_TEST_OVERRIDE.with(|v| v.get()) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<OptMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| OptMode::parse(std::env::var("NEOVM_JIT_OPT").ok().as_deref()))
+}
+
+/// Reach admissions for the new backend. Threading: an immutable scalar mask,
+/// shared by compilers; it contains neither Lisp values nor mutator state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OptAdmit {
+    pub args: bool,
+    pub env: bool,
+    pub vars: bool,
+    pub binds: bool,
+    pub switch: bool,
+    pub handlers: bool,
+}
+impl OptAdmit {
+    pub(crate) const ALL: Self = Self {
+        args: true,
+        env: true,
+        vars: true,
+        binds: true,
+        switch: true,
+        handlers: true,
+    };
+    pub(crate) fn parse(value: Option<&str>) -> Self {
+        let mut bits = Self::default();
+        for bit in value.unwrap_or("").split(',').map(str::trim) {
+            match bit {
+                "all" => return Self::ALL,
+                "args" => bits.args = true,
+                "env" => bits.env = true,
+                "vars" => bits.vars = true,
+                "binds" => bits.binds = true,
+                "switch" => bits.switch = true,
+                "handlers" => bits.handlers = true,
+                _ => {}
+            }
+        }
+        bits
+    }
+}
+pub(crate) fn jit_opt_admit() -> OptAdmit {
+    #[cfg(test)]
+    if let Some(bits) = OPT_ADMIT_TEST_OVERRIDE.with(|v| v.get()) {
+        return bits;
+    }
+    static BITS: std::sync::OnceLock<OptAdmit> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| OptAdmit::parse(std::env::var("NEOVM_JIT_OPT_ADMIT").ok().as_deref()))
+}
+#[cfg(test)]
+thread_local! {
+    /// Configuration only, never Lisp state.
+    static OPT_TEST_OVERRIDE: std::cell::Cell<Option<OptMode>> = const { std::cell::Cell::new(None) };
+    /// Configuration only, never Lisp state.
+    static OPT_ADMIT_TEST_OVERRIDE: std::cell::Cell<Option<OptAdmit>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn force_opt_for_test(mode: Option<OptMode>, admit: Option<OptAdmit>) {
+    OPT_TEST_OVERRIDE.with(|v| v.set(mode));
+    OPT_ADMIT_TEST_OVERRIDE.with(|v| v.set(admit));
+}
+
+/// Select the backend a test asserts, independently of the process configuration.
+/// Threading: test-thread compiler configuration only, never Lisp state; nested
+/// scopes restore the exact previous override, including its absence.
+#[cfg(test)]
+pub(crate) fn opt_mode_scope_for_test(mode: OptMode) -> impl Drop {
+    struct Scope(Option<OptMode>);
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            OPT_TEST_OVERRIDE.with(|value| value.set(self.0));
+        }
+    }
+    Scope(OPT_TEST_OVERRIDE.with(|value| value.replace(Some(mode))))
+}
+
+/// Independently selected mid-end passes. Threading: immutable process-wide
+/// compiler configuration only; it contains no Lisp values or mutator state.
+/// An empty list runs no transformations. Negative entries support bisection
+/// of an explicit list (for example `all,-gvn`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OptPasses {
+    pub fold: bool,
+    pub bool_rep: bool,
+    pub reps: bool,
+    pub gvn: bool,
+    pub range: bool,
+    pub licm: bool,
+    pub sink: bool,
+}
+
+impl OptPasses {
+    pub(crate) const ALL: Self = Self {
+        fold: true,
+        bool_rep: true,
+        reps: true,
+        gvn: true,
+        range: true,
+        licm: true,
+        sink: true,
+    };
+
+    pub(crate) fn parse(value: Option<&str>) -> Self {
+        let mut passes = Self::default();
+        for token in value.unwrap_or("").split(',').map(str::trim) {
+            let (name, on) = token
+                .strip_prefix('-')
+                .map_or((token, true), |name| (name, false));
+            match name {
+                "none" if on => passes = Self::default(),
+                "all" => passes = if on { Self::ALL } else { Self::default() },
+                "fold" => passes.fold = on,
+                "bool" => passes.bool_rep = on,
+                "reps" => passes.reps = on,
+                "gvn" => passes.gvn = on,
+                "range" => passes.range = on,
+                "licm" => passes.licm = on,
+                "sink" => passes.sink = on,
+                _ => {}
+            }
+        }
+        passes
+    }
+}
+
+pub(crate) fn jit_opt_passes() -> OptPasses {
+    #[cfg(test)]
+    if let Some(passes) = OPT_PASSES_TEST_OVERRIDE.with(|v| v.get()) {
+        return passes;
+    }
+    static PASSES: std::sync::OnceLock<OptPasses> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| OptPasses::parse(std::env::var("NEOVM_JIT_OPT_PASSES").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Compiler configuration only, never mutator or Lisp state.
+    static OPT_PASSES_TEST_OVERRIDE: std::cell::Cell<Option<OptPasses>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_opt_passes_for_test(passes: Option<OptPasses>) {
+    OPT_PASSES_TEST_OVERRIDE.with(|v| v.set(passes));
 }

@@ -495,6 +495,9 @@ impl BufferSourceOutputSetup {
             max_rows,
             walk_setup,
         );
+        if params.mini_measurement == crate::types::MiniWindowMeasurement::ToEnd {
+            setup.begin_request = setup.begin_request.with_growing_rows();
+        }
         setup.row_visibility_limit.allow_partial = params.window_system
             && !params.kind.is_minibuffer()
             && params.measurement_rows.is_none();
@@ -758,7 +761,8 @@ impl BufferSourceOutputSetup {
             // trailing `:extend` fill (GNU extend_face_to_end_of_line): a fill
             // whose bg equals the frame bg is a visual no-op and is skipped.
             Color::from_pixel(default_face.face().bg),
-        );
+        )
+        .with_read_boundary(source.read_boundary());
         let fallback_metrics = default_face.metrics();
         let tail_context = BufferSourceTailRequestContext::new(
             params,
@@ -1083,6 +1087,21 @@ impl BufferSourceOutputSetup {
                 buffer,
                 buf_access,
             );
+            let post_loop = match post_loop {
+                crate::buffer_source::body_render::BufferSourceBodyRenderOutcome::Complete(outcome) => outcome,
+                crate::buffer_source::body_render::BufferSourceBodyRenderOutcome::SyncHorizonExhausted => {
+                    output.output_target().builder().finish_edit_sync();
+                    output.restore_retry_checkpoint(retry_checkpoint);
+                    // The body failed before sync installation consumed its
+                    // rows. Preserve the exact admitted replay for an uncapped
+                    // local retry; restore the chrome taken before this walk.
+                    scroll.chrome = retained_chrome;
+                    scroll.chrome_memo = chrome_memo;
+                    return BufferSourceRenderAttemptOutcome::SyncSourceHorizonExhausted {
+                        replay: Some(Box::new(scroll)),
+                    };
+                }
+            };
             let (mut output, evaluator) = output.into_parts();
             // The rows below the edit move by what the walk produced; a walk
             // that never synchronized ran to the window bottom instead and
@@ -1107,15 +1126,12 @@ impl BufferSourceOutputSetup {
                 && let Some(reached) = edit_sync_reached
             {
                 synced_stop = Some(plan.stop_charpos as i64);
-                let placed = plan.install(reached, visible_bottom, geometry.mode_line_display_row);
-                edit_sync_shift = Some((
-                    placed
-                        .rows
-                        .iter()
-                        .map(|(index, _)| *index)
-                        .collect::<Vec<_>>(),
-                    placed.dy,
-                ));
+                let placed = if scroll.edit {
+                    plan.install_edit(reached, visible_bottom, geometry.mode_line_display_row)
+                } else {
+                    plan.install(reached, visible_bottom, geometry.mode_line_display_row)
+                };
+                edit_sync_shift = placed.shift_ledger();
                 scroll.reused_rows.extend(placed.rows);
                 scroll.reused_row_snapshots.extend(placed.row_snapshots);
                 scroll.reused_points.extend(placed.points);
@@ -1126,7 +1142,9 @@ impl BufferSourceOutputSetup {
                 }
             }
             // Whether reused rows sit BELOW the walked span.
-            let below_reused = scroll.bound_walk || edit_sync_shift.is_some();
+            // Sync still reuses rows below the walk when dy is zero; the
+            // optional vertical-shift ledger does not name this fact.
+            let below_reused = scroll.bound_walk || synced_stop.is_some();
 
             // Post-walk validation (GNU try_window_id: the regenerated region
             // must sync back up with the reused rows). The bounded walk just
@@ -1448,6 +1466,12 @@ impl BufferSourceOutputSetup {
                 measured_chrome_heights,
                 window_snapshots,
             );
+            #[cfg(test)]
+            if scroll.edit && synced_stop.is_some() {
+                // The stop was reached, install_edit ran, all cursor/replay and
+                // chrome checks passed, and this real producer returns Finished.
+                crate::incremental_layout::edit_sync::fontify_coverage_test_support::note_completed_sync_install();
+            }
             return BufferSourceRenderAttemptOutcome::Finished {
                 redisplay_positions,
                 query_restart_rows: Vec::new(),
@@ -1479,6 +1503,30 @@ impl BufferSourceOutputSetup {
             buffer,
             buf_access,
         );
+
+        let post_loop = match post_loop {
+            crate::buffer_source::body_render::BufferSourceBodyRenderOutcome::Complete(outcome) => outcome,
+            crate::buffer_source::body_render::BufferSourceBodyRenderOutcome::SyncHorizonExhausted => {
+                // A replay-free source has no sync horizon. Retain a complete
+                // retry route if a future caller violates that admission rule.
+                output.output_target().builder().finish_edit_sync();
+                output.restore_retry_checkpoint(retry_checkpoint);
+                return BufferSourceRenderAttemptOutcome::SyncSourceHorizonExhausted { replay: None };
+            }
+        };
+
+        if let crate::buffer_source::tail_render::BufferSourceEobCursorRow::Unavailable { boundary } =
+            post_loop.eob_cursor_row
+            && !params.force_start
+            && matches!(
+                self.position_publication,
+                WindowPositionPublication::Redisplay
+                    | WindowPositionPublication::RedisplayResumedScrollHook
+            )
+        {
+            output.restore_retry_checkpoint(retry_checkpoint);
+            return BufferSourceRenderAttemptOutcome::GnuMiniEobCursorUnavailable { boundary };
+        }
 
         let retry_plan = BufferSourceRetryPlan::from_post_loop(
             tail_context.params.window_id,
@@ -1547,25 +1595,30 @@ impl BufferSourceOutputSetup {
         // fringe bitmap when requested. This runs after the body is installed
         // (so `walk_setup.row_geometry` is immediately below the last buffer
         // row) and before mode-line chrome, with row and pixel boundary guards.
-        EndOfBufferRowsFillRequest::new(
-            params,
-            geometry.display_text_row_base,
-            geometry.max_rows,
-            geometry.text_y,
-            geometry.text_height,
-            geometry.char_height,
-            window_metrics.ascent(),
-            line_number_field,
-            walk_setup.beyond_accessible_end_line_prefix.as_ref(),
-        )
-        .fill(
-            buffer,
-            output.reborrow(),
-            evaluator,
-            window_faces,
-            render_services.face_ids(),
-            &walk_setup.row_geometry,
-        );
+        // A BEGV-to-ZV mini measurement ends at the real source row; the
+        // display-only EOB decoration tail must not hold its old allocation.
+        if params.mini_measurement != crate::types::MiniWindowMeasurement::ToEnd {
+            EndOfBufferRowsFillRequest::new(
+                params,
+                geometry.display_text_row_base,
+                geometry.max_rows,
+                geometry.text_y,
+                geometry.text_height,
+                geometry.char_height,
+                window_metrics.ascent(),
+                line_number_field,
+                walk_setup.beyond_accessible_end_line_prefix.as_ref(),
+            )
+            .fill(
+                buffer,
+                output.reborrow(),
+                evaluator,
+                window_faces,
+                render_services.face_ids(),
+                &walk_setup.row_geometry,
+            );
+        }
+
         // GNU's `overlay_arrow_at_row` draws the overlay arrow — a left-fringe
         // bitmap on a window-system frame with a left fringe, else the string
         // over the marked row's leading glyphs. Stamp it here for the same

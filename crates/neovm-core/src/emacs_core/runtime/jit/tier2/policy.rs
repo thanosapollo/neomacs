@@ -84,6 +84,11 @@ struct Ledger {
 }
 thread_local! { static LEDGER: Cell<Ledger> = const { Cell::new(Ledger { spent: 0, reserved: 0 }) }; }
 
+/// Newly admitted straight-line opt helpers stay small. Their countdown proves
+/// repeated native use; a stable snapshot and the existing CPU budget still
+/// precede compilation. Large call-dominated bodies keep the legacy worth test.
+const OPT_HELPER_MAX_OPS: usize = 64;
+
 /// A scalar OS thread CPU clock, also usable by the backend worker (no Lisp).
 pub(crate) fn cpu_time_us() -> u64 {
     #[cfg(unix)]
@@ -182,12 +187,34 @@ pub(crate) fn release(leaf: &CompiledLeaf) {
 /// Re-arm the retained T1 against widened feedback. The next request compares
 /// that exact snapshot after one stable work window (entries + cold poll credit).
 pub(crate) fn rearm_fallback(source: &RuntimeState, old: &CompiledLeaf) {
+    if super::super::compile::array_snapshot::selected() {
+        rearm_with_array_version(source, old);
+        return;
+    }
     release(old);
     let t2 = &old.obs.t2;
     if !t2.profiling() {
         return;
     }
     let mut p = t2.policy.borrow_mut();
+    p.version = Some(Version::read(source, p.ops_len));
+    p.attempts = 0;
+    t2.state.set(T2State::Idle);
+    t2.budget.set(i64::from(jit_tier2_policy().stable));
+}
+/// Selected-only twin: main's policy snapshot and array masks start one
+/// fresh stable window together. Threading: the leaf's owning mutator only;
+/// side rows contain scalar masks and never enlarge the hot policy layout.
+#[cold]
+#[inline(never)]
+fn rearm_with_array_version(source: &RuntimeState, old: &CompiledLeaf) {
+    release(old);
+    let t2 = &old.obs.t2;
+    if !t2.profiling() {
+        return;
+    }
+    let mut p = t2.policy.borrow_mut();
+    super::array_stability::reset(&old.obs, source, p.ops_len);
     p.version = Some(Version::read(source, p.ops_len));
     p.attempts = 0;
     t2.state.set(T2State::Idle);
@@ -214,6 +241,8 @@ pub(crate) fn upgrade_failed(old: &CompiledLeaf) {
 
 /// A budget denial is temporary. Keep the stable snapshot and retry
 /// admission after another work window without reserving CPU in the meantime.
+/// Stable opt helpers use this existing retry too: denial preserves their T1,
+/// source, caller slots and stability history until the normal seam can compile.
 fn admit_request(leaf: &CompiledLeaf, kind: T2Upgrade) -> Option<T2Decision> {
     if !budget_allows(leaf) {
         leaf.obs.t2.budget.set(i64::from(jit_tier2_policy().stable));
@@ -223,8 +252,40 @@ fn admit_request(leaf: &CompiledLeaf, kind: T2Upgrade) -> Option<T2Decision> {
     Some(T2Decision::Upgrade(kind))
 }
 
+/// Retain a profiling T1 whose selected opt feedback upgrade cannot compile
+/// yet. Only its owning mutator calls this cold helper. No source snapshot is
+/// scanned or replaced, no reservation is held, and no Lisp values are touched.
+/// The existing Idle-only Use/HOF gates close recording and credit while entry
+/// and poll countdowns continue. The next affordable request starts sampling.
+#[cold]
+#[inline(never)]
+pub(crate) fn wait_for_opt_budget(leaf: &CompiledLeaf, kind: T2Upgrade) -> bool {
+    if super::super::compile::jit_opt_mode() != super::super::compile::OptMode::Opt
+        || kind != T2Upgrade::Feedback
+        || leaf.tier() == LeafTier::Aot
+        || !leaf.obs.t2.profiling()
+    {
+        return false;
+    }
+    release(leaf);
+    leaf.obs.t2.state.set(T2State::BudgetWait);
+    leaf.obs.t2.budget.set(i64::from(jit_tier2_policy().stable));
+    true
+}
+
 /// Stability and admissibility, followed by budget; no Lisp and no GC.
 pub(crate) fn request_decision(leaf: &CompiledLeaf, source: &RuntimeState) -> Option<T2Decision> {
+    if super::super::compile::jit_opt_mode() == super::super::compile::OptMode::Opt {
+        request_decision_opt(leaf, source)
+    } else {
+        request_decision_legacy(leaf, source)
+    }
+}
+
+/// Original main admission, selected for OFF and Legacy. Threading: only the
+/// leaf's owning mutator calls this policy; shared feedback keeps its existing
+/// atomic accessors. No Opt state or array side registry is read by this body.
+fn request_decision_legacy(leaf: &CompiledLeaf, source: &RuntimeState) -> Option<T2Decision> {
     if leaf.tier() == LeafTier::Aot {
         // AOT has no T1 feedback window. Check affordability without
         // reserving until the compile seam, as every tier-spine job does.
@@ -282,6 +343,134 @@ pub(crate) fn request_decision(leaf: &CompiledLeaf, source: &RuntimeState) -> Op
     admit_request(leaf, kind)
 }
 
+/// Integrated Opt admission, selected by the existing immutable process mode.
+/// Threading: the leaf's policy and resource ledger belong to its owning mutator;
+/// array snapshots retain their existing synchronized side-registry protocol.
+fn request_decision_opt(leaf: &CompiledLeaf, source: &RuntimeState) -> Option<T2Decision> {
+    if leaf.tier() == LeafTier::Aot {
+        // AOT has no T1 feedback window. Check affordability without
+        // reserving until the compile seam, as every tier-spine job does.
+        return Some(match decide(leaf) {
+            T2Decision::Upgrade(kind) if budget_allows(leaf) => T2Decision::Upgrade(kind),
+            T2Decision::Upgrade(_) => {
+                bump_stats(|s| s.budget_denied += 1);
+                T2Decision::Keep
+            }
+            T2Decision::Keep => T2Decision::Keep,
+        });
+    }
+    let k = jit_tier2_policy();
+    let t2 = &leaf.obs.t2;
+    let banned = source.t2_reopts.load(std::sync::atomic::Ordering::Relaxed) >= k.max_reopt
+        || source.reopt_level() >= super::super::ReoptLevel::BaselineOnly;
+    if banned {
+        return match decide(leaf) {
+            T2Decision::Upgrade(kind) => admit_request(leaf, kind),
+            T2Decision::Keep => Some(T2Decision::Keep),
+        };
+    }
+    if super::super::compile::jit_opt_mode() == super::super::compile::OptMode::Opt
+        && t2.state.get() == T2State::BudgetWait
+    {
+        if !budget_allows(leaf) {
+            bump_stats(|s| s.budget_denied += 1);
+            t2.budget.set(i64::from(k.stable));
+            return None;
+        }
+        // Closed Use/HOF windows did not record call targets. Capture a fresh
+        // source snapshot and sample a full stable window before admitting any
+        // upgrade; affordability alone cannot prove stability across the pause.
+        let mut p = t2.policy.borrow_mut();
+        super::array_stability::reset(&leaf.obs, source, p.ops_len);
+        p.version = Some(Version::read(source, p.ops_len));
+        t2.state.set(T2State::Idle);
+        t2.budget.set(i64::from(k.stable));
+        return None;
+    }
+    let mut p = t2.policy.borrow_mut();
+    let version = Version::read(source, p.ops_len);
+    let unstable = p.version.as_ref() != Some(&version);
+    let array_version = if super::super::compile::array_snapshot::selected() {
+        super::array_stability::read(&leaf.obs, source, p.ops_len)
+    } else {
+        None
+    };
+    let unstable = unstable
+        || array_version
+            .as_ref()
+            .is_some_and(|version| version.changed);
+    if unstable && p.attempts < k.attempts {
+        if let Some(version) = array_version {
+            super::array_stability::publish(&leaf.obs, version);
+        }
+        p.version = Some(version);
+        p.attempts += 1;
+        t2.budget.set(i64::from(k.stable));
+        bump_stats(|s| s.unstable += 1);
+        return None;
+    }
+    let fallback = decide(leaf);
+    let dynamic_worth = source.call_sites().is_some_and(|sites| {
+        sites.sites().iter().any(|s| {
+            s.count() >= jit_tier2().window / 8
+                && matches!(s.target(), CallTarget::Sym(_) | CallTarget::Sources(_))
+        })
+    });
+    let kind = if let T2Decision::Upgrade(kind) = fallback {
+        Some(kind)
+    } else if !unstable
+        && !banned
+        && (p.loop_or_recursive || leaf.tier() == LeafTier::Mir || dynamic_worth)
+    {
+        Some(T2Upgrade::Feedback)
+    } else {
+        None
+    };
+    // An opt rebuild can improve a compact statically named call helper even
+    // when main's allocator/dynamic-target worth decision found no opportunity.
+    // Only opt selects this additional admission; every existing stability,
+    // source-ban and compile-budget check remains in force.
+    let kind = kind.or_else(|| {
+        if !unstable
+            && !banned
+            && super::super::compile::jit_opt_mode() == super::super::compile::OptMode::Opt
+            && leaf.selected_tier() == super::super::compile::opt_census::SelectedTier::Baseline
+            && (1..=OPT_HELPER_MAX_OPS).contains(&p.ops_len)
+        {
+            Some(T2Upgrade::Feedback)
+        } else {
+            None
+        }
+    });
+    drop(p);
+    // An opt compile replaces code rather than merely changing its allocator:
+    // use the T2 lifecycle so the existing T1 fallback remains rooted and can
+    // be restored on a counted deopt. The legacy decision is unchanged.
+    let kind = kind.map(|kind| {
+        if !banned
+            && !unstable
+            && super::super::compile::jit_opt_mode() == super::super::compile::OptMode::Opt
+        {
+            T2Upgrade::Feedback
+        } else {
+            kind
+        }
+    });
+    let Some(kind) = kind else {
+        bump_stats(|s| s.not_worth += 1);
+        return Some(T2Decision::Keep);
+    };
+    if super::super::compile::jit_opt_mode() == super::super::compile::OptMode::Opt {
+        let decision = admit_request(leaf, kind);
+        if decision.is_none() && !banned && !unstable {
+            wait_for_opt_budget(leaf, kind);
+        }
+        decision
+    } else {
+        admit_request(leaf, kind)
+    }
+}
+
 /// Called only for a counted, conclusive/repeated deopt, after its existing
 /// widening/retreat policy. C9 reuses that policy and the persistent site table.
 pub(crate) fn revert_if_t2(
@@ -323,3 +512,7 @@ pub(crate) fn revert_if_t2(
 #[cfg(test)]
 #[path = "tests/policy_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/policy_opt_test.rs"]
+mod opt_tests;

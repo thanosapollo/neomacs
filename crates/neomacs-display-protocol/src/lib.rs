@@ -31,6 +31,8 @@ pub mod modifier_policy;
 pub mod motion_spec;
 pub mod neo_term_palette;
 pub mod popup_placement;
+pub mod posn_frame_pool;
+pub mod posn_object_extent;
 pub mod present_mapping;
 pub mod presentation_origin;
 pub mod presented_frame;

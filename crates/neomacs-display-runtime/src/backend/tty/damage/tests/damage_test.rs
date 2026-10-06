@@ -38,12 +38,35 @@ fn output_string(rif: &mut TtyRif) -> String {
 }
 
 #[test]
-fn silent_knob_parses_on_and_defaults_off() {
-    assert!(!parse_tty_silent_knob(None));
+fn silent_knob_parses_on_and_defaults_on() {
+    assert!(parse_tty_silent_knob(None));
+    assert!(!parse_tty_silent_knob(Some("unknown")));
     assert!(!parse_tty_silent_knob(Some("")));
     assert!(!parse_tty_silent_knob(Some("off")));
     assert!(parse_tty_silent_knob(Some("on")));
     assert!(parse_tty_silent_knob(Some(" 1 ")));
+}
+
+#[cfg(unix)]
+#[test]
+fn silent_os_knob_distinguishes_absent_from_non_unicode_settings() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    assert!(parse_tty_silent_os_knob(None));
+    for value in ["on", "1", "true", "yes", " On "] {
+        assert!(parse_tty_silent_os_knob(Some(OsStr::new(value))));
+    }
+    for value in ["off", "0", "", "unknown", "false", "été"] {
+        assert!(!parse_tty_silent_os_knob(Some(OsStr::new(value))));
+    }
+    for value in [
+        b"\xff".as_slice(),
+        b"on\xff".as_slice(),
+        b"\xc3(".as_slice(),
+    ] {
+        assert!(!parse_tty_silent_os_knob(Some(OsStr::from_bytes(value))));
+    }
 }
 
 #[test]
@@ -1171,6 +1194,13 @@ fn verify_report_lines_from_concurrent_writers_never_interleave() {
 
 #[test]
 fn row_identity_knob_parses_and_defaults_to_appearance() {
+    for value in ["on", "1", "true", "yes", " TRUE ", "Yes"] {
+        assert_eq!(
+            parse_tty_row_identity_knob(Some(value)),
+            TtyRowIdentity::Appearance,
+            "{value}"
+        );
+    }
     assert_eq!(
         parse_tty_row_identity_knob(None),
         TtyRowIdentity::Appearance

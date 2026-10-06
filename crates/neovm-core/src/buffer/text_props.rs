@@ -6,6 +6,10 @@
 //! split at the edit range, change the affected interval plists, and preserve
 //! raw interval boundaries.  Higher-level property-change queries decide
 //! whether adjacent interval plists are semantically equal.
+//!
+//! | Knob | Default | Values | Effect |
+//! |---|---|---|---|
+//! | `NEOMACS_WATCHED_PROP_DEMAND` | `on` | `off`; `on`/`1`/`true`/`yes` | Advance bounded watched-property scans only after another interval is needed; generic cursors remain eager. |
 
 use crate::emacs_core::intern::SymId;
 use std::collections::HashMap;
@@ -729,6 +733,76 @@ impl Clone for IntervalTree {
             rightmost_id_cache: AtomicUsize::new(0),
         }
     }
+}
+
+/// Process policy for bounded watched-property scans. It contains no Lisp
+/// state; `OnceLock` publishes one immutable selector to concurrent readers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchedPropDemandMode {
+    Off,
+    On,
+}
+
+fn parse_watched_prop_demand_mode(value: Option<&str>) -> WatchedPropDemandMode {
+    if value.is_none_or(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "on" | "1" | "true" | "yes"
+        )
+    }) {
+        WatchedPropDemandMode::On
+    } else {
+        WatchedPropDemandMode::Off
+    }
+}
+
+/// Only an absent setting selects the default; a present non-Unicode
+/// setting keeps the explicit OFF path. This pure parser retains no state and
+/// can be called concurrently.
+fn parse_watched_prop_demand_os_mode(value: Option<&std::ffi::OsStr>) -> WatchedPropDemandMode {
+    match value {
+        None => parse_watched_prop_demand_mode(None),
+        Some(value) => value.to_str().map_or(WatchedPropDemandMode::Off, |value| {
+            parse_watched_prop_demand_mode(Some(value))
+        }),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static WATCHED_PROP_DEMAND_OVERRIDE: std::cell::Cell<Option<WatchedPropDemandMode>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn with_watched_prop_demand_mode_for_test<T>(
+    mode: WatchedPropDemandMode,
+    body: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<WatchedPropDemandMode>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WATCHED_PROP_DEMAND_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let restore = Restore(WATCHED_PROP_DEMAND_OVERRIDE.with(|cell| cell.replace(Some(mode))));
+    let result = body();
+    drop(restore);
+    result
+}
+
+#[inline]
+fn watched_prop_demand_mode() -> WatchedPropDemandMode {
+    #[cfg(test)]
+    if let Some(mode) = WATCHED_PROP_DEMAND_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<WatchedPropDemandMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        parse_watched_prop_demand_os_mode(
+            std::env::var_os("NEOMACS_WATCHED_PROP_DEMAND").as_deref(),
+        )
+    })
 }
 
 /// Forward in-order iterator over a tree's intervals (see [`IntervalTree::cursor_at`]).
@@ -3321,6 +3395,9 @@ impl TextPropertyTable {
         if cap <= pos {
             return cap;
         }
+        if watched_prop_demand_mode() == WatchedPropDemandMode::On {
+            return self.next_watched_property_change_demand(pos, cap, keys);
+        }
         // Same locate-once-then-step-siblings walk as
         // `next_single_property_change_after_char_pos`, comparing the watched keys
         // directly off each node's plist spine and bounded by `cap`.
@@ -3342,6 +3419,49 @@ impl TextPropertyTable {
                 }
                 None => {
                     // Trailing implicit-nil region at the tree end.
+                    if !watched_keys_equal_eq_plist(current, Value::NIL, keys) {
+                        return boundary;
+                    }
+                    return cap;
+                }
+            }
+        }
+    }
+
+    /// Keep the watched-key comparisons of GNU `compute_stop_pos`, but use
+    /// the carried end to reject an unused lookahead before `next_id`. Only
+    /// this bounded query selects the loop; generic cursors keep their policy.
+    ///
+    /// Each query borrows an immutable tree and keeps its seat and boundary in
+    /// local variables. No Lisp state is cached or published; independent
+    /// queries can read a shared tree concurrently under its existing contract.
+    #[inline]
+    fn next_watched_property_change_demand(
+        &self,
+        pos: CharPos0,
+        cap: CharPos0,
+        keys: &[Value],
+    ) -> CharPos0 {
+        let Some((start, mut id)) = self.intervals.find_id(pos) else {
+            return cap;
+        };
+        let current = self.intervals.nodes[id.0].plist;
+        let mut boundary = self.intervals.interval_end(start, id);
+        loop {
+            if boundary >= cap {
+                return cap;
+            }
+            match self.intervals.next_id(id) {
+                Some(next_id) => {
+                    let node = &self.intervals.nodes[next_id.0];
+                    if !watched_keys_equal_eq_plist(current, node.plist, keys) {
+                        return boundary;
+                    }
+                    boundary = self.intervals.interval_end(boundary, next_id);
+                    id = next_id;
+                }
+                None => {
+                    // The region beyond tree coverage reads as implicit nil.
                     if !watched_keys_equal_eq_plist(current, Value::NIL, keys) {
                         return boundary;
                     }
@@ -4576,6 +4696,88 @@ impl TextPropertyTable {
             }
         });
         table
+    }
+
+    /// Append a clipped source range with the exact interval result of
+    /// `append_shifted_at_char_offset(&source.slice_char_range(range), offset)`.
+    ///
+    /// GNU `copy_intervals` clips a source partition, and
+    /// `graft_intervals_into_buffer` copies each source plist into the covered
+    /// target intervals. Here the clipped run descriptors borrow the original
+    /// plists, so the existing graft makes the only spine copy. Raw boundaries,
+    /// plist order and duplicate keys, nil gaps, target splits, and predecessor
+    /// detachment remain those of the two-step operation.
+    ///
+    /// The borrow is synchronous and immutable, and the destination requires
+    /// exclusive access. No borrowed descriptor or original plist spine escapes;
+    /// the destination stores fresh spines with shallow-shared keys/values. There
+    /// is no new shared runtime state or assumption of a single mutator.
+    /// The caller must hold the source at the same capture point as the legacy
+    /// slice, without running Lisp between capture and graft.
+    #[inline]
+    pub fn append_source_slice_at_char_offset(
+        &mut self,
+        source: &TextPropertyTable,
+        range: CharRange,
+        offset: CharLen,
+    ) {
+        self.append_source_slice_at_char_offset_with_roots(source, range, offset, |_| {});
+    }
+
+    /// Publish only freshly grafted plist roots through the enclosing walk's
+    /// incremental root owner. The callback must not evaluate Lisp or collect.
+    pub(crate) fn append_source_slice_at_char_offset_with_roots(
+        &mut self,
+        source: &TextPropertyTable,
+        range: CharRange,
+        offset: CharLen,
+        new_root: impl FnMut(Value),
+    ) {
+        let start = range.start().get();
+        let end = range.end().get();
+        let mut runs = Vec::new();
+        if !range.is_empty() {
+            source.for_each_interval_overlapping(range, |interval_start, node_end, node| {
+                let new_start = interval_start.max(start) - start;
+                let new_end = node_end.min(end) - start;
+                if new_start < new_end {
+                    let mut run = IntervalRun::from_node(
+                        CharPos0::new(new_start),
+                        node,
+                        CharLen::new(new_end - new_start),
+                    );
+                    // `copy_plist_value` drops a dangling odd key or dotted
+                    // tail. A plist with no complete pair therefore becomes
+                    // nil in the legacy slice, BEFORE shape normalization.
+                    // Other plists stay borrowed and are canonicalized by the
+                    // graft's one copy; duplicate complete pairs stay ordered.
+                    if !run.plist.is_cons() || !run.plist.cons_cdr().is_cons() {
+                        run.plist = Value::NIL;
+                    }
+                    runs.push(run);
+                }
+            });
+        }
+        // In particular, an all-nil slice has no intervals, while nil gaps
+        // surrounding a non-nil run survive. Reuse the legacy normalizer so
+        // this method neither extends implicit trailing nil text nor merges
+        // the source's raw interval boundaries.
+        let runs = IntervalTree::normalize_runs_preserving_shape(runs);
+
+        // Append bumps these ticks even when the normalized slice is empty.
+        self.mutation_tick += 1;
+        self.syntax_prop_tick += 1;
+        if runs.iter().any(|run| run.has_syntax_prop) {
+            if let Ok(mut guard) = self.syntax_prop_ranges.lock() {
+                *guard = (0, Vec::new());
+            }
+        } else {
+            self.syntax_ranges_revalidate();
+        }
+        for run in &runs {
+            self.property_names.observe_plist(run.plist);
+        }
+        self.intervals.graft_shifted_runs(&runs, offset, new_root);
     }
 
     pub fn append_shifted_at_char_offset(&mut self, other: &TextPropertyTable, offset: CharLen) {

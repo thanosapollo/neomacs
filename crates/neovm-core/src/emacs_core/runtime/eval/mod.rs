@@ -52,8 +52,13 @@ use crate::gc_trace::GcTrace;
 use crate::tagged::header::{
     CLOSURE_ARGLIST, SubrDispatchKind, SubrFn, SubrInteractivity, SubrObj,
 };
-use crate::window::{FrameFullscreen, FrameManager, WindowId, WindowLayoutQueryAdapter};
+use crate::window::{
+    BodyRedisplayRevision, ForcedBodyRedisplay, FrameFullscreen, FrameManager, WindowId,
+    WindowLayoutQueryAdapter,
+};
 
+mod callback;
+pub(crate) use callback::{CheckedNativeCallback, native_callback_cache_enabled};
 mod subrs;
 #[cfg(test)]
 pub(crate) use subrs::SUBRS;
@@ -626,8 +631,8 @@ static BUILTIN_SYM_BITS: [std::sync::atomic::AtomicU64; BUILTIN_SYM_BITS_WORDS] 
 /// `neovm_jit_cbsym_read`'s only DYNAMIC arming test is this bitmap read
 /// (the arity check and the harness override are both compile-time under
 /// JIT), so a site that inlines the read has to reproduce exactly this and
-/// nothing else -- it is what makes the inline answer advice- and
-/// fset-sensitive in the same way the shim is.
+/// nothing else -- native registration sensitivity matches the shim.
+/// Primitive opcodes bypass advice and fset changes to the function cell.
 ///
 /// `None` for a symbol beyond the bitmap, whose answer lives in a
 /// `RefCell`-guarded table that generated code must not touch; the caller
@@ -685,6 +690,7 @@ pub(crate) fn register_global_subr_entry(sym_id: SymId, entry: SubrEntry) {
         entry.dispatch_kind,
         SubrInteractivity::from(entry.interactive_spec.is_some()),
     );
+    callback::publish_native_registration();
 }
 
 /// Look up a subr entry by SymId.
@@ -907,6 +913,7 @@ pub(crate) fn clear_global_subr_table() {
     }
     GLOBAL_SUBR_TABLE.with(|table| table.borrow_mut().clear());
     INLINE_SUBR_TABLE.with(|table| table.borrow_mut().clear());
+    callback::publish_native_registration();
 }
 
 /// Cached SymId for `internal--compiler-function-overrides`.
@@ -1204,6 +1211,9 @@ pub(crate) enum NativeUnwindAction {
     MinibufferSession {
         state: Box<super::reader::MinibufferSessionUnwind>,
     },
+    MinibufferBuffer {
+        state: Box<super::reader::MinibufferBufferUnwind>,
+    },
 }
 
 impl NativeUnwindAction {
@@ -1213,6 +1223,7 @@ impl NativeUnwindAction {
                 visit(configuration.trace_value())
             }
             Self::MinibufferSession { state } => state.trace_roots(visit),
+            Self::MinibufferBuffer { .. } => {}
         }
     }
 
@@ -1228,6 +1239,9 @@ impl NativeUnwindAction {
             } => configuration.restore(context, options),
             Self::MinibufferSession { state } => {
                 super::reader::unwind_minibuffer_session(context, *state)
+            }
+            Self::MinibufferBuffer { state } => {
+                super::reader::unwind_minibuffer_buffer(context, *state)
             }
         };
         context.restore_vm_roots(root_scope);
@@ -3321,6 +3335,16 @@ pub struct Context {
     #[allow(clippy::type_complexity)]
     // frontend callback seam avoids a core/layout dependency cycle
     pub redisplay_fn: Option<Box<dyn FnMut(&mut Self)>>,
+    /// First non-local mode-line exit deferred across the frontend's void
+    /// redisplay callback. Each Context belongs to one mutator at a time;
+    /// independent mutators own independent slots. Flow owns its payload's
+    /// GC pins until redisplay restores its state and returns the exit.
+    pub(crate) mode_line_display_flow: Option<Flow>,
+    /// Renderer-inert mini/echo geometry preparation before window-change
+    /// hooks. Exclusively invoked by the guarded redisplay transaction.
+    #[allow(clippy::type_complexity)]
+    pub redisplay_prepare_fn:
+        Option<Box<dyn FnMut(&mut Self, RedisplayMiniGeometryRequest) -> EvalResult>>,
     /// Frontend-installed font-shaping driver (GNU `font->driver->shape`).
     /// The gstring contract lives in src/font.c's `Ffont_shape_gstring`; the
     /// shaping engine lives in the display layer, so the frontend installs
@@ -3418,13 +3442,26 @@ pub struct Context {
     pub input_progress: neomacs_display_protocol::input_progress::InputProgress,
     /// Explicit redisplay invalidation generation, used for state that GNU
     /// marks with update_mode_lines/window redisplay flags.
+    ///
+    /// This counter also moves for presentation-only work (chrome, menu,
+    /// mode-line), so it must NOT be the reason a window relayouts its body
+    /// text; retained bodies key on [`BodyRedisplayRevision`] instead.
     redisplay_generation: u64,
+    /// Body-only redisplay revisions for `(force-window-update)`; see
+    /// [`BodyRedisplayRevision`]. Kept per window and per buffer so a targeted
+    /// force does not rebuild unrelated windows.
+    body_redisplay_all: u64,
+    body_redisplay_by_window: FxHashMap<WindowId, u64>,
+    body_redisplay_by_buffer: FxHashMap<BufferId, u64>,
     /// GNU `update_menu_bar` invalidation boundary.  This is narrower than
     /// `redisplay_generation`; see [`MenuBarRebuildGeneration`].
     menu_bar_rebuild_generation: u64,
     /// Which windows' chrome (mode/header/tab line) must be re-generated on
     /// the next redisplay. See [`ChromeDirty`].
     chrome_dirty: crate::emacs_core::chrome_dirty::ChromeDirty,
+    /// Pending GNU display ownership and private transaction state. Each
+    /// exclusively borrowed Context owns it; never a process/TLS Lisp cache.
+    pub(crate) gnu_redisplay_hooks: redisplay_hooks::RedisplayHookOwnership,
     /// Process-unique id for THIS evaluator instance. Lets thread-local
     /// caches outside neovm-core (e.g. the layout engine's menu-bar item
     /// cache) refuse entries from a previous Context: tests create many
@@ -3549,7 +3586,7 @@ pub struct Context {
     ///
     /// GNU's hot evaluator path reads the function cell directly. Neomacs only
     /// needs the override alist during compiler/macro machinery, so keep the
-    /// nil/common case as a cached flag and refresh it through the same runtime
+    /// nil/common case as a cached flag for genuine calls and refresh it through the same runtime
     /// binding paths that already maintain `quit-flag` and `noninteractive`.
     compiler_function_overrides_symbol: SymId,
     compiler_function_overrides_active: bool,
@@ -3566,13 +3603,14 @@ pub struct Context {
     /// thread-local's lookup plus RefCell borrow ran on every bind, unbind
     /// and native entry.
     pub(crate) jit_bind_stack: Vec<usize>,
-    /// The `function_epoch` at which compiled code last found `aset`'s
-    /// function cell still the builtin (and no compiler overrides active),
-    /// so `Op::Aset` shims ask the obarray only after a function cell changes
-    /// (every change, and an overrides toggle, advances the epoch). `u64::MAX`
-    /// is never a live epoch.
-    pub(crate) aset_fast_path_epoch: std::cell::Cell<u64>,
-    /// The same record for `apply` (`Vm::call_apply_native`).
+    /// Reserved former opcode epoch word. Primitive opcodes never consult it;
+    /// keeping its storage preserves Context offsets used by protected call
+    /// paths while the obsolete Aset guards are removed. Threading: this word
+    /// is never read or published and contains no Lisp or mutator state.
+    _reserved_opcode_epoch: std::cell::Cell<u64>,
+    /// The function epoch at which `apply` was last found to be the builtin
+    /// with compiler overrides inactive (`Vm::call_apply_native`). Genuine
+    /// calls must recheck after advice, redefinition or an overrides toggle.
     pub(crate) apply_fast_path_epoch: std::cell::Cell<u64>,
     /// Hot cache for named callable resolution in `funcall`/`apply`.
     /// Keyed by symbol id; entries are validated against the obarray's
@@ -5240,6 +5278,16 @@ impl Context {
             return Ok(None);
         };
         let previous_selected_window = frame.selected_window;
+        if super::eval::gnu_redisplay_hooks_enabled()
+            && frame.find_window(minibuffer_window_id).is_some()
+        {
+            // GNU minibuf.c:828 publishes set_window_buffer before normal
+            // Fselect_window; no Lisp executes until this transition commits.
+            self.gnu_mark_window_mode_line(minibuffer_window_id);
+            if previous_selected_window != minibuffer_window_id {
+                self.gnu_mark_selection(Some(previous_selected_window), minibuffer_window_id, true);
+            }
+        }
 
         super::window_cmds::remember_selected_window_point_in_state(
             &mut self.frames,
@@ -5249,6 +5297,12 @@ impl Context {
         if let Some(frame) = self.frames.get_mut(frame_id) {
             if let Some(window) = frame.find_window_mut(minibuffer_window_id) {
                 window.set_buffer(minibuf_id);
+                if super::eval::gnu_redisplay_hooks_enabled() {
+                    if let crate::window::Window::Leaf { hscroll, .. } = window {
+                        *hscroll = 0;
+                    }
+                    window.set_suspend_auto_hscroll(false);
+                }
                 crate::window::window_markers::attach_window_position_markers(
                     &mut self.buffers,
                     window,
@@ -7668,6 +7722,14 @@ mod sort_predicate;
 
 mod command_loop;
 
+pub(crate) mod redisplay_hooks;
+#[cfg(any(test, feature = "redisplay-test-policy"))]
+pub use redisplay_hooks::RedisplayHookPolicyGuard;
+pub(crate) use redisplay_hooks::gnu_redisplay_hooks_enabled;
+pub use redisplay_hooks::{
+    RedisplayMiniGeometryRequest, RedisplayMiniGeometrySource, RedisplayMiniPreparationFailure,
+};
+
 mod vm_shared;
 
 mod signal_dispatch;
@@ -7754,6 +7816,11 @@ mod attention_word_tests;
 #[cfg(test)]
 #[path = "tests/idle_redisplay.rs"]
 mod idle_redisplay_tests;
+
+#[cfg(test)]
+#[path = "tests/redisplay_mode_line_flow.rs"]
+mod redisplay_mode_line_flow_tests;
+
 // The debug leaf guard: GC safe points, Lisp entries and binding pushes
 // refuse to run under a leaf builtin, and leaves leave state untouched.
 #[cfg(all(test, debug_assertions))]

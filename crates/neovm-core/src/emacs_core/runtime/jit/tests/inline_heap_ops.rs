@@ -162,6 +162,244 @@ fn a_covering_window_sends_every_store_to_the_barrier() {
     assert_eq!(print_value(&cell), "(t . 2)");
 }
 
+/// Builds CLIF only: no unchecked proof is ever executed. Compiler state and
+/// the temporary module belong to this invocation and contain no Lisp state.
+fn cons_store_clif(
+    is_cdr: bool,
+    proof: impl FnOnce(ClifValue, ClifValue) -> heap_inline::ConsStoreProof,
+) -> Function {
+    let mut module = JITModule::new(
+        cranelift_jit::JITBuilder::new(cranelift_module::default_libcall_names()).unwrap(),
+    );
+    let config = module.target_config();
+    let groups = ShimGroups {
+        subr_spec: false,
+        cbsym_spec: false,
+        tier2_profile: false,
+        direct_shapes: false,
+        call_census: false,
+        direct_framed: false,
+        collection_journal: false,
+        collection_observation_gate: false,
+        hof: false,
+    };
+    let ids = ShimIds::declare(&mut module, config.default_call_conv, types::I64, groups).unwrap();
+    let mut signature = Signature::new(config.default_call_conv);
+    signature.params = vec![AbiParam::new(types::I64); 3];
+    signature.returns.push(AbiParam::new(types::I64));
+    let mut function = Function::with_name_signature(UserFuncName::user(0, 0), signature);
+    let refs = RtRefs::new(
+        ids,
+        groups,
+        &mut function,
+        config.default_call_conv,
+        types::I64,
+    );
+    let mut context = cranelift_frontend::FunctionBuilderContext::new();
+    lowering::imm_pool_reset();
+    {
+        let mut fb = FunctionBuilder::new(&mut function, &mut context);
+        let entry = fb.create_block();
+        fb.append_block_params_for_function_params(entry);
+        fb.switch_to_block(entry);
+        fb.seal_block(entry);
+        let params = fb.block_params(entry).to_vec();
+        let vmctx_var = fb.declare_var(types::I64);
+        fb.def_var(vmctx_var, params[0]);
+        let args_slot =
+            fb.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let result_slot =
+            fb.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let rt = lowering::RtCtx {
+            refs,
+            vmctx_var,
+            ptr_ty: types::I64,
+            call_args_slot: args_slot,
+            call_result_slot: result_slot,
+            rootwin: None,
+            heap: Some(params[0]),
+            inline_alloc: false,
+            generational: std::cell::Cell::new(Some(false)),
+            direct_sites: std::cell::Cell::new(0),
+            self_direct_source: None,
+            poll: t2_profile::PollEmit::default(),
+            inline_entry_cache: None,
+        };
+        let slow = fb.create_block();
+        let merge = fb.create_block();
+        let result = fb.declare_var(types::I64);
+        heap_inline::emit_inline_cons_store_with_proof(
+            &mut fb,
+            &rt,
+            params[1],
+            params[2],
+            is_cdr,
+            slow,
+            result,
+            merge,
+            proof(params[1], params[2]),
+        );
+        fb.switch_to_block(slow);
+        fb.seal_block(slow);
+        let failed = fb.ins().iconst(types::I64, 0);
+        fb.ins().return_(&[failed]);
+        fb.switch_to_block(merge);
+        fb.seal_block(merge);
+        let value = fb.use_var(result);
+        fb.ins().return_(&[value]);
+        fb.finalize(config);
+    }
+    function
+}
+
+/// The opt tier's explicit cons guard replaces only the shared store's second
+/// tag test. Its exact deopt state, forced deopt and every barrier slow path
+/// remain observable. Threading: the context and leaf belong to this test;
+/// scoped overrides hold compiler configuration only.
+#[test]
+fn opt_cons_store_proofs_keep_deopt_and_barrier_paths() {
+    use super::compile_pipeline_tests::captured_clif;
+    use crate::emacs_core::jit::opt::ir::ParamShape;
+    use crate::tagged::gc::WriteTrackingMode;
+
+    struct Settings;
+    impl Drop for Settings {
+        fn drop(&mut self) {
+            force_opt_for_test(None, None);
+            force_deopt_for_test(false);
+        }
+    }
+    let _settings = Settings;
+    force_deopt_for_test(false);
+    let lower = |f: &ByteCodeFunction| {
+        lower_leaf_full_osr_with_opt(
+            f.executable_ops(),
+            &f.constants,
+            2,
+            f.executable_gnu_byte_offset_map(),
+            None,
+            None,
+            0,
+            Some(ParamShape {
+                required: 2,
+                ..ParamShape::default()
+            }),
+        )
+        .expect("store lowers")
+    };
+    let mut eval = Context::new();
+    let ctx_ptr = &mut eval as *mut Context as *mut u8;
+    for op in [Op::Setcar, Op::Setcdr] {
+        let is_cdr = matches!(op, Op::Setcdr);
+        let dynamic = cons_store_clif(is_cdr, |_, _| heap_inline::ConsStoreProof::default());
+        let wrong = cons_store_clif(is_cdr, |_, other| {
+            heap_inline::ConsStoreProof::GuardedCons(other)
+        });
+        let matching = cons_store_clif(is_cdr, |cell, _| {
+            heap_inline::ConsStoreProof::GuardedCons(cell)
+        });
+        assert_eq!(
+            dynamic.display().to_string(),
+            wrong.display().to_string(),
+            "{op:?}: mismatched proof retains identical CLIF"
+        );
+        let instruction_count = |clif: &Function, opcode| {
+            clif.layout
+                .blocks()
+                .flat_map(|block| clif.layout.block_insts(block))
+                .filter(|inst| clif.dfg.insts[*inst].opcode() == opcode)
+                .count()
+        };
+        use cranelift_codegen::ir::Opcode;
+        assert_eq!(instruction_count(&dynamic, Opcode::Band), 1);
+        assert_eq!(instruction_count(&matching, Opcode::Band), 0);
+        assert_eq!(instruction_count(&dynamic, Opcode::Brif), 2);
+        assert_eq!(instruction_count(&matching, Opcode::Brif), 1);
+        for (retained, count) in [(Opcode::Load, 2), (Opcode::Store, 1)] {
+            assert_eq!(instruction_count(&matching, retained), count);
+            assert_eq!(
+                instruction_count(&dynamic, retained),
+                instruction_count(&matching, retained)
+            );
+        }
+        assert_eq!(instruction_count(&matching, Opcode::Icmp), 1);
+        let mut f = store_fn(op.clone());
+        f.seal_hand_assembled_ops();
+        force_opt_for_test(Some(OptMode::Off), Some(OptAdmit::ALL));
+        let baseline = captured_clif(|| {
+            lower(&f);
+        });
+        force_opt_for_test(Some(OptMode::Opt), Some(OptAdmit::ALL));
+        let mut leaf = None;
+        let optimized = captured_clif(|| leaf = Some(lower(&f)));
+        let leaf = leaf.unwrap();
+        assert_eq!(
+            leaf.selected_tier(),
+            crate::emacs_core::jit::compile::opt_census::SelectedTier::Opt
+        );
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(optimized.len(), 1);
+        let tag_tests = |clif: &str| clif.lines().filter(|line| line.contains("band ")).count();
+        assert_eq!(
+            tag_tests(&optimized[0]),
+            tag_tests(&baseline[0]),
+            "{op:?}: explicit guard must replace the shared tag test"
+        );
+
+        for bad in [Value::NIL, Value::fixnum(3)] {
+            let args = [bad, Value::T];
+            let NativeRun::DeoptAt(frame) = leaf.call(ctx_ptr, &args) else {
+                panic!("{op:?}: non-cons must leave through the explicit guard")
+            };
+            assert_eq!(frame.pc, 2);
+            assert_eq!(frame.stack.as_slice(), &[bad, Value::T, bad, Value::T]);
+        }
+
+        let args = keep(&mut eval, &["(cons 'old 'old)", "(list 'new)"]);
+        let (cell, value) = (args[0], args[1]);
+        eval.tagged_heap
+            .set_write_tracking_mode(WriteTrackingMode::OwnersAndRecords);
+        let before = shim_calls();
+        assert_eq!(native(ctx_ptr, &leaf, &args, "opt tracked"), "(new)");
+        assert_eq!(
+            shim_calls() - before,
+            1,
+            "{op:?}: window sends store to shim"
+        );
+        assert!(eval.tagged_heap.is_dirty_owner(cell));
+        eval.tagged_heap
+            .set_write_tracking_mode(WriteTrackingMode::Disabled);
+
+        eval.tagged_heap.set_concurrent_active_for_test(true);
+        let before = shim_calls();
+        assert_eq!(
+            native(ctx_ptr, &leaf, &[cell, Value::T], "opt marking"),
+            "t"
+        );
+        let logged = eval.tagged_heap.take_satb_shared_for_test();
+        eval.tagged_heap.set_concurrent_active_for_test(false);
+        assert_eq!(shim_calls() - before, 1, "{op:?}: mark sends store to shim");
+        assert!(logged.iter().any(|old| old.bits() == value.bits()));
+
+        force_deopt_for_test(true);
+        let forced = lower(&f);
+        force_deopt_for_test(false);
+        let args = keep(&mut eval, &["(cons 'old 'old)", "(list 'new)"]);
+        let old_cell = print_value(&args[0]);
+        let before = shim_calls();
+        let NativeRun::DeoptAt(frame) = forced.call(ctx_ptr, &args) else {
+            panic!("{op:?}: forced guard must deopt before the store")
+        };
+        assert_eq!(frame.pc, 2);
+        assert_eq!(
+            frame.stack.as_slice(),
+            &[args[0], args[1], args[0], args[1]]
+        );
+        assert_eq!(print_value(&args[0]), old_cell);
+        assert_eq!(shim_calls(), before);
+    }
+}
+
 /// While a concurrent mark runs the window is ALL, so a compiled store logs
 /// the overwritten car in the SATB buffer (the pre-image the mark must keep)
 /// exactly as the interpreter's store does; after the mark, stores are
@@ -407,7 +645,7 @@ fn plain_vector_and_record_stores_stay_inline() {
         ("(cons 1 2)", "0", "'z", false),
         ("nil", "0", "'z", false),
     ];
-    // The first call arms the context's `aset` epoch cell through the shim.
+    // Perform one primitive store before measuring each shape.
     let warm = keep(&mut eval, &["(vector 0)"])[0];
     native(
         ctx_ptr,
@@ -489,7 +727,7 @@ fn a_string_store_still_reaches_the_string_inline_behind_the_vector_store() {
         ("(cons 1 2)", "0", "'z", false),
         ("(vector 1 2 3)", "3", "'z", false),
     ];
-    // The first call arms the context's `aset` epoch cell through the shim.
+    // Perform one primitive store before measuring each shape.
     let warm = keep(&mut eval, &["(vector 0)"])[0];
     native(
         ctx_ptr,
@@ -522,12 +760,10 @@ fn a_string_store_still_reaches_the_string_inline_behind_the_vector_store() {
     }
 }
 
-/// A stale `aset` epoch (a function-cell write since the cell was armed)
-/// sends the next store to the shim, which re-arms the cell; the store
-/// after it is inline again. A redefined `aset` keeps every store in the
-/// shim, which answers the general call.
+/// Baset stores inline without a function-epoch gate. Unrelated function-cell
+/// writes and replacing aset itself leave the primitive opcode unchanged.
 #[test]
-fn a_function_cell_write_sends_the_next_aset_to_the_shim() {
+fn function_cell_writes_do_not_regate_inline_aset() {
     let mut eval = legacy_context();
     let ctx_ptr = &mut eval as *mut Context as *mut u8;
     let leaf = compile_bytecode_function(&aset_fn()).expect("aset compiles");
@@ -552,10 +788,14 @@ fn a_function_cell_write_sends_the_next_aset_to_the_shim() {
         .expect("fset");
     let before = aset_shim_calls();
     store(&mut eval, 3);
-    assert_eq!(aset_shim_calls() - before, 1, "a moved epoch re-validates");
+    assert_eq!(
+        aset_shim_calls(),
+        before,
+        "a moved function epoch leaves Baset inline"
+    );
     let before = aset_shim_calls();
     store(&mut eval, 4);
-    assert_eq!(aset_shim_calls(), before, "re-armed");
+    assert_eq!(aset_shim_calls(), before, "still inline");
     assert_eq!(print_value(&v), "[0 4]");
 
     eval.eval_str(
@@ -567,12 +807,12 @@ fn a_function_cell_write_sends_the_next_aset_to_the_shim() {
         let before = aset_shim_calls();
         store(&mut eval, n);
         assert_eq!(
-            aset_shim_calls() - before,
-            1,
-            "a redefined aset never inlines"
+            aset_shim_calls(),
+            before,
+            "Baset remains inline when aset is redefined"
         );
     }
-    assert_eq!(print_value(&v), "[0 (7)]");
+    assert_eq!(print_value(&v), "[0 7]");
     eval.eval_str("(fset 'aset aset-orig)").expect("restore");
 }
 
@@ -600,7 +840,7 @@ fn tenured_owners_store_inline_once_remembered() {
     let b = eval.eval_str("aset-old-b").expect("b");
     assert!(eval.tagged_heap.is_tenured_for_test(a));
     assert!(eval.tagged_heap.is_tenured_for_test(b));
-    // Arm the context's `aset` epoch cell.
+    // Perform an initial primitive store before measuring the barriers.
     let young = keep(&mut eval, &["(vector 0)"])[0];
     native(
         ctx_ptr,
@@ -780,6 +1020,9 @@ fn osr_into_a_cons_loop_allocates_inline() {
 /// allocates nothing at all.
 #[test]
 fn mir_conses_allocate_inline_or_not_at_all() {
+    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
+        crate::emacs_core::jit::compile::OptMode::Legacy,
+    );
     let mut eval = legacy_context();
     let ctx_ptr = &mut eval as *mut Context as *mut u8;
     // (lambda (a b) (cons a (cons b nil))): both escape.
@@ -942,7 +1185,7 @@ fn inline_aref_and_aset_have_no_slot0_test() {
         ],
     );
     let (vector, record, tag_vector) = (args[0], args[1], args[2]);
-    // The first `aset` arms the context's epoch cell through the shim.
+    // Perform an initial primitive store before measuring the inline sites.
     native(
         ctx_ptr,
         &aset,

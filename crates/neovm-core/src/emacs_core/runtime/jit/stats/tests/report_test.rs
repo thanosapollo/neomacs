@@ -209,6 +209,14 @@ fn leaf_row(id: u64, deopt_at: u64, deopt_rerun: u64) -> LeafReportRow {
         compile_us: 0,
         mir: Some("taken".into()),
         t2: Default::default(),
+        opt_fold: None,
+        opt_bool: None,
+        opt_reps: None,
+        opt_gvn: None,
+        opt_range: None,
+        opt_licm: None,
+        opt_sink: None,
+        opt_arrays: None,
     }
 }
 
@@ -348,6 +356,9 @@ fn jit_final_report_profile_leaf_rows_have_fewer_than_13_columns() {
 /// deopt pc is annotated with the bytecode op there.
 #[test]
 fn jit_final_report_collects_named_leaves_from_a_context() {
+    let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
+        crate::emacs_core::jit::compile::OptMode::Legacy,
+    );
     // Exact native outcomes: immune to a NEOVM_JIT_FORCE_DEOPT=1 suite run.
     crate::emacs_core::jit::compile::force_deopt_for_test(false);
     use crate::emacs_core::bytecode::ByteCodeFunction;
@@ -570,4 +581,130 @@ fn jit_final_report_t2_line_renders_the_work_split() {
         line.contains("top=2:f:106:0.0:94.3,1:f:100:90.0:90.0"),
         "{line}"
     );
+}
+
+/// Pass metadata must stay absent by default and remain a distinct short CSV
+/// record when selected, even for an OSR leaf or a comma-bearing source name.
+#[test]
+fn jit_final_report_boolean_census_is_optional_and_eleven_columns() {
+    use crate::emacs_core::jit::opt::passes::bools::BoolStats;
+    let mut leaf = leaf_row(13, 0, 0);
+    let absent = FinalReport {
+        leaves: vec![leaf.clone()],
+        ..Default::default()
+    };
+    assert!(
+        absent
+            .profile_leaf_rows()
+            .iter()
+            .all(|r| !r.starts_with("#opt-bool,"))
+    );
+    leaf.name = Some("bool,name".into());
+    leaf.osr_pc = Some(7);
+    leaf.opt_bool = Some(Box::new(BoolStats {
+        opaque_producers: 1,
+        constant_producers: 2,
+        phi_params: 3,
+        refinements: 4,
+        selects: 5,
+        nil_tests: 6,
+        tagged_views: 7,
+    }));
+    let present = FinalReport {
+        leaves: vec![leaf],
+        ..Default::default()
+    };
+    let rows = present.profile_leaf_rows();
+    let bool_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.starts_with("#opt-bool,"))
+        .collect();
+    assert_eq!(bool_rows.len(), 1);
+    assert_eq!(
+        bool_rows[0].as_str(),
+        "#opt-bool,13,bool;name,7,1,2,3,4,5,6,7\n"
+    );
+    assert_eq!(bool_rows[0].trim_end().split(',').count(), 11);
+}
+
+#[test]
+fn jit_final_report_integer_census_is_optional_and_twelve_columns() {
+    use crate::emacs_core::jit::opt::{
+        ir::RepsCensus,
+        passes::{reps::RepsStats, reps_lift::LiftStats},
+    };
+    let mut leaf = leaf_row(17, 0, 0);
+    let absent = FinalReport {
+        leaves: vec![leaf.clone()],
+        ..Default::default()
+    };
+    assert!(
+        absent
+            .profile_leaf_rows()
+            .iter()
+            .all(|r| !r.starts_with("#opt-reps,"))
+    );
+    leaf.name = Some("integer,name".into());
+    leaf.osr_pc = Some(9);
+    leaf.opt_reps = Some(Box::new(RepsCensus {
+        lift: LiftStats {
+            lifted_arithmetic: 1,
+            lifted_comparisons: 2,
+            type_guards: 3,
+        },
+        selection: RepsStats {
+            raw_values: 4,
+            raw_phis: 5,
+            tagged_arithmetic: 6,
+            raw_arithmetic: 7,
+            tagged_views: 8,
+        },
+    }));
+    let present = FinalReport {
+        leaves: vec![leaf],
+        ..Default::default()
+    };
+    let rows = present.profile_leaf_rows();
+    let reps_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.starts_with("#opt-reps,"))
+        .collect();
+    assert_eq!(reps_rows.len(), 1);
+    assert_eq!(
+        reps_rows[0].as_str(),
+        "#opt-reps,17,integer;name,9,1,2,3,4,5,6,7,8\n"
+    );
+    assert_eq!(reps_rows[0].trim_end().split(',').count(), 12);
+}
+
+#[test]
+fn jit_final_report_gvn_census_is_optional_and_seven_columns() {
+    use crate::emacs_core::jit::opt::passes::gvn::GvnStats;
+    let mut leaf = leaf_row(19, 0, 0);
+    let absent = FinalReport {
+        leaves: vec![leaf.clone()],
+        ..Default::default()
+    };
+    assert!(
+        absent
+            .profile_leaf_rows()
+            .iter()
+            .all(|r| !r.starts_with("#opt-gvn,"))
+    );
+    leaf.name = Some("gvn,name".into());
+    leaf.osr_pc = Some(11);
+    leaf.opt_gvn = Some(Box::new(GvnStats {
+        pure_reuses: 1,
+        load_reuses: 2,
+        store_forwards: 3,
+    }));
+    let present = FinalReport {
+        leaves: vec![leaf],
+        ..Default::default()
+    };
+    let rows = present.profile_leaf_rows();
+    let gvn_rows: Vec<_> = rows.iter().filter(|r| r.starts_with("#opt-gvn,")).collect();
+    assert_eq!(gvn_rows.len(), 1);
+    assert_eq!(gvn_rows[0].as_str(), "#opt-gvn,19,gvn;name,11,1,2,3\n");
+    assert_eq!(gvn_rows[0].trim_end().split(',').count(), 7);
 }
