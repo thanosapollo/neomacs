@@ -27,37 +27,87 @@ use winit::dpi::PhysicalPosition;
 use winit::event::{DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase};
 use winit::window::WindowId;
 
-/// Zoom notches for one wheel event over a model: line deltas count as
-/// notches; pixel deltas (touchpads) count one notch per 50 px.
-fn model_wheel_notches(delta: MouseScrollDelta) -> i32 {
+/// Zoom notches, possibly fractional, in one wheel event over a model:
+/// line deltas count as notches; pixel deltas (touchpads) count one notch
+/// per 50 px.
+fn model_wheel_notches(delta: MouseScrollDelta) -> Option<f64> {
     let notches = match delta {
         MouseScrollDelta::LineDelta(_, y) | MouseScrollDelta::ContinuousLineDelta(_, y) => {
             f64::from(y)
         }
         MouseScrollDelta::PixelDelta(p) => p.y / 50.0,
-        _ => 0.0,
+        _ => return None,
     };
-    if !notches.is_finite() {
-        return 0;
-    }
-    (notches.round() as i32).clamp(-10, 10)
+    notches.is_finite().then_some(notches)
 }
 
-/// Wheel input over models, turned into whole zoom notches.
+/// The most notches one wheel event may zoom.
+const MODEL_WHEEL_MAX_NOTCHES: f64 = 10.0;
+
+/// Wheel input over models, turned into whole zoom notches. Fractions
+/// (touchpads, high-resolution wheels) carry over to the next event of the
+/// same gesture, so a stream of small deltas zooms as much as one big one.
 #[derive(Debug, Default)]
-pub(super) struct ModelWheel {}
+pub(super) struct ModelWheel {
+    remainder: Option<WheelRemainder>,
+}
+
+/// The part of a notch one device has scrolled over one model and not yet
+/// zoomed, and when.
+#[derive(Debug)]
+struct WheelRemainder {
+    device: Option<DeviceId>,
+    id: u32,
+    notches: f64,
+    at: std::time::Instant,
+}
 
 impl ModelWheel {
-    /// The whole notches `delta` from `device` over model `id` amounts to.
+    /// The whole notches `delta` from `device` over model `id` amounts to,
+    /// with what this device last left over this model. That remainder is
+    /// dropped when the gesture changes hands (another device or model,
+    /// or the wheel leaving the model: [`Self::reset`]), when a new
+    /// gesture starts or the old one ends, and after a quiet period as
+    /// long as the one that settles a wheel burst.
     pub(super) fn notches(
         &mut self,
-        _device: Option<DeviceId>,
-        _id: u32,
+        device: Option<DeviceId>,
+        id: u32,
         delta: MouseScrollDelta,
-        _phase: TouchPhase,
-        _now: std::time::Instant,
+        phase: TouchPhase,
+        now: std::time::Instant,
     ) -> i32 {
-        model_wheel_notches(delta)
+        let previous = self.remainder.take();
+        let Some(step) = model_wheel_notches(delta) else {
+            return 0;
+        };
+        let carried = previous
+            .filter(|r| {
+                r.device == device
+                    && r.id == id
+                    && phase != TouchPhase::Started
+                    && now.saturating_duration_since(r.at)
+                        < neomacs_renderer_wgpu::model::store::WHEEL_QUIET
+            })
+            .map_or(0.0, |r| r.notches);
+        let total = (carried + step).clamp(-MODEL_WHEEL_MAX_NOTCHES, MODEL_WHEEL_MAX_NOTCHES);
+        // Whole notches toward zero; the fraction waits for the next event.
+        let whole = total.trunc();
+        let left = total - whole;
+        if left != 0.0 && !matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            self.remainder = Some(WheelRemainder {
+                device,
+                id,
+                notches: left,
+                at: now,
+            });
+        }
+        whole as i32
+    }
+
+    /// The wheel left the models: nothing carries into a later gesture.
+    pub(super) fn reset(&mut self) {
+        self.remainder = None;
     }
 }
 
@@ -1844,6 +1894,9 @@ impl RenderApp {
                 );
                 return;
             }
+            // Not over an interactive model (or modified): any fraction
+            // left over a model belongs to a gesture that has moved on.
+            self.model_wheel.reset();
             let position = PointerPosition {
                 x: ev_x,
                 y: ev_y,
