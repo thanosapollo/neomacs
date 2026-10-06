@@ -16,10 +16,14 @@ use crate::model::gpu::{
 };
 use crate::model::scene::ModelScene;
 use crate::model::store::ModelGpuHost;
+use crate::shader_surface_cache::{PreparedSurface, ShaderSurfaceCache};
 
 pub(crate) struct ModelCache {
     models: HashMap<u32, ModelGpu>,
     budget: ModelBudget,
+    /// Test fault injection: the next composite installation fails.
+    #[cfg(test)]
+    fail_next_composite: bool,
 }
 
 impl ModelCache {
@@ -27,6 +31,8 @@ impl ModelCache {
         Self {
             models: HashMap::new(),
             budget: ModelBudget::from_env(),
+            #[cfg(test)]
+            fail_next_composite: false,
         }
     }
 }
@@ -39,15 +45,29 @@ impl WgpuRenderer {
 
     fn install_model_texture(&mut self, id: u32, logical: (u32, u32)) -> Result<(), String> {
         let gpu = self.models.models.get(&id).ok_or("model not uploaded")?;
-        let (texture, view) = gpu.texture();
-        let size_px = gpu.size_px();
-        let layout = self.caches.image.bind_group_layout();
-        let sampler = self.caches.image.sampler();
-        self.caches.surface.insert_rendered(
+        let ((texture, view), size_px) = (gpu.texture(), gpu.size_px());
+        let prepared = self.prepare_model_composite(texture, view, logical, size_px)?;
+        self.caches.surface.install_prepared(id, prepared);
+        Ok(())
+    }
+
+    /// Build the composite surface entry for a model texture without
+    /// installing it (the fallible step of every installation).
+    fn prepare_model_composite(
+        &mut self,
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        logical: (u32, u32),
+        size_px: (u32, u32),
+    ) -> Result<PreparedSurface, String> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.models.fail_next_composite) {
+            return Err("injected composite failure".to_owned());
+        }
+        ShaderSurfaceCache::prepare_rendered(
             &self.device,
-            layout,
-            sampler,
-            id,
+            self.caches.image.bind_group_layout(),
+            self.caches.image.sampler(),
             texture,
             view,
             logical,
@@ -105,20 +125,42 @@ impl ModelGpuHost for WgpuRenderer {
             .get(&id)
             .ok_or("model not uploaded")?
             .size_px();
-        if old != size_px {
-            // The new targets are reserved while the old ones still exist:
-            // that overlap is the peak, and what is admitted.
-            let new_bytes = target_bytes(size_px.0, size_px.1);
-            self.models.budget.reserve(id, new_bytes)?;
-            let gpu = self.models.models.get_mut(&id).expect("uploaded");
-            if let Err(error) = gpu.resize(&self.device, size_px) {
+        if old == size_px {
+            // Same targets: only the logical size the composite uses.
+            self.install_model_texture(id, logical)?;
+            return Ok(size_px);
+        }
+        // Transactional: reserve, then stage the new targets AND their
+        // composite entry while the old ones stay installed and accounted
+        // (that overlap is the peak, and what is admitted). Any failure
+        // rolls back the reservation and drops what was staged; only then
+        // are both owners committed, infallibly, and the old reservation
+        // released.
+        let new_bytes = target_bytes(size_px.0, size_px.1);
+        self.models.budget.reserve(id, new_bytes)?;
+        let staged = match ModelGpu::stage_targets(&self.device, size_px) {
+            Ok(staged) => staged,
+            Err(error) => {
                 self.models.budget.release(id, new_bytes);
                 return Err(error);
             }
-            self.models.budget.release(id, target_bytes(old.0, old.1));
-        }
-        // The surface entry carries the logical size the composite uses.
-        self.install_model_texture(id, logical)?;
+        };
+        let (texture, view) = staged.texture();
+        let prepared = match self.prepare_model_composite(texture, view, logical, size_px) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                drop(staged);
+                self.models.budget.release(id, new_bytes);
+                return Err(error);
+            }
+        };
+        self.models
+            .models
+            .get_mut(&id)
+            .expect("uploaded")
+            .commit_targets(staged);
+        self.caches.surface.install_prepared(id, prepared);
+        self.models.budget.release(id, target_bytes(old.0, old.1));
         Ok(size_px)
     }
 
@@ -154,3 +196,7 @@ impl ModelGpuHost for WgpuRenderer {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "models/tests.rs"]
+mod tests;

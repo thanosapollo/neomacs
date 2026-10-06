@@ -193,6 +193,17 @@ const PICK_MAPPING: u8 = 1;
 const PICK_MAPPED: u8 = 2;
 const PICK_MAP_FAILED: u8 = 3;
 
+/// Render targets created by [`ModelGpu::stage_targets`] and not yet
+/// committed.
+pub struct StagedTargets(Targets);
+
+impl StagedTargets {
+    /// The resolved colour texture and its view (for the composite).
+    pub fn texture(&self) -> (wgpu::Texture, wgpu::TextureView) {
+        (self.0.texture.clone(), self.0.view.clone())
+    }
+}
+
 /// One uploaded model with its render and pick targets.
 pub struct ModelGpu {
     pipeline: wgpu::RenderPipeline,
@@ -569,12 +580,27 @@ impl ModelGpu {
     /// Replace the render targets with `size_px` ones. The old targets stay
     /// until the new ones exist, so a failure leaves the model as it was.
     pub fn resize(&mut self, device: &wgpu::Device, size_px: (u32, u32)) -> Result<(), String> {
-        check_target_size(device, size_px)?;
-        let targets = scoped(device, "model resize rejected", || {
-            Targets::new(device, size_px)
-        })?;
-        self.targets = targets;
+        let staged = Self::stage_targets(device, size_px)?;
+        self.commit_targets(staged);
         Ok(())
+    }
+
+    /// Create `size_px` render targets without installing them, so a caller
+    /// can prepare everything else that depends on them (the composite bind
+    /// group) before committing any owner.
+    pub fn stage_targets(
+        device: &wgpu::Device,
+        size_px: (u32, u32),
+    ) -> Result<StagedTargets, String> {
+        check_target_size(device, size_px)?;
+        scoped(device, "model resize rejected", || {
+            StagedTargets(Targets::new(device, size_px))
+        })
+    }
+
+    /// Install staged targets; the old ones are dropped. Infallible.
+    pub fn commit_targets(&mut self, staged: StagedTargets) {
+        self.targets = staged.0;
     }
 
     /// Draw the scene into the colour texture.
