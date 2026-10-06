@@ -121,8 +121,9 @@ impl Quote {
 }
 
 /// Significant digits a number keeps. A decimal halfway point between two
-/// `f64` has at most 767 significant digits, so the first 800 digits and
-/// whether any later one is nonzero round exactly as the whole text does.
+/// `f64` has at most 768 significant digits (`(2^54 - 3) * 2^-1075` has
+/// exactly that many), so the first 800 digits and whether any later one
+/// is nonzero round exactly as the whole text does.
 const MAX_SIGNIFICANT: usize = 800;
 
 /// An exponent this large in magnitude over- or underflows whatever the
@@ -466,10 +467,15 @@ impl ObjParser {
         Ok(())
     }
 
-    /// Parse `chunk`, the file's next bytes.
-    pub fn feed(&mut self, chunk: &[u8], cancelled: &dyn Fn() -> bool) -> Result<(), ObjError> {
-        for window in chunk.chunks(SCAN_WINDOW) {
+    /// Parse `chunk`, the file's next bytes. It is cut where the current
+    /// [`SCAN_WINDOW`] ends, so the poll falls every `SCAN_WINDOW` bytes of
+    /// the file however the caller sizes its chunks.
+    pub fn feed(&mut self, mut chunk: &[u8], cancelled: &dyn Fn() -> bool) -> Result<(), ObjError> {
+        while !chunk.is_empty() {
+            let allowance = SCAN_WINDOW - self.scanned;
+            let (window, rest) = chunk.split_at(allowance.min(chunk.len()));
             self.feed_window(window, cancelled)?;
+            chunk = rest;
         }
         Ok(())
     }
@@ -491,8 +497,9 @@ impl ObjParser {
         })
     }
 
-    /// Validate `window` as UTF-8 and parse it, then poll once a whole
-    /// [`SCAN_WINDOW`] has gone by.
+    /// Validate `window` (at most what is left of the current
+    /// [`SCAN_WINDOW`]) as UTF-8 and parse it, then poll once the whole
+    /// window has gone by.
     fn feed_window(&mut self, window: &[u8], cancelled: &dyn Fn() -> bool) -> Result<(), ObjError> {
         let joined;
         let bytes = if self.split_char.is_empty() {
@@ -518,7 +525,7 @@ impl ObjParser {
         self.split_char.extend_from_slice(&bytes[valid..]);
         self.scanned += window.len();
         if self.scanned >= SCAN_WINDOW {
-            self.scanned = 0;
+            self.scanned -= SCAN_WINDOW;
             if cancelled() {
                 return Err(ObjError::Cancelled);
             }

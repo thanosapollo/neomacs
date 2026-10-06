@@ -693,3 +693,129 @@ fn numbers_match_the_correctly_rounded_value_of_the_whole_text() {
         Err(ObjError::NumberOutOfBounds { line: 1 })
     );
 }
+
+/// SOL-REVIEW-3 SHOULD 4: the public incremental parser polls once per
+/// [`SCAN_WINDOW`] bytes whatever the feeds' sizes: uneven feeds (one byte
+/// short of a window, then a whole window) inside one long comment, which
+/// has no line or word checkpoint, still poll at every window boundary.
+#[test]
+fn the_incremental_parser_polls_every_window_for_uneven_feeds() {
+    let polls = std::cell::Cell::new(0usize);
+    let count = || {
+        polls.set(polls.get() + 1);
+        false
+    };
+    let mut parser = ObjParser::new(WIDE);
+    parser.feed(b"#", &count).unwrap();
+    let mut fed = 1usize;
+    let filler = vec![b'x'; SCAN_WINDOW];
+    for round in 0..8 {
+        let len = if round % 2 == 0 {
+            SCAN_WINDOW - 2
+        } else {
+            SCAN_WINDOW
+        };
+        parser.feed(&filler[..len], &count).unwrap();
+        fed += len;
+        assert_eq!(
+            polls.get(),
+            fed / SCAN_WINDOW,
+            "polls after {fed} bytes in feeds of {len}"
+        );
+    }
+}
+
+/// The exact decimal expansion of `k * 2^-1075` (every binary64 halfway
+/// point is one), from exact integer arithmetic.
+fn exact_binary_fraction(k: u64) -> String {
+    // k * 5^1075 in base 10^9 limbs, least significant first.
+    let mut limbs: Vec<u64> = vec![
+        k % 1_000_000_000,
+        k / 1_000_000_000 % 1_000_000_000,
+        k / 1_000_000_000_000_000_000,
+    ];
+    for _ in 0..1075 {
+        let mut carry = 0u64;
+        for limb in &mut limbs {
+            let v = *limb * 5 + carry;
+            *limb = v % 1_000_000_000;
+            carry = v / 1_000_000_000;
+        }
+        if carry > 0 {
+            limbs.push(carry);
+        }
+    }
+    let mut digits = String::new();
+    for limb in limbs.iter().rev() {
+        digits.push_str(&format!("{limb:09}"));
+    }
+    let digits = digits.trim_start_matches('0');
+    let digits = format!("{digits:0>1076}");
+    let (int, frac) = digits.split_at(digits.len() - 1075);
+    format!("{int}.{frac}")
+}
+
+/// Significant digits of a decimal text (no sign or exponent).
+fn significant_digits(text: &str) -> usize {
+    let digits: String = text.chars().filter(char::is_ascii_digit).collect();
+    digits.trim_start_matches('0').trim_end_matches('0').len()
+}
+
+/// SOL-REVIEW-3 NIT 1: halfway points, subnormals and sticky tails beyond
+/// [`MAX_SIGNIFICANT`] digits round as the whole text does. The longest
+/// binary64 midpoint, `(2^54 - 3) * 2^-1075`, has 768 significant digits.
+#[test]
+fn halfway_subnormal_and_sticky_tail_vectors_round_exactly() {
+    let longest = exact_binary_fraction((1 << 54) - 3);
+    assert_eq!(significant_digits(&longest), 768);
+    assert!(significant_digits(&longest) < MAX_SIGNIFICANT);
+    let below_one = "0.99999999999999994448884876874217297881841659545898437500";
+    let above_one = "1.00000000000000011102230246251565404236316680908203125";
+    let mut vectors = vec![
+        longest.clone(),
+        // Ties to even: down to 1, up to 2^-1074, ...
+        above_one.to_owned(),
+        below_one.to_owned(),
+        exact_binary_fraction(1),
+        exact_binary_fraction(3),
+        // The smallest subnormal, the largest one, and the smallest normal.
+        exact_binary_fraction(2),
+        exact_binary_fraction((1 << 53) - 2),
+        exact_binary_fraction(1 << 53),
+        "4.9406564584124654e-324".to_owned(),
+        "2.4703282292062327e-324".to_owned(),
+        "2.4703282292062328e-324".to_owned(),
+    ];
+    // A nonzero digit far past the kept prefix breaks each tie upward; a
+    // tail of zeros does not; one short of the midpoint rounds down.
+    for midpoint in [longest, above_one.to_owned(), exact_binary_fraction(1)] {
+        let zeros = "0".repeat(MAX_SIGNIFICANT + 50);
+        vectors.push(format!("{midpoint}{zeros}1"));
+        vectors.push(format!("{midpoint}{zeros}"));
+        let mut short = midpoint.clone().into_bytes();
+        let last = short
+            .iter()
+            .rposition(|b| (b'1'..=b'9').contains(b))
+            .unwrap();
+        short[last] -= 1;
+        vectors.push(format!("{}{}9", String::from_utf8(short).unwrap(), zeros));
+        vectors.push(format!("-{midpoint}{zeros}1"));
+    }
+    for text in &vectors {
+        let expected: f64 = text.parse().unwrap();
+        assert_eq!(
+            parse_number(text, 1).map(f64::to_bits),
+            Ok(expected.to_bits()),
+            "{}…",
+            &text[..text.len().min(40)]
+        );
+    }
+    // The sticky tail changes the result (the vectors are not vacuous).
+    let tie = exact_binary_fraction(1);
+    let zeros = "0".repeat(MAX_SIGNIFICANT + 50);
+    assert_eq!(parse_number(&tie, 1), Ok(0.0));
+    assert_eq!(
+        parse_number(&format!("{tie}{zeros}1"), 1),
+        Ok(f64::from_bits(1))
+    );
+}
