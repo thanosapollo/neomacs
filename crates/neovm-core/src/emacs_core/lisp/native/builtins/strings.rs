@@ -1673,6 +1673,39 @@ fn ensure_float_alternate_decimal(mut s: String) -> String {
     s
 }
 
+/// Rust's formatter refuses a precision above `u16::MAX`; C's printf, which
+/// GNU uses, does not.  A double's exact decimal expansion has at most 1074
+/// fraction digits and 767 significant ones, so digits past this many are
+/// always zeros: print this many and append the rest.
+const EXACT_FLOAT_DIGITS: usize = 1100;
+
+/// `%.PRECf` for any PREC.
+fn float_fixed(f: f64, prec: usize) -> String {
+    let shown = prec.min(EXACT_FLOAT_DIGITS);
+    let mut s = format!("{:.shown$}", f);
+    s.extend(std::iter::repeat_n('0', prec - shown));
+    s
+}
+
+/// `%.PRECe` (or `E`) for any PREC, before exponent normalization.
+fn float_exponent(f: f64, prec: usize, upper: bool) -> String {
+    let shown = prec.min(EXACT_FLOAT_DIGITS);
+    let s = if upper {
+        format!("{:.shown$E}", f)
+    } else {
+        format!("{:.shown$e}", f)
+    };
+    if shown == prec {
+        return s;
+    }
+    let mark = s.rfind(['e', 'E']).unwrap_or(s.len());
+    let mut out = String::with_capacity(s.len() + (prec - shown));
+    out.push_str(&s[..mark]);
+    out.extend(std::iter::repeat_n('0', prec - shown));
+    out.push_str(&s[mark..]);
+    out
+}
+
 /// Format a float with the given spec.
 fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
     // C printf spells non-finite values nan/inf (NAN/INF for the uppercase
@@ -1693,7 +1726,7 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
     let alternate = spec.sharp && f.is_finite();
     let s = match spec.conversion {
         'f' => {
-            let s = format!("{:.prec$}", f, prec = prec);
+            let s = float_fixed(f, prec);
             if alternate {
                 ensure_float_alternate_decimal(s)
             } else {
@@ -1701,7 +1734,7 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
             }
         }
         'e' => {
-            let s = normalize_exp_notation(&format!("{:.prec$e}", f, prec = prec));
+            let s = normalize_exp_notation(&float_exponent(f, prec, false));
             if alternate {
                 ensure_float_alternate_decimal(s)
             } else {
@@ -1709,7 +1742,7 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
             }
         }
         'E' => {
-            let s = normalize_exp_notation(&format!("{:.prec$E}", f, prec = prec));
+            let s = normalize_exp_notation(&float_exponent(f, prec, true));
             if alternate {
                 ensure_float_alternate_decimal(s)
             } else {
@@ -1719,7 +1752,9 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
         'g' | 'G' => {
             let p = if prec == 0 { 1 } else { prec };
             // %g uses %e if exponent < -4 or >= precision, else %f
-            let exp_fmt = format!("{:.prec$e}", f, prec = p.saturating_sub(1));
+            // Digits past EXACT_FLOAT_DIGITS are zeros, so they cannot carry
+            // into the exponent.
+            let exp_fmt = float_exponent(f, p.saturating_sub(1).min(EXACT_FLOAT_DIGITS), false);
             // Parse the exponent
             let exp_val = exp_fmt
                 .rfind('e')
@@ -1727,7 +1762,7 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
                 .unwrap_or(0);
             if exp_val < -4 || exp_val >= p as i32 {
                 // Use %e style, strip trailing zeros
-                let mut s = format!("{:.prec$e}", f, prec = p.saturating_sub(1));
+                let mut s = float_exponent(f, p.saturating_sub(1), false);
                 // Strip trailing zeros before 'e'
                 if !alternate && let Some(e_pos) = s.rfind('e') {
                     let mantissa = &s[..e_pos];
@@ -1747,7 +1782,7 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> String {
             } else {
                 // Use %f style with appropriate decimals
                 let decimal_places = (p as i32 - exp_val - 1).max(0) as usize;
-                let mut s = format!("{:.prec$}", f, prec = decimal_places);
+                let mut s = float_fixed(f, decimal_places);
                 // Strip trailing zeros after decimal point
                 if !alternate && s.contains('.') {
                     s = s.trim_end_matches('0').to_string();
@@ -2693,7 +2728,10 @@ pub(crate) fn builtin_make_string(args: Vec<Value>) -> EvalResult {
         let mut buf = [0u8; emacs_char::MAX_MULTIBYTE_LENGTH];
         let len = emacs_char::char_string(ch, &mut buf);
         let unit = &buf[..len];
-        let mut data = Vec::with_capacity(len * count);
+        let mut data = Vec::new();
+        len.checked_mul(count)
+            .and_then(|bytes| data.try_reserve_exact(bytes).ok())
+            .ok_or_else(crate::emacs_core::alloc::memory_full)?;
         for _ in 0..count {
             data.extend_from_slice(unit);
         }
@@ -2707,7 +2745,10 @@ pub(crate) fn builtin_make_string(args: Vec<Value>) -> EvalResult {
                 vec![Value::symbol("characterp"), args[1]],
             ));
         }
-        let data = vec![ch as u8; count];
+        let mut data = Vec::new();
+        data.try_reserve_exact(count)
+            .map_err(|_| crate::emacs_core::alloc::memory_full())?;
+        data.resize(count, ch as u8);
         Ok(Value::heap_string(
             crate::heap_types::LispString::from_unibyte(data),
         ))

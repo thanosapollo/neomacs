@@ -9799,6 +9799,92 @@ fn large_length_predicates_signal_circular_list_like_gnu() {
     }
 }
 
+/// GNU signals `memory_full` -- `(error "Memory exhausted--...")` -- when an
+/// allocation this large fails, and prints floats with any precision.  These
+/// requests used to abort or panic the whole process.
+#[test]
+fn oversized_requests_signal_or_succeed_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = crate::emacs_core::Context::new();
+    let mut eval = |src: &str| {
+        let value = ev.eval_str(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        crate::emacs_core::print_value_with_eval(&ev, &value)
+    };
+    for size in [
+        "(make-string most-positive-fixnum ?a)",
+        "(make-string most-positive-fixnum ?\u{e9})",
+        "(make-string (/ most-positive-fixnum 2) ?\u{e9})",
+        "(make-vector most-positive-fixnum nil)",
+        "(make-list most-positive-fixnum nil)",
+        "(make-hash-table :size most-positive-fixnum)",
+        "(make-bool-vector most-positive-fixnum nil)",
+    ] {
+        assert_eq!(
+            eval(&format!(
+                "(condition-case e {size} (error (substring (car (cdr e)) 0 16)))"
+            )),
+            "\"Memory exhausted\"",
+            "{size}"
+        );
+    }
+    // Lengths, heads and tails are GNU Emacs output.
+    for (spec, x, expected) in [
+        (
+            "%.70000f",
+            "0.1",
+            "(70002 \"0.1000000000000000055511\" \"000000\")",
+        ),
+        (
+            "%.70000f",
+            "1e300",
+            "(70302 \"100000000000000005250476\" \"000000\")",
+        ),
+        (
+            "%.70000e",
+            "-2.5e-300",
+            "(70008 \"-2.499999999999999979757\" \"0e-300\")",
+        ),
+        (
+            "%.70000e",
+            "5e-324",
+            "(70007 \"4.9406564584124654417656\" \"0e-324\")",
+        ),
+        (
+            "%.70000g",
+            "0.1",
+            "(57 \"0.1000000000000000055511\" \"015625\")",
+        ),
+        (
+            "%.70000g",
+            "1e300",
+            "(301 \"100000000000000005250476\" \"540160\")",
+        ),
+        (
+            "%.70000g",
+            "5e-324",
+            "(757 \"4.9406564584124654417656\" \"5e-324\")",
+        ),
+        (
+            "%#.70000g",
+            "123456.789",
+            "(70001 \"123456.78900000000430736\" \"000000\")",
+        ),
+        (
+            "%#.70000e",
+            "123456.789",
+            "(70006 \"1.2345678900000000430736\" \"00e+05\")",
+        ),
+    ] {
+        assert_eq!(
+            eval(&format!(
+                "(let ((s (format \"{spec}\" {x}))) (list (length s) (substring s 0 24) (substring s -6)))"
+            )),
+            expected,
+            "{spec} {x}"
+        );
+    }
+}
+
 #[test]
 fn vconcat_signals_circular_list_like_gnu() {
     crate::test_utils::init_test_tracing();

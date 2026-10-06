@@ -829,6 +829,13 @@ impl std::ops::Index<&HashKey> for HashTableStorage {
 }
 
 impl HashTableStorage {
+    /// [`Self::with_capacity`], or `None` when the memory is not available.
+    fn try_with_capacity(capacity: usize) -> Option<Self> {
+        let mut storage = Self::with_capacity(0);
+        storage.slots.try_reserve_exact(capacity).ok()?;
+        storage.index.try_reserve(capacity).then_some(storage)
+    }
+
     fn with_capacity(capacity: usize) -> Self {
         Self {
             index: HashIndex::with_capacity(capacity),
@@ -2122,6 +2129,22 @@ impl LispHashTable {
         }
     }
 
+    /// [`Self::new_with_options`], or `None` when SIZE entries cannot be
+    /// allocated (GNU reports `memory_full`).
+    pub fn try_new_with_options(
+        test: HashTableTest,
+        size: i64,
+        weakness: Option<HashTableWeakness>,
+        rehash_size: f64,
+        rehash_threshold: f64,
+    ) -> Option<Self> {
+        let data = HashTableStorage::try_with_capacity(size.max(0) as usize)?;
+        let mut table = Self::new_with_options(test, 0, weakness, rehash_size, rehash_threshold);
+        table.size = size;
+        table.data = data;
+        Some(table)
+    }
+
     pub fn insert(&mut self, hash_key: HashKey, key: Value, value: Value) -> Option<Value> {
         self.data.insert(hash_key, key, value)
     }
@@ -2647,6 +2670,25 @@ impl TaggedValue {
     /// Allocate a hash table.
     pub fn hash_table(test: HashTableTest) -> Self {
         with_tagged_heap(|h| h.alloc_hash_table(LispHashTable::new(test)))
+    }
+
+    /// [`Self::hash_table_with_options`], or `None` when SIZE entries cannot
+    /// be allocated.
+    pub fn try_hash_table_with_options(
+        test: HashTableTest,
+        size: i64,
+        weakness: Option<HashTableWeakness>,
+        rehash_size: f64,
+        rehash_threshold: f64,
+    ) -> Option<Self> {
+        let table = LispHashTable::try_new_with_options(
+            test,
+            size,
+            weakness,
+            rehash_size,
+            rehash_threshold,
+        )?;
+        Some(with_tagged_heap(|h| h.alloc_hash_table(table)))
     }
 
     /// Allocate a hash table with options.

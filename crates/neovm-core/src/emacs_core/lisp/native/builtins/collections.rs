@@ -14,7 +14,12 @@ use crate::emacs_core::value::{HashProbe, HashTableMakeKeyword, ValueKind, VecLi
 pub(crate) fn builtin_make_vector(args: Vec<Value>) -> EvalResult {
     expect_args("make-vector", &args, 2)?;
     let len = expect_wholenump(&args[0])? as usize;
-    Ok(Value::vector(vec![args[1]; len]))
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(len)
+        .map_err(|_| crate::emacs_core::alloc::memory_full())?;
+    items.resize(len, args[1]);
+    Ok(Value::vector(items))
 }
 
 pub(crate) fn builtin_vector_slice(_eval: &mut super::eval::Context, args: &[Value]) -> EvalResult {
@@ -539,7 +544,8 @@ pub(crate) fn builtin_make_hash_table_slice(args: &[Value]) -> EvalResult {
         }
     };
 
-    let table = Value::hash_table_with_options(test, size, weakness, 1.5, 0.8125);
+    let table = Value::try_hash_table_with_options(test, size, weakness, 1.5, 0.8125)
+        .ok_or_else(crate::emacs_core::alloc::memory_full)?;
     if table.is_hash_table() {
         let _ = table.with_hash_table_mut(|ht| {
             ht.test_name = test_name;

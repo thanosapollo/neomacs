@@ -103,6 +103,13 @@ impl HashIndex {
         self.table.clear();
     }
 
+    /// [`Self::reserve`], reporting failure instead of aborting.
+    pub(super) fn try_reserve(&mut self, additional: usize) -> bool {
+        self.table
+            .try_reserve(additional, |entry| entry.hash)
+            .is_ok()
+    }
+
     pub(super) fn reserve(&mut self, additional: usize) {
         self.table.reserve(additional, |entry| entry.hash);
     }

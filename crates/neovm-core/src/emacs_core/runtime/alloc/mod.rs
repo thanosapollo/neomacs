@@ -4,8 +4,21 @@
 //! startup runs.  Keep those defaults here so Lisp like `jit-lock.el` can rely
 //! on the same low-level variables during runtime and bootstrap.
 
+use crate::emacs_core::error::{Flow, LispCondition, signal};
 use crate::emacs_core::symbol::Obarray;
 use crate::emacs_core::value::Value;
+
+/// GNU's `memory_full` signal (`alloc.c`): `memory-signal-data`'s
+/// `(error "Memory exhausted--...")`, for a request that cannot be allocated.
+/// Reported instead of letting the allocator abort the process.
+pub(crate) fn memory_full() -> Flow {
+    signal(
+        LispCondition::Error,
+        vec![Value::string(
+            "Memory exhausted--use M-x save-some-buffers then exit and restart Emacs",
+        )],
+    )
+}
 
 /// Register bootstrap variables owned by the allocation / GC subsystem.
 pub fn register_bootstrap_vars(obarray: &mut Obarray) {
