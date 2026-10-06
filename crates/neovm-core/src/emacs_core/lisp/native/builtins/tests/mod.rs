@@ -9799,6 +9799,67 @@ fn large_length_predicates_signal_circular_list_like_gnu() {
     }
 }
 
+/// GNU `Fapply` measures the spread list with `list_length` and `concat`
+/// measures list arguments with `Flength` before using them, so a circular
+/// list signals `circular-list` instead of growing the argument vector
+/// without bound (apply) or spinning without a quit check (concat).
+#[test]
+fn apply_and_concat_signal_circular_list_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = crate::emacs_core::Context::new();
+    for (src, expected) in [
+        (
+            "(let ((c (list 1 2 3))) (setcdr (nthcdr 2 c) c) (condition-case e (apply '+ 1 c) (error (car e))))",
+            "circular-list",
+        ),
+        (
+            "(let ((c (list '+ 1 2))) (setcdr (nthcdr 2 c) (cdr c)) (condition-case e (apply c) (error (car e))))",
+            "circular-list",
+        ),
+        (
+            "(let ((c (list 97 98))) (setcdr (cdr c) c) (condition-case e (concat \"x\" c) (error (car e))))",
+            "circular-list",
+        ),
+        (
+            "(condition-case e (apply '+ 1 '(2 . 3)) (error e))",
+            "(wrong-type-argument listp 3)",
+        ),
+        (
+            "(condition-case e (concat \"a\" '(97 98 . 99)) (error e))",
+            "(wrong-type-argument listp 99)",
+        ),
+        (
+            "(let ((c (list 97))) (setcdr c c) (condition-case e (concat 'foo c) (error e)))",
+            "(wrong-type-argument sequencep foo)",
+        ),
+        (
+            "(let ((c (list 97))) (setcdr c c) (condition-case e (concat '(a) c) (error e)))",
+            "(wrong-type-argument characterp a)",
+        ),
+        (
+            "(let ((c (list 97))) (setcdr c c) (condition-case e (concat [a] c) (error e)))",
+            "(wrong-type-argument characterp a)",
+        ),
+        (
+            "(let ((c (list 97))) (setcdr c c) (condition-case e (concat (make-bool-vector 1 nil) c) (error (car e))))",
+            "wrong-type-argument",
+        ),
+        (
+            "(condition-case e (concat '(a . 3) 'foo) (error e))",
+            "(wrong-type-argument listp 3)",
+        ),
+        ("(apply '+ 1 '(2 3))", "6"),
+        ("(concat \"a\" '(98 99) [100])", "\"abcd\""),
+    ] {
+        let value = ev.eval_str(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        assert_eq!(
+            crate::emacs_core::print_value_with_eval(&ev, &value),
+            expected,
+            "{src}"
+        );
+    }
+}
+
 #[test]
 fn vconcat_signals_circular_list_like_gnu() {
     crate::test_utils::init_test_tracing();

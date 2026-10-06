@@ -391,6 +391,11 @@ pub(crate) fn builtin_apply_slice(eval: &mut super::eval::Context, args: &[Value
     }
 
     let last = args[args.len() - 1];
+    // GNU `Fapply` takes `list_length (spread_arg)` first: a circular spread
+    // list signals `circular-list` rather than growing the argument vector.
+    if last.is_cons() {
+        super::cons_list::proper_list_length_or_signal(last)?;
+    }
     let mut call_args = LispArgVec::new();
 
     if args.len() == 1 {
