@@ -1337,6 +1337,31 @@ fn format_string_overflow_error() -> Flow {
 /// signals "Maximum string size exceeded".
 const FORMAT_MAX_BUFSIZE: usize = 1 << 61;
 
+/// Make room for ADDITIONAL more bytes in RESULT, GNU `styled_format`'s one
+/// result buffer (editfns.c:4257-4284): signal "Maximum string size
+/// exceeded" when the text so far and the new text reach `max_bufsize`, and
+/// memory-full when the buffer cannot grow.  Every append to the result
+/// comes here first, so no growth sized by a width, a precision or the text
+/// already emitted can abort.  The growth is amortized, like GNU's doubling.
+fn format_reserve(result: &mut Vec<u8>, additional: usize) -> Result<(), Flow> {
+    if additional >= FORMAT_MAX_BUFSIZE.saturating_sub(result.len()) {
+        return Err(format_string_overflow_error());
+    }
+    result
+        .try_reserve(additional)
+        .map_err(|_| crate::emacs_core::alloc::memory_full())
+}
+
+/// Push SPAN onto the result's property bookkeeping, signalling memory-full
+/// when it cannot grow.
+fn format_push_span<T>(spans: &mut Vec<T>, span: T) -> Result<(), Flow> {
+    spans
+        .try_reserve(1)
+        .map_err(|_| crate::emacs_core::alloc::memory_full())?;
+    spans.push(span);
+    Ok(())
+}
+
 /// GNU `styled_format`'s `USEFUL_PRECISION_MAX`: no float digit past this
 /// precision is nonzero.  GNU prints at most this many digits and adds any
 /// excess precision as zeros (Rust's formatter also refuses a precision
@@ -2107,10 +2132,14 @@ fn result_bytes_imply_multibyte(data: &[u8]) -> bool {
 /// Down-convert canonical multibyte Emacs bytes to unibyte raw bytes. Only valid
 /// when the content has no genuine multibyte character (ASCII + eight-bit only),
 /// which `build_format_result` guarantees before choosing a unibyte result; a
-/// stray multibyte char is preserved defensively rather than dropped.
-fn emacs_bytes_to_unibyte(data: &[u8]) -> Vec<u8> {
+/// stray multibyte char is preserved defensively rather than dropped.  The
+/// copy, with room for the string's NUL, signals memory-full when it does
+/// not fit: it is as large as the result.
+fn emacs_bytes_to_unibyte(data: &[u8]) -> Result<Vec<u8>, Flow> {
     use crate::emacs_core::emacs_char;
-    let mut out = Vec::with_capacity(data.len());
+    let mut out = Vec::new();
+    out.try_reserve_exact(data.len() + 1)
+        .map_err(|_| crate::emacs_core::alloc::memory_full())?;
     let mut pos = 0usize;
     while pos < data.len() {
         let (code, len) = emacs_char::string_char(&data[pos..]);
@@ -2123,7 +2152,7 @@ fn emacs_bytes_to_unibyte(data: &[u8]) -> Vec<u8> {
             push_emacs_char(&mut out, code);
         }
     }
-    out
+    Ok(out)
 }
 
 // The tuple is the private, single-return handoff for bytes, property spans,
@@ -2212,6 +2241,7 @@ fn do_format(
                 // `new_result` (see `push_format_literal_code`'s default
                 // arm) — multibyteness is decided from the result bytes in
                 // `build_format_result`.
+                format_reserve(&mut result, run_end - i)?;
                 result.extend_from_slice(&fmt_bytes[i..run_end]);
                 i = run_end;
                 continue;
@@ -2222,6 +2252,10 @@ fn do_format(
                 let source_start = format_char_pos;
                 i += char_len;
                 format_char_pos += 1;
+                format_reserve(
+                    &mut result,
+                    crate::emacs_core::emacs_char::MAX_MULTIBYTE_LENGTH,
+                )?;
                 if code < 0x80 && matches!(quoting_style, FormatMessageQuotingStyle::None) {
                     result.push(code as u8);
                 } else {
@@ -2230,13 +2264,16 @@ fn do_format(
                     new_result |= pushed.translated;
                 }
                 if track_props {
-                    source_spans.push(FormatSourceSpan {
-                        source_char_start: source_start,
-                        source_char_end: format_char_pos,
-                        result_char_start: result_char_pos,
-                        result_char_end: result_char_pos + 1,
-                        kind: FormatSpanKind::Literal,
-                    });
+                    format_push_span(
+                        &mut source_spans,
+                        FormatSourceSpan {
+                            source_char_start: source_start,
+                            source_char_end: format_char_pos,
+                            result_char_start: result_char_pos,
+                            result_char_end: result_char_pos + 1,
+                            kind: FormatSpanKind::Literal,
+                        },
+                    )?;
                     result_char_pos += 1;
                 }
             }
@@ -2254,15 +2291,19 @@ fn do_format(
         // Any conversion, `%%` included, makes the result genuinely new.
         new_result = true;
         if spec.conversion == '%' {
+            format_reserve(&mut result, 1)?;
             result.push(b'%');
             if track_props {
-                source_spans.push(FormatSourceSpan {
-                    source_char_start: source_start,
-                    source_char_end: spec_source_end,
-                    result_char_start: result_char_pos,
-                    result_char_end: result_char_pos + 1,
-                    kind: FormatSpanKind::PercentEscape,
-                });
+                format_push_span(
+                    &mut source_spans,
+                    FormatSourceSpan {
+                        source_char_start: source_start,
+                        source_char_end: spec_source_end,
+                        result_char_start: result_char_pos,
+                        result_char_end: result_char_pos + 1,
+                        kind: FormatSpanKind::PercentEscape,
+                    },
+                )?;
                 result_char_pos += 1;
             }
             continue;
@@ -2311,6 +2352,7 @@ fn do_format(
                         // the general path's str_to_multibyte promotion
                         // (issue #131 eight-bit chars).
                         if ls.is_multibyte() || ls.as_bytes().is_ascii() {
+                            format_reserve(&mut result, ls.as_bytes().len())?;
                             result.extend_from_slice(ls.as_bytes());
                             arg_idx = this_arg_idx + 1;
                             continue;
@@ -2339,14 +2381,17 @@ fn do_format(
                         .as_lisp_string()
                         .map(|string| string.schars())
                         .unwrap_or(0);
-                    spans.push(FormatPropSpan {
-                        result_char_start: result_char_pos + field_char_start_in_formatted,
-                        result_char_end: result_char_pos
-                            + field_char_start_in_formatted
-                            + span_char_len,
-                        source: arg,
-                        arg_char_len,
-                    });
+                    format_push_span(
+                        &mut spans,
+                        FormatPropSpan {
+                            result_char_start: result_char_pos + field_char_start_in_formatted,
+                            result_char_end: result_char_pos
+                                + field_char_start_in_formatted
+                                + span_char_len,
+                            source: arg,
+                            arg_char_len,
+                        },
+                    )?;
                 }
                 field
             }
@@ -2370,6 +2415,8 @@ fn do_format(
                     && !spec.sharp
                     && let ValueKind::Fixnum(n) = args[this_arg_idx].kind()
                 {
+                    // At most 20 bytes: "-9223372036854775808".
+                    format_reserve(&mut result, 20)?;
                     push_i64_decimal(&mut result, n);
                     arg_idx = this_arg_idx + 1;
                     continue;
@@ -2417,23 +2464,21 @@ fn do_format(
         // and this field must stay below max_bufsize, and the result must
         // grow to hold them, before the field's padding and zeros are
         // written into it.
-        let field_len = field
-            .len()
-            .filter(|&len| len < FORMAT_MAX_BUFSIZE.saturating_sub(result.len()))
-            .ok_or_else(format_string_overflow_error)?;
-        result
-            .try_reserve(field_len)
-            .map_err(|_| crate::emacs_core::alloc::memory_full())?;
+        let field_len = field.len().ok_or_else(format_string_overflow_error)?;
+        format_reserve(&mut result, field_len)?;
         if track_props {
             let formatted_chars = field.chars();
             if formatted_chars > 0 {
-                source_spans.push(FormatSourceSpan {
-                    source_char_start: source_start,
-                    source_char_end: spec_source_end,
-                    result_char_start: result_char_pos,
-                    result_char_end: result_char_pos + formatted_chars,
-                    kind: FormatSpanKind::Conversion,
-                });
+                format_push_span(
+                    &mut source_spans,
+                    FormatSourceSpan {
+                        source_char_start: source_start,
+                        source_char_end: spec_source_end,
+                        result_char_start: result_char_pos,
+                        result_char_end: result_char_pos + formatted_chars,
+                        kind: FormatSpanKind::Conversion,
+                    },
+                )?;
             }
             result_char_pos += formatted_chars;
         }
@@ -2451,11 +2496,11 @@ fn do_format(
 
 fn build_format_result(
     args: &[Value],
-    bytes: Vec<u8>,
+    mut bytes: Vec<u8>,
     spans: &[FormatPropSpan],
     source_spans: &[FormatSourceSpan],
     force_multibyte_result: bool,
-) -> Value {
+) -> Result<Value, Flow> {
     // GNU `styled_format` decides multibyteness from the format/argument strings
     // and from %c/%S/quoting that forces it; neomacs also inspects the result for
     // a genuine (non eight-bit) multibyte character, since %S/printer output can
@@ -2471,12 +2516,19 @@ fn build_format_result(
     // `bytes` are canonical multibyte Emacs encoding. A unibyte result has no
     // genuine multibyte character, so down-convert eight-bit chars back to raw
     // bytes (preserving e.g. a raw unibyte payload passed through verbatim).
+    // The string takes BYTES as its payload and appends a NUL: make room
+    // for it here, where failing to grow signals memory-full.
+    if bytes.len() == bytes.capacity() && (multibyte || all_ascii) {
+        bytes
+            .try_reserve_exact(1)
+            .map_err(|_| crate::emacs_core::alloc::memory_full())?;
+    }
     let result = Value::heap_string(if multibyte {
         crate::heap_types::LispString::from_emacs_bytes(bytes)
     } else if all_ascii {
         crate::heap_types::LispString::from_unibyte(bytes)
     } else {
-        crate::heap_types::LispString::from_unibyte(emacs_bytes_to_unibyte(&bytes))
+        crate::heap_types::LispString::from_unibyte(emacs_bytes_to_unibyte(&bytes)?)
     });
 
     // Copy text properties from the format string first, then from each
@@ -2496,7 +2548,7 @@ fn build_format_result(
     // that got flattened by `(format "%-37s" ...)`).
     apply_format_prop_spans(result, spans);
 
-    result
+    Ok(result)
 }
 
 /// Return GNU `styled_format`'s exact `%s` identity result when it is a string.
@@ -2541,13 +2593,7 @@ pub(crate) fn builtin_format_wrapper_strict_slice(
         if !new_result {
             return Ok(args[0]);
         }
-        Ok(build_format_result(
-            args,
-            bytes,
-            &spans,
-            &source_spans,
-            force_multibyte_result,
-        ))
+        build_format_result(args, bytes, &spans, &source_spans, force_multibyte_result)
     })
 }
 
@@ -2720,13 +2766,7 @@ pub(crate) fn builtin_format_message_slice(
         if !new_result {
             return Ok(args[0]);
         }
-        Ok(build_format_result(
-            args,
-            bytes,
-            &spans,
-            &source_spans,
-            force_multibyte_result,
-        ))
+        build_format_result(args, bytes, &spans, &source_spans, force_multibyte_result)
     })
 }
 

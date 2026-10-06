@@ -10059,6 +10059,10 @@ fn format_padding_child_under_address_limit() {
         rlim_max: 0,
     };
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) }, 0);
+    // A piped core_pattern ignores RLIMIT_CORE; an undumpable process is
+    // never dumped.
+    // SAFETY: PR_SET_DUMPABLE takes no pointers.
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) }, 0);
     let value = ev.eval_str(&src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
     println!(
         "RESULT={}",
@@ -10070,9 +10074,10 @@ fn format_padding_child_under_address_limit() {
 /// `styled_format` writes them straight into its one result buffer and
 /// signals memory-full when that cannot grow.  Building them in a separate
 /// string aborted the process once the result had room for the field but
-/// the heap had none for a second copy.  Each form runs in a child process
-/// limited to 384 MiB more address space: a 256 MiB field fits once, not
-/// twice, and a 1 GiB field never fits.
+/// the heap had none for a second copy.  Every later growth must signal
+/// the same way: the text after a field, and the final copy into a string.
+/// Each form runs in a child process limited to 384 MiB more address space:
+/// a 256 MiB field fits once, not twice, and a 1 GiB field never fits.
 #[test]
 fn format_padding_is_written_into_the_reserved_result() {
     crate::test_utils::init_test_tracing();
@@ -10080,6 +10085,7 @@ fn format_padding_is_written_into_the_reserved_result() {
         "{}::format_padding_child_under_address_limit",
         module_path!().split_once("::").expect("crate path").1
     );
+    let mut failures = Vec::new();
     for (src, expected) in [
         ("(length (format \"%268435456f\" 1.0))", "268435456"),
         ("(length (format \"%-268435456f\" 1.0))", "268435456"),
@@ -10090,6 +10096,41 @@ fn format_padding_is_written_into_the_reserved_result() {
         ("(length (format \"%.268435456f\" 1.0))", "268435458"),
         (
             "(condition-case e (format \"%1073741824f\" 1.0) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        // Whatever follows a 256 MiB field doubles the result, which no
+        // longer fits: GNU signals memory-full.  The final unibyte copy of
+        // a 256 MiB result does not fit either.
+        (
+            "(condition-case e (format \"%268435456fX\" 1.0) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format \"%268435456dX\" 1) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format \"%.268435456fX\" 1.0) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format \"%268435456f%%\" 1.0) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format \"%268435456f%s\" 1.0 \"X\") (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format \"%268435456f%d\" 1.0 1) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format-message \"%268435456f`\" 1.0) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format \"%268435456s\" (unibyte-string 255)) (error (substring (car (cdr e)) 0 16)))",
             "\"Memory exhausted\"",
         ),
     ] {
@@ -10105,17 +10146,17 @@ fn format_padding_is_written_into_the_reserved_result() {
             .output()
             .expect("spawn child test");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "{src}: child {}\n{stdout}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            stdout.contains(&format!("RESULT={expected}\n")),
-            "{src}: expected {expected}\n{stdout}"
-        );
+        if !output.status.success() {
+            failures.push(format!(
+                "{src}: child {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        } else if !stdout.contains(&format!("RESULT={expected}\n")) {
+            failures.push(format!("{src}: expected {expected}\n{stdout}"));
+        }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// GNU `allocate_record' rejects records over 4095 slots, the type included.
