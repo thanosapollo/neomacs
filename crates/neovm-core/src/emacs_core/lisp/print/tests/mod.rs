@@ -921,3 +921,206 @@ fn hash_table_printer_omits_default_eql_test_like_gnu() {
         "OK \"#s(hash-table data (1 2))\"",
     );
 }
+
+// ---------------------------------------------------------------------------
+// `princ` / `%s` printer: GNU `print_object` cycle and depth bounds.
+//
+// Expected strings are GNU Emacs 31 output with
+// `internal-make-interpreted-closure-function' nil, so closures keep their
+// whole lexical environment, trailing `t' included, as in a bare Context.
+// ---------------------------------------------------------------------------
+
+fn princ_eval(src: &str) -> String {
+    let mut ev = crate::emacs_core::Context::new();
+    ev.set_lexical_binding(true);
+    crate::emacs_core::format_eval_result(&ev.eval_str(src))
+}
+
+/// SRC with X bound to N levels of WRAP around nil.
+fn nested(n: usize, wrap: &str, body: &str) -> String {
+    format!(
+        "(let ((x nil) (i 0)) (while (< i {n}) (setq x {wrap}) (setq i (1+ i))) {body})"
+    )
+}
+
+const CIRCULAR: &str = r#"OK (error "Apparently circular structure being printed")"#;
+
+#[test]
+fn princ_prints_a_closure_that_captures_itself_as_an_ancestor() {
+    assert_eq!(
+        princ_eval(r#"(let (f) (setq f (lambda () f)) (format "%s" f))"#),
+        r##"OK "#[nil (f) ((f . #0) t)]""##
+    );
+}
+
+#[test]
+fn princ_prints_a_circular_list_captured_by_a_closure() {
+    assert_eq!(
+        princ_eval(r#"(let ((c (list 1))) (setcdr c c) (format "%s" (lambda () c)))"#),
+        r##"OK "#[nil (c) ((c 1 1 . #2) t)]""##
+    );
+}
+
+#[test]
+fn princ_prints_a_closure_inside_the_vector_it_captures() {
+    assert_eq!(
+        princ_eval(
+            r#"(let ((v (make-vector 3 nil))) (aset v 1 (lambda () v)) (format "%s" (aref v 1)))"#
+        ),
+        r##"OK "#[nil (v) ((v . [nil #0 nil]) t)]""##
+    );
+}
+
+#[test]
+fn princ_to_a_function_and_error_message_string_share_the_cycle_bound() {
+    assert_eq!(
+        princ_eval(
+            r#"(let (f) (setq f (lambda () f))
+                 (let ((s ""))
+                   (princ f (lambda (ch) (setq s (concat s (string ch)))))
+                   s))"#
+        ),
+        r##"OK "#[nil (f) ((f . #0) t)]""##
+    );
+    assert_eq!(
+        princ_eval(
+            r#"(let (f) (setq f (lambda () f)) (error-message-string (list 'user-error f)))"#
+        ),
+        r##"OK "#[nil (f) ((f . #0) t)]""##
+    );
+}
+
+#[test]
+fn princ_prints_tail_cycles_with_gnu_tortoise_index() {
+    for (src, expected) in [
+        (
+            r#"(let ((c (list 1 2))) (setcdr (cdr c) c) (format "%s" c))"#,
+            r#"OK "(1 2 1 2 . #2)""#,
+        ),
+        (
+            r#"(let ((c (list 1 2 3 4 5))) (setcdr (nthcdr 4 c) (nthcdr 2 c)) (format "%s" c))"#,
+            r#"OK "(1 2 3 4 5 . #2)""#,
+        ),
+        (
+            r#"(let ((c (list 1))) (setcdr c c) (format "%s" c))"#,
+            r#"OK "(1 . #0)""#,
+        ),
+        (
+            r#"(let ((c (list 1))) (setcdr c c) (format "%s" (list 'quote c)))"#,
+            r#"OK "'(1 . #0)""#,
+        ),
+    ] {
+        assert_eq!(princ_eval(src), expected, "{src}");
+    }
+}
+
+#[test]
+fn princ_prints_enclosing_aggregates_by_depth() {
+    for (src, expected) in [
+        (r#"(let ((v (vector 1 nil))) (aset v 1 v) (format "%s" v))"#, r#"OK "[1 #0]""#),
+        (
+            r#"(let ((v (vector 1 nil))) (aset v 1 (list "s" v)) (format "%s" v))"#,
+            r#"OK "[1 (s #0)]""#,
+        ),
+        (
+            r#"(let ((r (record 'foo nil))) (aset r 1 r) (format "%s" r))"#,
+            r##"OK "#s(foo #0)""##,
+        ),
+        (r#"(let ((c (list nil))) (setcar c c) (format "%s" c))"#, r#"OK "(#0)""#),
+        (
+            r#"(let ((c (list 'a))) (setcar c (list 'quote c)) (format "%s" c))"#,
+            r#"OK "('#0)""#,
+        ),
+    ] {
+        assert_eq!(princ_eval(src), expected, "{src}");
+    }
+}
+
+#[test]
+fn princ_signals_at_gnu_print_depth_instead_of_overflowing() {
+    assert_eq!(
+        princ_eval(&nested(199, "(list x)", r#"(length (format "%s" x))"#)),
+        "OK 401"
+    );
+    for wrap in ["(list x)", "(vector x)", "(let ((y x)) (lambda () y))"] {
+        assert_eq!(
+            princ_eval(&nested(200, wrap, r#"(condition-case e (format "%s" x) (error e))"#)),
+            CIRCULAR,
+            "{wrap}"
+        );
+    }
+    assert_eq!(
+        princ_eval(&nested(
+            10_000,
+            "(let ((y x)) (lambda () y))",
+            r#"(condition-case e (format "%s" x) (error e))"#
+        )),
+        CIRCULAR
+    );
+    assert_eq!(
+        princ_eval(&nested(
+            200,
+            "(list x)",
+            "(condition-case e (error-message-string (list 'user-error x)) (error e))"
+        )),
+        CIRCULAR
+    );
+    // `'X' is a tail call, so only the inner lists count toward the depth.
+    assert_eq!(
+        princ_eval(&nested(101, "(list 'quote (list x))", r#"(length (format "%s" x))"#)),
+        "OK 306"
+    );
+}
+
+#[test]
+fn princ_with_print_circle_survives_deep_and_cyclic_data() {
+    assert_eq!(
+        princ_eval(&nested(
+            10_000,
+            "(list x)",
+            r#"(let ((print-circle t)) (length (format "%s" x)))"#
+        )),
+        "OK 20003"
+    );
+    assert_eq!(
+        princ_eval(r#"(let ((print-circle t) f) (setq f (lambda () f)) (stringp (format "%s" f)))"#),
+        "OK t"
+    );
+}
+
+#[test]
+fn princ_honors_print_level_and_print_length_like_gnu() {
+    for (src, expected) in [
+        (r#"(let ((print-level 2)) (format "%s" '(1 (2 (3 (4))))))"#, r#"OK "(1 (2 ...))""#),
+        (r#"(let ((print-level 1)) (format "%s" [1 [2 [3]]]))"#, r#"OK "[1 [2 [3]]]""#),
+        (r#"(let ((print-level 1)) (format "%s" (list 1 [2 (3)])))"#, r#"OK "(1 [2 ...])""#),
+        (r#"(let ((print-level 0)) (format "%s" (list 1)))"#, r#"OK "...""#),
+        (r#"(let ((print-level -1)) (format "%s" (list 1)))"#, r#"OK "...""#),
+        (r#"(let ((print-level 1)) (format "%s" ''(1)))"#, r#"OK "'(1)""#),
+        (r#"(let ((print-length 2)) (format "%s" '(1 2 3 4)))"#, r#"OK "(1 2 ...)""#),
+        (r#"(let ((print-length 0)) (format "%s" (list 1 2)))"#, r#"OK "(...)""#),
+        (r#"(let ((print-length 1)) (format "%s" (cons 1 2)))"#, r#"OK "(1 . 2)""#),
+        (r#"(let ((print-length -1)) (format "%s" (list 1 2)))"#, r#"OK "(1 2)""#),
+        (r#"(let ((print-length 2)) (format "%s" [1 2 3 4]))"#, r#"OK "[1 2 ...]""#),
+        (r#"(let ((print-length 0)) (format "%s" [1 2]))"#, r#"OK "[...]""#),
+        (r#"(let ((print-length 1)) (format "%s" (record 'r 1 2)))"#, r##"OK "#s(r ...)""##),
+        (
+            r#"(let ((c (list 1 2))) (setcdr (cdr c) c) (let ((print-length 3)) (format "%s" c)))"#,
+            r#"OK "(1 2 1 ...)""#,
+        ),
+    ] {
+        assert_eq!(princ_eval(src), expected, "{src}");
+    }
+}
+
+#[test]
+fn princ_shorthands_follow_gnu_print_quoted_rules() {
+    for (src, expected) in [
+        (r#"(format "%s" '(a (\, b)))"#, r#"OK "(a (, b))""#),
+        (r#"(format "%s" '(\` (a (\, b) (\,@ c))))"#, r#"OK "`(a ,b ,@c)""#),
+        (r#"(format "%s" '(quote x y))"#, r#"OK "(quote x y)""#),
+        (r#"(format "%s" (list 'quote "a\200"))"#, r#"OK "'a\\200""#),
+    ] {
+        assert_eq!(princ_eval(src), expected, "{src}");
+    }
+}

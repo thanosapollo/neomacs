@@ -1253,7 +1253,10 @@ pub(crate) fn builtin_format_slice(eval: &mut super::eval::Context, args: &[Valu
     builtin_format_wrapper_strict_slice(eval, args)
 }
 
-fn format_percent_s_in_state(ctx: &crate::emacs_core::eval::Context, value: &Value) -> Vec<u8> {
+fn format_percent_s_in_state(
+    ctx: &crate::emacs_core::eval::Context,
+    value: &Value,
+) -> Result<Vec<u8>, Flow> {
     super::misc_eval::print_value_princ_bytes(ctx, value)
 }
 
@@ -2061,7 +2064,7 @@ fn emacs_bytes_to_unibyte(data: &[u8]) -> Vec<u8> {
 #[allow(clippy::type_complexity)]
 fn do_format(
     args: &[Value],
-    princ_fn: &dyn Fn(&Value) -> Vec<u8>,
+    princ_fn: &dyn Fn(&Value) -> Result<Vec<u8>, Flow>,
     prin1_fn: &dyn Fn(&Value) -> Vec<u8>,
     quoting_style: FormatMessageQuotingStyle,
 ) -> Result<
@@ -2253,7 +2256,7 @@ fn do_format(
                 let (s, src_multibyte) = if let Some(ls) = arg.as_lisp_string() {
                     (ls.as_bytes().to_vec(), ls.is_multibyte())
                 } else {
-                    (princ_fn(&arg), true)
+                    (princ_fn(&arg)?, true)
                 };
                 let (formatted, content_byte_start_in_formatted, content_byte_end_in_formatted) =
                     format_string_spec_tracked(&s, src_multibyte, &spec);
