@@ -1736,3 +1736,54 @@ fn error_message_string_keeps_properties_only_for_a_lone_error_string() {
         r#"OK ((#("SYM" 0 3 (p 1)) (p 1)) ("SYM" nil) ("SYM: \"extra\"" nil) ("SYM: more" nil))"#
     );
 }
+
+/// The standard error symbols carry GNU's `error-conditions` and messages
+/// (GNU 32.0.50, `emacs -Q`), so handlers written for GNU catch them:
+/// EACCES is a `file-error`, overflow is a `range-error`, and the
+/// C-defined conditions packages signal exist.
+#[test]
+fn standard_error_hierarchy_matches_gnu() {
+    crate::test_utils::init_test_tracing();
+    let results = bootstrap_eval_all(
+        r#"(mapcar (lambda (s) (list s (get s 'error-conditions) (get s 'error-message)))
+             '(permission-denied overflow-error underflow-error singularity-error
+               excessive-variable-binding inhibited-interaction user-search-failed
+               thread-buffer-killed))
+           (condition-case e (signal 'permission-denied '("x")) (file-error (car e)))
+           (condition-case e (signal 'overflow-error nil) (range-error (car e)))"#,
+    );
+    assert_eq!(
+        results,
+        vec![
+            concat!(
+                "OK ((permission-denied (permission-denied file-error error) ",
+                "\"Cannot access file or directory\") ",
+                "(overflow-error (overflow-error range-error arith-error error) ",
+                "\"Arithmetic overflow error\") ",
+                "(underflow-error (underflow-error range-error arith-error error) ",
+                "\"Arithmetic underflow error\") ",
+                "(singularity-error (singularity-error domain-error arith-error error) ",
+                "\"Arithmetic singularity error\") ",
+                "(excessive-variable-binding (excessive-variable-binding recursion-error error) ",
+                "\"Variable binding depth exceeds max-specpdl-size\") ",
+                "(inhibited-interaction (inhibited-interaction error) ",
+                "\"User interaction while inhibited\") ",
+                "(user-search-failed (user-search-failed user-error search-failed error) ",
+                "\"Search failed\") ",
+                "(thread-buffer-killed (thread-buffer-killed error) ",
+                "\"Thread's current buffer killed\"))"
+            ),
+            "OK permission-denied",
+            "OK overflow-error",
+        ]
+    );
+    let reg = ErrorRegistry::new();
+    assert_eq!(
+        reg.conditions_for("permission-denied"),
+        vec!["permission-denied", "file-error", "error"]
+    );
+    assert_eq!(
+        reg.conditions_for("overflow-error"),
+        vec!["overflow-error", "range-error", "arith-error", "error"]
+    );
+}

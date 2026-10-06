@@ -368,12 +368,6 @@ pub fn init_standard_errors(obarray: &mut Obarray) {
     register_simple(obarray, "type-mismatch", "Type mismatch", &["error"]);
     register_simple(
         obarray,
-        "permission-denied",
-        "Permission denied",
-        &["error"],
-    );
-    register_simple(
-        obarray,
         "recursion-error",
         "Excessive recursive calling error",
         &["error"],
@@ -381,12 +375,6 @@ pub fn init_standard_errors(obarray: &mut Obarray) {
 
     // --- arith-error family ---
     register_simple(obarray, "arith-error", "Arithmetic error", &["error"]);
-    register_simple(
-        obarray,
-        "overflow-error",
-        "Arithmetic overflow error",
-        &["arith-error"],
-    );
     register_simple(
         obarray,
         "range-error",
@@ -399,15 +387,36 @@ pub fn init_standard_errors(obarray: &mut Obarray) {
         "Arithmetic domain error",
         &["arith-error"],
     );
+    // GNU data.c: overflow and underflow are range errors, a singularity
+    // is a domain error.
+    register_simple(
+        obarray,
+        "overflow-error",
+        "Arithmetic overflow error",
+        &["range-error"],
+    );
     register_simple(
         obarray,
         "underflow-error",
         "Arithmetic underflow error",
-        &["arith-error"],
+        &["range-error"],
+    );
+    register_simple(
+        obarray,
+        "singularity-error",
+        "Arithmetic singularity error",
+        &["domain-error"],
     );
 
     // --- file-error family ---
     register_simple(obarray, "file-error", "File error", &["error"]);
+    // GNU fileio.c: EACCES signals a file-error.
+    register_simple(
+        obarray,
+        "permission-denied",
+        "Cannot access file or directory",
+        &["file-error"],
+    );
     register_simple(
         obarray,
         "file-already-exists",
@@ -645,6 +654,34 @@ pub fn init_standard_errors(obarray: &mut Obarray) {
         "excessive-lisp-nesting",
         "Lisp nesting exceeds `max-lisp-eval-depth'",
         &["recursion-error"],
+    );
+    // GNU eval.c.
+    register_simple(
+        obarray,
+        "excessive-variable-binding",
+        "Variable binding depth exceeds max-specpdl-size",
+        &["recursion-error"],
+    );
+    // GNU minibuf.c.
+    register_simple(
+        obarray,
+        "inhibited-interaction",
+        "User interaction while inhibited",
+        &["error"],
+    );
+    // GNU search.c lists the conditions explicitly, user-error first.
+    put_error_properties(
+        obarray,
+        "user-search-failed",
+        "Search failed",
+        vec!["user-search-failed", "user-error", "search-failed", "error"],
+    );
+    // GNU thread.c.
+    register_simple(
+        obarray,
+        "thread-buffer-killed",
+        "Thread's current buffer killed",
+        &["error"],
     );
 }
 
@@ -1258,8 +1295,9 @@ impl ErrorRegistry {
             "wrong-number-of-arguments",
             "wrong-type-argument",
             "cl-assertion-failed",
-            "permission-denied",
             "recursion-error",
+            "inhibited-interaction",
+            "thread-buffer-killed",
         ];
         for name in &simple_children_of_error {
             self.parents.insert(intern(name), vec![intern("error")]);
@@ -1274,20 +1312,30 @@ impl ErrorRegistry {
         // arith-error family.
         self.parents
             .insert(intern("arith-error"), vec![intern("error")]);
-        for name in &[
-            "overflow-error",
-            "range-error",
-            "domain-error",
-            "underflow-error",
-        ] {
+        for name in &["range-error", "domain-error"] {
             self.parents
                 .insert(intern(name), vec![intern("arith-error")]);
         }
+        for name in &["overflow-error", "underflow-error"] {
+            self.parents
+                .insert(intern(name), vec![intern("range-error")]);
+        }
+        self.parents
+            .insert(intern("singularity-error"), vec![intern("domain-error")]);
+        for name in &["excessive-lisp-nesting", "excessive-variable-binding"] {
+            self.parents
+                .insert(intern(name), vec![intern("recursion-error")]);
+        }
+        self.parents.insert(
+            intern("user-search-failed"),
+            vec![intern("user-error"), intern("search-failed")],
+        );
 
         // file-error family.
         self.parents
             .insert(intern("file-error"), vec![intern("error")]);
         for name in &[
+            "permission-denied",
             "file-already-exists",
             "file-date-error",
             "file-locked",
