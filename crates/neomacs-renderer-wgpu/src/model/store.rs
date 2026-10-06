@@ -10,7 +10,7 @@
 //! [`ModelStore::take_events`], in the order the state changes happened; the
 //! render thread forwards them on the one ordered input channel.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -110,6 +110,13 @@ struct Entry {
     rendered: Option<Snapshot>,
     /// What each showing window presented, for picks.
     presented: BTreeMap<WindowKey, Snapshot>,
+    /// Windows whose older pictures (composition ring, pinned pane
+    /// pictures, frame/theme transition and child resize crossfade
+    /// sources) may still hold this model's pixels, whether or not the
+    /// window shows it now: every window that presented it, until that
+    /// window's older-picture owners are all discarded (see
+    /// [`ModelStore::presented_blended`]).
+    pictured_in: BTreeSet<WindowKey>,
     pick: Option<PendingPick>,
     queued_pick: Option<(Snapshot, (u32, u32))>,
     wheel_deadline: Option<Instant>,
@@ -265,6 +272,7 @@ impl ModelStore {
                 readiness: Readiness::default(),
                 rendered: None,
                 presented: BTreeMap::new(),
+                pictured_in: BTreeSet::new(),
                 pick: None,
                 queued_pick: None,
                 wheel_deadline: None,
@@ -414,6 +422,9 @@ impl ModelStore {
             entry.queued_pick = None;
             entry.rendered = None;
             entry.presented.clear();
+            // Every window's composition ring, transition and crossfade
+            // sources died with the device.
+            entry.pictured_in.clear();
             entry.readiness.left_all();
             // Provenance is gone first, so settling cannot report a stale
             // true level on the way.
@@ -718,6 +729,7 @@ impl ModelStore {
     /// picks; every other model leaves, including one whose glyph the
     /// frame carries fully clipped.
     pub fn presented(&mut self, window: WindowKey, shown: &BTreeMap<u32, Snapshot>) {
+        self.note_pictured(window, shown);
         if self.hidden.contains(&window) {
             return;
         }
@@ -745,12 +757,28 @@ impl ModelStore {
     /// picture than its fresh glyph passes (a pane morph, a frame or theme
     /// transition, a child resize crossfade), with `fresh` what those
     /// passes composited. The older pixels may hold any model the window
-    /// showed before at an older snapshot, which one snapshot cannot
-    /// describe (SOL-REVIEW-2 MUST 2). So every model the window showed or
-    /// now composites stays (or joins) as a member at no one rev: the fence
-    /// stays down and no pick resolves in this window until it presents a
-    /// settled frame. A model in neither is untouched.
+    /// presented before at an older snapshot, which one snapshot cannot
+    /// describe (SOL-REVIEW-2 MUST 2). So every model the window now
+    /// composites, shows, or may still picture in its older pictures stays
+    /// (or joins) as a member at no one rev: the fence stays down and no
+    /// pick resolves in this window until it presents a settled frame. A
+    /// model in none of these is untouched.
+    ///
+    /// "May still picture" is not current membership (SOL-REVIEW-3 MUST 1):
+    /// a window that was hidden or occluded, or presented frames without
+    /// the model, keeps its composition ring and transition sources, which
+    /// a crossfade after exposure blends in. It is every model the window
+    /// presented, fresh or blended, hidden or not, until its older-picture
+    /// owners are all discarded: when the window is destroyed
+    /// ([`Self::window_destroyed`]), on device loss ([`Self::renderer_lost`]),
+    /// or when the model is freed. A settled frame proves nothing here: the
+    /// ring's previous slot can be older than the last presented frame
+    /// (retained-static frames do not rotate it), and a surface resize
+    /// flushes the ring and frame transitions but not child crossfade
+    /// sources. The cost is a lowered fence during a later blend in a window
+    /// that once showed the model.
     pub fn presented_blended(&mut self, window: WindowKey, fresh: &BTreeMap<u32, Snapshot>) {
+        self.note_pictured(window, fresh);
         if self.hidden.contains(&window) {
             return;
         }
@@ -760,7 +788,10 @@ impl ModelStore {
             if entry.status != ModelStatus::Ready {
                 continue;
             }
-            if fresh.contains_key(&id) || entry.readiness.is_showing_in(window) {
+            if fresh.contains_key(&id)
+                || entry.readiness.is_showing_in(window)
+                || entry.pictured_in.contains(&window)
+            {
                 entry.readiness.presented_unsettled(window);
                 entry.presented.remove(&window);
                 self.evaluate(id);
@@ -768,8 +799,28 @@ impl ModelStore {
         }
     }
 
-    /// `window` is deleted, or showed nothing in its last attempt: it
-    /// leaves every showing set and its capture ends.
+    /// `window` composited (and presented) the models in `picture`: their
+    /// pixels may now live in its older pictures.
+    fn note_pictured(&mut self, window: WindowKey, picture: &BTreeMap<u32, Snapshot>) {
+        for id in picture.keys() {
+            if let Some(entry) = self.entries.get_mut(id) {
+                entry.pictured_in.insert(window);
+            }
+        }
+    }
+
+    /// `window` was destroyed: it leaves (as [`Self::window_gone`]), and its
+    /// older pictures are gone with it.
+    pub fn window_destroyed(&mut self, window: WindowKey) {
+        self.window_gone(window);
+        for entry in self.entries.values_mut() {
+            entry.pictured_in.remove(&window);
+        }
+    }
+
+    /// `window` showed nothing in its last attempt, or is hidden: it leaves
+    /// every showing set and its capture ends. Its older pictures, which a
+    /// later blend may show, are kept ([`Self::presented_blended`]).
     pub fn window_gone(&mut self, window: WindowKey) {
         self.hidden.remove(&window);
         if self.capture.is_some_and(|c| c.window == window) {

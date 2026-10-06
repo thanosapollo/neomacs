@@ -122,7 +122,11 @@ impl RenderApp {
     /// minimized Wayland window just stops receiving frame callbacks), so
     /// there the models learn of hiding only from Lisp's visibility
     /// requests, which leave until the next presentation
-    /// ([`Self::note_models_visibility`]).
+    /// ([`Self::note_models_visibility`]). A window the compositor alone
+    /// hides there (another workspace, fully covered) is unobservable: it
+    /// stays in the showing sets as long as its frames are accepted, and a
+    /// successfully submitted Wayland frame is no proof that the compositor
+    /// displayed it (SOL-REVIEW-3 NIT 2).
     ///
     /// An occluded window shows no model: it leaves the showing sets and
     /// its capture ends at once (both reported before any later input),

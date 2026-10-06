@@ -104,6 +104,24 @@ impl RenderApp {
         self.flush_model_events();
     }
 
+    /// Top-level window `emacs_frame_id` submitted a frame whose fresh
+    /// glyph passes composited `picture`; `blends_older` is whether its
+    /// composition also showed an older picture
+    /// ([`super::render_pass::model_provenance::blends_older_pictures`]).
+    /// The presentation branch of `render_frame_window_impl`.
+    pub(super) fn note_models_frame_submitted(
+        &mut self,
+        emacs_frame_id: u64,
+        picture: &ModelPicture,
+        blends_older: bool,
+    ) {
+        if blends_older {
+            self.note_models_presented_blended(emacs_frame_id, picture);
+        } else {
+            self.note_models_presented(emacs_frame_id, picture);
+        }
+    }
+
     /// [`Self::note_models_presented`] for a frame whose composition also
     /// shows pixels of an older picture than its fresh glyph passes
     /// ([`super::render_pass::model_provenance::blends_older_pictures`]):
@@ -128,10 +146,22 @@ impl RenderApp {
         self.flush_model_events();
     }
 
+    /// Window `emacs_frame_id` was deleted: it shows no model, and its
+    /// older pictures (composition ring, transition sources) are gone.
+    pub(super) fn note_models_window_destroyed(&mut self, emacs_frame_id: u64) {
+        self.models.window_destroyed(emacs_frame_id);
+        self.model_wheel.reset();
+        self.flush_model_events();
+    }
+
     /// Window `emacs_frame_id` is hidden, iconified or occluded: it leaves
     /// now (its capture ends) and stays out until shown and presented.
     pub(super) fn note_models_window_hidden(&mut self, emacs_frame_id: u64) {
         self.models.window_hidden(emacs_frame_id);
+        // A wheel fraction left over a model in a window that stopped
+        // showing does not carry into a gesture after it returns, even
+        // without a leave or focus event (SOL-REVIEW-3 SHOULD 2).
+        self.model_wheel.reset();
         self.flush_model_events();
     }
 
@@ -162,6 +192,9 @@ impl RenderApp {
             }
             crate::thread_comm::WindowVisibility::Iconified
             | crate::thread_comm::WindowVisibility::Invisible => {
+                // Even where the hiding cannot be confirmed, the request
+                // ends a wheel gesture over the window's models.
+                self.model_wheel.reset();
                 if platform_reports_hiding {
                     self.note_models_window_hidden(emacs_frame_id);
                 } else {

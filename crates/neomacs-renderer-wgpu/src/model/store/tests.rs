@@ -112,6 +112,7 @@ fn loading_entry(token: u64) -> Entry {
         readiness: Readiness::default(),
         rendered: None,
         presented: BTreeMap::new(),
+        pictured_in: BTreeSet::new(),
         pick: None,
         queued_pick: None,
         wheel_deadline: None,
@@ -1005,4 +1006,34 @@ fn failing_mid_orbit_settles_the_interaction_with_a_view() {
         "{events:?}"
     );
     assert!(!store.motion(W, (20.0, 0.0)), "the capture ended");
+}
+
+/// SOL-REVIEW-3 MUST 1, at the store: what a window composited while it
+/// was hidden (its presentations are not showings) still lands in its
+/// composition ring, so a blend after exposure holds the fence down for
+/// that model although the window never joined; destroying the window
+/// forgets it.
+#[test]
+fn a_blend_after_exposure_counts_what_the_window_composited_while_hidden() {
+    const B: WindowKey = 2;
+    let mut host = FakeHost::default();
+    let mut store = loaded_store(&mut host);
+    store.window_hidden(W);
+    store.render_dirty(&mut host);
+    let picture = store.rendered_snapshots();
+    store.presented(W, &picture);
+    store.presented(B, &picture);
+    assert_eq!(kinds(&store.take_events()), ["ready", "R{true,1,0}"]);
+    store.window_shown(W);
+    store.presented_blended(W, &BTreeMap::new());
+    assert_eq!(
+        kinds(&store.take_events()),
+        ["R{false,1,0}"],
+        "W's ring holds the model it composited while hidden"
+    );
+    store.presented(W, &BTreeMap::new());
+    assert_eq!(kinds(&store.take_events()), ["R{true,1,0}"]);
+    store.window_destroyed(W);
+    store.presented_blended(W, &BTreeMap::new());
+    assert!(store.take_events().is_empty(), "W's ring died with it");
 }

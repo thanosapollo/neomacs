@@ -210,11 +210,7 @@ impl RenderApp {
         #[cfg(feature = "video")]
         renderer.finish_submitted_video_surface();
         frame_stats::note_submission(neomacs_display_protocol::frame_time::observe_platform_now());
-        if blends_older {
-            self.note_models_presented_blended(emacs_frame_id, &models);
-        } else {
-            self.note_models_presented(emacs_frame_id, &models);
-        }
+        self.note_models_frame_submitted(emacs_frame_id, &models, blends_older);
 
         if !child_frame_ids.is_empty() || !removed_child_frame_ids.is_empty() {
             tracing::debug!(

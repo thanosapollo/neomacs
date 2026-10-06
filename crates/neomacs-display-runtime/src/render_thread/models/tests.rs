@@ -883,3 +883,145 @@ fn an_outgoing_crossfade_keeps_the_window_a_member_until_it_ends() {
     app.note_models_presented(A, &super::ModelPicture::new());
     assert_eq!(delivered(&emacs), ["R{true,1,0}"]);
 }
+
+// ----------------------------------------------------------------------
+// SOL-REVIEW-3 MUST 1: the older pictures a window's composition can blend
+// in (its composition ring, pinned pane pictures, transition and child
+// crossfade sources) outlive its showing membership.
+
+/// SOL-REVIEW-3's trace. A and B show the model at X; A is occluded and
+/// leaves; the model moves to Y, which B presents, raising the fence. A is
+/// exposed and its first frame crossfades from its composition ring's
+/// picture, which still holds X, while its fresh passes draw no model (its
+/// buffer changed meanwhile). The fence must drop until A presents a frame
+/// without the older picture, through the branch `render_frame_window_impl`
+/// takes for a blended submission.
+#[test]
+fn a_window_exposed_into_a_crossfade_holds_the_fence_down_for_its_older_models() {
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    present(&mut app, A);
+    present(&mut app, B);
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+
+    app.handle_window_occluded(A, true);
+    assert!(delivered(&emacs).is_empty(), "B still shows rev 1");
+    update(&mut app, &mut host, 1, yaw(30.0));
+    app.models.render_dirty(&mut host);
+    present(&mut app, B);
+    assert_eq!(delivered(&emacs), ["R{false,2,1}", "R{true,2,1}"]);
+
+    app.handle_window_occluded(A, false);
+    assert!(
+        delivered(&emacs).is_empty(),
+        "exposure is not a presentation"
+    );
+    // A's theme crossfade: fresh passes without the model, blending the
+    // ring's earlier composition (the model at X) in.
+    app.note_models_frame_submitted(A, &super::ModelPicture::new(), true);
+    assert_eq!(
+        delivered(&emacs),
+        ["R{false,2,1}"],
+        "the fence stayed up while A blends the model's X pixels"
+    );
+    assert!(app.models.press(A, hit(), (10.0, 10.0)));
+    app.models
+        .release(A, Some(hit()), Instant::now(), &mut host);
+    assert!(host.picks.is_empty(), "a pick resolved against a blend");
+
+    // The crossfade ends: A shows no model, B alone counts again.
+    app.note_models_frame_submitted(A, &super::ModelPicture::new(), false);
+    assert_eq!(delivered(&emacs), ["R{true,2,1}"]);
+}
+
+/// A settled frame without the model does not prove the window's older
+/// pictures forgot it: the composition ring's previous slot can be older
+/// than the last presented frame (a retained-static frame does not rotate
+/// it). A later blend in that window still holds the fence down.
+#[test]
+fn a_settled_frame_without_the_model_does_not_forget_its_older_pictures() {
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    present(&mut app, A);
+    present(&mut app, B);
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+    app.note_models_frame_submitted(A, &super::ModelPicture::new(), false);
+    assert!(delivered(&emacs).is_empty(), "B shows rev 1");
+    app.note_models_frame_submitted(A, &super::ModelPicture::new(), true);
+    assert_eq!(delivered(&emacs), ["R{false,1,0}"]);
+    app.note_models_frame_submitted(A, &super::ModelPicture::new(), false);
+    assert_eq!(delivered(&emacs), ["R{true,1,0}"]);
+}
+
+/// Older pictures die with the device and with the window: a blend in a
+/// window whose older-picture owners were all discarded holds nothing down.
+#[test]
+fn older_pictures_are_forgotten_with_the_device_and_the_window() {
+    let (mut app, emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    present(&mut app, A);
+    present(&mut app, B);
+    assert_eq!(delivered(&emacs), ["ready", "R{true,1,0}"]);
+    // A is deleted; a blend in a window of that id pictures nothing old.
+    app.note_models_window_destroyed(A);
+    assert!(delivered(&emacs).is_empty(), "B shows rev 1");
+    app.note_models_frame_submitted(A, &super::ModelPicture::new(), true);
+    assert!(delivered(&emacs).is_empty(), "A's ring died with it");
+    // Device loss discards every window's ring and transition sources.
+    app.note_models_renderer_lost();
+    assert_eq!(delivered(&emacs), ["R{false,2,0}"]);
+    app.models.upload_pending(&mut host);
+    app.models.render_dirty(&mut host);
+    app.flush_model_events();
+    present(&mut app, A);
+    assert_eq!(delivered(&emacs), ["R{true,3,0}"]);
+    app.note_models_frame_submitted(B, &super::ModelPicture::new(), true);
+    assert!(
+        delivered(&emacs).is_empty(),
+        "B's older pictures died with the device"
+    );
+}
+
+// SOL-REVIEW-3 SHOULD 2: hiding or occluding the window ends a wheel
+// gesture, without an intervening leave, focus or non-model wheel event.
+#[test]
+fn a_wheel_remainder_does_not_survive_hiding_or_occluding_the_window() {
+    use crate::thread_comm::WindowVisibility;
+    use winit::event::{DeviceId, TouchPhase};
+    let (mut app, _emacs) = app_with_channel();
+    let mut host = FakeHost::default();
+    with_ready_model(&mut app, &mut host);
+    present(&mut app, A);
+    let pad = Some(DeviceId::from_raw(1));
+    let t0 = Instant::now();
+    let ms = |n: u64| t0 + Duration::from_millis(n);
+    let wheel = |app: &mut RenderApp, y, phase, at| {
+        app.model_wheel.notches(pad, MODEL, pixels(y), phase, at)
+    };
+    // 0.6 notch left over the model; A is occluded and exposed again.
+    assert_eq!(wheel(&mut app, 30.0, TouchPhase::Started, ms(0)), 0);
+    app.handle_window_occluded(A, true);
+    app.handle_window_occluded(A, false);
+    assert_eq!(
+        wheel(&mut app, 30.0, TouchPhase::Moved, ms(5)),
+        0,
+        "the remainder survived occlusion"
+    );
+    let mut t = 10;
+    for platform_reports_hiding in [true, false] {
+        for hidden in [WindowVisibility::Invisible, WindowVisibility::Iconified] {
+            assert_eq!(wheel(&mut app, 30.0, TouchPhase::Started, ms(t)), 0);
+            app.note_models_visibility(A, hidden, platform_reports_hiding);
+            app.note_models_visibility(A, WindowVisibility::Visible, platform_reports_hiding);
+            assert_eq!(
+                wheel(&mut app, 30.0, TouchPhase::Moved, ms(t + 5)),
+                0,
+                "the remainder survived {hidden:?} (reported: {platform_reports_hiding})"
+            );
+            t += 10;
+        }
+    }
+}

@@ -400,7 +400,7 @@ impl RenderApp {
         }
         let destroyed = self.frame_windows.process_destroys();
         for frame_id in &destroyed {
-            self.note_models_window_gone(*frame_id);
+            self.note_models_window_destroyed(*frame_id);
         }
         if self
             .tooltips
