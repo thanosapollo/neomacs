@@ -421,7 +421,9 @@ fn assert_tier_i_cases(cases: &[(&'static str, &'static str)]) {
 /// GNU `Flet_star` walks the live VARLIST with `FOR_EACH_TAIL`, reading
 /// each cdr after evaluating and binding the element before it: an init
 /// form that breaks a cycle lets `let*' return, one that makes the varlist
-/// circular or improper signals.  The `fix15-ls' cases run the `let*' as a
+/// circular or improper signals.  `CHECK_LIST_END (varlist, XCAR (args))`
+/// reports an improper varlist itself, not its final cdr, even when it was
+/// improper from the start.  The `fix15-ls' cases run the `let*' as a
 /// function body, which Tier-I compiles while the varlist is still proper
 /// and then runs over the mutated one.
 #[test]
@@ -447,8 +449,22 @@ fn circular_form_let_star_walks_the_live_varlist() {
             "(progn
                (setq fix15-c (list (list 'a '(progn (setcdr fix15-c 5) 7))))
                (condition-case e (eval (list 'let* fix15-c 'a) LEX)
-                 (error (list (car e) (cadr e)))))",
-            "(wrong-type-argument listp)",
+                 (error (list (car e) (cadr e) (eq (nth 2 e) fix15-c)))))",
+            "(wrong-type-argument listp t)",
+        ),
+        (
+            "(progn
+               (setq fix15-c (list (list 'a '(progn (setcdr (cdr fix15-c) 5) 7)) '(b 2)))
+               (condition-case e (eval (list 'let* fix15-c 'a) LEX)
+                 (error (list (car e) (cadr e) (eq (nth 2 e) fix15-c)))))",
+            "(wrong-type-argument listp t)",
+        ),
+        (
+            "(progn
+               (setq fix15-c (cons '(a 1) 5))
+               (condition-case e (eval (list 'let* fix15-c 'a) LEX)
+                 (error (list (car e) (cadr e) (eq (nth 2 e) fix15-c)))))",
+            "(wrong-type-argument listp t)",
         ),
     ] {
         for lex in ["nil", "t"] {
@@ -483,8 +499,59 @@ fn circular_form_let_star_walks_the_live_varlist() {
                               (error (list (car e) (eq (cadr e) fix15-c)))))))",
             "(7 (circular-list t))",
         ),
+        (
+            "(progn
+               (setq fix15-gc nil)
+               (setq fix15-c
+                     (list (list 'a '(progn (when fix15-gc (setcdr fix15-c 5)) 7))))
+               (defalias 'fix15-ls4
+                 (eval (list 'function (list 'lambda nil (list 'let* fix15-c 'a))) t))
+               (list (fix15-ls4)
+                     (progn (setq fix15-gc t)
+                            (condition-case e (fix15-ls4)
+                              (error (list (car e) (cadr e) (eq (nth 2 e) fix15-c)))))))",
+            "(7 (wrong-type-argument listp t))",
+        ),
     ]);
     assert_tier_i_cases(&cases);
+}
+
+/// Unlike `let*`'s `CHECK_LIST_END (varlist, XCAR (args))`, every other
+/// form reaches GNU's `list_length`, whose `CHECK_LIST_END (list, list)`
+/// reports the final cdr itself, not the list it ends.
+#[test]
+fn improper_form_args_report_their_final_cdr() {
+    let gnu = "(wrong-type-argument listp t)";
+    let mut cases: Vec<(&'static str, &'static str)> = Vec::new();
+    for form in [
+        "(cons 'progn (cons 1 fix15-datum))",
+        "(cons 'cond (cons '(nil 1) fix15-datum))",
+        "(cons 'setq (cons 'fix15-n (cons 1 fix15-datum)))",
+        "(list 'let (cons '(a 1) fix15-datum) 'a)",
+        "(cons 'lambda (cons nil (cons 1 fix15-datum)))",
+        "(cons 'list (cons 1 fix15-datum))",
+        "(cons 'when (cons t (cons 1 fix15-datum)))",
+    ] {
+        for lex in ["nil", "t"] {
+            let src: &'static str = format!(
+                "(progn (setq fix15-datum (copy-sequence \"s\"))
+                   (condition-case e (eval {form} {lex})
+                     (error (list (car e) (cadr e) (eq (nth 2 e) fix15-datum)))))"
+            )
+            .leak();
+            cases.push((src, gnu));
+        }
+    }
+    for expander in ["macroexpand", "macroexpand-1"] {
+        let src: &'static str = format!(
+            "(progn (setq fix15-datum (copy-sequence \"s\"))
+               (condition-case e ({expander} (cons 'when (cons t (cons 1 fix15-datum))))
+                 (error (list (car e) (cadr e) (eq (nth 2 e) fix15-datum)))))"
+        )
+        .leak();
+        cases.push((src, gnu));
+    }
+    assert_cases(&cases);
 }
 
 /// GNU `Flet_star` keeps the cons it is walking, and `FOR_EACH_TAIL` its

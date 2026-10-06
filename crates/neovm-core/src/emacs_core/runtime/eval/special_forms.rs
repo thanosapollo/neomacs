@@ -473,9 +473,13 @@ impl Context {
                 self.set_eval_temp_root_slot(tortoise_temp_slot, cycle.tortoise());
             }
             if !bindings.is_nil() {
-                // GNU `CHECK_LIST_END (varlist, XCAR (args))`: the varlist
-                // the form holds now, which the backtrace frame keeps alive.
-                return Err(self.listp_error(tail.cons_car()));
+                // GNU `CHECK_LIST_END (varlist, XCAR (args))`: the whole
+                // varlist the form holds now (not its final cdr), which the
+                // backtrace frame keeps alive.
+                return Err(signal(
+                    LispCondition::WrongTypeArgument,
+                    vec![Value::symbol("listp"), tail.cons_car()],
+                ));
             }
             Ok(())
         })();
