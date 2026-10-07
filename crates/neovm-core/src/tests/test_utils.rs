@@ -88,15 +88,34 @@ pub fn load_minimal_gnu_backquote_runtime(eval: &mut Context) {
 
 /// Load GNU `macroexp.el` after the early `subr.el` layer, mirroring the
 /// loadup phase before later Lisp files such as `simple.el` are evaluated.
+///
+/// `pcase.el` is loaded the way lisp/loadup.el:148-157 loads it: when
+/// `macroexp.el` came from source, its own `pcase` uses cannot run before
+/// `pcase` exists, so `pcase.el` is loaded with eager macro-expansion
+/// skipped and `macroexp.el` is then reloaded to expand those uses.  A
+/// plain load of an uncompiled `pcase.el` there signals `Eager
+/// macro-expansion failure: (void-function pcase)`, in GNU as here.
 pub fn load_gnu_macroexp_runtime(eval: &mut Context) {
     if eval.obarray().symbol_function("macroexp-progn").is_some() {
         return;
     }
     let load_path = get_load_path(eval.obarray(), eval.buffers.current_buffer());
-    for name in &["emacs-lisp/macroexp", "emacs-lisp/pcase"] {
-        let path = find_required_lisp_file(name, &load_path);
-        load_file(eval, &path).unwrap_or_else(|err| panic!("load {name}: {err:?}"));
-    }
+    let macroexp = find_required_lisp_file("emacs-lisp/macroexp", &load_path);
+    let pcase = find_required_lisp_file("emacs-lisp/pcase", &load_path);
+    load_file(eval, &macroexp).unwrap_or_else(|err| panic!("load emacs-lisp/macroexp: {err:?}"));
+    let lisp_path = |path: &PathBuf| {
+        crate::emacs_core::print::print_value(&Value::string(path.to_string_lossy().to_string()))
+    };
+    let (macroexp, pcase) = (lisp_path(&macroexp), lisp_path(&pcase));
+    let form = format!(
+        "(if (compiled-function-p (symbol-function 'macroexpand-all))
+             (load {pcase} nil t t)
+           (let ((macroexp--pending-eager-loads '(skip))) (load {pcase} nil t t))
+           (let ((max-lisp-eval-depth (* 2 max-lisp-eval-depth)))
+             (load {macroexp} nil t t)))"
+    );
+    eval.eval_str(&form)
+        .unwrap_or_else(|err| panic!("load emacs-lisp/pcase like loadup.el: {err:?}"));
 }
 
 /// Load the GNU `simple.el` undo auto-amalgamation surface needed by
@@ -359,19 +378,14 @@ pub fn load_minimal_gnu_help_runtime(eval: &mut Context) {
     load_minimal_gnu_backquote_runtime(eval);
     let load_path = get_load_path(eval.obarray(), eval.buffers.current_buffer());
     for name in &[
-        "keymap",
-        "widget",
-        "custom",
-        "cus-face",
-        "faces",
-        "bindings",
-        "emacs-lisp/macroexp",
-        "emacs-lisp/pcase",
-        "emacs-lisp/gv",
+        "keymap", "widget", "custom", "cus-face", "faces", "bindings",
     ] {
         let path = find_required_lisp_file(name, &load_path);
         load_file(eval, &path).unwrap_or_else(|err| panic!("load {name}: {err:?}"));
     }
+    load_gnu_macroexp_runtime(eval);
+    let gv = find_required_lisp_file("emacs-lisp/gv", &load_path);
+    load_file(eval, &gv).unwrap_or_else(|err| panic!("load emacs-lisp/gv: {err:?}"));
     apply_ldefs_boot_autoloads_for_names(
         eval,
         &[
