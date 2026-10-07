@@ -3175,7 +3175,7 @@ pub(crate) fn builtin_replace_match_with_state_and_flags(
     buffers: &mut crate::buffer::BufferManager,
     match_data: &mut Option<super::regex::MatchData>,
     args: &[Value],
-    _case_symbols_as_words: bool,
+    case_symbols_as_words: bool,
 ) -> EvalResult {
     expect_min_args("replace-match", args, 1)?;
     if args.len() > 5 {
@@ -3258,6 +3258,26 @@ pub(crate) fn builtin_replace_match_with_state_and_flags(
             ));
         }
         let string_md_snapshot = md_snapshot.as_ref().map(match_data_for_explicit_string_arg);
+        // GNU `Freplace_match` decides and applies the case of a string
+        // replacement with the current buffer's case and syntax tables too.
+        let tables = if fixedcase {
+            None
+        } else {
+            buffers.current_buffer().map(|buf| {
+                (
+                    crate::emacs_core::syntax::SyntaxTable::for_buffer(buf),
+                    crate::emacs_core::casetab::CaseTableOverride::for_buffer_readonly(buf),
+                )
+            })
+        };
+        let case_context = tables.as_ref().map(|(syntax, casetab)| {
+            crate::emacs_core::search::ReplaceCaseContext {
+                syntax,
+                casetab,
+                symbols_as_words: case_symbols_as_words,
+                in_buffer: false,
+            }
+        });
         return match crate::emacs_core::search::replace_match_lisp_string_with_syntax(
             source,
             newtext_lisp,
@@ -3265,6 +3285,7 @@ pub(crate) fn builtin_replace_match_with_state_and_flags(
             literal,
             subexp,
             &string_md_snapshot,
+            case_context,
         ) {
             Ok(result) => Ok(Value::heap_string(result)),
             Err(msg) if msg == missing_subexp_error => Err(missing_subexp_signal(raw_subexp)),
@@ -3314,6 +3335,7 @@ pub(crate) fn builtin_replace_match_with_state_and_flags(
             literal,
             subexp,
             &md_snapshot,
+            case_symbols_as_words,
         )
         .map_err(|msg| {
             if msg == missing_subexp_error {
@@ -3463,6 +3485,7 @@ pub(crate) fn builtin_replace_match(
                         literal,
                         subexp,
                         &eval.match_data,
+                        case_symbols_as_words,
                     )
                     .map_err(|msg| {
                         if msg == missing_subexp_error {

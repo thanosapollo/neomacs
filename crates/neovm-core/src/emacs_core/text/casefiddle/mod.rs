@@ -1082,26 +1082,32 @@ where
 /// syntax table drive GNU's `Freplace_match` decisions (`UPPERCASEP` /
 /// `LOWERCASEP` + `SYNTAX`). Used by the buffer replace-match path, which has
 /// both tables in scope.
-pub(crate) fn apply_replace_match_case_lisp_cased<W, U, L>(
+pub(crate) fn apply_replace_match_case_lisp_cased(
     replacement: &LispString,
     matched: &LispString,
-    is_word_char: W,
-    is_upper: U,
-    is_lower: L,
+    is_word: impl Fn(u32) -> bool,
+    is_prefix: impl Fn(u32) -> bool,
     casetab: &CaseTableOverride,
-) -> LispString
-where
-    W: FnMut(char) -> bool,
-    U: FnMut(char) -> bool,
-    L: FnMut(char) -> bool,
-{
-    match replace_match_case_action_lisp_cased(matched, is_word_char, is_upper, is_lower) {
+    target: CaseTarget,
+) -> LispString {
+    let action = replace_match_case_action_lisp_cased(
+        matched,
+        |ch| is_word(ch as u32),
+        |ch| casetab.is_upper(ch),
+        |ch| casetab.is_lower(ch),
+    );
+    match action {
         ReplaceMatchCaseAction::NoChange => replacement.clone(),
         ReplaceMatchCaseAction::AllCaps => upcase_lisp_string_emacs_compat(replacement, casetab),
-        ReplaceMatchCaseAction::CapInitial => upcase_initials_lisp_string(
+        // GNU applies `Fupcase_initials` to a string replacement and
+        // `Fupcase_initials_region` to a buffer one.
+        ReplaceMatchCaseAction::CapInitial => capitalize_like_gnu(
             replacement,
-            |code| char::from_u32(code).is_some_and(char::is_alphanumeric),
+            is_word,
+            is_prefix,
             casetab,
+            WordRest::Keep,
+            target,
         ),
     }
 }

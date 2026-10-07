@@ -1187,3 +1187,49 @@ fn replace_match_expands_an_ampersand_as_the_subexp_like_gnu() {
         r#"OK ("xxfoo<BAR>yy" "xxfoo<foo|BAR>yy" "xx<fooBAR>yy" "BAZ" "xxfoo<BAR>yy")"#
     );
 }
+
+/// `replace-match` with FIXEDCASE nil decides and applies case the way GNU
+/// `Freplace_match` does, for a string target as for the buffer: the current
+/// buffer's case table and syntax table, and `case-symbols-as-words`.  A
+/// string target is cased like `upcase-initials` on a string (no syntax
+/// prefix rule); a buffer target like `upcase-initials-region` (prefix rule).
+/// Expected values are GNU Emacs 31's.
+#[test]
+fn replace_match_cases_with_the_buffers_tables_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (cl-flet ((run (setup matched newtext)
+                    (with-temp-buffer
+                      (set-syntax-table (make-syntax-table))
+                      (funcall setup)
+                      (let ((case-fold-search t)
+                            (s (concat "<" matched ">")))
+                        (string-match (regexp-quote matched) s)
+                        (list (replace-match newtext nil nil s)
+                              (progn (erase-buffer) (insert s) (goto-char (point-min))
+                                     (search-forward matched)
+                                     (replace-match newtext nil nil)
+                                     (buffer-string)))))))
+          (list
+           ;; H made caseless: no capitalized initial, so no change.
+           (run (lambda ()
+                  (let ((tbl (copy-case-table (standard-case-table))))
+                    (set-case-syntax ?H "w" tbl)
+                    (set-case-table tbl)))
+                "Hello" "world")
+           ;; Word boundaries come from the syntax table.
+           (run (lambda () (modify-syntax-entry ?- "w")) "Hello" "foo-bar")
+           (run #'ignore "Hello" "foo-bar")
+           (run (lambda () (setq-local case-symbols-as-words t)) "Hello" "foo_bar")
+           ;; The prefix flag matters only in the buffer.
+           (run (lambda () (modify-syntax-entry ?' "w p")) "Hello" "'foo")
+           ;; Initials are titlecased.
+           (run #'ignore "École" "ǆemal")))
+        "#,
+    );
+    assert_eq!(
+        result,
+        r#"OK (("<world>" "<world>") ("<Foo-bar>" "<Foo-bar>") ("<Foo-Bar>" "<Foo-Bar>") ("<Foo_bar>" "<Foo_bar>") ("<'foo>" "<'Foo>") ("<ǅemal>" "<ǅemal>"))"#
+    );
+}
