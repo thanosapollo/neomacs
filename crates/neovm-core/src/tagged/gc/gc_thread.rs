@@ -232,17 +232,30 @@ pub(super) enum GcRequest {
     ConcurrentMark(ConcurrentMarkJob),
 }
 
-pub(super) static GC_THREAD: std::sync::OnceLock<
-    std::sync::Mutex<std::sync::mpsc::Sender<GcRequest>>,
-> = std::sync::OnceLock::new();
+/// One heap's GC thread: spawned at the heap's first GC request, it serves
+/// only that heap's requests, in order, and exits when the heap drops.
+///
+/// Per heap, not per process. A concurrent mark job occupies its thread
+/// until its OWN heap's mutator stops it (`join_concurrent_mark`, at a GC
+/// safepoint or in `Drop`). On a single process-wide FIFO thread, a heap
+/// whose owner stopped reaching GC safepoints mid-mark (a `Context` kept
+/// alive but not run) held the thread indefinitely and every other heap's
+/// request queued behind it, so that heap's drop or stop-the-world mark
+/// waited on another owner — possibly the very thread now blocked in it.
+/// With a thread per heap every wait is for the heap's own job, which the
+/// heap can always stop, so no heap ever waits on another.
+#[derive(Default)]
+pub(super) struct GcWorker {
+    requests: Option<std::sync::mpsc::Sender<GcRequest>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
 
-/// Lazily spawn the process-global GC thread and return its request channel.
-/// The thread lives for the process; it loops draining requests.
-pub(super) fn gc_thread() -> std::sync::MutexGuard<'static, std::sync::mpsc::Sender<GcRequest>> {
-    GC_THREAD
-        .get_or_init(|| {
+impl GcWorker {
+    /// Hand `request` to this heap's GC thread, spawning it on first use.
+    pub(super) fn send(&mut self, request: GcRequest) {
+        if self.requests.is_none() {
             let (tx, rx) = std::sync::mpsc::channel::<GcRequest>();
-            std::thread::Builder::new()
+            let thread = std::thread::Builder::new()
                 .name("neovm-gc".to_string())
                 .spawn(move || {
                     while let Ok(req) = rx.recv() {
@@ -260,10 +273,28 @@ pub(super) fn gc_thread() -> std::sync::MutexGuard<'static, std::sync::mpsc::Sen
                     }
                 })
                 .expect("spawn neovm-gc thread");
-            std::sync::Mutex::new(tx)
-        })
-        .lock()
-        .expect("gc thread channel poisoned")
+            self.requests = Some(tx);
+            self.thread = Some(thread);
+        }
+        self.requests
+            .as_ref()
+            .expect("GC worker channel")
+            .send(request)
+            .expect("neovm-gc thread is gone");
+    }
+}
+
+impl Drop for GcWorker {
+    fn drop(&mut self) {
+        // The owning heap's `Drop` has already joined any in-flight mark
+        // (and a `MarkAll` never outlives its blocked caller), so the thread
+        // is idle in `recv`: closing the channel ends it, and joining keeps
+        // no thread alive past its heap.
+        drop(self.requests.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Atomically set an OWNED cons cell's mark bit using only its pointer. The mark

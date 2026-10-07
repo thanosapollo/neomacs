@@ -335,9 +335,7 @@ impl TaggedHeap {
             mapped_cons_ranges: self.staged_mapped_cons_scan.take(),
             mapped_veclikes: self.staged_mapped_veclikes.take(),
         };
-        gc_thread()
-            .send(GcRequest::ConcurrentMark(job))
-            .expect("neovm-gc thread is gone");
+        self.gc_worker.send(GcRequest::ConcurrentMark(job));
         self.handshake.last_start_jobasm_us = jobasm_t0.elapsed().as_micros() as u64;
         // Pacer: open this cycle's mark window (closed by `incremental_finish`).
         self.pace_mark_start = Some(std::time::Instant::now());
