@@ -294,13 +294,9 @@ Return a bounded printed value; effects are not rolled back on failure."
     (cancel-timer timer) (process-put peer 'send-timer nil))
   (when (and neomacs-mcp--active (eq peer (plist-get neomacs-mcp--active :peer)))
     (setf (plist-get neomacs-mcp--active :cancelled) t))
-  (let ((buffer (process-buffer peer)))
-    (when (process-live-p peer) (delete-process peer))
-    ;; Deleting a process never kills its buffer.  Accept names a
-    ;; connection's buffer after the listener; nothing else uses it.
-    (when (and (buffer-live-p buffer)
-               (string-prefix-p "neomacs-mcp <" (buffer-name buffer)))
-      (kill-buffer buffer))))
+  ;; Like `delete-process', never kill PEER's buffer: the listener's
+  ;; filter gives connections none, so any buffer is not ours.
+  (when (process-live-p peer) (delete-process peer)))
 
 (defun neomacs-mcp--sentinel (peer _event)
   "Retire PEER when its native transport closes; ignore EVENT."
