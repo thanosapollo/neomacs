@@ -1187,3 +1187,65 @@ fn replace_match_expands_an_ampersand_as_the_subexp_like_gnu() {
         r#"OK ("xxfoo<BAR>yy" "xxfoo<foo|BAR>yy" "xx<fooBAR>yy" "BAZ" "xxfoo<BAR>yy")"#
     );
 }
+
+/// The single-allocation join of replace-match pieces gives exactly what
+/// the pairwise `concat` fold gives: representation, characters (unibyte
+/// high bytes become eight-bit characters in a multibyte result), with no
+/// text properties.  Pieces with properties keep taking the fold.
+#[test]
+fn replacement_piece_join_matches_the_pairwise_fold() {
+    use crate::heap_types::LispString;
+    let fold = |pieces: &[LispString]| {
+        let mut acc = pieces[0].clone();
+        for piece in &pieces[1..] {
+            acc = acc.concat(piece);
+        }
+        acc
+    };
+    let cases: Vec<Vec<LispString>> = vec![
+        vec![
+            LispString::from_unibyte(b"ab".to_vec()),
+            LispString::from_unibyte(vec![0xe9, b'c']),
+            LispString::from_unibyte(Vec::new()),
+        ],
+        vec![
+            LispString::from_unibyte(vec![b'x', 0xff]),
+            LispString::from_utf8("\u{3b1}\u{3b2}"),
+            LispString::from_unibyte(vec![0x80]),
+        ],
+        vec![
+            LispString::from_utf8(""),
+            LispString::from_unibyte(b"plain".to_vec()),
+            LispString::from_unibyte(Vec::new()),
+        ],
+        vec![
+            LispString::from_utf8("h\u{e9}"),
+            LispString::from_utf8(" "),
+            LispString::from_utf8("w\u{1F600}"),
+        ],
+    ];
+    for pieces in cases {
+        let expected = fold(&pieces);
+        let joined = concat_lisp_string_pieces(pieces);
+        assert_eq!(joined.as_bytes(), expected.as_bytes());
+        assert_eq!(joined.is_multibyte(), expected.is_multibyte());
+        assert_eq!(joined.schars(), expected.schars());
+        assert!(!joined.has_intervals());
+    }
+}
+
+/// Promoting unibyte text while joining encodes it exactly as
+/// `str_to_multibyte` does, and the size estimate is exact.
+#[test]
+fn appending_unibyte_text_as_multibyte_matches_the_converter() {
+    use crate::emacs_core::emacs_char::{
+        count_size_as_multibyte, extend_as_multibyte, str_to_multibyte,
+    };
+    let all: Vec<u8> = (0..=255).collect();
+    for src in [&b""[..], b"ascii only", &[0x80, b'a', 0xff], &all] {
+        let mut out = b"prefix".to_vec();
+        extend_as_multibyte(&mut out, src);
+        assert_eq!(&out[6..], &str_to_multibyte(src)[..]);
+        assert_eq!(out.len() - 6, count_size_as_multibyte(src));
+    }
+}

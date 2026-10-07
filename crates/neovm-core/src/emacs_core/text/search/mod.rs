@@ -318,17 +318,53 @@ fn replace_match_on_substring(
     .map_err(|msg| signal("error", vec![Value::string(msg)]))
 }
 
+/// Join the pieces of a replaced string into one fresh string, as GNU
+/// `Freplace_match` does with a single `concat3`: one allocation sized for
+/// the result, instead of a binary fold that builds and drops intermediate
+/// strings.  Pieces with text properties take the fold, which merges their
+/// interval tables.
 fn concat_lisp_string_pieces(
     pieces: Vec<crate::heap_types::LispString>,
 ) -> crate::heap_types::LispString {
-    let mut iter = pieces.into_iter();
-    let Some(mut acc) = iter.next() else {
-        return crate::heap_types::LispString::from_unibyte(Vec::new());
-    };
-    for piece in iter {
-        acc = acc.concat(&piece);
+    use crate::heap_types::LispString;
+    if pieces.len() <= 1 || pieces.iter().any(LispString::has_intervals) {
+        let mut iter = pieces.into_iter();
+        let Some(mut acc) = iter.next() else {
+            return LispString::from_unibyte(Vec::new());
+        };
+        for piece in iter {
+            acc = acc.concat(&piece);
+        }
+        return acc;
     }
-    acc
+    let multibyte = pieces.iter().any(LispString::is_multibyte);
+    let encoded_len = |piece: &LispString| {
+        if multibyte && !piece.is_multibyte() {
+            crate::emacs_core::emacs_char::count_size_as_multibyte(piece.as_bytes())
+        } else {
+            piece.sbytes()
+        }
+    };
+    // One more byte for the terminator the string appends.
+    let mut data = Vec::with_capacity(pieces.iter().map(encoded_len).sum::<usize>() + 1);
+    if !multibyte {
+        for piece in &pieces {
+            data.extend_from_slice(piece.as_bytes());
+        }
+        return LispString::from_unibyte(data);
+    }
+    let mut chars = 0;
+    for piece in &pieces {
+        if piece.is_multibyte() {
+            data.extend_from_slice(piece.as_bytes());
+        } else {
+            // A unibyte piece's high bytes become eight-bit characters, as in
+            // GNU `concat` (one character per byte either way).
+            crate::emacs_core::emacs_char::extend_as_multibyte(&mut data, piece.as_bytes());
+        }
+        chars += piece.schars();
+    }
+    LispString::from_emacs_bytes_with_chars(data, chars)
 }
 
 fn empty_lisp_string(multibyte: bool) -> crate::heap_types::LispString {
