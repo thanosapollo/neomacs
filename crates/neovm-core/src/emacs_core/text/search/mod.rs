@@ -599,7 +599,13 @@ fn replace_match_lisp_string_with_syntax_and_properties(
             crate::emacs_core::casefiddle::apply_replace_match_case_lisp(&replacement, &matched)
         };
         if cased.schars() == replacement.schars() {
-            *cased.intervals_mut() = replacement.intervals().clone();
+            // GNU keeps a property-free string's interval pointer null; only
+            // copy a table that exists.
+            if replacement.has_intervals() {
+                *cased.intervals_mut() = replacement.intervals().clone();
+            } else {
+                cased.clear_intervals();
+            }
         }
         replacement = cased;
     }
