@@ -972,7 +972,9 @@ where
     let mut some_lowercase = false;
     let mut some_uppercase = false;
     let mut some_nonuppercase_initial = false;
-    let mut prev_is_word = false;
+    // GNU `Freplace_match` starts with `prevc = '\n'`, so a newline with word
+    // syntax makes the first matched character continue a word.
+    let mut prev_is_word = is_word_char('\n');
 
     for ch in matched.chars() {
         if ch.is_lowercase() {
@@ -1152,7 +1154,9 @@ where
     let mut some_lowercase = false;
     let mut some_uppercase = false;
     let mut some_nonuppercase_initial = false;
-    let mut prev_is_word = false;
+    // GNU `Freplace_match` starts with `prevc = '\n'`, so a newline with word
+    // syntax makes the first matched character continue a word.
+    let mut prev_is_word = is_word_char('\n');
 
     let bytes = matched.as_bytes();
     let mut pos = 0;

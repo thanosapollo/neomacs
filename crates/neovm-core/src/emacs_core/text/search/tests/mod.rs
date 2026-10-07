@@ -1233,3 +1233,24 @@ fn replace_match_cases_with_the_buffers_tables_like_gnu() {
         r#"OK (("<world>" "<world>") ("<Foo-bar>" "<Foo-bar>") ("<Foo-Bar>" "<Foo-Bar>") ("<Foo_bar>" "<Foo_bar>") ("<'foo>" "<'Foo>") ("<ǅemal>" "<ǅemal>"))"#
     );
 }
+
+/// GNU `Freplace_match` classifies the matched text starting from
+/// `prevc = '\n'`, so with newline as a word constituent a lowercase match
+/// counts as a capitalized multi-letter word.  Expected values are GNU's.
+#[test]
+fn replace_match_case_starts_after_a_newline_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (with-temp-buffer
+          (set-syntax-table (make-syntax-table))
+          (modify-syntax-entry ?\n "w")
+          (let ((s "<hello>"))
+            (string-match "hello" s)
+            (list (replace-match "world" nil nil s)
+                  (progn (insert s) (goto-char 1) (search-forward "hello")
+                         (replace-match "world") (buffer-string)))))
+        "#,
+    );
+    assert_eq!(result, r#"OK ("<World>" "<World>")"#);
+}
