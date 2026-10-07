@@ -838,6 +838,7 @@ impl RenderApp {
                         effective_scale
                     );
                     ws.pending_scale_factor = Some(scale_factor);
+                    ws.forget_applied_geometry_hints();
                 }
             }
 

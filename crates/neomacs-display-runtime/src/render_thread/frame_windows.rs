@@ -70,6 +70,12 @@ pub(crate) struct GuiFrameNativeWindowState {
     pub scale_factor: f64,
     /// Borderless native-window chrome state for this frame window.
     pub(super) chrome: WindowChrome,
+    /// Hints last applied to `window`, if known.  GNU
+    /// `xg_wm_set_size_hint` skips a request identical to the last one; here
+    /// a repeat is not free either, because winit's Wayland backend requests
+    /// a redraw on every minimum-size update, re-rendering the previous frame
+    /// just ahead of the one that is about to arrive.
+    pub(super) applied_geometry_hints: Option<GuiFrameGeometryHints>,
 }
 
 impl GuiFrameNativeWindowState {
@@ -1678,13 +1684,26 @@ impl GuiFrameWindowState {
     pub(super) fn apply_geometry_hints(&mut self, geometry_hints: GuiFrameGeometryHints) {
         match &mut self.lifecycle {
             FrameLifecycle::Active { native, .. } => {
-                apply_window_geometry_hints(native.window.as_ref(), geometry_hints);
+                if native.applied_geometry_hints != Some(geometry_hints) {
+                    apply_window_geometry_hints(native.window.as_ref(), geometry_hints);
+                    native.applied_geometry_hints = Some(geometry_hints);
+                }
             }
             FrameLifecycle::Pending {
                 geometry_hints: gh, ..
             } => {
                 *gh = Some(geometry_hints);
             }
+        }
+    }
+
+    /// Forget which hints the native window holds, so the next request is
+    /// applied even if identical.  On a scale change winit's X11 backend
+    /// rewrites WM_NORMAL_HINTS from its own state, dropping the base size
+    /// applied here.
+    pub(super) fn forget_applied_geometry_hints(&mut self) {
+        if let FrameLifecycle::Active { native, .. } = &mut self.lifecycle {
+            native.applied_geometry_hints = None;
         }
     }
 
@@ -2269,6 +2288,7 @@ impl GuiFrameWindowManager {
                                     height: phys.height,
                                     scale_factor,
                                     chrome: chrome.clone(),
+                                    applied_geometry_hints: Some(req.geometry_hints),
                                 },
                                 mouse_hidden_for_typing: false,
                                 ime_enabled: false,
