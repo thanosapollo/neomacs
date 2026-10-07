@@ -2830,6 +2830,8 @@ impl Context {
                 self.buffers.reclaim_dead_buffer(id);
             }
         }
+        // Once per completed prune batch, not once per swept buffer.
+        self.buffers.shrink_dead_buffer_records();
     }
 
     /// Drop the deleted-process records whose process object this cycle

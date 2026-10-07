@@ -5401,11 +5401,9 @@ pub struct BufferManager {
     /// it makes `BUFFER_LIVE_P` false while keeping slots like
     /// `last_name` and `filename` queryable.
     ///
-    /// Records are boxed: the map keeps its high-water capacity after the
-    /// collector reclaims them, and an inline `Buffer` would make every
-    /// empty bucket cost a whole record (about 1.3 KB), so a burst of
-    /// temporary buffers between collections stayed resident for the life
-    /// of the session.
+    /// Records are boxed so spare buckets cost a pointer, not an inline
+    /// `Buffer` (about 1.3 KB). After GC pruning, a sparse map shrinks with
+    /// headroom for ordinary create/kill churn.
     dead_buffers: FxHashMap<BufferId, DeadBufferRecord>,
     /// The base buffer object of each killed indirect buffer that has a
     /// record. GNU `mark_buffer` marks `base_buffer`, so a referenced dead
@@ -5957,12 +5955,24 @@ impl BufferManager {
     }
 
     /// Entry bytes the killed-record map keeps reserved: usable capacity
-    /// times entry size, leaving out control bytes. The map does not shrink
-    /// when records are reclaimed, so this is set by the most killed buffers
-    /// ever awaiting collection at once.
+    /// times entry size, leaving out control bytes.
     #[cfg(test)]
     pub(crate) fn dead_buffer_map_reserved_bytes(&self) -> usize {
         self.dead_buffers.capacity() * std::mem::size_of::<(BufferId, DeadBufferRecord)>()
+    }
+
+    /// Release a burst's spare table after the GC finishes pruning records.
+    /// A quarter-full trigger and a half-full target leave growth headroom;
+    /// retaining at least 64 entries avoids reallocating for small, steady
+    /// create/kill churn. Hash-table rounding can retain up to 128 entries.
+    pub(crate) fn shrink_dead_buffer_records(&mut self) {
+        const FLOOR: usize = 64;
+        let len = self.dead_buffers.len();
+        let capacity = self.dead_buffers.capacity();
+        if capacity > FLOOR * 2 && len < capacity / 4 {
+            self.dead_buffers
+                .shrink_to(len.saturating_mul(2).max(FLOOR));
+        }
     }
 
     /// Immutable access to a buffer object, live or killed.
@@ -6275,7 +6285,9 @@ impl BufferManager {
 
     /// Return the last known name for a dead buffer id, if available.
     pub fn dead_buffer_last_name_value(&self, id: BufferId) -> Option<Value> {
-        self.dead_buffers.get(&id).map(|buffer| buffer.last_name_value())
+        self.dead_buffers
+            .get(&id)
+            .map(|buffer| buffer.last_name_value())
     }
 
     /// Drop the record of a killed buffer whose object the collector freed.
