@@ -356,6 +356,19 @@ enum WordRest {
 /// the table has no entry.  So a buffer case table that pairs `Q` with `a`
 /// still capitalizes `a` to `A`, as in GNU.
 fn push_word_initial(out: &mut Vec<u8>, code: u32, casetab: &CaseTableOverride) {
+    if code < 0x80 {
+        // ASCII: only lowercase letters have a title case (their upper case).
+        let byte = code as u8;
+        let mapped = if byte.is_ascii_lowercase() {
+            byte.to_ascii_uppercase() as i64
+        } else {
+            casetab
+                .map(CaseMap::Up, code as i64)
+                .unwrap_or_else(|| byte.to_ascii_uppercase() as i64)
+        };
+        push_multibyte_char_code(out, mapped as u32);
+        return;
+    }
     if let Some(c) = code_to_char(code as i64) {
         let title = titlecase_word_initial(c);
         let mut chars = title.chars();
@@ -393,11 +406,13 @@ fn capitalize_like_gnu(
     };
 
     if !text.is_multibyte() {
-        // GNU `do_casify_unibyte_string`: a byte above ASCII is a raw byte,
-        // which has no case; an ASCII byte is cased like the character.
+        // GNU `do_casify_unibyte_string`: each byte is cased as the character
+        // `make_char_multibyte` gives, so a byte above ASCII is a raw-byte
+        // character (for syntax too), which has no case.  A result that does
+        // not fit a byte leaves an ASCII byte to plain ASCII casing.
         let mut out = Vec::with_capacity(text.sbytes());
         for &byte in text.as_bytes() {
-            let was_inword = step(byte as u32);
+            let was_inword = step(crate::emacs_core::emacs_char::unibyte_to_char(byte));
             out.push(
                 if !byte.is_ascii() || (was_inword && rest == WordRest::Keep) {
                     byte
@@ -406,15 +421,14 @@ fn capitalize_like_gnu(
                     // wins over the case table.
                     byte.to_ascii_uppercase()
                 } else {
-                    let (which, default) = if was_inword {
+                    let (which, ascii) = if was_inword {
                         (CaseMap::Down, byte.to_ascii_lowercase())
                     } else {
                         (CaseMap::Up, byte.to_ascii_uppercase())
                     };
                     match casetab.map(which, byte as i64) {
-                        Some(m) if (0..0x80).contains(&m) => m as u8,
-                        Some(_) => byte,
-                        None => default,
+                        Some(m) if m < 0x100 => m as u8,
+                        Some(_) | None => ascii,
                     }
                 },
             );

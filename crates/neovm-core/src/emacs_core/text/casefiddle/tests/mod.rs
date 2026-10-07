@@ -498,3 +498,31 @@ fn unibyte_capitalization_leaves_raw_bytes_alone_like_gnu() {
         "OK (\"\\351abc\" \"\\351abc\" \"Xy\\311z\" nil (\"Abc\" \"Abc\" \"Aac\"))"
     );
 }
+
+/// A unibyte byte above ASCII takes the syntax of its raw-byte character,
+/// and an ASCII byte whose case-table mapping does not fit a byte falls back
+/// to ASCII casing (GNU `do_casify_unibyte_string`).  Expected values are
+/// GNU Emacs 31's.
+#[test]
+fn unibyte_capitalization_uses_raw_byte_syntax_and_ascii_fallback_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (list
+         (with-temp-buffer
+           (set-syntax-table (make-syntax-table))
+           (modify-syntax-entry ?é ".")
+           (capitalize "\351ABC"))
+         (with-temp-buffer
+           (set-syntax-table (make-syntax-table))
+           (modify-syntax-entry (unibyte-char-to-multibyte 233) ".")
+           (capitalize "\351ABC"))
+         (with-temp-buffer
+           (let ((tbl (copy-case-table (standard-case-table))))
+             (set-case-syntax-pair ?A ?ω tbl)
+             (set-case-table tbl))
+           (capitalize (string-as-unibyte "BA"))))
+        "#,
+    );
+    assert_eq!(result, "OK (\"\\351abc\" \"\\351Abc\" \"Ba\")");
+}
