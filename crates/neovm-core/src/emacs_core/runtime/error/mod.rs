@@ -1079,7 +1079,7 @@ fn format_opaque_handle_in_state(
         if let Some(buf) = buffers.get(buf_id) {
             return Some(format!("#<buffer {}>", buf.name_runtime_string_owned()));
         }
-        if buffers.dead_buffer_last_name_value(buf_id).is_some() {
+        if buffers.is_killed(buf_id) {
             return Some("#<killed buffer>".to_string());
         }
     }

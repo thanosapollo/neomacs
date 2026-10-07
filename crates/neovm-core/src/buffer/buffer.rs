@@ -5398,6 +5398,11 @@ pub struct BufferManager {
     /// it makes `BUFFER_LIVE_P` false while keeping slots like
     /// `last_name` and `filename` queryable.
     dead_buffers: FxHashMap<BufferId, Buffer>,
+    /// The base buffer object of each killed indirect buffer that has a
+    /// record. GNU `mark_buffer` marks `base_buffer`, so a referenced dead
+    /// indirect buffer keeps its (dead) base, whose record would otherwise
+    /// go with its unreferenced object.
+    dead_indirect_bases: FxHashMap<BufferId, Value>,
     buffer_order: Vec<BufferId>,
     /// Written only by [`BufferManager::set_current_id`], which keeps
     /// [`Self::current_raw`] in step.
@@ -5613,6 +5618,7 @@ impl BufferManager {
         let mut mgr = Self {
             buffers: LiveBuffers::default(),
             dead_buffers: FxHashMap::default(),
+            dead_indirect_bases: FxHashMap::default(),
             buffer_order: Vec::new(),
             current: None,
             current_raw: 0,
@@ -5936,6 +5942,11 @@ impl BufferManager {
         self.dead_buffers.get(&id)
     }
 
+    /// How many killed buffers still have a record here.
+    pub fn dead_buffer_count(&self) -> usize {
+        self.dead_buffers.len()
+    }
+
     /// Immutable access to a buffer object, live or killed.
     pub fn get_any(&self, id: BufferId) -> Option<&Buffer> {
         self.buffers.get(&id).or_else(|| self.dead_buffers.get(&id))
@@ -6218,6 +6229,17 @@ impl BufferManager {
             buf.mark_killed_after_local_reset();
             self.dead_buffers.insert(*killed_id, buf);
         }
+        // The buffer objects stop being roots: each killed record now lives
+        // exactly as long as its object is referenced (`reclaim_dead_buffer`).
+        if crate::tagged::gc::tagged_heap_is_installed() {
+            for killed_id in &killed_ids {
+                if let Some(base) = self.dead_buffers.get(killed_id).and_then(|b| b.base_buffer) {
+                    self.dead_indirect_bases
+                        .insert(*killed_id, Value::make_buffer(base));
+                }
+            }
+            crate::tagged::gc::with_tagged_heap(|heap| heap.note_buffers_killed(&killed_ids));
+        }
         self.buffer_order
             .retain(|buffer_id| !killed_set.contains(buffer_id));
 
@@ -6234,6 +6256,31 @@ impl BufferManager {
     /// Return the last known name for a dead buffer id, if available.
     pub fn dead_buffer_last_name_value(&self, id: BufferId) -> Option<Value> {
         self.dead_buffers.get(&id).map(Buffer::last_name_value)
+    }
+
+    /// Drop the record of a killed buffer whose object the collector freed.
+    /// GNU's sweep frees the dead `struct buffer` itself (`sweep_vectors` in
+    /// alloc.c); here the object is the handle and this record its contents,
+    /// so the record goes once the handle has. Whatever only the record held
+    /// is collected by the next cycle. A live id is left alone.
+    ///
+    /// The record is traced as a root while it exists, so a killed buffer
+    /// whose own record refers back to its object (an always-local slot
+    /// holding the buffer) stays; GNU would collect that cycle.
+    pub fn reclaim_dead_buffer(&mut self, id: BufferId) {
+        self.dead_buffers.remove(&id);
+        self.dead_indirect_bases.remove(&id);
+    }
+
+    /// One past the highest buffer id issued so far.
+    pub(crate) fn next_buffer_id(&self) -> u64 {
+        self.next_id
+    }
+
+    /// Whether `id` was issued and its buffer has since been killed. Ids
+    /// are never reused, so this holds even after the record is gone.
+    pub fn is_killed(&self, id: BufferId) -> bool {
+        id.0 > 0 && id.0 < self.next_id && self.buffers.get(&id).is_none()
     }
 
     /// List all live buffer ids in buffer-list order, with the most recently
@@ -7648,6 +7695,7 @@ impl BufferManager {
             next_marker_id,
             labeled_restrictions: FxHashMap::default(),
             dead_buffers: FxHashMap::default(),
+            dead_indirect_bases: FxHashMap::default(),
             default_text_backend_kind,
             buffer_defaults,
             saved_point_before_command,
@@ -7773,6 +7821,9 @@ impl GcTrace for BufferManager {
             }
             visit(buffer.local_var_alist.as_lisp_alist());
             visit(buffer.keymap);
+        }
+        for base in self.dead_indirect_bases.values() {
+            visit(*base);
         }
         // Phase 10D: `buffer_defaults` holds the global default
         // values for every per-buffer slot. Mirrors GNU's

@@ -1538,8 +1538,13 @@ impl TaggedHeap {
         let roots: Vec<(TaggedValue, &'static str)> = self
             .buffer_registry
             .iter()
-            .flatten()
-            .map(|value| (*value, "buffer-registry"))
+            .filter_map(|slot| match slot {
+                // Only live buffers are roots; a killed buffer's object lives
+                // only through references (GNU marks it from `Vbuffer_alist`
+                // while live, via ordinary references once killed).
+                RegistrySlot::Live(value) => Some((*value, "buffer-registry")),
+                _ => None,
+            })
             .chain(
                 self.window_registry
                     .values()
@@ -1555,11 +1560,13 @@ impl TaggedHeap {
                     .values()
                     .map(|value| (*value, "timer-registry")),
             )
-            .chain(
-                self.process_registry
-                    .values()
-                    .map(|value| (*value, "process-registry")),
-            )
+            .chain(self.process_registry.iter().filter_map(|slot| match slot {
+                // Only live processes are roots (GNU marks them from
+                // `Vprocess_alist`); a deleted one lives only through
+                // references.
+                RegistrySlot::Live(value) => Some((*value, "process-registry")),
+                _ => None,
+            }))
             .chain(
                 self.canonical_empty_strings
                     .values()
@@ -1843,6 +1850,8 @@ impl TaggedHeap {
         memory_telemetry::observe(self, memory_telemetry::Phase::FinalMark);
         self.promote_survivors_world_stopped();
         self.unchain_dead_markers();
+        self.prune_unmarked_killed_buffers();
+        self.prune_unmarked_deleted_processes();
         self.reset_generational_remembered_world_stopped();
 
         // -- Sweep phase --

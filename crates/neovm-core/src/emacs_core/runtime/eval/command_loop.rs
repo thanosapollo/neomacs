@@ -2153,6 +2153,18 @@ impl Context {
         self.gc_driver_active = prev;
     }
 
+    /// GNU's mark puts a buffer-local binding still set up for a killed
+    /// buffer back to the global one (`mark_localized_symbol`, alloc.c), so
+    /// the binding cache does not keep the killed buffer alive. Called once
+    /// per collection before its mark, never while a mark runs: the
+    /// concurrent marker may be reading these roots.
+    fn swap_out_killed_buffer_bindings(&mut self) {
+        debug_assert!(!self.tagged_heap.mark_in_progress());
+        let buffers = &self.buffers;
+        self.obarray
+            .swap_out_killed_buffer_bindings(|id| buffers.is_killed(id));
+    }
+
     pub(super) fn gc_collect_from_current_roots_body(&mut self, force_complete: bool) {
         // GNU `garbage_collect' shortens every live buffer's undo list before
         // it marks anything: "Don't keep undo information around forever. Do
@@ -2168,6 +2180,14 @@ impl Context {
             || !(self.tagged_heap.mark_in_progress() || self.tagged_heap.sweep_in_progress())
         {
             crate::emacs_core::undo::compact_buffers_for_gc(self);
+        }
+        // A cycle about to start here (not an explicit collection, which
+        // starts its own below) first unloads bindings set up for killed
+        // buffers.
+        if !force_complete
+            && !(self.tagged_heap.mark_in_progress() || self.tagged_heap.sweep_in_progress())
+        {
+            self.swap_out_killed_buffer_bindings();
         }
         let start = std::time::Instant::now();
         // These two are the caches keyed on a raw heap address -- the address
@@ -2206,6 +2226,9 @@ impl Context {
                 if (*heap_ptr).sweep_in_progress() {
                     (*heap_ptr).finish_incremental_sweep_now();
                 }
+                // No mark runs now: unload bindings set up for a buffer
+                // killed meanwhile, including during the cycle drained above.
+                self.swap_out_killed_buffer_bindings();
                 // Disarms a concurrent first cycle drained above, so this
                 // cycle traces the whole image before it promotes (see
                 // `begin_stw_collection`).
@@ -2335,6 +2358,8 @@ impl Context {
         // single drain point for `TaggedHeap::pending_surface_destroys`.
         self.drain_pending_surface_destroys();
         self.drain_pending_video_destroys();
+        self.drain_pending_buffer_reclaims();
+        self.drain_pending_process_reclaims();
         // GNU `garbage_collect` runs the doomed finalizers before
         // `post-gc-hook`.  A collection that completes while the cconv memo
         // observes a Lisp run leaves both to the end of that run.
@@ -2778,6 +2803,41 @@ impl Context {
         for id in ids {
             if let Err(err) = host.destroy_video(id) {
                 tracing::debug!(video_id = id.get(), "gc video destroy failed: {err}");
+            }
+        }
+    }
+
+    /// Drop the killed-buffer records whose buffer object this cycle freed.
+    /// An id whose object was made again since (a Rust-held id turned back
+    /// into a Lisp value) keeps its record until that object goes too.
+    ///
+    /// The match data names its buffer by id, where GNU's
+    /// `last_thing_searched` holds the buffer object: `(match-data t)` can
+    /// still return that killed buffer. Its record waits, checked again
+    /// after each cycle, until the match data moves on.
+    pub(super) fn drain_pending_buffer_reclaims(&mut self) {
+        let searched = match self.match_data.as_ref().map(|md| md.source()) {
+            Some(crate::emacs_core::regex::MatchDataSource::Buffer(id)) => Some(id),
+            _ => None,
+        };
+        for id in self.tagged_heap.take_pending_buffer_reclaims() {
+            if !self.tagged_heap.buffer_object_reclaimed(id) {
+                continue;
+            }
+            if Some(id) == searched {
+                self.tagged_heap.requeue_buffer_reclaim(id);
+            } else {
+                self.buffers.reclaim_dead_buffer(id);
+            }
+        }
+    }
+
+    /// Drop the deleted-process records whose process object this cycle
+    /// freed, as `drain_pending_buffer_reclaims` does for killed buffers.
+    pub(super) fn drain_pending_process_reclaims(&mut self) {
+        for id in self.tagged_heap.take_pending_process_reclaims() {
+            if self.tagged_heap.process_object_reclaimed(id) {
+                self.processes.reclaim_deleted_process(id);
             }
         }
     }

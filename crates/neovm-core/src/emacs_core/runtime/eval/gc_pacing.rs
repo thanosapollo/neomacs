@@ -133,10 +133,27 @@ impl Context {
                         visit(value);
                     }
                 }
-                SpecBinding::LetLocal { old_value, .. } => visit(*old_value),
-                SpecBinding::LetDefault { old_value, .. } => {
+                // GNU's specpdl holds the binding's `where` buffer as an
+                // object (`specbind`, eval.c), so a buffer killed inside the
+                // `let` stays referenced until the binding unwinds.
+                SpecBinding::LetLocal {
+                    old_value,
+                    buffer_id,
+                    ..
+                } => {
+                    visit(*old_value);
+                    self.visit_buffer_object(*buffer_id, visit);
+                }
+                SpecBinding::LetDefault {
+                    old_value,
+                    buffer_id,
+                    ..
+                } => {
                     if let Some(value) = old_value.get() {
                         visit(value);
+                    }
+                    if let Some(id) = buffer_id.get() {
+                        self.visit_buffer_object(id, visit);
                     }
                 }
                 SpecBinding::LexicalEnv { old_lexenv } => visit(*old_lexenv),
@@ -180,6 +197,10 @@ impl Context {
                     visit(*lexenv);
                 }
                 SpecBinding::SaveRestriction { state } => {
+                    // `save_restriction_save` (editfns.c) keeps the buffer
+                    // object either way: as the unnarrowed state, and with
+                    // its labeled restrictions (`labeled_restrictions_save`).
+                    self.visit_buffer_object(state.state().buffer_id, visit);
                     let mut roots = Vec::new();
                     state.state().trace_roots(&mut roots);
                     // The saved bounds live as marker ids only; root the
@@ -192,15 +213,19 @@ impl Context {
                 }
                 SpecBinding::SaveExcursion { marker, .. } => visit(*marker),
                 SpecBinding::NativeUnwind { action } => action.trace_roots(visit),
-                // EXHAUSTIVE ON PURPOSE — no catch-all arm. These four carry
-                // no Lisp value (a buffer id, two lengths, nothing), and a new
+                // `record_unwind_current_buffer` (buffer.c) saves the buffer
+                // object, which keeps a buffer killed meanwhile referenced.
+                SpecBinding::SaveCurrentBuffer { buffer_id } => {
+                    self.visit_buffer_object(*buffer_id, visit);
+                }
+                // EXHAUSTIVE ON PURPOSE — no catch-all arm. These three carry
+                // no Lisp value (two lengths, nothing), and a new
                 // `SpecBinding` variant must state which group it belongs to
                 // instead of being absorbed by a `_ => {}`. A root walk is the
                 // one match where "the compiler did not complain" and "the
                 // value is marked" must be the same sentence
                 // (DIVERGENCES.md 161's residual, closed by 162).
-                SpecBinding::SaveCurrentBuffer { .. }
-                | SpecBinding::LoadsInProgress { .. }
+                SpecBinding::LoadsInProgress { .. }
                 | SpecBinding::RequireStack { .. }
                 | SpecBinding::Nop => {}
             }
@@ -367,10 +392,26 @@ impl Context {
         group("coding_systems");
         self.coding_systems.trace_roots_with(visit);
         group("match_data");
-        if let Some(ref md) = self.match_data
-            && let Some(crate::emacs_core::regex::SearchedString::Heap(val)) = md.searched_string()
-        {
-            visit(*val);
+        // GNU's `last_thing_searched` (search.c) is the searched string or
+        // buffer object; the match data here names a buffer by id.
+        if let Some(ref md) = self.match_data {
+            if let Some(crate::emacs_core::regex::SearchedString::Heap(val)) = md.searched_string()
+            {
+                visit(*val);
+            }
+            if let crate::emacs_core::regex::MatchDataSource::Buffer(id) = md.source() {
+                self.visit_buffer_object(id, visit);
+            }
+        }
+    }
+
+    /// Visit the object of buffer `id` if one was made. A Rust holder that
+    /// names a buffer by id where GNU holds the object calls this, so a
+    /// killed buffer it names is not freed under it. A live buffer's object
+    /// is a root anyway.
+    fn visit_buffer_object(&self, id: crate::buffer::BufferId, visit: &mut dyn FnMut(Value)) {
+        if let Some(value) = self.tagged_heap.buffer_object_for_trace(id) {
+            visit(value);
         }
     }
 

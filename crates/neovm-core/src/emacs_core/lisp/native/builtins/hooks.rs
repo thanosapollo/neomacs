@@ -1117,6 +1117,27 @@ impl WindowConfigurationSnapshot {
 fn window_configuration_snapshot_roots(snapshot: &WindowConfigurationSnapshot) -> Value {
     let mut roots = Vec::new();
     snapshot.trace_roots(&mut roots);
+    // GNU's saved configuration holds its current buffer and every saved
+    // window's buffer as objects (`Fcurrent_window_configuration`,
+    // window.c), so a buffer killed after the capture stays referenced
+    // while the configuration does. The snapshot names them by id.
+    let leaf_buffers = snapshot
+        .tree
+        .leaf_ids()
+        .into_iter()
+        .filter_map(|id| snapshot.tree.find(id).and_then(|window| window.buffer_id()));
+    let minibuffer_buffer = snapshot
+        .minibuffer_leaf
+        .as_ref()
+        .and_then(|window| window.buffer_id());
+    roots.extend(
+        snapshot
+            .current_buffer
+            .into_iter()
+            .chain(leaf_buffers)
+            .chain(minibuffer_buffer)
+            .map(Value::make_buffer),
+    );
     Value::vector(roots)
 }
 

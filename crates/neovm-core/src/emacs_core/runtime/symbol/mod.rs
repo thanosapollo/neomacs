@@ -3232,6 +3232,32 @@ impl Obarray {
         Some(unsafe { &mut *sym.val.blv })
     }
 
+    /// GNU `mark_localized_symbol` (alloc.c): a buffer-local binding still
+    /// set up for a killed buffer goes back to the global binding before
+    /// the mark, so the cache does not keep the killed buffer alive. Done
+    /// as the `kill-buffer` and `kill-local-variable` paths do it
+    /// (`swap_in_global_binding`). A binding forwarded to a native slot
+    /// needs no slot write: `swap_in_blv` never loads a buffer's value into
+    /// the slot, so it still holds the default.
+    pub(crate) fn swap_out_killed_buffer_bindings(
+        &mut self,
+        is_killed: impl Fn(crate::buffer::BufferId) -> bool,
+    ) {
+        for &blv_ptr in &self.blvs {
+            // Safety: the pool holds live BLVs; `&mut self` excludes other
+            // borrows of them.
+            let blv = unsafe { &mut *blv_ptr };
+            if blv.where_buf_id == NO_WHERE_BUF
+                || !is_killed(crate::buffer::BufferId(blv.where_buf_id))
+            {
+                continue;
+            }
+            blv.set_where(Value::NIL);
+            blv.found = false;
+            blv.valcell = blv.defcell;
+        }
+    }
+
     /// Install a `BUFFER_OBJFWD` forwarder on a symbol. Phase 8a of
     /// the symbol-redirect refactor. Mirrors GNU `defvar_per_buffer`
     /// (`src/buffer.c:4990-5012`).

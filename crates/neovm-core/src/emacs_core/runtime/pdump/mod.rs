@@ -809,6 +809,13 @@ fn reconstruct_evaluator_after_symbol_table_with_decoder_and_value_fixups(
         load_bookmark_manager(&state.bookmarks),
         load_watcher_list(&mut decoder, &state.watchers),
     );
+    // Values loaded from the dump can name buffers killed before it; their
+    // objects are not roots (see `TaggedHeap::note_restored_buffers`).
+    {
+        let buffers = &eval.buffers;
+        eval.tagged_heap
+            .note_restored_buffers(buffers.next_buffer_id(), |id| buffers.get(id).is_some());
+    }
 
     // Phase 10E follow-up: re-install BUFFER_OBJFWD forwarders.
     // `pdump::convert::load_symbol_data` leaves SymbolValue::Forwarded

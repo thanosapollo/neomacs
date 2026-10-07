@@ -1919,7 +1919,7 @@ impl<'a> PrincPrinter<'a> {
                 let id = value.as_buffer_id().unwrap();
                 if let Some(buf) = ctx.buffers.get(id) {
                     out.extend_from_slice(buf.name_runtime_string_owned().as_bytes());
-                } else if ctx.buffers.dead_buffer_last_name_value(id).is_some() {
+                } else if ctx.buffers.is_killed(id) {
                     out.extend_from_slice(b"#<killed buffer>");
                 } else {
                     out.extend_from_slice(&self.prin1_bytes(&value));

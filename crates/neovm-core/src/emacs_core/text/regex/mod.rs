@@ -1216,6 +1216,22 @@ impl MatchData {
         }
     }
 
+    /// The heap object this match data names, for a caller that saves it
+    /// in a Rust local across arbitrary Lisp: the searched string, or the
+    /// searched buffer's object. GNU's `last_thing_searched` and
+    /// `saved_last_thing_searched` are Lisp objects that keep a buffer
+    /// killed after the search alive (search.c, thread.h).
+    pub(crate) fn gc_root(&self) -> Option<super::value::Value> {
+        match &self.kind {
+            MatchDataKind::StringChars {
+                searched: Some(SearchedString::Heap(value)),
+                ..
+            } => Some(*value),
+            MatchDataKind::StringChars { .. } => None,
+            MatchDataKind::Buffer { id, .. } => Some(super::value::Value::make_buffer(*id)),
+        }
+    }
+
     pub(crate) fn source(&self) -> MatchDataSource {
         match self.kind {
             MatchDataKind::StringChars { .. } => MatchDataSource::String,
