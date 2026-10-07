@@ -1224,6 +1224,14 @@ fn replacement_piece_join_matches_the_pairwise_fold() {
             LispString::from_utf8("w\u{1F600}"),
         ],
     ];
+    // Independent of `concat`: GNU's internal bytes for "x\377", alpha beta
+    // and "\200" (raw bytes become the eight-bit characters C1 BF and C0 80).
+    let mixed = concat_lisp_string_pieces(cases[1].clone());
+    assert_eq!(
+        mixed.as_bytes(),
+        &[b'x', 0xc1, 0xbf, 0xce, 0xb1, 0xce, 0xb2, 0xc0, 0x80]
+    );
+    assert_eq!(mixed.schars(), 5);
     for pieces in cases {
         let expected = fold(&pieces);
         let joined = concat_lisp_string_pieces(pieces);
