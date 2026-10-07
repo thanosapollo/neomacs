@@ -6,11 +6,20 @@
 //! feedback retains its advertised clock ID; consumers must reject mismatched
 //! domains. X11/non-Wayland captures contain local stages only.
 //! Repeated draws of one sealed revision intentionally repeat its identity.
+//! `submit` marks the root glyph pass's queue submission, not the frame's
+//! final GPU submission; a rebuilt retained static scene records it twice.
 //!
-//! Hot threads only sample clocks and try_send fixed-size records. One writer
-//! owns the file, buffers JSONL, and flushes every 100 ms (no fsync). Its queue
-//! is bounded; dropped records are reported separately. Abrupt process exit can
-//! lose a tail. Call shutdown after GUI/evaluator teardown for a normal drain.
+//! Enabling the trace also requests Wayland presentation feedback for every
+//! frame, which keeps the render thread waking while feedback is pending. A
+//! traced run therefore measures a slightly busier renderer than an untraced one.
+//!
+//! Hot threads only sample clocks and try_send fixed-size records; nobody
+//! waits on the queue, so a send never wakes another thread. One writer owns
+//! the file and drains the queue every 10 ms into buffered JSONL (no fsync).
+//! The queue is bounded; dropped records are reported separately. Abrupt
+//! process exit can lose a tail. Call [`init`] early so the writer thread is
+//! not started under a hot-path lock, and [`shutdown`] after GUI/evaluator
+//! teardown for a normal drain.
 
 use crate::PresentationId;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
@@ -25,11 +34,11 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const CAPACITY: usize = 4096;
-const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+const DRAIN_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +138,12 @@ pub fn enabled() -> bool {
     recorder().is_some()
 }
 
+/// Read the configuration and start the writer, if enabled, before any hot
+/// path records a stage.
+pub fn init() {
+    let _ = recorder();
+}
+
 #[cfg(target_os = "linux")]
 fn clock_ns(clock: libc::clockid_t) -> Option<u64> {
     let mut time = libc::timespec {
@@ -173,6 +188,27 @@ impl Recorder {
     }
 }
 
+fn stamp_with(
+    recorder: &Recorder,
+    stage: Stage,
+    frame: u64,
+    presentation: PresentationId,
+    clock: impl FnOnce(Stage) -> Option<(u32, u64, Option<u64>)>,
+) -> Option<Record> {
+    let Some((clock_id, ns, realtime_ns)) = clock(stage) else {
+        recorder.dropped.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    Some(Record {
+        stage,
+        frame,
+        presentation: presentation.get(),
+        clock_id,
+        ns,
+        realtime_ns,
+    })
+}
+
 fn record_to(
     recorder: Option<&Recorder>,
     stage: Stage,
@@ -181,23 +217,33 @@ fn record_to(
     clock: impl FnOnce(Stage) -> Option<(u32, u64, Option<u64>)>,
 ) {
     let Some(recorder) = recorder else { return };
-    if let Some((clock_id, ns, realtime_ns)) = clock(stage) {
-        recorder.send(Record {
-            stage,
-            frame,
-            presentation: presentation.get(),
-            clock_id,
-            ns,
-            realtime_ns,
-        });
-    } else {
-        recorder.dropped.fetch_add(1, Ordering::Relaxed);
+    if let Some(record) = stamp_with(recorder, stage, frame, presentation, clock) {
+        recorder.send(record);
     }
 }
 
 #[inline]
 pub fn record(stage: Stage, frame: u64, presentation: PresentationId) {
     record_to(recorder(), stage, frame, presentation, sample);
+}
+
+/// A stage timestamp taken now and queued later by [`Stamp::emit`], so a
+/// caller can sample inside a critical section and queue after leaving it.
+#[must_use]
+pub struct Stamp(Record);
+
+/// Sample a stage without queueing it. `None` when the trace is disabled.
+#[inline]
+pub fn stamp(stage: Stage, frame: u64, presentation: PresentationId) -> Option<Stamp> {
+    stamp_with(recorder()?, stage, frame, presentation, sample).map(Stamp)
+}
+
+impl Stamp {
+    pub fn emit(self) {
+        if let Some(recorder) = recorder() {
+            recorder.send(self.0);
+        }
+    }
 }
 
 /// Preserve the compositor's native timestamp/domain, not callback receive time.
@@ -233,25 +279,26 @@ fn write_records(
     stopped: Receiver<()>,
     dropped: &AtomicU64,
 ) -> io::Result<()> {
-    let mut flushed = Instant::now();
     loop {
-        if stopped.try_recv().is_ok() {
-            // Finite drain even if another producer is still exiting.
-            for record in incoming.try_iter().take(CAPACITY) {
-                write_record(&mut writer, &record)?;
+        // Sleep on the stop channel only: producers never have a waiting
+        // receiver to wake, so their sends stay free of syscalls.
+        let stop = !matches!(
+            stopped.recv_timeout(DRAIN_INTERVAL),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        );
+        // A bounded drain per pass, even if a producer is still exiting.
+        for _ in 0..CAPACITY {
+            match incoming.try_recv() {
+                Ok(record) => write_record(&mut writer, &record)?,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    return flush_records(&mut writer, dropped);
+                }
             }
-            return flush_records(&mut writer, dropped);
         }
-        match incoming.recv_timeout(FLUSH_INTERVAL.saturating_sub(flushed.elapsed())) {
-            Ok(record) => write_record(&mut writer, &record)?,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                return flush_records(&mut writer, dropped);
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-        }
-        if flushed.elapsed() >= FLUSH_INTERVAL {
-            flush_records(&mut writer, dropped)?;
-            flushed = Instant::now();
+        flush_records(&mut writer, dropped)?;
+        if stop {
+            return Ok(());
         }
     }
 }

@@ -4545,6 +4545,9 @@ pub fn run(mode: RuntimeMode) {
     let mut crash_build = String::new();
     build_info::write_build_provenance(&mut crash_build);
     let _logging_guard = neovm_core::logging::init_with_build_info(log_target, &crash_build);
+    // Start an opt-in presentation trace writer before any render or
+    // evaluator lock can record a stage.
+    neomacs_display_protocol::present_trace::init();
     Context::initialize_termination_signals(startup.noninteractive);
 
     if mode == RuntimeMode::Raw

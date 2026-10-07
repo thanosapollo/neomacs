@@ -153,6 +153,33 @@ fn writer_drains_and_flushes_at_normal_shutdown() {
 }
 
 #[test]
+fn deferred_stamp_keeps_its_sample_time() {
+    let (recorder, incoming) = queue(2);
+    let record = stamp_with(
+        &recorder,
+        Stage::Publish,
+        7,
+        PresentationId::new(42),
+        |_| Some((1, 123, Some(456))),
+    )
+    .unwrap();
+    assert!(incoming.try_recv().is_err(), "stamping must not queue");
+    recorder.send(record);
+    let queued = incoming.try_recv().unwrap();
+    assert_eq!((queued.ns, queued.realtime_ns), (123, Some(456)));
+}
+
+#[test]
+fn writer_stops_promptly_with_an_empty_queue() {
+    let (_events, incoming) = bounded::<Record>(1);
+    let (stop, stopped) = bounded(1);
+    stop.try_send(()).unwrap();
+    let mut bytes = Vec::new();
+    write_records(&mut bytes, incoming, stopped, &AtomicU64::new(0)).unwrap();
+    assert!(bytes.is_empty());
+}
+
+#[test]
 fn writer_flushes_when_producers_disconnect() {
     let (events, incoming) = bounded(1);
     let (_stop, stopped) = bounded(1);
@@ -187,7 +214,14 @@ fn environment_trace_writes_and_drains_jsonl() {
             Stage::Superseded,
             Stage::Discarded,
         ] {
-            record(stage, 7, PresentationId::new(42));
+            if stage == Stage::Superseded {
+                // The deferred form queues exactly what it sampled.
+                if let Some(stamp) = stamp(stage, 7, PresentationId::new(42)) {
+                    stamp.emit();
+                }
+            } else {
+                record(stage, 7, PresentationId::new(42));
+            }
         }
         presented(7, PresentationId::new(42), 17, 999);
         shutdown();
