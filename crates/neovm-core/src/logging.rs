@@ -232,8 +232,38 @@ pub fn init_for_tests() {
     let _ = init(LogTarget::Test);
 }
 
-fn make_env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
+fn make_env_filter<S>() -> impl tracing_subscriber::layer::Filter<S> + Send + Sync + 'static
+where
+    S: tracing::Subscriber,
+{
+    use tracing_subscriber::filter::FilterExt;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let directives = std::env::var(EnvFilter::DEFAULT_ENV).ok();
+    let keep_dumps = wants_cranelift_function_dumps(directives.as_deref());
+    filter.and(tracing_subscriber::filter::filter_fn(move |meta| {
+        keep_dumps || !is_cranelift_function_dump(meta)
+    }))
+}
+
+/// `cranelift-jit` logs every function it defines, with its whole CLIF body,
+/// at `info` (`cranelift_jit::backend`).  That is a debugging dump, not an
+/// operational message: under the packaged `RUST_LOG=info` it formatted and
+/// wrote megabytes of IR per session.  Treat it as debug output.
+fn is_cranelift_function_dump(meta: &tracing::Metadata<'_>) -> bool {
+    *meta.level() == tracing::Level::INFO && meta.target() == "cranelift_jit::backend"
+}
+
+/// Whether `RUST_LOG` asks for the dumps: it names cranelift, or some
+/// directive selects `debug` or `trace`.
+fn wants_cranelift_function_dumps(directives: Option<&str>) -> bool {
+    let Some(directives) = directives else {
+        return false;
+    };
+    directives.contains("cranelift")
+        || directives.split(',').any(|directive| {
+            let level = directive.rsplit('=').next().unwrap_or("").trim();
+            level.eq_ignore_ascii_case("debug") || level.eq_ignore_ascii_case("trace")
+        })
 }
 
 /// Resolve the log file path from environment.

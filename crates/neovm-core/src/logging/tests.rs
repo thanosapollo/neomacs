@@ -233,3 +233,51 @@ fn crash_reports_follow_target_policy_and_first_initializer() {
         }
     }
 }
+
+/// Which of the backend's (INFO, WARN) events pass `make_env_filter` under
+/// `RUST_LOG=directives`, next to whether neovm's own INFO passes.
+fn cranelift_events_enabled(directives: &str) -> (bool, bool, bool) {
+    // SAFETY: test-only; these logging tests read RUST_LOG on this thread
+    // only, inside `make_env_filter`, before restoring it.
+    let saved = std::env::var_os("RUST_LOG");
+    unsafe { std::env::set_var("RUST_LOG", directives) };
+    let subscriber = Registry::default().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(io::sink)
+            .with_filter(make_env_filter()),
+    );
+    match saved {
+        Some(saved) => unsafe { std::env::set_var("RUST_LOG", saved) },
+        None => unsafe { std::env::remove_var("RUST_LOG") },
+    }
+    tracing::subscriber::with_default(subscriber, || {
+        (
+            tracing::enabled!(target: "cranelift_jit::backend", tracing::Level::INFO),
+            tracing::enabled!(target: "cranelift_jit::backend", tracing::Level::WARN),
+            tracing::enabled!(target: "neovm_core::jit", tracing::Level::INFO),
+        )
+    })
+}
+
+#[test]
+fn cranelift_function_dumps_are_debug_output() {
+    // The packaged default: dumps hidden, everything else at info kept.
+    assert_eq!(cranelift_events_enabled("info"), (false, true, true));
+    assert_eq!(
+        cranelift_events_enabled("warn,neovm_core=info"),
+        (false, true, true)
+    );
+    // Asking for debug output, or for cranelift by name, keeps them.
+    assert_eq!(cranelift_events_enabled("debug"), (true, true, true));
+    assert_eq!(
+        cranelift_events_enabled("info,cranelift_jit=info"),
+        (true, true, true)
+    );
+    // Never widens a stricter filter.
+    assert_eq!(cranelift_events_enabled("off"), (false, false, false));
+    assert_eq!(cranelift_events_enabled("error"), (false, false, false));
+    assert_eq!(
+        cranelift_events_enabled("neovm_core=info"),
+        (false, false, true)
+    );
+}
