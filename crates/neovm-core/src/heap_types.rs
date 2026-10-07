@@ -1055,20 +1055,26 @@ impl LispString {
         // promote its raw bytes to the Emacs multibyte encoding (high bytes ->
         // eight-bit chars) like GNU `concat`, rather than splicing raw bytes
         // into a multibyte string and producing a malformed sequence.
-        let mut data = if multibyte && !self.is_multibyte() {
-            crate::emacs_core::emacs_char::str_to_multibyte(self.as_bytes())
-        } else {
-            self.as_bytes().to_vec()
+        // One allocation sized for both encoded payloads and the terminator;
+        // the character count is known, so release builds do not recount it.
+        let promote = |piece: &Self| multibyte && !piece.is_multibyte();
+        let encoded_len = |piece: &Self| {
+            if promote(piece) {
+                crate::emacs_core::emacs_char::count_size_as_multibyte(piece.as_bytes())
+            } else {
+                piece.sbytes()
+            }
         };
-        if multibyte && !other.is_multibyte() {
-            data.extend_from_slice(&crate::emacs_core::emacs_char::str_to_multibyte(
-                other.as_bytes(),
-            ));
-        } else {
-            data.extend_from_slice(other.as_bytes());
+        let mut data = Vec::with_capacity(encoded_len(self) + encoded_len(other) + 1);
+        for piece in [self, other] {
+            if promote(piece) {
+                crate::emacs_core::emacs_char::extend_as_multibyte(&mut data, piece.as_bytes());
+            } else {
+                data.extend_from_slice(piece.as_bytes());
+            }
         }
         let mut result = if multibyte {
-            Self::from_emacs_bytes(data)
+            Self::from_emacs_bytes_with_chars(data, self.schars() + other.schars())
         } else {
             Self::from_unibyte(data)
         };

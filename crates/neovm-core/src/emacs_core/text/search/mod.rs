@@ -314,21 +314,58 @@ fn replace_match_on_substring(
         literal,
         subexp,
         match_data,
+        None,
     )
     .map_err(|msg| signal("error", vec![Value::string(msg)]))
 }
 
+/// Join the pieces of a replaced string into one fresh string, as GNU
+/// `Freplace_match` does with a single `concat3`: one allocation sized for
+/// the result, instead of a binary fold that builds and drops intermediate
+/// strings.  Pieces with text properties take the fold, which merges their
+/// interval tables.
 fn concat_lisp_string_pieces(
     pieces: Vec<crate::heap_types::LispString>,
 ) -> crate::heap_types::LispString {
-    let mut iter = pieces.into_iter();
-    let Some(mut acc) = iter.next() else {
-        return crate::heap_types::LispString::from_unibyte(Vec::new());
-    };
-    for piece in iter {
-        acc = acc.concat(&piece);
+    use crate::heap_types::LispString;
+    if pieces.len() <= 1 || pieces.iter().any(LispString::has_intervals) {
+        let mut iter = pieces.into_iter();
+        let Some(mut acc) = iter.next() else {
+            return LispString::from_unibyte(Vec::new());
+        };
+        for piece in iter {
+            acc = acc.concat(&piece);
+        }
+        return acc;
     }
-    acc
+    let multibyte = pieces.iter().any(LispString::is_multibyte);
+    let encoded_len = |piece: &LispString| {
+        if multibyte && !piece.is_multibyte() {
+            crate::emacs_core::emacs_char::count_size_as_multibyte(piece.as_bytes())
+        } else {
+            piece.sbytes()
+        }
+    };
+    // One more byte for the terminator the string appends.
+    let mut data = Vec::with_capacity(pieces.iter().map(encoded_len).sum::<usize>() + 1);
+    if !multibyte {
+        for piece in &pieces {
+            data.extend_from_slice(piece.as_bytes());
+        }
+        return LispString::from_unibyte(data);
+    }
+    let mut chars = 0;
+    for piece in &pieces {
+        if piece.is_multibyte() {
+            data.extend_from_slice(piece.as_bytes());
+        } else {
+            // A unibyte piece's high bytes become eight-bit characters, as in
+            // GNU `concat` (one character per byte either way).
+            crate::emacs_core::emacs_char::extend_as_multibyte(&mut data, piece.as_bytes());
+        }
+        chars += piece.schars();
+    }
+    LispString::from_emacs_bytes_with_chars(data, chars)
 }
 
 fn empty_lisp_string(multibyte: bool) -> crate::heap_types::LispString {
@@ -517,6 +554,65 @@ fn lisp_string_slice_for_replace_match(
     }
 }
 
+/// The current buffer's tables, which GNU `Freplace_match` consults to decide
+/// and apply the case of the replacement when FIXEDCASE is nil, whether the
+/// target is the buffer or an explicit string.
+#[derive(Clone, Copy)]
+pub(crate) struct ReplaceCaseContext<'a> {
+    pub(crate) syntax: &'a crate::emacs_core::syntax::SyntaxTable,
+    pub(crate) casetab: &'a crate::emacs_core::casetab::CaseTableOverride,
+    /// `case-symbols-as-words`: symbol constituents count as word ones.
+    pub(crate) symbols_as_words: bool,
+    /// `Some(multibyte)` for a buffer replacement, which GNU inserts first
+    /// and then cases in the buffer's representation with
+    /// `upcase-initials-region` (syntax prefix rule); `None` for a string
+    /// replacement, cased as `upcase-initials` does.
+    pub(crate) buffer_multibyte: Option<bool>,
+}
+
+impl ReplaceCaseContext<'_> {
+    /// GNU `SYNTAX (c) == Sword`, widened to symbols by `case-symbols-as-words`
+    /// (`Freplace_match`, `case_ch_is_word`).
+    fn is_word(&self, code: u32) -> bool {
+        use crate::emacs_core::syntax::{SyntaxClass, syntax_class_at_char_code};
+        let class = syntax_class_at_char_code(&self.syntax.chartable(), code);
+        class == SyntaxClass::Word || (self.symbols_as_words && class == SyntaxClass::Symbol)
+    }
+
+    /// GNU `syntax_prefix_flag_p`, consulted only for buffer replacements.
+    /// (The caller passes the target, which decides whether it is used.)
+    fn is_prefix(&self, code: u32) -> bool {
+        use crate::emacs_core::syntax::{SyntaxFlags, syntax_entry_at_char_code};
+        syntax_entry_at_char_code(&self.syntax.chartable(), code)
+            .is_some_and(|entry| entry.flags.contains(SyntaxFlags::PREFIX))
+    }
+}
+
+/// TEXT in the representation GNU `copy_text` gives it when inserted into a
+/// buffer whose `enable-multibyte-characters` is MULTIBYTE: a unibyte byte
+/// becomes its character (raw bytes eight-bit ones), and a multibyte
+/// character its low byte.  One character per byte either way, so text
+/// properties carry over unchanged.
+fn in_representation(
+    text: crate::heap_types::LispString,
+    multibyte: bool,
+) -> crate::heap_types::LispString {
+    use crate::emacs_core::emacs_char::{str_to_multibyte, str_to_unibyte};
+    use crate::heap_types::LispString;
+    if text.is_multibyte() == multibyte {
+        return text;
+    }
+    let mut converted = if multibyte {
+        LispString::from_emacs_bytes_with_chars(str_to_multibyte(text.as_bytes()), text.schars())
+    } else {
+        LispString::from_unibyte(str_to_unibyte(text.as_bytes()))
+    };
+    if text.has_intervals() {
+        *converted.intervals_mut() = text.intervals().clone();
+    }
+    converted
+}
+
 pub(crate) fn replace_match_lisp_string_with_syntax(
     source: &crate::heap_types::LispString,
     newtext: &crate::heap_types::LispString,
@@ -524,10 +620,19 @@ pub(crate) fn replace_match_lisp_string_with_syntax(
     literal: bool,
     subexp: usize,
     match_data: &Option<super::regex::MatchData>,
+    case_context: Option<ReplaceCaseContext<'_>>,
 ) -> Result<crate::heap_types::LispString, String> {
     // Replacing into a STRING: `\?' is tolerated as a literal (search.c:2567).
     replace_match_lisp_string_with_syntax_and_properties(
-        source, newtext, fixedcase, literal, subexp, match_data, true, true, None,
+        source,
+        newtext,
+        fixedcase,
+        literal,
+        subexp,
+        match_data,
+        true,
+        true,
+        case_context,
     )
 }
 
@@ -541,10 +646,7 @@ fn replace_match_lisp_string_with_syntax_and_properties(
     match_data: &Option<super::regex::MatchData>,
     preserve_substitution_properties: bool,
     string_replacement: bool,
-    buffer_case_context: Option<(
-        &crate::emacs_core::syntax::SyntaxTable,
-        &crate::emacs_core::casetab::CaseTableOverride,
-    )>,
+    case_context: Option<ReplaceCaseContext<'_>>,
 ) -> Result<crate::heap_types::LispString, String> {
     let md = match match_data {
         Some(md) => md,
@@ -583,17 +685,27 @@ fn replace_match_lisp_string_with_syntax_and_properties(
         // matched/replacement LispStrings instead of round-tripping through the
         // PUA-sentinel storage form, so eight-bit bytes and PUA glyphs are not
         // confused.
-        let mut cased = if let Some((syntax_table, casetab)) = buffer_case_context {
+        let mut cased = if let Some(context) = case_context {
+            use crate::emacs_core::casefiddle::CaseTarget;
+            let target = match context.buffer_multibyte {
+                Some(multibyte) => {
+                    // GNU inserts the replacement, converting it to the
+                    // buffer's representation (`copy_text`), before casing it.
+                    replacement = in_representation(replacement, multibyte);
+                    CaseTarget::Buffer
+                }
+                None => CaseTarget::String,
+            };
             // GNU `Freplace_match` case analysis uses the buffer's case table
             // (UPPERCASEP/LOWERCASEP) and syntax table (word boundaries), so a
             // custom case table (set-case-syntax-pair) capitalizes accordingly.
             crate::emacs_core::casefiddle::apply_replace_match_case_lisp_cased(
                 &replacement,
                 &matched,
-                |ch| syntax_table.char_syntax(ch) == crate::emacs_core::syntax::SyntaxClass::Word,
-                |ch| casetab.is_upper(ch),
-                |ch| casetab.is_lower(ch),
-                casetab,
+                |code| context.is_word(code),
+                |code| context.is_prefix(code),
+                context.casetab,
+                target,
             )
         } else {
             crate::emacs_core::casefiddle::apply_replace_match_case_lisp(&replacement, &matched)
@@ -620,6 +732,7 @@ pub(crate) fn compute_buffer_replacement_lisp_string(
     literal: bool,
     subexp: usize,
     match_data: &Option<super::regex::MatchData>,
+    symbols_as_words: bool,
 ) -> Result<(usize, usize, crate::heap_types::LispString), String> {
     let md = match match_data {
         Some(md) => md,
@@ -681,7 +794,12 @@ pub(crate) fn compute_buffer_replacement_lisp_string(
         &replacement_match_option,
         false,
         false,
-        Some((&buffer_syntax_table, &buffer_case_override)),
+        Some(ReplaceCaseContext {
+            syntax: &buffer_syntax_table,
+            casetab: &buffer_case_override,
+            symbols_as_words,
+            buffer_multibyte: Some(buf.get_multibyte()),
+        }),
     )?;
     let replace_start = if replacement_match_data.source().is_string() {
         super::regex::char_pos_to_byte_lisp_string(

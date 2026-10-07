@@ -340,118 +340,177 @@ fn upcase_lisp_string_emacs_compat(text: &LispString, casetab: &CaseTableOverrid
     LispString::from_emacs_bytes(out)
 }
 
-fn capitalize_lisp_string(
+/// Whether [`capitalize_like_gnu`] cases a string or buffer text.  GNU
+/// differs between the two in the syntax prefix rule and in how a unibyte
+/// byte takes a case-table mapping that does not fit a byte.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaseTarget {
+    String,
+    Buffer,
+}
+
+/// What [`capitalize_like_gnu`] does to a character inside a word.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WordRest {
+    /// `capitalize`: down-case it.
+    Downcase,
+    /// `upcase-initials`: leave it alone.
+    Keep,
+}
+
+/// The cased form of a word-initial character, GNU `case_character_impl`
+/// with flag `CASE_CAPITALIZE`: the Unicode title-case mapping (special
+/// casing, then the `titlecase` property) wins; only a character without one
+/// goes through the case table (`upcase`), which leaves it unchanged when
+/// the table has no entry.  So a buffer case table that pairs `Q` with `a`
+/// still capitalizes `a` to `A`, as in GNU.
+fn push_word_initial(out: &mut Vec<u8>, code: u32, casetab: &CaseTableOverride) {
+    if code < 0x80 {
+        // ASCII: only lowercase letters have a title case (their upper case).
+        let byte = code as u8;
+        let mapped = if byte.is_ascii_lowercase() {
+            byte.to_ascii_uppercase() as i64
+        } else {
+            casetab
+                .map(CaseMap::Up, code as i64)
+                .unwrap_or_else(|| byte.to_ascii_uppercase() as i64)
+        };
+        push_multibyte_char_code(out, mapped as u32);
+        return;
+    }
+    if let Some(c) = code_to_char(code as i64) {
+        let title = titlecase_word_initial(c);
+        let mut chars = title.chars();
+        if chars.next() != Some(c) || chars.next().is_some() {
+            push_multibyte_chars(out, title.chars());
+            return;
+        }
+    }
+    let mapped = casetab
+        .map(CaseMap::Up, code as i64)
+        .unwrap_or_else(|| upcase_char(code as i64));
+    push_multibyte_char_code(out, mapped as u32);
+}
+
+/// GNU `casify_object` / `casify_region` with `CASE_CAPITALIZE` or
+/// `CASE_CAPITALIZE_UP` (`case_character_impl`).  Every character that does
+/// not continue a word is title-cased, word constituent or not; characters
+/// inside a word are down-cased or kept per `rest`.  A character continues
+/// a word when the previous one was in a word; it starts one when it is a
+/// word constituent (`is_word`, which carries `case-symbols-as-words`), and
+/// in a buffer only if it lacks the syntax prefix flag (`is_prefix`).
+fn capitalize_like_gnu(
     text: &LispString,
     is_word: impl Fn(u32) -> bool,
+    is_prefix: impl Fn(u32) -> bool,
     casetab: &CaseTableOverride,
+    rest: WordRest,
+    target: CaseTarget,
 ) -> LispString {
+    let mut inword = false;
+    let mut step = |code: u32| {
+        let was_inword = inword;
+        inword = is_word(code) && (was_inword || target == CaseTarget::String || !is_prefix(code));
+        was_inword
+    };
+
     if !text.is_multibyte() {
+        // GNU `do_casify_unibyte_string` / `do_casify_unibyte_region`: each
+        // byte is cased as the character `make_char_multibyte` gives, so a
+        // byte above ASCII is a raw-byte character (for syntax too), which
+        // has no case.  A mapping that does not fit a byte leaves an ASCII
+        // byte of a string to plain ASCII casing; in a buffer it is cut to a
+        // byte by `make_char_unibyte`.
         let mut out = Vec::with_capacity(text.sbytes());
-        let mut new_word = true;
         for &byte in text.as_bytes() {
-            if is_word(byte as u32) {
-                // Word-initial up-cases via the up table, the rest down-cases
-                // via the down table (GNU `casify_object` CASE_CAPITALIZE).
-                let which = if new_word { CaseMap::Up } else { CaseMap::Down };
-                out.push(
-                    casetab
-                        .map(which, byte as i64)
-                        .map(|m| m as u8)
-                        .unwrap_or(if new_word {
-                            byte.to_ascii_uppercase()
-                        } else {
-                            byte.to_ascii_lowercase()
-                        }),
-                );
-                new_word = false;
-            } else {
-                out.push(byte);
-                new_word = true;
-            }
+            let was_inword = step(crate::emacs_core::emacs_char::unibyte_to_char(byte));
+            out.push(
+                if !byte.is_ascii() || (was_inword && rest == WordRest::Keep) {
+                    byte
+                } else if !was_inword && byte.is_ascii_lowercase() {
+                    // An ASCII lowercase letter has a title-case mapping, which
+                    // wins over the case table.
+                    byte.to_ascii_uppercase()
+                } else {
+                    let (which, ascii) = if was_inword {
+                        (CaseMap::Down, byte.to_ascii_lowercase())
+                    } else {
+                        (CaseMap::Up, byte.to_ascii_uppercase())
+                    };
+                    match casetab.map(which, byte as i64) {
+                        None => ascii,
+                        Some(m) if m < 0x100 => m as u8,
+                        Some(_) if target == CaseTarget::String => ascii,
+                        Some(m) => make_char_unibyte(m),
+                    }
+                },
+            );
         }
         return LispString::from_unibyte(out);
     }
 
     let mut out = Vec::with_capacity(text.sbytes());
-    let mut new_word = true;
     for code in super::builtins::lisp_string_char_codes(text) {
-        let ch = code_to_char(code as i64);
-        if is_word(code) {
-            let which = if new_word { CaseMap::Up } else { CaseMap::Down };
-            if let Some(mapped) = casetab.map(which, code as i64) {
+        let was_inword = step(code);
+        if !was_inword {
+            push_word_initial(&mut out, code, casetab);
+        } else if rest == WordRest::Downcase {
+            if let Some(mapped) = casetab.map(CaseMap::Down, code as i64) {
                 push_multibyte_char_code(&mut out, mapped as u32);
             } else {
-                match ch {
-                    Some(c) if new_word => {
-                        push_multibyte_chars(&mut out, titlecase_word_initial(c).chars())
-                    }
+                match code_to_char(code as i64) {
                     Some(c) => push_multibyte_chars(&mut out, c.to_lowercase()),
                     None => push_multibyte_char_code(&mut out, code),
                 }
             }
-            new_word = false;
         } else {
             push_multibyte_char_code(&mut out, code);
-            new_word = true;
         }
     }
     LispString::from_emacs_bytes(out)
 }
 
-fn upcase_initials_lisp_string(
+/// GNU `make_char_unibyte` (`CHAR_TO_BYTE8`) for a non-ASCII character: a
+/// raw-byte character gives its byte, any other its low eight bits.
+fn make_char_unibyte(code: i64) -> u8 {
+    let code = code as u32;
+    if crate::emacs_core::emacs_char::char_byte8_p(code) {
+        crate::emacs_core::emacs_char::char_to_byte8(code)
+    } else {
+        (code & 0xFF) as u8
+    }
+}
+
+/// `capitalize` on a string (no syntax prefix rule).
+fn capitalize_lisp_string(
     text: &LispString,
     is_word: impl Fn(u32) -> bool,
     casetab: &CaseTableOverride,
 ) -> LispString {
-    if !text.is_multibyte() {
-        let mut out = Vec::with_capacity(text.sbytes());
-        let mut new_word = true;
-        for &byte in text.as_bytes() {
-            if is_word(byte as u32) {
-                // Only the word-initial is up-cased; the rest is left as-is.
-                out.push(if new_word {
-                    casetab
-                        .map(CaseMap::Up, byte as i64)
-                        .map(|m| m as u8)
-                        .unwrap_or_else(|| byte.to_ascii_uppercase())
-                } else {
-                    byte
-                });
-                new_word = false;
-            } else {
-                out.push(byte);
-                new_word = true;
-            }
-        }
-        return LispString::from_unibyte(out);
-    }
+    capitalize_like_gnu(
+        text,
+        is_word,
+        |_| false,
+        casetab,
+        WordRest::Downcase,
+        CaseTarget::String,
+    )
+}
 
-    let mut out = Vec::with_capacity(text.sbytes());
-    let mut new_word = true;
-    for code in super::builtins::lisp_string_char_codes(text) {
-        let ch = code_to_char(code as i64);
-        if is_word(code) {
-            if new_word {
-                if let Some(mapped) = casetab.map(CaseMap::Up, code as i64) {
-                    push_multibyte_char_code(&mut out, mapped as u32);
-                } else {
-                    match ch {
-                        Some(c) => {
-                            push_multibyte_chars(&mut out, titlecase_word_initial(c).chars())
-                        }
-                        None => push_multibyte_char_code(&mut out, code),
-                    }
-                }
-            } else {
-                push_multibyte_char_code(&mut out, code);
-            }
-            new_word = false;
-        } else {
-            push_multibyte_char_code(&mut out, code);
-            new_word = true;
-        }
-    }
-    LispString::from_emacs_bytes(out)
+/// `upcase-initials` on a string (no syntax prefix rule).
+pub(crate) fn upcase_initials_lisp_string(
+    text: &LispString,
+    is_word: impl Fn(u32) -> bool,
+    casetab: &CaseTableOverride,
+) -> LispString {
+    capitalize_like_gnu(
+        text,
+        is_word,
+        |_| false,
+        casetab,
+        WordRest::Keep,
+        CaseTarget::String,
+    )
 }
 
 fn preserve_downcase_case_string_payload(code: i64) -> bool {
@@ -913,7 +972,9 @@ where
     let mut some_lowercase = false;
     let mut some_uppercase = false;
     let mut some_nonuppercase_initial = false;
-    let mut prev_is_word = false;
+    // GNU `Freplace_match` starts with `prevc = '\n'`, so a newline with word
+    // syntax makes the first matched character continue a word.
+    let mut prev_is_word = is_word_char('\n');
 
     for ch in matched.chars() {
         if ch.is_lowercase() {
@@ -1023,26 +1084,32 @@ where
 /// syntax table drive GNU's `Freplace_match` decisions (`UPPERCASEP` /
 /// `LOWERCASEP` + `SYNTAX`). Used by the buffer replace-match path, which has
 /// both tables in scope.
-pub(crate) fn apply_replace_match_case_lisp_cased<W, U, L>(
+pub(crate) fn apply_replace_match_case_lisp_cased(
     replacement: &LispString,
     matched: &LispString,
-    is_word_char: W,
-    is_upper: U,
-    is_lower: L,
+    is_word: impl Fn(u32) -> bool,
+    is_prefix: impl Fn(u32) -> bool,
     casetab: &CaseTableOverride,
-) -> LispString
-where
-    W: FnMut(char) -> bool,
-    U: FnMut(char) -> bool,
-    L: FnMut(char) -> bool,
-{
-    match replace_match_case_action_lisp_cased(matched, is_word_char, is_upper, is_lower) {
+    target: CaseTarget,
+) -> LispString {
+    let action = replace_match_case_action_lisp_cased(
+        matched,
+        |ch| is_word(ch as u32),
+        |ch| casetab.is_upper(ch),
+        |ch| casetab.is_lower(ch),
+    );
+    match action {
         ReplaceMatchCaseAction::NoChange => replacement.clone(),
         ReplaceMatchCaseAction::AllCaps => upcase_lisp_string_emacs_compat(replacement, casetab),
-        ReplaceMatchCaseAction::CapInitial => upcase_initials_lisp_string(
+        // GNU applies `Fupcase_initials` to a string replacement and
+        // `Fupcase_initials_region` to a buffer one.
+        ReplaceMatchCaseAction::CapInitial => capitalize_like_gnu(
             replacement,
-            |code| char::from_u32(code).is_some_and(char::is_alphanumeric),
+            is_word,
+            is_prefix,
             casetab,
+            WordRest::Keep,
+            target,
         ),
     }
 }
@@ -1087,7 +1154,9 @@ where
     let mut some_lowercase = false;
     let mut some_uppercase = false;
     let mut some_nonuppercase_initial = false;
-    let mut prev_is_word = false;
+    // GNU `Freplace_match` starts with `prevc = '\n'`, so a newline with word
+    // syntax makes the first matched character continue a word.
+    let mut prev_is_word = is_word_char('\n');
 
     let bytes = matched.as_bytes();
     let mut pos = 0;
@@ -1171,9 +1240,17 @@ pub(crate) fn builtin_capitalize_region(
     args: Vec<Value>,
 ) -> EvalResult {
     let is_word = crate::emacs_core::syntax::casing_word_predicate(ctx);
+    let is_prefix = crate::emacs_core::syntax::casing_prefix_predicate(ctx);
     let casetab = CaseTableOverride::for_current_buffer(ctx)?;
     casify_region_in_state(ctx, args, "capitalize-region", move |s| {
-        capitalize_lisp_string(s, is_word, &casetab)
+        capitalize_like_gnu(
+            s,
+            is_word,
+            is_prefix,
+            &casetab,
+            WordRest::Downcase,
+            CaseTarget::Buffer,
+        )
     })
 }
 
@@ -1182,9 +1259,17 @@ pub(crate) fn builtin_upcase_initials_region(
     args: Vec<Value>,
 ) -> EvalResult {
     let is_word = crate::emacs_core::syntax::casing_word_predicate(ctx);
+    let is_prefix = crate::emacs_core::syntax::casing_prefix_predicate(ctx);
     let casetab = CaseTableOverride::for_current_buffer(ctx)?;
     casify_region_in_state(ctx, args, "upcase-initials-region", move |s| {
-        upcase_initials_lisp_string(s, is_word, &casetab)
+        capitalize_like_gnu(
+            s,
+            is_word,
+            is_prefix,
+            &casetab,
+            WordRest::Keep,
+            CaseTarget::Buffer,
+        )
     })
 }
 
@@ -1211,9 +1296,17 @@ pub(crate) fn builtin_capitalize_word(
     args: Vec<Value>,
 ) -> EvalResult {
     let is_word = crate::emacs_core::syntax::casing_word_predicate(ctx);
+    let is_prefix = crate::emacs_core::syntax::casing_prefix_predicate(ctx);
     let casetab = CaseTableOverride::for_current_buffer(ctx)?;
     casify_word_in_state(ctx, args, "capitalize-word", move |s| {
-        capitalize_lisp_string(s, is_word, &casetab)
+        capitalize_like_gnu(
+            s,
+            is_word,
+            is_prefix,
+            &casetab,
+            WordRest::Downcase,
+            CaseTarget::Buffer,
+        )
     })
 }
 

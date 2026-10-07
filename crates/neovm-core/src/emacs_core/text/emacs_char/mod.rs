@@ -952,6 +952,23 @@ pub fn str_to_multibyte(src: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Append unibyte text to `out` in the multibyte encoding, as
+/// [`str_to_multibyte`] converts it, without a temporary vector.
+pub fn extend_as_multibyte(out: &mut Vec<u8>, src: &[u8]) {
+    if src.is_ascii() {
+        out.extend_from_slice(src);
+        return;
+    }
+    for &c in src {
+        if c <= 0x7F {
+            out.push(c);
+        } else {
+            out.push(0xC0 | ((c >> 6) & 1));
+            out.push(0x80 | (c & 0x3F));
+        }
+    }
+}
+
 /// Convert multibyte text to unibyte text, one output byte per character.
 ///
 /// Mirrors GNU `copy_text` with `from_multibyte=1, to_multibyte=0`

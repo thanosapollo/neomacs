@@ -1187,3 +1187,176 @@ fn replace_match_expands_an_ampersand_as_the_subexp_like_gnu() {
         r#"OK ("xxfoo<BAR>yy" "xxfoo<foo|BAR>yy" "xx<fooBAR>yy" "BAZ" "xxfoo<BAR>yy")"#
     );
 }
+
+/// `replace-match` with FIXEDCASE nil decides and applies case the way GNU
+/// `Freplace_match` does, for a string target as for the buffer: the current
+/// buffer's case table and syntax table, and `case-symbols-as-words`.  A
+/// string target is cased like `upcase-initials` on a string (no syntax
+/// prefix rule); a buffer target like `upcase-initials-region` (prefix rule).
+/// Expected values are GNU Emacs 31's.
+#[test]
+fn replace_match_cases_with_the_buffers_tables_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (let ((run (lambda (setup matched newtext)
+                    (with-temp-buffer
+                      (set-syntax-table (make-syntax-table))
+                      (funcall setup)
+                      (let ((case-fold-search t)
+                            (s (concat "<" matched ">")))
+                        (string-match (regexp-quote matched) s)
+                        (list (replace-match newtext nil nil s)
+                              (progn (erase-buffer) (insert s) (goto-char (point-min))
+                                     (search-forward matched)
+                                     (replace-match newtext nil nil)
+                                     (buffer-string))))))))
+          (list
+           ;; H made caseless: no capitalized initial, so no change.
+           (funcall run (lambda ()
+                  (let ((tbl (copy-case-table (standard-case-table))))
+                    (set-case-syntax ?H "w" tbl)
+                    (set-case-table tbl)))
+                "Hello" "world")
+           ;; Word boundaries come from the syntax table.
+           (funcall run (lambda () (modify-syntax-entry ?- "w")) "Hello" "foo-bar")
+           (funcall run #'ignore "Hello" "foo-bar")
+           (funcall run (lambda () (setq-local case-symbols-as-words t)) "Hello" "foo_bar")
+           ;; The prefix flag matters only in the buffer.
+           (funcall run (lambda () (modify-syntax-entry ?' "w p")) "Hello" "'foo")
+           ;; Initials are titlecased.
+           (funcall run #'ignore "École" "ǆemal")))
+        "#,
+    );
+    assert_eq!(
+        result,
+        r#"OK (("<world>" "<world>") ("<Foo-bar>" "<Foo-bar>") ("<Foo-Bar>" "<Foo-Bar>") ("<Foo_bar>" "<Foo_bar>") ("<'foo>" "<'Foo>") ("<ǅemal>" "<ǅemal>"))"#
+    );
+}
+
+/// GNU `Freplace_match` classifies the matched text starting from
+/// `prevc = '\n'`, so with newline as a word constituent a lowercase match
+/// counts as a capitalized multi-letter word.  Expected values are GNU's.
+#[test]
+fn replace_match_case_starts_after_a_newline_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (with-temp-buffer
+          (set-syntax-table (make-syntax-table))
+          (modify-syntax-entry ?\n "w")
+          (let ((s "<hello>"))
+            (string-match "hello" s)
+            (list (replace-match "world" nil nil s)
+                  (progn (insert s) (goto-char 1) (search-forward "hello")
+                         (replace-match "world") (buffer-string)))))
+        "#,
+    );
+    assert_eq!(result, r#"OK ("<World>" "<World>")"#);
+}
+
+/// GNU inserts a buffer replacement before casing it, so the text is cased
+/// in the buffer's representation; a string replacement keeps its own.
+/// Expected values are GNU Emacs 31's.
+#[test]
+fn replace_match_cases_in_the_targets_representation_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (list
+         (with-temp-buffer
+           (let ((tbl (copy-case-table (standard-case-table))))
+             (set-case-syntax-pair ?Ā ?X tbl)
+             (set-case-table tbl))
+           (insert "<Hello>") (goto-char 1) (search-forward "Hello")
+           (replace-match (string-as-unibyte "Xoo"))
+           (append (buffer-string) nil))
+         (with-temp-buffer
+           (set-buffer-multibyte nil)
+           (insert "<Hello>") (goto-char 1) (search-forward "Hello")
+           (replace-match "éoo")
+           (append (buffer-string) nil))
+         (with-temp-buffer
+           (let ((tbl (copy-case-table (standard-case-table))))
+             (set-case-syntax-pair ?Ā ?X tbl)
+             (set-case-table tbl))
+           (let ((s "<Hello>"))
+             (string-match "Hello" s)
+             (append (replace-match (string-as-unibyte "Xoo") nil nil s) nil))))
+        "#,
+    );
+    assert_eq!(
+        result,
+        "OK ((60 256 111 111 62) (60 233 111 111 62) (60 88 111 111 62))"
+    );
+}
+
+/// The single-allocation join of replace-match pieces gives exactly what
+/// the pairwise `concat` fold gives: representation, characters (unibyte
+/// high bytes become eight-bit characters in a multibyte result), with no
+/// text properties.  Pieces with properties keep taking the fold.
+#[test]
+fn replacement_piece_join_matches_the_pairwise_fold() {
+    use crate::heap_types::LispString;
+    let fold = |pieces: &[LispString]| {
+        let mut acc = pieces[0].clone();
+        for piece in &pieces[1..] {
+            acc = acc.concat(piece);
+        }
+        acc
+    };
+    let cases: Vec<Vec<LispString>> = vec![
+        vec![
+            LispString::from_unibyte(b"ab".to_vec()),
+            LispString::from_unibyte(vec![0xe9, b'c']),
+            LispString::from_unibyte(Vec::new()),
+        ],
+        vec![
+            LispString::from_unibyte(vec![b'x', 0xff]),
+            LispString::from_utf8("\u{3b1}\u{3b2}"),
+            LispString::from_unibyte(vec![0x80]),
+        ],
+        vec![
+            LispString::from_utf8(""),
+            LispString::from_unibyte(b"plain".to_vec()),
+            LispString::from_unibyte(Vec::new()),
+        ],
+        vec![
+            LispString::from_utf8("h\u{e9}"),
+            LispString::from_utf8(" "),
+            LispString::from_utf8("w\u{1F600}"),
+        ],
+    ];
+    // Independent of `concat`: GNU's internal bytes for "x\377", alpha beta
+    // and "\200" (raw bytes become the eight-bit characters C1 BF and C0 80).
+    let mixed = concat_lisp_string_pieces(cases[1].clone());
+    assert_eq!(
+        mixed.as_bytes(),
+        &[b'x', 0xc1, 0xbf, 0xce, 0xb1, 0xce, 0xb2, 0xc0, 0x80]
+    );
+    assert_eq!(mixed.schars(), 5);
+    for pieces in cases {
+        let expected = fold(&pieces);
+        let joined = concat_lisp_string_pieces(pieces);
+        assert_eq!(joined.as_bytes(), expected.as_bytes());
+        assert_eq!(joined.is_multibyte(), expected.is_multibyte());
+        assert_eq!(joined.schars(), expected.schars());
+        assert!(!joined.has_intervals());
+    }
+}
+
+/// Promoting unibyte text while joining encodes it exactly as
+/// `str_to_multibyte` does, and the size estimate is exact.
+#[test]
+fn appending_unibyte_text_as_multibyte_matches_the_converter() {
+    use crate::emacs_core::emacs_char::{
+        count_size_as_multibyte, extend_as_multibyte, str_to_multibyte,
+    };
+    let all: Vec<u8> = (0..=255).collect();
+    for src in [&b""[..], b"ascii only", &[0x80, b'a', 0xff], &all] {
+        let mut out = b"prefix".to_vec();
+        extend_as_multibyte(&mut out, src);
+        assert_eq!(&out[6..], &str_to_multibyte(src)[..]);
+        assert_eq!(out.len() - 6, count_size_as_multibyte(src));
+    }
+}

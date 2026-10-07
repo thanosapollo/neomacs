@@ -434,3 +434,120 @@ fn case_words_follow_casify_region_like_gnu() {
         "OK (buffer-read-only (4 t ((2 . 4) (\"bc\" . 2))) (\"ABC DÉF ghi\" 9) text-read-only (\"STRASSE x\" 8 10))"
     );
 }
+
+/// Capitalization follows GNU `case_character_impl`: a word initial takes its
+/// Unicode title case before the buffer's case table, any character that
+/// does not continue a word is title-cased (word constituent or not), and in
+/// a buffer a syntax prefix char does not start a word.  Expected values are
+/// GNU Emacs 31's.
+#[test]
+fn capitalization_follows_gnu_case_character() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+(list
+  (with-temp-buffer
+    (set-syntax-table (make-syntax-table))
+    (let ((tbl (copy-case-table (standard-case-table))))
+      (set-case-syntax-pair ?Q ?a tbl)
+      (set-case-table tbl))
+    (list (upcase-initials "abc") (capitalize "abc") (upcase "abc")
+          (progn (insert "abc abc") (upcase-initials-region 1 4)
+                 (capitalize-region 5 8) (buffer-string))
+          (upcase-initials "qbc")))
+  (with-temp-buffer
+    (set-syntax-table (make-syntax-table))
+    (modify-syntax-entry ?x ".")
+    (list (upcase-initials "x-x") (upcase-initials "axb") (capitalize "x-xAX")
+          (progn (insert "x-x") (upcase-initials-region 1 4) (buffer-string))))
+  (with-temp-buffer
+    (set-syntax-table (make-syntax-table))
+    (modify-syntax-entry ?' "w p")
+    (list (upcase-initials "'foo") (capitalize "'FOO")
+          (progn (insert "'foo 'FOO 'bar") (upcase-initials-region 1 5)
+                 (capitalize-region 6 10)
+                 (goto-char 11) (capitalize-word 1)
+                 (buffer-string))))
+  (list (upcase-initials "ǆemal ǅx Ǆx") (capitalize "ǄEMAL") (upcase-initials "ßa") (capitalize "ﬁx")))
+        "#,
+    );
+    assert_eq!(
+        result,
+        r#"OK (("Abc" "Abc" "QBC" "Abc Abc" "Qbc") ("X-X" "AxB" "X-XAx" "X-X") ("'foo" "'foo" "'Foo 'Foo 'Bar") ("ǅemal ǅx ǅx" "ǅemal" "Ssa" "Fix"))"#
+    );
+}
+
+/// A unibyte string's raw bytes have no case but take part in words, as in
+/// GNU `do_casify_unibyte_string`.  Expected values are GNU Emacs 31's.
+#[test]
+fn unibyte_capitalization_leaves_raw_bytes_alone_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (list (capitalize "\351ABC") (upcase-initials "\351abc") (capitalize "xY\311Z")
+              (multibyte-string-p (capitalize "\351ABC"))
+              (with-temp-buffer
+                (let ((tbl (copy-case-table (standard-case-table))))
+                  (set-case-syntax-pair ?Q ?a tbl)
+                  (set-case-table tbl))
+                (list (capitalize "abc") (upcase-initials "abc") (capitalize "AQC"))))
+        "#,
+    );
+    assert_eq!(
+        result,
+        "OK (\"\\351abc\" \"\\351abc\" \"Xy\\311z\" nil (\"Abc\" \"Abc\" \"Aac\"))"
+    );
+}
+
+/// A unibyte byte above ASCII takes the syntax of its raw-byte character,
+/// and an ASCII byte whose case-table mapping does not fit a byte falls back
+/// to ASCII casing (GNU `do_casify_unibyte_string`).  Expected values are
+/// GNU Emacs 31's.
+#[test]
+fn unibyte_capitalization_uses_raw_byte_syntax_and_ascii_fallback_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (list
+         (with-temp-buffer
+           (set-syntax-table (make-syntax-table))
+           (modify-syntax-entry ?é ".")
+           (capitalize "\351ABC"))
+         (with-temp-buffer
+           (set-syntax-table (make-syntax-table))
+           (modify-syntax-entry (unibyte-char-to-multibyte 233) ".")
+           (capitalize "\351ABC"))
+         (with-temp-buffer
+           (let ((tbl (copy-case-table (standard-case-table))))
+             (set-case-syntax-pair ?A ?ω tbl)
+             (set-case-table tbl))
+           (capitalize (string-as-unibyte "BA"))))
+        "#,
+    );
+    assert_eq!(result, "OK (\"\\351abc\" \"\\351Abc\" \"Ba\")");
+}
+
+/// In a unibyte buffer a case-table mapping that does not fit a byte is cut
+/// to its low byte (GNU `do_casify_unibyte_region`, `make_char_unibyte`),
+/// not replaced by ASCII casing as in a string.  Expected values are GNU's.
+#[test]
+fn unibyte_buffer_capitalization_truncates_wide_mappings_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (mapcar (lambda (op)
+                  (with-temp-buffer
+                    (set-buffer-multibyte nil)
+                    (let ((tbl (copy-case-table (standard-case-table))))
+                      (set-case-syntax-pair ?A ?Ł tbl)
+                      (set-case-table tbl))
+                    (insert "BA xa")
+                    (funcall op)
+                    (buffer-string)))
+                (list (lambda () (capitalize-region 1 6))
+                      (lambda () (goto-char 1) (capitalize-word 2))
+                      (lambda () (upcase-initials-region 1 6))))
+        "#,
+    );
+    assert_eq!(result, r#"OK ("BA Xa" "BA Xa" "BA Xa")"#);
+}

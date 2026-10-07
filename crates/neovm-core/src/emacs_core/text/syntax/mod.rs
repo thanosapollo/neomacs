@@ -4561,6 +4561,24 @@ pub(crate) fn casing_word_predicate(
     }
 }
 
+/// GNU `syntax_prefix_flag_p` against the current buffer's syntax table:
+/// whether `code` carries the `p` flag.  Case conversion in a buffer
+/// (`casify_region`) uses it so that a prefix char such as `'` does not start
+/// a word for capitalization.
+pub(crate) fn casing_prefix_predicate(
+    eval: &super::eval::Context,
+) -> impl Fn(u32) -> bool + Copy + 'static {
+    let chartable = eval
+        .buffers
+        .current_buffer()
+        .map(|buf| SyntaxTable::for_buffer(buf).chartable);
+    move |code: u32| match chartable {
+        Some(table) => syntax_entry_at_char_code(&table, code)
+            .is_some_and(|entry| entry.flags.contains(SyntaxFlags::PREFIX)),
+        None => false,
+    }
+}
+
 /// `(syntax-after POS)` — return syntax descriptor for char at POS.
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
 pub(crate) fn builtin_syntax_after(
