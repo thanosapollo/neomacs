@@ -2896,3 +2896,254 @@ fn forward_adjacent_puts_keep_the_tree_shallow_with_local_balancing() {
         "{intervals} intervals at depth {depth} (log2 {log2}) after the backward pass"
     );
 }
+
+/// A table whose `[0, 4000)` is 400 ten-char intervals that all carry the
+/// same plist: fragmented first, then reset, as eshell output ends up.
+fn equal_plist_run_table() -> TextPropertyTable {
+    let mut table = TextPropertyTable::new();
+    for i in 0..400 {
+        put_chars(
+            &mut table,
+            i * 10,
+            i * 10 + 10,
+            Value::symbol("chunk"),
+            Value::fixnum(i as i64),
+        );
+    }
+    put_chars(&mut table, 0, 4000, Value::symbol("chunk"), Value::NIL);
+    put_chars(
+        &mut table,
+        0,
+        4000,
+        Value::symbol("field"),
+        Value::symbol("output"),
+    );
+    table
+}
+
+#[test]
+fn bounded_property_walks_stop_at_their_bound_over_equal_plist_runs() {
+    crate::test_utils::init_test_tracing();
+    let table = equal_plist_run_table();
+    // The run really is fragmented: raw boundaries every ten chars.
+    assert_eq!(
+        table
+            .previous_interval_boundary_before_char_pos(char_pos(3995))
+            .map(CharPos0::get),
+        Some(3990)
+    );
+
+    // Unbounded, the walk crosses every interval to reach point-min.
+    take_raw_walk_steps();
+    assert_eq!(previous_change_before_char(&table, 3995), None);
+    assert!(take_raw_walk_steps() >= 399);
+
+    // Bounded at the start of the last line (GNU passes LIMIT here), it looks
+    // no further back than the bound.
+    assert_eq!(
+        table.previous_property_change_before_char_pos_after(char_pos(3995), char_pos(3990)),
+        None
+    );
+    assert_eq!(take_raw_walk_steps(), 0);
+    assert_eq!(
+        table.previous_property_change_before_char_pos_after(char_pos(3995), char_pos(3970)),
+        None
+    );
+    assert!(take_raw_walk_steps() <= 2);
+
+    assert_eq!(
+        table.next_property_change_after_char_pos_before(char_pos(5), char_pos(30)),
+        None
+    );
+    assert!(take_raw_walk_steps() <= 2);
+    assert_eq!(next_change_after_char(&table, 5), Some(4000));
+}
+
+#[test]
+fn bounded_property_walks_report_exactly_the_unbounded_changes_inside_the_bound() {
+    crate::test_utils::init_test_tracing();
+    let mut table = equal_plist_run_table();
+    // Real changes at 1000, 1500 and 2500, an `eq'-distinct but `equal'
+    // value at 3000, and a property-order permutation at 3500 (no change).
+    put_chars(
+        &mut table,
+        1000,
+        1500,
+        Value::symbol("face"),
+        Value::symbol("bold"),
+    );
+    put_chars(
+        &mut table,
+        2500,
+        3000,
+        Value::symbol("face"),
+        Value::string("x"),
+    );
+    put_chars(
+        &mut table,
+        3000,
+        3500,
+        Value::symbol("face"),
+        Value::string("x"),
+    );
+    put_chars(&mut table, 3500, 3510, Value::symbol("field"), Value::NIL);
+    put_chars(
+        &mut table,
+        3500,
+        3510,
+        Value::symbol("field"),
+        Value::symbol("output"),
+    );
+    for pos in (0..=4100).step_by(37) {
+        let unbounded_prev = previous_change_before_char(&table, pos);
+        let unbounded_next = next_change_after_char(&table, pos);
+        for bound in (0..=4100).step_by(53) {
+            let prev = table
+                .previous_property_change_before_char_pos_after(char_pos(pos), char_pos(bound))
+                .map(CharPos0::get);
+            assert_eq!(
+                prev,
+                unbounded_prev.filter(|&p| p > bound),
+                "prev {pos} {bound}"
+            );
+            let next = table
+                .next_property_change_after_char_pos_before(char_pos(pos), char_pos(bound))
+                .map(CharPos0::get);
+            assert_eq!(
+                next,
+                unbounded_next.filter(|&p| p < bound),
+                "next {pos} {bound}"
+            );
+        }
+    }
+    assert_eq!(previous_change_before_char(&table, 3200), Some(3000));
+    assert_eq!(next_change_after_char(&table, 2600), Some(3000));
+    // `face' ends at 3500; the reordered plist at 3500..3510 is no change.
+    assert_eq!(next_change_after_char(&table, 3200), Some(3500));
+    assert_eq!(next_change_after_char(&table, 3600), Some(4000));
+    assert_eq!(previous_change_before_char(&table, 3990), Some(3500));
+}
+
+/// The walks as they were before they compared plists in place: pair
+/// vectors and one positional lookup per boundary.
+fn reference_previous_change(table: &TextPropertyTable, pos: usize) -> Option<usize> {
+    if pos == 0 {
+        return None;
+    }
+    let current = table.plist_at(char_pos(pos - 1)).unwrap_or_default();
+    let mut cursor = char_pos(pos);
+    while let Some(prev) = table.previous_interval_boundary_before_char_pos(cursor) {
+        if prev == CharPos0::ZERO {
+            return None;
+        }
+        let before = table.plist_at(char_pos(prev.get() - 1)).unwrap_or_default();
+        if !plists_equal_eq(&current, &before) {
+            return Some(prev.get());
+        }
+        if prev >= cursor {
+            return None;
+        }
+        cursor = prev;
+    }
+    None
+}
+
+fn reference_next_change(table: &TextPropertyTable, pos: usize) -> Option<usize> {
+    let current = table.plist_at(char_pos(pos)).unwrap_or_default();
+    let mut cursor = pos;
+    while let Some(next) = next_raw_boundary_after_char(table, cursor) {
+        let after = table.plist_at(char_pos(next)).unwrap_or_default();
+        if !plists_equal_eq(&current, &after) {
+            return Some(next);
+        }
+        if next <= cursor {
+            return None;
+        }
+        cursor = next;
+    }
+    None
+}
+
+#[test]
+fn in_place_property_walks_match_the_pair_vector_walks() {
+    crate::test_utils::init_test_tracing();
+    let mut table = equal_plist_run_table();
+    put_chars(
+        &mut table,
+        1000,
+        1500,
+        Value::symbol("face"),
+        Value::symbol("bold"),
+    );
+    put_chars(
+        &mut table,
+        2500,
+        3000,
+        Value::symbol("face"),
+        Value::string("x"),
+    );
+    put_chars(
+        &mut table,
+        3000,
+        3500,
+        Value::symbol("face"),
+        Value::string("x"),
+    );
+    put_chars(
+        &mut table,
+        3995,
+        4000,
+        Value::symbol("face"),
+        Value::symbol("bold"),
+    );
+    for pos in 0..=4010 {
+        assert_eq!(
+            previous_change_before_char(&table, pos),
+            reference_previous_change(&table, pos),
+            "prev {pos}"
+        );
+        assert_eq!(
+            next_change_after_char(&table, pos),
+            reference_next_change(&table, pos),
+            "next {pos}"
+        );
+    }
+    let empty = TextPropertyTable::new();
+    for pos in 0..3 {
+        assert_eq!(previous_change_before_char(&empty, pos), None);
+        assert_eq!(next_change_after_char(&empty, pos), None);
+    }
+}
+
+#[test]
+fn in_place_plist_equality_matches_the_pair_vector_comparison() {
+    crate::test_utils::init_test_tracing();
+    let (a, b, c) = (Value::symbol("a"), Value::symbol("b"), Value::symbol("c"));
+    let (one, two) = (Value::fixnum(1), Value::fixnum(2));
+    let s1 = Value::string("s");
+    let s2 = Value::string("s");
+    let plists = [
+        Value::NIL,
+        Value::list(vec![a, one]),
+        Value::list(vec![a, two]),
+        Value::list(vec![a, one, b, two]),
+        Value::list(vec![b, two, a, one]),
+        Value::list(vec![a, one, b]),
+        Value::list(vec![a, one, a, two]),
+        Value::list(vec![a, two, a, one]),
+        Value::list(vec![a, one, a, one]),
+        Value::list(vec![a, one, c, Value::NIL]),
+        Value::list(vec![a, s1]),
+        Value::list(vec![a, s2]),
+        Value::list(vec![a]),
+    ];
+    for left in plists {
+        for right in plists {
+            assert_eq!(
+                plist_values_equal_eq(left, right),
+                plists_equal_eq(&plist_pairs(left), &plist_pairs(right)),
+                "{left:?} vs {right:?}"
+            );
+        }
+    }
+}

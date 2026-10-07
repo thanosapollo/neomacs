@@ -1036,6 +1036,9 @@ impl LispString {
     ) -> Option<Self> {
         let mut result =
             self.slice_no_properties_with_char_bounds(start, end, char_start, char_end)?;
+        if !self.has_intervals() {
+            return Some(result);
+        }
         let intervals = self.intervals().slice_char_range(CharRange::new(
             CharPos0::new(char_start),
             CharPos0::new(char_end),
@@ -1070,10 +1073,14 @@ impl LispString {
             Self::from_unibyte(data)
         };
 
-        let mut intervals = self.intervals().clone();
-        intervals.append_shifted_at_char_offset(other.intervals(), CharLen::new(self.schars()));
-        if !intervals.is_empty() {
-            *result.intervals_mut() = intervals;
+        // Property-free pieces have no table to combine (GNU: null interval
+        // pointers); don't clone and append two empty ones.
+        if self.has_intervals() || other.has_intervals() {
+            let mut intervals = self.intervals().clone();
+            intervals.append_shifted_at_char_offset(other.intervals(), CharLen::new(self.schars()));
+            if !intervals.is_empty() {
+                *result.intervals_mut() = intervals;
+            }
         }
         result
     }

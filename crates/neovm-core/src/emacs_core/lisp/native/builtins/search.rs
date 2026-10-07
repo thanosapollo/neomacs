@@ -3230,9 +3230,11 @@ pub(crate) fn builtin_replace_match_with_state_and_flags(
         )
     };
     // C-level `error()' messages are requoted via `text-quoting-style' by
-    // GNU's doprnt (e.g. "Invalid use of `\\' ..." -> curly quotes).
-    let quoting_style = crate::emacs_core::coding::effective_text_quoting_style(obarray);
+    // GNU's doprnt (e.g. "Invalid use of `\\' ..." -> curly quotes).  Like
+    // doprnt, resolve the style only when an error is actually raised: a
+    // successful call (millions in `replace-regexp-in-string') never needs it.
     let c_error = |msg: String| {
+        let quoting_style = crate::emacs_core::coding::effective_text_quoting_style(obarray);
         signal(
             "error",
             vec![Value::string(

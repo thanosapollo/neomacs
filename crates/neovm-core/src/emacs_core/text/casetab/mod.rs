@@ -426,20 +426,25 @@ fn current_case_table_for_buffer_in_state(
     buffers: &mut crate::buffer::BufferManager,
 ) -> Result<Value, Flow> {
     use crate::buffer::buffer::BUFFER_SLOT_CASE_TABLE;
-    let fallback = ensure_standard_case_table_object_in_state(obarray)?;
-    let current_id = buffers
-        .current_buffer_id()
-        .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
-    let buf = buffers
-        .get_mut(current_id)
-        .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
+    let current_id = buffers.current_buffer_id();
 
     // Mirrors GNU `Fcurrent_case_table` (`casetab.c:65-72`):
     //     return BVAR (current_buffer, downcase_table);
-    let value = buf.slots[BUFFER_SLOT_CASE_TABLE.index()];
-    if is_case_table(&value) {
-        return Ok(value);
+    // Every search starts here, so the installed table is returned without
+    // first resolving the standard one, which only an unset slot needs.
+    if let Some(buf) = current_id.and_then(|id| buffers.get(id)) {
+        let value = buf.slots[BUFFER_SLOT_CASE_TABLE.index()];
+        if is_case_table(&value) {
+            return Ok(value);
+        }
     }
+
+    let fallback = ensure_standard_case_table_object_in_state(obarray)?;
+    let current_id =
+        current_id.ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
+    let buf = buffers
+        .get_mut(current_id)
+        .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
 
     // Slot unset or invalid: seed from the standard table —
     // matches GNU `reset_buffer` cloning the standard tables
@@ -812,7 +817,12 @@ fn ensure_case_table_derived_slots(table: Value) -> Result<(), Flow> {
         map_case_table(canon, |key, elt| shuffle(eqv, key, elt))?;
         set_case_table_extra(table, 2, eqv);
     }
-    set_case_table_extra(canon, 2, eqv);
+    // GNU search.c re-links canon's eqv on every match; that is a plain slot
+    // store there, but a barriered char-table mutation here.  Skip it when
+    // the link is already in place.
+    if !eq_value(&case_table_extra(canon, 2), &eqv) {
+        set_case_table_extra(canon, 2, eqv);
+    }
 
     Ok(())
 }

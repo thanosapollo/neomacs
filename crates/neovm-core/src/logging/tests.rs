@@ -233,3 +233,89 @@ fn crash_reports_follow_target_policy_and_first_initializer() {
         }
     }
 }
+
+/// Which of the backend's (INFO, WARN) events pass `make_env_filter` under
+/// `RUST_LOG=directives`, next to whether neovm's own INFO passes.
+fn cranelift_events_enabled(directives: &str) -> (bool, bool, bool) {
+    // SAFETY: nextest runs each test in its own process, so nothing else
+    // reads the environment while this test sets and restores RUST_LOG.
+    let saved = std::env::var_os("RUST_LOG");
+    unsafe { std::env::set_var("RUST_LOG", directives) };
+    let subscriber = Registry::default().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(io::sink)
+            .with_filter(make_env_filter()),
+    );
+    match saved {
+        Some(saved) => unsafe { std::env::set_var("RUST_LOG", saved) },
+        None => unsafe { std::env::remove_var("RUST_LOG") },
+    }
+    tracing::subscriber::with_default(subscriber, || {
+        (
+            tracing::enabled!(target: "cranelift_jit::backend", tracing::Level::INFO),
+            tracing::enabled!(target: "cranelift_jit::backend", tracing::Level::WARN),
+            tracing::enabled!(target: "neovm_core::jit", tracing::Level::INFO),
+        )
+    })
+}
+
+#[test]
+fn cranelift_function_dumps_are_debug_output() {
+    // The packaged default: dumps hidden, everything else at info kept.
+    assert_eq!(cranelift_events_enabled("info"), (false, true, true));
+    assert_eq!(
+        cranelift_events_enabled("warn,neovm_core=info"),
+        (false, true, true)
+    );
+    // Asking for debug output, or for cranelift by name, keeps them.
+    assert_eq!(cranelift_events_enabled("debug"), (true, true, true));
+    assert_eq!(
+        cranelift_events_enabled("info,cranelift_jit=info"),
+        (true, true, true)
+    );
+    // Never widens a stricter filter.
+    assert_eq!(cranelift_events_enabled("off"), (false, false, false));
+    assert_eq!(cranelift_events_enabled("error"), (false, false, false));
+    assert_eq!(
+        cranelift_events_enabled("neovm_core=info"),
+        (false, false, true)
+    );
+}
+
+#[test]
+fn cranelift_dump_opt_in_reads_directive_levels() {
+    assert!(!wants_cranelift_function_dumps(None));
+    assert!(!wants_cranelift_function_dumps(Some("")));
+    assert!(!wants_cranelift_function_dumps(Some(
+        "info,[span{x=debug}]=info"
+    )));
+    assert!(wants_cranelift_function_dumps(Some("neovm_core=DEBUG")));
+    assert!(wants_cranelift_function_dumps(Some("warn,trace")));
+}
+
+/// The quieting filter keeps the user's level as the subscriber's maximum,
+/// so the `log` bridge still drops finer records before formatting them.
+#[test]
+fn cranelift_quieting_keeps_the_level_hint() {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::layer::Filter;
+    for (directives, level) in [
+        ("info", LevelFilter::INFO),
+        ("warn", LevelFilter::WARN),
+        ("debug", LevelFilter::DEBUG),
+    ] {
+        let saved = std::env::var_os("RUST_LOG");
+        // SAFETY: as in `cranelift_events_enabled`.
+        unsafe { std::env::set_var("RUST_LOG", directives) };
+        let filter = make_env_filter::<Registry>();
+        match saved {
+            Some(saved) => unsafe { std::env::set_var("RUST_LOG", saved) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
+        }
+        assert_eq!(
+            Filter::<Registry>::max_level_hint(&filter),
+            Some(level),
+            "{directives}"
+        );
+    }
+}

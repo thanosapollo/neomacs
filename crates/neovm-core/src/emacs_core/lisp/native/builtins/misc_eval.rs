@@ -359,6 +359,11 @@ fn char_property_buffer_id_for_object(
     super::textprop::resolve_char_property_buffer_id_with_frames(frames, buffers, object)
 }
 
+/// 0-based character position of the 1-based Lisp position `pos`.
+fn elisp_pos_to_char_pos0(pos: i64) -> crate::buffer::CharPos0 {
+    crate::buffer::CharPos0::new((pos - 1).max(0) as usize)
+}
+
 fn next_char_property_change_for_buffer(
     buf: &crate::buffer::buffer::Buffer,
     position: i64,
@@ -375,8 +380,12 @@ fn next_char_property_change_for_buffer(
         temp = limit;
     }
 
-    if let Some(next) = buf.text_props_next_change_after_emacs_byte_pos(EmacsBytePos::new(byte_pos))
-    {
+    // GNU `Fnext_char_property_change' passes this clamp to
+    // `Fnext_property_change' as LIMIT; walking past it is wasted work.
+    if let Some(next) = buf.text_props_next_change_after_emacs_byte_pos_before(
+        EmacsBytePos::new(byte_pos),
+        elisp_pos_to_char_pos0(temp),
+    ) {
         let next_pos = textprop::byte_to_elisp_pos(buf, next);
         if next < accessible.end() && next_pos < temp {
             return Ok(next_pos);
@@ -401,9 +410,14 @@ fn previous_char_property_change_for_buffer(
         temp = limit;
     }
 
-    if let Some(prev) =
-        buf.text_props_previous_change_before_emacs_byte_pos(EmacsBytePos::new(byte_pos))
-    {
+    // GNU `Fprevious_char_property_change' passes this clamp to
+    // `Fprevious_property_change' as LIMIT.  Walking past it made every
+    // field-constrained `beginning-of-line' (eshell output, prompts) visit
+    // all the equal-plist intervals before the line.
+    if let Some(prev) = buf.text_props_previous_change_before_emacs_byte_pos_after(
+        EmacsBytePos::new(byte_pos),
+        elisp_pos_to_char_pos0(temp),
+    ) {
         let prev_pos = textprop::byte_to_elisp_pos(buf, prev);
         if prev > accessible.start() && prev_pos > temp {
             return Ok(prev_pos);
