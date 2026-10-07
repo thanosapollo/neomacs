@@ -311,38 +311,71 @@ mod tests {
         }
     }
 
+    /// Owner bits: low slots straddle the ordinary dump spans, high slots
+    /// sit inside the wrapped span's top part, and every third owner reuses
+    /// its predecessor's address under another tag.
+    fn owner_bits(slot: usize, tag: u8, high: bool) -> usize {
+        let tag = [TAG_CONS, TAG_STRING, TAG_VECLIKE][usize::from(tag)];
+        let address = if high {
+            (usize::MAX - 0xfff) + (slot % 0x100) * 16
+        } else {
+            slot << 4
+        };
+        address & !TAG_MASK | tag
+    }
+
     proptest! {
         #[test]
         fn reclaiming_owners_matches_a_full_rescan(
-            owners in prop::collection::vec((1usize..0x900, 0u8..3, any::<bool>()), 0..200),
+            owners in prop::collection::vec(
+                (1usize..0x900, 0u8..3, any::<bool>(), any::<bool>()),
+                0..200,
+            ),
             first in any::<u8>(),
             second in any::<u8>(),
         ) {
             let dump = dump_window(first);
             let mut envelope = ObservedEnvelope::new();
             envelope.rebuild(dump);
+            let mut all = FxHashSet::default();
             let mut dead = FxHashSet::default();
-            for &(slot, tag, dies) in &owners {
-                let tag = [TAG_CONS, TAG_STRING, TAG_VECLIKE][usize::from(tag)];
-                let bits = (slot << 4) | tag;
+            let mut previous: Option<usize> = None;
+            for (index, &(slot, tag, high, dies)) in owners.iter().enumerate() {
+                let mut bits = owner_bits(slot, tag, high);
+                if index % 3 == 2 {
+                    if let Some(alias) = previous {
+                        // Same address, a different tag.
+                        let tag = TAG_CONS + ((alias & TAG_MASK) - TAG_CONS + 1) % 3;
+                        bits = alias & !TAG_MASK | tag;
+                    }
+                }
+                previous = Some(bits);
                 envelope.insert(bits);
+                all.insert(bits);
                 if dies {
                     dead.insert(bits);
                 }
             }
-            prop_assert_eq!(state(&envelope), scanned(&envelope.owners, dump));
+            prop_assert_eq!(&envelope.owners, &all);
+            prop_assert_eq!(state(&envelope), scanned(&all, dump));
 
             // Same dump span: the incremental path.
             envelope.retain_owners(dump, |bits| !dead.contains(&bits));
-            prop_assert!(envelope.owners.iter().all(|bits| !dead.contains(bits)));
-            prop_assert_eq!(state(&envelope), scanned(&envelope.owners, dump));
+            let survivors: FxHashSet<usize> = all.difference(&dead).copied().collect();
+            prop_assert_eq!(&envelope.owners, &survivors);
+            prop_assert_eq!(state(&envelope), scanned(&survivors, dump));
 
             // A changed dump span takes the full rebuild.
             let moved = dump_window(second);
-            let survivors: Vec<usize> = envelope.owners.iter().copied().collect();
-            let half: FxHashSet<usize> = survivors.iter().copied().step_by(2).collect();
-            envelope.retain_owners(moved, |bits| !half.contains(&bits));
-            prop_assert_eq!(state(&envelope), scanned(&envelope.owners, moved));
+            let doomed: FxHashSet<usize> = survivors
+                .iter()
+                .copied()
+                .filter(|bits| (bits >> 4) % 2 == usize::from(second % 2))
+                .collect();
+            envelope.retain_owners(moved, |bits| !doomed.contains(&bits));
+            let rest: FxHashSet<usize> = survivors.difference(&doomed).copied().collect();
+            prop_assert_eq!(&envelope.owners, &rest);
+            prop_assert_eq!(state(&envelope), scanned(&rest, moved));
         }
     }
 }
