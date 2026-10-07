@@ -3591,7 +3591,7 @@ fn eval_display_queries_accept_live_frame_designator() {
 }
 
 #[test]
-fn window_system_prefers_selected_frame_then_global_fallback() {
+fn window_system_prefers_selected_frame_then_selected_terminal() {
     crate::test_utils::init_test_tracing();
     let mut eval = crate::emacs_core::Context::new();
 
@@ -3604,14 +3604,22 @@ fn window_system_prefers_selected_frame_then_global_fallback() {
         "window-system should not synthesize a frame when no frame exists"
     );
 
-    eval.set_variable("window-system", Value::symbol("tty"));
+    // GNU Fwindow_system is `framep' of the selected frame, never the
+    // `window-system' variable.  With no frame yet, the selected terminal is
+    // the initial one, which `terminal-live-p' reports as t.
+    eval.set_variable("window-system", Value::symbol("neo"));
     assert_eq!(
         builtin_window_system(&mut eval, vec![]).unwrap(),
-        Value::symbol("tty")
+        Value::NIL
+    );
+    assert_eq!(
+        crate::emacs_core::terminal::pure::builtin_terminal_live_p(&mut eval, vec![Value::NIL])
+            .unwrap(),
+        Value::T
     );
     assert!(
         eval.frames.frame_list().is_empty(),
-        "window-system should use the global fallback without synthesizing a frame"
+        "window-system should read the selected terminal without synthesizing a frame"
     );
 
     let frame_id = crate::emacs_core::window_cmds::ensure_selected_frame_id(&mut eval);

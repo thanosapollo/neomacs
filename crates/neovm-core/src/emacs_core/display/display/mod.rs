@@ -865,6 +865,22 @@ pub(crate) fn builtin_window_system(
         if let Some(window_system) = selected_frame_window_system_symbol_in_state(&eval.frames) {
             return Ok(window_system);
         }
+        // GNU Fwindow_system (frame.c) is `framep' of the selected frame: its
+        // terminal's output method, with a text terminal's t reported as nil.
+        // Before the first frame exists, ask the selected terminal the same
+        // way, so `window-system' agrees with `terminal-live-p' and the
+        // `display-*' predicates instead of echoing the `window-system'
+        // variable.
+        if eval.frames.selected_frame().is_none() {
+            let terminal_type =
+                super::terminal::pure::builtin_terminal_live_p(eval, vec![Value::NIL])?;
+            if terminal_type.is_t() {
+                return Ok(Value::NIL);
+            }
+            if !terminal_type.is_nil() {
+                return Ok(terminal_type);
+            }
+        }
     } else if let Some(window_system) =
         frame_window_system_symbol_in_state(&mut eval.frames, &mut eval.buffers, args.first())?
     {

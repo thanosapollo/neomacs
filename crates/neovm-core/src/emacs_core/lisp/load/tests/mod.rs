@@ -2938,14 +2938,14 @@ fn bootstrap_runtime_gui_surface_matches_gnu_icons_residency() {
 }
 
 #[test]
-fn bootstrap_runtime_display_selections_p_is_true_under_neomacs_gui_surface() {
+fn bootstrap_runtime_display_selections_p_is_nil_before_first_neomacs_gui_frame() {
+    // GNU frame.el `display-selections-p' asks `framep-on-display', and before
+    // `frame-initialize' the selected frame is still on the initial terminal.
     crate::test_utils::init_test_tracing();
     let mut eval =
         create_bootstrap_evaluator_cached_with_features(&["x", "neomacs"]).expect("bootstrap");
-    let value = eval
-        .eval_str("(display-selections-p)")
-        .expect("display-selections-p");
-    assert_eq!(value, Value::T);
+    let rendered = eval_rendered(&mut eval, "(list (window-system) (display-selections-p))");
+    assert_eq!(rendered, "OK (nil nil)");
 }
 
 #[test]
@@ -3187,7 +3187,7 @@ fn bootstrap_runtime_cached_gui_surface_clears_transient_loader_state() {
 }
 
 #[test]
-fn bootstrap_runtime_cached_gui_surface_restores_window_system_surface() {
+fn bootstrap_runtime_cached_gui_surface_is_textual_before_first_frame() {
     crate::test_utils::init_test_tracing();
     let mut eval = create_bootstrap_evaluator_cached_with_features(&["x", "neomacs"])
         .expect("bootstrap evaluator");
@@ -3195,15 +3195,22 @@ fn bootstrap_runtime_cached_gui_surface_restores_window_system_surface() {
         eval.frames.frame_list().is_empty(),
         "cached GUI bootstrap should not synthesize a fallback frame before host bootstrap"
     );
+    // GNU before `frame-initialize' (early-init, `before-init-hook'):
+    // `initial-window-system' names the window system, but the selected frame
+    // is on the initial terminal, so `window-system' (frame.c Fwindow_system),
+    // `terminal-live-p' (terminal.c) and every `display-*' query describe that
+    // text terminal.
     let rendered = eval_rendered(
         &mut eval,
         r#"(list (window-system)
                  initial-window-system
+                 (terminal-live-p nil)
+                 (framep-on-display)
                  (display-graphic-p)
                  (display-color-cells)
                  (display-visual-class))"#,
     );
-    assert_eq!(rendered, "OK (neo neo t 16777216 true-color)");
+    assert_eq!(rendered, "OK (nil neo t t nil 0 static-gray)");
     assert!(
         eval.frames.frame_list().is_empty(),
         "display queries should not synthesize a fallback frame before host bootstrap"
