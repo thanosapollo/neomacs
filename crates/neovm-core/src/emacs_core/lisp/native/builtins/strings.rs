@@ -1613,9 +1613,12 @@ fn parse_format_spec(bytes: &[u8], pos: &mut usize) -> Result<ParsedFormatSpec, 
 }
 
 /// Lay out the formatted number S, with EXCESS zeros before any exponent,
-/// padded to the spec's width; zero padding goes after a sign.
+/// padded to the spec's width.  Like GNU `styled_format`, zero padding goes
+/// after any sign (`-`, `+`, or the space flag's ` `), and only when the
+/// text after it starts with a digit: an infinity or a NaN is padded with
+/// spaces.
 fn number_field(s: String, excess: usize, spec: &FormatSpec) -> FormatField {
-    let sign_len = usize::from(s.starts_with(['-', '+']));
+    let sign_len = usize::from(s.starts_with(['-', '+', ' ']));
     let mark = s.find(['e', 'E']).unwrap_or(s.len());
     let mut head = s.into_bytes();
     let tail = head.split_off(mark);
@@ -1628,7 +1631,8 @@ fn number_field(s: String, excess: usize, spec: &FormatSpec) -> FormatField {
         tail,
         ..FormatField::default()
     };
-    field.pad(width, spec, spec.zero);
+    let zero_pad = spec.zero && field.mid.first().is_some_and(u8::is_ascii_hexdigit);
+    field.pad(width, spec, zero_pad);
     field
 }
 
@@ -1778,19 +1782,66 @@ fn format_bignum_spec(n: &Integer, spec: &FormatSpec) -> FormatField {
 }
 
 fn format_integer_float_spec(f: f64, spec: &FormatSpec) -> Result<FormatField, Flow> {
-    if !f.is_finite() && matches!(spec.conversion, 'd' | 'i') {
-        let text = if f.is_nan() {
-            "nan"
-        } else if f.is_sign_negative() {
-            "-inf"
-        } else {
-            "inf"
-        };
-        return Ok(number_field(text.to_string(), 0, spec));
+    if matches!(spec.conversion, 'd' | 'i') {
+        return Ok(format_float_decimal_spec(f, spec));
+    }
+    // GNU converts the float with `double_to_integer`, which signals
+    // `overflow-error` for an infinity or a NaN.
+    if !f.is_finite() {
+        return Err(signal(LispCondition::OverflowError, vec![]));
     }
 
     let big = Integer::rounding_from(f.trunc(), RoundingMode::Down).0;
     Ok(format_bignum_spec(&big, spec))
+}
+
+/// Format float F for `%d`/`%i` like GNU `styled_format`: sprintf prints
+/// its truncation through `%.0f` with the plus and space flags, so a zero
+/// is printed even with precision 0, a negative zero is unsigned, and a
+/// NaN is signed by its sign bit.  GNU then counts the first character as
+/// a sign whenever it is not a digit, even the `i` of `inf` or the `n` of
+/// `nan`, when it adds the precision's leading zeros after the sign.
+fn format_float_decimal_spec(f: f64, spec: &FormatSpec) -> FormatField {
+    let t = f.trunc();
+    let negative = if f.is_nan() {
+        f.is_sign_negative()
+    } else {
+        t < 0.0
+    };
+    let digits = if f.is_nan() {
+        "nan".to_string()
+    } else if f.is_infinite() {
+        "inf".to_string()
+    } else {
+        Integer::rounding_from(t.abs(), RoundingMode::Down)
+            .0
+            .to_string()
+    };
+    let sign: &[u8] = if negative {
+        b"-"
+    } else if spec.plus {
+        b"+"
+    } else if spec.space {
+        b" "
+    } else {
+        b""
+    };
+    let len = sign.len() + digits.len();
+    let signedp =
+        usize::from(!sign.is_empty() || !digits.starts_with(|c: char| c.is_ascii_digit()));
+    let zeros = spec
+        .precision
+        .map_or(0, |precision| precision - precision.min(len - signedp));
+    let zero_pad =
+        spec.zero && spec.precision.is_none() && digits.as_bytes()[0].is_ascii_hexdigit();
+    let mut field = FormatField {
+        head: sign.to_vec(),
+        leading_zeros: zeros,
+        mid: digits.into_bytes(),
+        ..FormatField::default()
+    };
+    field.pad(len.saturating_add(zeros), spec, zero_pad);
+    field
 }
 
 /// Normalize Rust scientific notation to match C printf: sign always
@@ -1827,7 +1878,17 @@ fn ensure_float_alternate_decimal(mut s: String) -> String {
 /// Format a float with the given spec.
 fn format_float_spec(f: f64, spec: &FormatSpec) -> FormatField {
     // C printf spells non-finite values nan/inf (NAN/INF for the uppercase
-    // conversions), with the sign bit preserved (e.g. 0.0/0.0 -> "-nan").
+    // conversions), signed by the sign bit (e.g. 0.0/0.0 -> "-nan") or else
+    // by the plus or space flag.
+    let sign = if f.is_sign_negative() {
+        "-"
+    } else if spec.plus {
+        "+"
+    } else if spec.space {
+        " "
+    } else {
+        ""
+    };
     if !f.is_finite() {
         let upper = matches!(spec.conversion, 'E' | 'G' | 'F');
         let body = if f.is_nan() {
@@ -1837,7 +1898,6 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> FormatField {
         } else {
             "inf"
         };
-        let sign = if f.is_sign_negative() { "-" } else { "" };
         return number_field(format!("{sign}{body}"), 0, spec);
     }
     let precision = spec.precision.unwrap_or(6);
@@ -1915,12 +1975,11 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> FormatField {
         }
         _ => format!("{:.prec$}", f, prec = prec),
     };
-    let s = if spec.plus && f >= 0.0 && !f.is_nan() {
-        format!("+{}", s)
-    } else if spec.space && f >= 0.0 && !f.is_nan() {
-        format!(" {}", s)
-    } else {
+    // Rust already prints the `-` of a negative number or negative zero.
+    let s = if f.is_sign_negative() {
         s
+    } else {
+        format!("{sign}{s}")
     };
     // GNU `styled_format': the excess precision becomes zeros after the last
     // digit before any exponent -- for %g only with `#', whose trailing
@@ -2490,7 +2549,20 @@ fn do_format(
                     .map_err(|_| format_spec_type_mismatch_error())?;
                 let formatted_char = format_char_argument(n)?;
                 force_multibyte_result |= formatted_char.force_multibyte_result;
-                format_string_spec(&formatted_char.rendered, true, &spec)
+                if formatted_char.force_multibyte_result {
+                    format_string_spec(&formatted_char.rendered, true, &spec)
+                } else {
+                    // GNU `styled_format` formats an ASCII character as one
+                    // byte, none for precision 0, padded by that byte count
+                    // with spaces whatever its display width or the flags.
+                    let mut field = FormatField::text(if spec.precision == Some(0) {
+                        Vec::new()
+                    } else {
+                        formatted_char.rendered
+                    });
+                    field.pad(field.mid.len(), &spec, false);
+                    field
+                }
             }
             _ => {
                 return Err(signal(
