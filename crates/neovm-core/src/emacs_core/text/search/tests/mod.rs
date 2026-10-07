@@ -1254,3 +1254,39 @@ fn replace_match_case_starts_after_a_newline_like_gnu() {
     );
     assert_eq!(result, r#"OK ("<World>" "<World>")"#);
 }
+
+/// GNU inserts a buffer replacement before casing it, so the text is cased
+/// in the buffer's representation; a string replacement keeps its own.
+/// Expected values are GNU Emacs 31's.
+#[test]
+fn replace_match_cases_in_the_targets_representation_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (list
+         (with-temp-buffer
+           (let ((tbl (copy-case-table (standard-case-table))))
+             (set-case-syntax-pair ?Ā ?X tbl)
+             (set-case-table tbl))
+           (insert "<Hello>") (goto-char 1) (search-forward "Hello")
+           (replace-match (string-as-unibyte "Xoo"))
+           (append (buffer-string) nil))
+         (with-temp-buffer
+           (set-buffer-multibyte nil)
+           (insert "<Hello>") (goto-char 1) (search-forward "Hello")
+           (replace-match "éoo")
+           (append (buffer-string) nil))
+         (with-temp-buffer
+           (let ((tbl (copy-case-table (standard-case-table))))
+             (set-case-syntax-pair ?Ā ?X tbl)
+             (set-case-table tbl))
+           (let ((s "<Hello>"))
+             (string-match "Hello" s)
+             (append (replace-match (string-as-unibyte "Xoo") nil nil s) nil))))
+        "#,
+    );
+    assert_eq!(
+        result,
+        "OK ((60 256 111 111 62) (60 233 111 111 62) (60 88 111 111 62))"
+    );
+}

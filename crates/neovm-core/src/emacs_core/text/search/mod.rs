@@ -527,9 +527,11 @@ pub(crate) struct ReplaceCaseContext<'a> {
     pub(crate) casetab: &'a crate::emacs_core::casetab::CaseTableOverride,
     /// `case-symbols-as-words`: symbol constituents count as word ones.
     pub(crate) symbols_as_words: bool,
-    /// GNU cases a buffer replacement with `upcase-initials-region`, whose
-    /// syntax prefix rule a string replacement (`upcase-initials`) lacks.
-    pub(crate) in_buffer: bool,
+    /// `Some(multibyte)` for a buffer replacement, which GNU inserts first
+    /// and then cases in the buffer's representation with
+    /// `upcase-initials-region` (syntax prefix rule); `None` for a string
+    /// replacement, cased as `upcase-initials` does.
+    pub(crate) buffer_multibyte: Option<bool>,
 }
 
 impl ReplaceCaseContext<'_> {
@@ -542,11 +544,37 @@ impl ReplaceCaseContext<'_> {
     }
 
     /// GNU `syntax_prefix_flag_p`, consulted only for buffer replacements.
+    /// (The caller passes the target, which decides whether it is used.)
     fn is_prefix(&self, code: u32) -> bool {
         use crate::emacs_core::syntax::{SyntaxFlags, syntax_entry_at_char_code};
         syntax_entry_at_char_code(&self.syntax.chartable(), code)
             .is_some_and(|entry| entry.flags.contains(SyntaxFlags::PREFIX))
     }
+}
+
+/// TEXT in the representation GNU `copy_text` gives it when inserted into a
+/// buffer whose `enable-multibyte-characters` is MULTIBYTE: a unibyte byte
+/// becomes its character (raw bytes eight-bit ones), and a multibyte
+/// character its low byte.  One character per byte either way, so text
+/// properties carry over unchanged.
+fn in_representation(
+    text: crate::heap_types::LispString,
+    multibyte: bool,
+) -> crate::heap_types::LispString {
+    use crate::emacs_core::emacs_char::{str_to_multibyte, str_to_unibyte};
+    use crate::heap_types::LispString;
+    if text.is_multibyte() == multibyte {
+        return text;
+    }
+    let mut converted = if multibyte {
+        LispString::from_emacs_bytes_with_chars(str_to_multibyte(text.as_bytes()), text.schars())
+    } else {
+        LispString::from_unibyte(str_to_unibyte(text.as_bytes()))
+    };
+    if text.has_intervals() {
+        *converted.intervals_mut() = text.intervals().clone();
+    }
+    converted
 }
 
 pub(crate) fn replace_match_lisp_string_with_syntax(
@@ -622,6 +650,16 @@ fn replace_match_lisp_string_with_syntax_and_properties(
         // PUA-sentinel storage form, so eight-bit bytes and PUA glyphs are not
         // confused.
         let mut cased = if let Some(context) = case_context {
+            use crate::emacs_core::casefiddle::CaseTarget;
+            let target = match context.buffer_multibyte {
+                Some(multibyte) => {
+                    // GNU inserts the replacement, converting it to the
+                    // buffer's representation (`copy_text`), before casing it.
+                    replacement = in_representation(replacement, multibyte);
+                    CaseTarget::Buffer
+                }
+                None => CaseTarget::String,
+            };
             // GNU `Freplace_match` case analysis uses the buffer's case table
             // (UPPERCASEP/LOWERCASEP) and syntax table (word boundaries), so a
             // custom case table (set-case-syntax-pair) capitalizes accordingly.
@@ -631,11 +669,7 @@ fn replace_match_lisp_string_with_syntax_and_properties(
                 |code| context.is_word(code),
                 |code| context.is_prefix(code),
                 context.casetab,
-                if context.in_buffer {
-                    crate::emacs_core::casefiddle::CaseTarget::Buffer
-                } else {
-                    crate::emacs_core::casefiddle::CaseTarget::String
-                },
+                target,
             )
         } else {
             crate::emacs_core::casefiddle::apply_replace_match_case_lisp(&replacement, &matched)
@@ -722,7 +756,7 @@ pub(crate) fn compute_buffer_replacement_lisp_string(
             syntax: &buffer_syntax_table,
             casetab: &buffer_case_override,
             symbols_as_words,
-            in_buffer: true,
+            buffer_multibyte: Some(buf.get_multibyte()),
         }),
     )?;
     let replace_start = if replacement_match_data.source().is_string() {

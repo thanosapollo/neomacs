@@ -3275,7 +3275,7 @@ pub(crate) fn builtin_replace_match_with_state_and_flags(
                 syntax,
                 casetab,
                 symbols_as_words: case_symbols_as_words,
-                in_buffer: false,
+                buffer_multibyte: None,
             }
         });
         return match crate::emacs_core::search::replace_match_lisp_string_with_syntax(
