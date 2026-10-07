@@ -1697,6 +1697,16 @@ impl GuiFrameWindowState {
         }
     }
 
+    /// Forget which hints the native window holds, so the next request is
+    /// applied even if identical.  On a scale change winit's X11 backend
+    /// rewrites WM_NORMAL_HINTS from its own state, dropping the base size
+    /// applied here.
+    pub(super) fn forget_applied_geometry_hints(&mut self) {
+        if let FrameLifecycle::Active { native, .. } = &mut self.lifecycle {
+            native.applied_geometry_hints = None;
+        }
+    }
+
     pub(super) fn set_decorations(&mut self, decorated: bool) {
         match &mut self.lifecycle {
             FrameLifecycle::Active { native, .. } => {
