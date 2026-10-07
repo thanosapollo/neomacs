@@ -3645,6 +3645,17 @@ fn window_system_prefers_selected_frame_then_selected_terminal() {
         Value::NIL,
         "an explicit non-window-system frame must not fall back to global window-system"
     );
+    // The `window-system' variable is still `neo' here; GNU never reads it.
+    assert_eq!(
+        builtin_window_system(&mut eval, vec![]).unwrap(),
+        Value::NIL,
+        "a selected non-window-system frame must not fall back to global window-system"
+    );
+    assert_eq!(
+        builtin_window_system(&mut eval, vec![Value::NIL]).unwrap(),
+        Value::NIL,
+        "a nil designator names the selected non-window-system frame"
+    );
 
     let err = builtin_window_system(&mut eval, vec![Value::string("x")]).unwrap_err();
     match err.into_kind() {

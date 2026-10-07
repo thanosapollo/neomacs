@@ -3218,6 +3218,42 @@ fn bootstrap_runtime_cached_gui_surface_is_textual_before_first_frame() {
 }
 
 #[test]
+fn bootstrap_runtime_cached_gui_surface_window_system_survives_initial_frame() {
+    // Materializing the initial text frame must not change the answer: GNU
+    // Fwindow_system (frame.c) is `framep' of the selected frame and never
+    // reads the `window-system' variable, which is still `neo' here.
+    crate::test_utils::init_test_tracing();
+    let mut eval = create_bootstrap_evaluator_cached_with_features(&["x", "neomacs"])
+        .expect("bootstrap evaluator");
+    let rendered = eval_rendered(
+        &mut eval,
+        r#"(list (window-system)
+                 (progn (selected-frame) (window-system))
+                 (window-system (selected-frame))
+                 (terminal-live-p nil))"#,
+    );
+    assert_eq!(rendered, "OK (nil nil nil t)");
+}
+
+#[test]
+fn bootstrap_runtime_window_system_ignores_variable_on_text_frame() {
+    // GNU oracle: emacs -Q --batch, (setq window-system 'neo) first.
+    crate::test_utils::init_test_tracing();
+    let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap evaluator");
+    let rendered = eval_rendered(
+        &mut eval,
+        r#"(progn
+             (setq window-system 'neo)
+             (list (window-system)
+                   (window-system (selected-frame))
+                   window-system
+                   (terminal-live-p nil)
+                   (display-graphic-p)))"#,
+    );
+    assert_eq!(rendered, "OK (nil nil neo t nil)");
+}
+
+#[test]
 fn bootstrap_runtime_require_eieio_restores_cl_loaddefs_surface() {
     crate::test_utils::init_test_tracing();
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
