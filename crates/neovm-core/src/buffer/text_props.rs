@@ -2419,6 +2419,81 @@ fn watched_keys_equal_eq_plist(left: Value, right: Value, keys: &[Value]) -> boo
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static RAW_WALK_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Intervals the complete-plist walks have stepped onto on this thread since
+/// the last call (test-only cost probe).
+#[cfg(test)]
+pub(crate) fn take_raw_walk_steps() -> usize {
+    RAW_WALK_STEPS.with(|steps| steps.replace(0))
+}
+
+#[inline]
+fn note_raw_walk_step() {
+    #[cfg(test)]
+    RAW_WALK_STEPS.with(|steps| steps.set(steps.get() + 1));
+}
+
+/// Number of complete key/value pairs in `plist`, counted the way
+/// [`plist_pairs`] collects them (a dangling key is dropped).
+fn plist_pair_count(plist: Value) -> usize {
+    let mut count = 0;
+    let mut tail = plist;
+    while tail.is_cons() {
+        let rest = tail.cons_cdr();
+        if !rest.is_cons() {
+            break;
+        }
+        count += 1;
+        tail = rest.cons_cdr();
+    }
+    count
+}
+
+/// Whether `plist` holds the pair `(key . value)`, both compared with `eq`.
+fn plist_has_pair_eq(plist: Value, key: Value, value: Value) -> bool {
+    let mut tail = plist;
+    while tail.is_cons() {
+        let rest = tail.cons_cdr();
+        if !rest.is_cons() {
+            return false;
+        }
+        if eq_value(&tail.cons_car(), &key) && eq_value(&rest.cons_car(), &value) {
+            return true;
+        }
+        tail = rest.cons_cdr();
+    }
+    false
+}
+
+/// [`plists_equal_eq`] on the interval plists themselves, without
+/// materializing pair vectors: GNU `intervals_equal` likewise walks the two
+/// property lists in place.  The interval walks call this once per interval,
+/// so an allocation here was paid per interval visited.
+fn plist_values_equal_eq(left: Value, right: Value) -> bool {
+    if eq_value(&left, &right) {
+        return true;
+    }
+    if plist_pair_count(left) != plist_pair_count(right) {
+        return false;
+    }
+    let mut tail = left;
+    while tail.is_cons() {
+        let rest = tail.cons_cdr();
+        if !rest.is_cons() {
+            break;
+        }
+        if !plist_has_pair_eq(right, tail.cons_car(), rest.cons_car()) {
+            return false;
+        }
+        tail = rest.cons_cdr();
+    }
+    true
+}
+
 fn plists_equal_eq(left: &[(Value, Value)], right: &[(Value, Value)]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -4186,27 +4261,49 @@ impl TextPropertyTable {
         None
     }
 
+    /// First interval boundary after `pos` where the complete plist changes
+    /// (`eq` keys and values, order-insensitive), giving up at the first
+    /// boundary at or past `bound`.  One tree descent to seat, then sibling
+    /// steps comparing the stored plists in place, like GNU
+    /// `Fnext_property_change`'s `next_interval` loop.
     fn next_property_change_raw(&self, pos: CharPos0, bound: Option<CharPos0>) -> Option<CharPos0> {
-        let current = self.plist_at(pos).unwrap_or_default();
-        let mut cursor = pos;
-        while let Some(next) = self.next_interval_boundary_raw(cursor) {
-            if bound.is_some_and(|bound| next >= bound) {
+        let mut cursor = self.intervals.cursor_at(pos);
+        // Past the last interval there is nothing but the implicit nil tail.
+        let (_, mut boundary, seed) = cursor.next()?;
+        let current = seed.plist;
+        loop {
+            if bound.is_some_and(|bound| boundary >= bound) {
                 return None;
             }
-            let next_plist = self.plist_at(next).unwrap_or_default();
-            if !plists_equal_eq(&current, &next_plist) {
-                return Some(next);
+            match cursor.next() {
+                Some((_, end, node)) => {
+                    note_raw_walk_step();
+                    if !plist_values_equal_eq(current, node.plist) {
+                        return Some(boundary);
+                    }
+                    boundary = end;
+                }
+                // The tree end changes to the empty plist of the implicit tail.
+                None => return (plist_pair_count(current) != 0).then_some(boundary),
             }
-            if next.get() <= cursor.get() {
-                return None;
-            }
-            cursor = next;
         }
-        None
     }
 
     pub fn previous_property_change_before_char_pos(&self, pos: CharPos0) -> Option<CharPos0> {
-        self.previous_property_change_raw(pos)
+        self.previous_property_change_raw(pos, None)
+    }
+
+    /// [`Self::previous_property_change_before_char_pos`] that gives up at the
+    /// first interval boundary at or before `bound`: GNU
+    /// `Fprevious_property_change` stops its interval walk at LIMIT, so a
+    /// field-constrained `beginning-of-line` looks at the current line only
+    /// instead of every interval of a long equal-plist run before it.
+    pub fn previous_property_change_before_char_pos_after(
+        &self,
+        pos: CharPos0,
+        bound: CharPos0,
+    ) -> Option<CharPos0> {
+        self.previous_property_change_raw(pos, Some(bound))
     }
 
     /// Previous boundary where the single property `name` changes, ignoring
@@ -4263,32 +4360,52 @@ impl TextPropertyTable {
         }
     }
 
-    fn previous_property_change_raw(&self, pos: CharPos0) -> Option<CharPos0> {
+    /// Last interval boundary before `pos` where the complete plist changes,
+    /// comparing the plist just before `pos` with each preceding interval's;
+    /// gives up at the first boundary at or before `bound`.  Seats once at the
+    /// interval before `pos` and steps predecessors in place, the shape of
+    /// GNU `Fprevious_property_change`'s `previous_interval` loop.
+    fn previous_property_change_raw(
+        &self,
+        pos: CharPos0,
+        bound: Option<CharPos0>,
+    ) -> Option<CharPos0> {
         if pos == CharPos0::ZERO {
             return None;
         }
-
-        let current = self
-            .plist_at(pos.saturating_sub_len(CharLen::new(1)))
-            .unwrap_or_default();
-        let mut cursor = pos;
-        while let Some(prev) = self.previous_interval_boundary_raw(cursor) {
-            if prev == CharPos0::ZERO {
+        let (current, mut boundary, seat) = match self
+            .intervals
+            .find_id(pos.saturating_sub_len(CharLen::new(1)))
+        {
+            Some((start, id)) => {
+                let seat = self.intervals.prev_id(id).map(|prev| {
+                    (
+                        start.saturating_sub_len(self.intervals.node_len(prev)),
+                        prev,
+                    )
+                });
+                (self.intervals.nodes[id.0].plist, start, seat)
+            }
+            // Before `pos` lies the implicit empty tail; its run starts at
+            // the tree end, preceded by the last interval.
+            None => (
+                Value::NIL,
+                CharPos0::ZERO.add_len(self.intervals.len()),
+                self.intervals.last_interval(),
+            ),
+        };
+        let mut cursor = self.intervals.reverse_cursor_from(seat);
+        loop {
+            if boundary == CharPos0::ZERO || bound.is_some_and(|bound| boundary <= bound) {
                 return None;
             }
-            let previous_plist = self
-                .plist_at(prev.saturating_sub_len(CharLen::new(1)))
-                .unwrap_or_default();
-            if !plists_equal_eq(&current, &previous_plist) {
-                return Some(prev);
+            let (start, _, node) = cursor.next()?;
+            note_raw_walk_step();
+            if !plist_values_equal_eq(current, node.plist) {
+                return Some(boundary);
             }
-            if prev.get() >= cursor.get() {
-                return None;
-            }
-            cursor = prev;
+            boundary = start;
         }
-
-        None
     }
 
     /// Return the next raw interval boundary after `pos`, even when adjacent

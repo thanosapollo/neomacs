@@ -2212,6 +2212,26 @@ impl BufferText {
         prev.map(|prev| self.char_pos_to_emacs_byte_pos(prev))
     }
 
+    /// [`Self::text_props_previous_change_before_emacs_byte_pos`] bounded by
+    /// the character position `bound`: no boundary at or before it is
+    /// reported or walked past.
+    pub fn text_props_previous_change_before_emacs_byte_pos_after(
+        &self,
+        pos: EmacsBytePos,
+        bound: CharPos0,
+    ) -> Option<EmacsBytePos> {
+        let char_pos = self
+            .byte_range_to_char_range(EmacsByteRange::new(pos, pos))
+            .start();
+        let prev = {
+            self.storage
+                .borrow()
+                .text_props
+                .previous_property_change_before_char_pos_after(char_pos, bound)
+        };
+        prev.map(|prev| self.char_pos_to_emacs_byte_pos(prev))
+    }
+
     pub fn text_props_previous_single_change_before_emacs_byte_pos(
         &self,
         pos: EmacsBytePos,

@@ -3483,6 +3483,20 @@ impl Buffer {
             .text_props_previous_change_before_emacs_byte_pos(self.clamped_emacs_byte_pos(pos))
     }
 
+    /// The previous property change before `pos` strictly after the
+    /// character position `bound`, or `None`.
+    pub fn text_props_previous_change_before_emacs_byte_pos_after(
+        &self,
+        pos: EmacsBytePos,
+        bound: CharPos0,
+    ) -> Option<EmacsBytePos> {
+        self.text
+            .text_props_previous_change_before_emacs_byte_pos_after(
+                self.clamped_emacs_byte_pos(pos),
+                bound,
+            )
+    }
+
     pub fn text_props_previous_single_change_before_emacs_byte_pos(
         &self,
         pos: EmacsBytePos,
