@@ -90,6 +90,19 @@ impl FrameSender {
             .iter()
             .position(|queued| queued.frame_placement.frame() == frame)
             .and_then(|index| pending.remove(index));
+        // Timestamp on the producer, before the consumer can acquire this state.
+        neomacs_display_protocol::present_trace::record(
+            neomacs_display_protocol::present_trace::Stage::Publish,
+            frame.get(),
+            state.presentation(),
+        );
+        if let Some(old) = &old {
+            neomacs_display_protocol::present_trace::record(
+                neomacs_display_protocol::present_trace::Stage::Superseded,
+                frame.get(),
+                old.state.presentation(),
+            );
+        }
         pending.push_back(QueuedPresentation {
             state,
             skipped_predecessor: old.is_some(),

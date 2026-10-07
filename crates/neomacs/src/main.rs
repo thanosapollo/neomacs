@@ -3735,6 +3735,7 @@ fn run_gui_main_thread(
         }
     };
 
+    neomacs_display_protocol::present_trace::shutdown();
     if evaluator_exit.restart {
         tracing::warn!("restart requested via kill-emacs, but restart is not implemented yet");
     }

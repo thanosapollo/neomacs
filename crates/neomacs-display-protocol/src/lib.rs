@@ -34,6 +34,7 @@ pub mod popup_placement;
 pub mod posn_frame_pool;
 pub mod posn_object_extent;
 pub mod present_mapping;
+pub mod present_trace;
 pub mod presentation_origin;
 pub mod presented_frame;
 pub mod presented_pointer;
