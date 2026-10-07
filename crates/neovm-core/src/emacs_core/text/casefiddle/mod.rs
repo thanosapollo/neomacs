@@ -340,6 +340,15 @@ fn upcase_lisp_string_emacs_compat(text: &LispString, casetab: &CaseTableOverrid
     LispString::from_emacs_bytes(out)
 }
 
+/// Whether [`capitalize_like_gnu`] cases a string or buffer text.  GNU
+/// differs between the two in the syntax prefix rule and in how a unibyte
+/// byte takes a case-table mapping that does not fit a byte.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaseTarget {
+    String,
+    Buffer,
+}
+
 /// What [`capitalize_like_gnu`] does to a character inside a word.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WordRest {
@@ -389,27 +398,29 @@ fn push_word_initial(out: &mut Vec<u8>, code: u32, casetab: &CaseTableOverride) 
 /// inside a word are down-cased or kept per `rest`.  A character continues
 /// a word when the previous one was in a word; it starts one when it is a
 /// word constituent (`is_word`, which carries `case-symbols-as-words`), and
-/// in a buffer only if it lacks the syntax prefix flag (`is_prefix`, which
-/// is constantly false for strings).
+/// in a buffer only if it lacks the syntax prefix flag (`is_prefix`).
 fn capitalize_like_gnu(
     text: &LispString,
     is_word: impl Fn(u32) -> bool,
     is_prefix: impl Fn(u32) -> bool,
     casetab: &CaseTableOverride,
     rest: WordRest,
+    target: CaseTarget,
 ) -> LispString {
     let mut inword = false;
     let mut step = |code: u32| {
         let was_inword = inword;
-        inword = is_word(code) && (was_inword || !is_prefix(code));
+        inword = is_word(code) && (was_inword || target == CaseTarget::String || !is_prefix(code));
         was_inword
     };
 
     if !text.is_multibyte() {
-        // GNU `do_casify_unibyte_string`: each byte is cased as the character
-        // `make_char_multibyte` gives, so a byte above ASCII is a raw-byte
-        // character (for syntax too), which has no case.  A result that does
-        // not fit a byte leaves an ASCII byte to plain ASCII casing.
+        // GNU `do_casify_unibyte_string` / `do_casify_unibyte_region`: each
+        // byte is cased as the character `make_char_multibyte` gives, so a
+        // byte above ASCII is a raw-byte character (for syntax too), which
+        // has no case.  A mapping that does not fit a byte leaves an ASCII
+        // byte of a string to plain ASCII casing; in a buffer it is cut to a
+        // byte by `make_char_unibyte`.
         let mut out = Vec::with_capacity(text.sbytes());
         for &byte in text.as_bytes() {
             let was_inword = step(crate::emacs_core::emacs_char::unibyte_to_char(byte));
@@ -427,8 +438,10 @@ fn capitalize_like_gnu(
                         (CaseMap::Up, byte.to_ascii_uppercase())
                     };
                     match casetab.map(which, byte as i64) {
+                        None => ascii,
                         Some(m) if m < 0x100 => m as u8,
-                        Some(_) | None => ascii,
+                        Some(_) if target == CaseTarget::String => ascii,
+                        Some(m) => make_char_unibyte(m),
                     }
                 },
             );
@@ -457,13 +470,31 @@ fn capitalize_like_gnu(
     LispString::from_emacs_bytes(out)
 }
 
+/// GNU `make_char_unibyte` (`CHAR_TO_BYTE8`) for a non-ASCII character: a
+/// raw-byte character gives its byte, any other its low eight bits.
+fn make_char_unibyte(code: i64) -> u8 {
+    let code = code as u32;
+    if crate::emacs_core::emacs_char::char_byte8_p(code) {
+        crate::emacs_core::emacs_char::char_to_byte8(code)
+    } else {
+        (code & 0xFF) as u8
+    }
+}
+
 /// `capitalize` on a string (no syntax prefix rule).
 fn capitalize_lisp_string(
     text: &LispString,
     is_word: impl Fn(u32) -> bool,
     casetab: &CaseTableOverride,
 ) -> LispString {
-    capitalize_like_gnu(text, is_word, |_| false, casetab, WordRest::Downcase)
+    capitalize_like_gnu(
+        text,
+        is_word,
+        |_| false,
+        casetab,
+        WordRest::Downcase,
+        CaseTarget::String,
+    )
 }
 
 /// `upcase-initials` on a string (no syntax prefix rule).
@@ -472,7 +503,14 @@ pub(crate) fn upcase_initials_lisp_string(
     is_word: impl Fn(u32) -> bool,
     casetab: &CaseTableOverride,
 ) -> LispString {
-    capitalize_like_gnu(text, is_word, |_| false, casetab, WordRest::Keep)
+    capitalize_like_gnu(
+        text,
+        is_word,
+        |_| false,
+        casetab,
+        WordRest::Keep,
+        CaseTarget::String,
+    )
 }
 
 fn preserve_downcase_case_string_payload(code: i64) -> bool {
@@ -1195,7 +1233,14 @@ pub(crate) fn builtin_capitalize_region(
     let is_prefix = crate::emacs_core::syntax::casing_prefix_predicate(ctx);
     let casetab = CaseTableOverride::for_current_buffer(ctx)?;
     casify_region_in_state(ctx, args, "capitalize-region", move |s| {
-        capitalize_like_gnu(s, is_word, is_prefix, &casetab, WordRest::Downcase)
+        capitalize_like_gnu(
+            s,
+            is_word,
+            is_prefix,
+            &casetab,
+            WordRest::Downcase,
+            CaseTarget::Buffer,
+        )
     })
 }
 
@@ -1207,7 +1252,14 @@ pub(crate) fn builtin_upcase_initials_region(
     let is_prefix = crate::emacs_core::syntax::casing_prefix_predicate(ctx);
     let casetab = CaseTableOverride::for_current_buffer(ctx)?;
     casify_region_in_state(ctx, args, "upcase-initials-region", move |s| {
-        capitalize_like_gnu(s, is_word, is_prefix, &casetab, WordRest::Keep)
+        capitalize_like_gnu(
+            s,
+            is_word,
+            is_prefix,
+            &casetab,
+            WordRest::Keep,
+            CaseTarget::Buffer,
+        )
     })
 }
 
@@ -1237,7 +1289,14 @@ pub(crate) fn builtin_capitalize_word(
     let is_prefix = crate::emacs_core::syntax::casing_prefix_predicate(ctx);
     let casetab = CaseTableOverride::for_current_buffer(ctx)?;
     casify_word_in_state(ctx, args, "capitalize-word", move |s| {
-        capitalize_like_gnu(s, is_word, is_prefix, &casetab, WordRest::Downcase)
+        capitalize_like_gnu(
+            s,
+            is_word,
+            is_prefix,
+            &casetab,
+            WordRest::Downcase,
+            CaseTarget::Buffer,
+        )
     })
 }
 

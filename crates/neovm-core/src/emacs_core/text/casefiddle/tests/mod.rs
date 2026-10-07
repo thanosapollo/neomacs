@@ -526,3 +526,28 @@ fn unibyte_capitalization_uses_raw_byte_syntax_and_ascii_fallback_like_gnu() {
     );
     assert_eq!(result, "OK (\"\\351abc\" \"\\351Abc\" \"Ba\")");
 }
+
+/// In a unibyte buffer a case-table mapping that does not fit a byte is cut
+/// to its low byte (GNU `do_casify_unibyte_region`, `make_char_unibyte`),
+/// not replaced by ASCII casing as in a string.  Expected values are GNU's.
+#[test]
+fn unibyte_buffer_capitalization_truncates_wide_mappings_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (mapcar (lambda (op)
+                  (with-temp-buffer
+                    (set-buffer-multibyte nil)
+                    (let ((tbl (copy-case-table (standard-case-table))))
+                      (set-case-syntax-pair ?A ?Ł tbl)
+                      (set-case-table tbl))
+                    (insert "BA xa")
+                    (funcall op)
+                    (buffer-string)))
+                (list (lambda () (capitalize-region 1 6))
+                      (lambda () (goto-char 1) (capitalize-word 2))
+                      (lambda () (upcase-initials-region 1 6))))
+        "#,
+    );
+    assert_eq!(result, r#"OK ("BA Xa" "BA Xa" "BA Xa")"#);
+}
