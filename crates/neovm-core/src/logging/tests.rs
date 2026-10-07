@@ -237,8 +237,8 @@ fn crash_reports_follow_target_policy_and_first_initializer() {
 /// Which of the backend's (INFO, WARN) events pass `make_env_filter` under
 /// `RUST_LOG=directives`, next to whether neovm's own INFO passes.
 fn cranelift_events_enabled(directives: &str) -> (bool, bool, bool) {
-    // SAFETY: test-only; these logging tests read RUST_LOG on this thread
-    // only, inside `make_env_filter`, before restoring it.
+    // SAFETY: nextest runs each test in its own process, so nothing else
+    // reads the environment while this test sets and restores RUST_LOG.
     let saved = std::env::var_os("RUST_LOG");
     unsafe { std::env::set_var("RUST_LOG", directives) };
     let subscriber = Registry::default().with(
@@ -280,4 +280,42 @@ fn cranelift_function_dumps_are_debug_output() {
         cranelift_events_enabled("neovm_core=info"),
         (false, false, true)
     );
+}
+
+#[test]
+fn cranelift_dump_opt_in_reads_directive_levels() {
+    assert!(!wants_cranelift_function_dumps(None));
+    assert!(!wants_cranelift_function_dumps(Some("")));
+    assert!(!wants_cranelift_function_dumps(Some(
+        "info,[span{x=debug}]=info"
+    )));
+    assert!(wants_cranelift_function_dumps(Some("neovm_core=DEBUG")));
+    assert!(wants_cranelift_function_dumps(Some("warn,trace")));
+}
+
+/// The quieting filter keeps the user's level as the subscriber's maximum,
+/// so the `log` bridge still drops finer records before formatting them.
+#[test]
+fn cranelift_quieting_keeps_the_level_hint() {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::layer::Filter;
+    for (directives, level) in [
+        ("info", LevelFilter::INFO),
+        ("warn", LevelFilter::WARN),
+        ("debug", LevelFilter::DEBUG),
+    ] {
+        let saved = std::env::var_os("RUST_LOG");
+        // SAFETY: as in `cranelift_events_enabled`.
+        unsafe { std::env::set_var("RUST_LOG", directives) };
+        let filter = make_env_filter::<Registry>();
+        match saved {
+            Some(saved) => unsafe { std::env::set_var("RUST_LOG", saved) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
+        }
+        assert_eq!(
+            Filter::<Registry>::max_level_hint(&filter),
+            Some(level),
+            "{directives}"
+        );
+    }
 }

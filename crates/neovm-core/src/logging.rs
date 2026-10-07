@@ -240,9 +240,18 @@ where
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     let directives = std::env::var(EnvFilter::DEFAULT_ENV).ok();
     let keep_dumps = wants_cranelift_function_dumps(directives.as_deref());
-    filter.and(tracing_subscriber::filter::filter_fn(move |meta| {
-        keep_dumps || !is_cranelift_function_dump(meta)
-    }))
+    // Carry the user's level hint: without one the combined filter reports no
+    // maximum, and the `log` bridge would pass every trace record of every
+    // dependency on to the dynamic filter.
+    let max_level = filter
+        .max_level_hint()
+        .unwrap_or(tracing_subscriber::filter::LevelFilter::TRACE);
+    filter.and(
+        tracing_subscriber::filter::filter_fn(move |meta| {
+            keep_dumps || !is_cranelift_function_dump(meta)
+        })
+        .with_max_level_hint(max_level),
+    )
 }
 
 /// `cranelift-jit` logs every function it defines, with its whole CLIF body,
