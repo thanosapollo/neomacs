@@ -17,7 +17,8 @@ use super::frame_pass::{BoxSpanSet, FrameParams, FramePassCtx};
 use super::glyphs::{
     CHAR_OVERLAP_MIN_AXIS, RenderedCharBounds, RenderedGlyphGeometry, build_coverage_vertices,
     color_is_grayscale, coverage_background_color, coverage_foreground_color,
-    log_cursor_glyph_alignment, log_rendered_char_overlaps, trace_face_debug_enabled,
+    glyph_geometry_diagnostics_enabled, log_cursor_glyph_alignment, log_rendered_char_overlaps,
+    trace_face_debug_enabled,
 };
 use super::row_reuse;
 use super::{GlyphRenderStats, WgpuRenderer};
@@ -49,6 +50,7 @@ impl WgpuRenderer {
         seen_single_keys: &mut HashSet<GlyphKey>,
         seen_composed_keys: &mut HashSet<ComposedGlyphKey>,
     ) {
+        let geometry_diagnostics = glyph_geometry_diagnostics_enabled();
         for overlay_pass in 0..2 {
             let want_overlay = overlay_pass == 1;
 
@@ -64,19 +66,20 @@ impl WgpuRenderer {
                 seen_single_keys,
                 seen_composed_keys,
                 stats,
+                geometry_diagnostics,
             );
 
-            log_rendered_char_overlaps(
-                ctx.params.frame_glyphs.frame_placement.frame().get(),
-                if want_overlay { "overlay" } else { "text" },
-                &batches.rendered_char_bounds,
-            );
-            log_cursor_glyph_alignment(
-                ctx.params.frame_glyphs.frame_placement.frame().get(),
-                if want_overlay { "overlay" } else { "text" },
-                ctx.params.frame_glyphs,
-                &batches.rendered_char_bounds,
-            );
+            if geometry_diagnostics {
+                let frame_id = ctx.params.frame_glyphs.frame_placement.frame().get();
+                let pass_name = if want_overlay { "overlay" } else { "text" };
+                log_rendered_char_overlaps(frame_id, pass_name, &batches.rendered_char_bounds);
+                log_cursor_glyph_alignment(
+                    frame_id,
+                    pass_name,
+                    ctx.params.frame_glyphs,
+                    &batches.rendered_char_bounds,
+                );
+            }
 
             self.draw_box_borders(ctx, want_overlay, spans);
             self.draw_text_glyph_batches(ctx, want_overlay, glyph_atlas, &batches, stats);
@@ -102,6 +105,7 @@ impl WgpuRenderer {
         seen_single_keys: &mut HashSet<GlyphKey>,
         seen_composed_keys: &mut HashSet<ComposedGlyphKey>,
         stats: &mut GlyphRenderStats,
+        geometry_diagnostics: bool,
     ) -> TextGlyphBatches {
         let frame_glyphs = params.frame_glyphs;
         let face_debug_call_id = params.face_debug_call_id;
@@ -162,6 +166,7 @@ impl WgpuRenderer {
                 seen_single_keys,
                 seen_composed_keys,
                 glyph_face_cache: None,
+                geometry_diagnostics,
             };
             row_reuse::assemble_rows_with_reuse(&chunks, &ctx, cache, &mut tessellator)
         };
@@ -192,6 +197,8 @@ struct LiveRowTessellator<'r, 'p> {
     seen_single_keys: &'r mut HashSet<GlyphKey>,
     seen_composed_keys: &'r mut HashSet<ComposedGlyphKey>,
     glyph_face_cache: Option<(FaceId, MaterializedFaceData)>,
+    /// Collect [`RenderedCharBounds`] for the geometry diagnostics.
+    geometry_diagnostics: bool,
 }
 
 impl row_reuse::RowTessellator for LiveRowTessellator<'_, '_> {
@@ -438,7 +445,10 @@ impl row_reuse::RowTessellator for LiveRowTessellator<'_, '_> {
                                 (glyph_y, glyph_h, tex_v_min_base, tex_v_max_base)
                             };
 
-                        if glyph_w > CHAR_OVERLAP_MIN_AXIS && glyph_h > CHAR_OVERLAP_MIN_AXIS {
+                        if self.geometry_diagnostics
+                            && glyph_w > CHAR_OVERLAP_MIN_AXIS
+                            && glyph_h > CHAR_OVERLAP_MIN_AXIS
+                        {
                             out.bounds.push(RenderedCharBounds {
                                 glyph_index,
                                 row_role: *row_role,

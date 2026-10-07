@@ -2,7 +2,7 @@ use super::{
     CharOverlapClassification, CursorCellAlignment, CursorCellContract, CursorInlineDirection,
     ExpectedCharOverlap, GlyphCellRect, RenderedCharBounds, RenderedGlyphGeometry,
     ResolvedCursorRect, char_overlap, cursor_cell_alignment, cursor_glyph_slot_rect,
-    frame_default_glyph_metrics, log_cursor_glyph_alignment,
+    frame_default_glyph_metrics, geometry_diagnostics_requested, log_cursor_glyph_alignment,
 };
 use neomacs_display_protocol::face::BoxVerticalEdges;
 use neomacs_display_protocol::frame_glyphs::{
@@ -1265,4 +1265,15 @@ fn coverage_shader_validates_grayscale_and_subpixel_entry_points() {
             "missing coverage entry point {name}"
         );
     }
+}
+
+#[test]
+fn geometry_diagnostics_are_opt_in() {
+    use std::ffi::OsStr;
+
+    assert!(!geometry_diagnostics_requested(None));
+    assert!(!geometry_diagnostics_requested(Some(OsStr::new(""))));
+    assert!(!geometry_diagnostics_requested(Some(OsStr::new("0"))));
+    assert!(geometry_diagnostics_requested(Some(OsStr::new("1"))));
+    assert!(geometry_diagnostics_requested(Some(OsStr::new("yes"))));
 }

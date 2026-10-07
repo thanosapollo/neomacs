@@ -809,6 +809,26 @@ pub(super) fn trace_face_debug_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("NEOMACS_TRACE_FACE_COLORS").is_some())
 }
 
+/// Whether the text pass collects per-glyph bounds and runs the overlap and
+/// cursor-alignment diagnostics over them.
+///
+/// The diagnostics only log; they never choose pixels. Collecting the bounds
+/// allocates a label per glyph and the overlap scan sorts and compares every
+/// drawn glyph, on every frame, so they stay off unless
+/// `NEOMACS_GLYPH_GEOMETRY_DIAGNOSTICS` is set to a value other than `0`.
+pub(super) fn glyph_geometry_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        geometry_diagnostics_requested(
+            std::env::var_os("NEOMACS_GLYPH_GEOMETRY_DIAGNOSTICS").as_deref(),
+        )
+    })
+}
+
+pub(super) fn geometry_diagnostics_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty() && value != "0")
+}
+
 fn next_face_debug_call_id() -> u64 {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
