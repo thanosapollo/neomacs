@@ -14481,11 +14481,11 @@ fn pcase_integer_literal_pattern() {
         "emacs-lisp/byte-run",
         "emacs-lisp/backquote",
         "subr",
-        "emacs-lisp/macroexp",
-        "emacs-lisp/pcase",
     ] {
         load_and_report(&mut eval, name, &load_path);
     }
+    // macroexp.el and pcase.el in GNU's loadup.el:148-157 order.
+    crate::test_utils::load_gnu_macroexp_runtime(&mut eval);
 
     // Test 1: basic integer pattern
     tracing::info!("Test 1: pcase with integer literal 32");

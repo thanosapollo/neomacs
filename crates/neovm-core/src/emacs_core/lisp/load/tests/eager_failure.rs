@@ -114,6 +114,81 @@ fn throw_out_of_an_eager_expander_reaches_the_enclosing_catch() {
     assert_eq!(runtime_startup_eval_one(form), "OK (thrown nil nil)");
 }
 
+/// A Lisp tree with no `.elc`: `macroexp.el` is interpreted and `pcase` is
+/// not defined yet, so `macroexp--expand-all`'s own `pcase` calls fail.  GNU
+/// 32.0.50 signals `Eager macro-expansion failure: (void-function pcase)` for
+/// a plain load of `pcase.el` in that state, and loadup.el:148-157 avoids it
+/// by loading `pcase.el` with `macroexp--pending-eager-loads` = `(skip)` and
+/// then reloading `macroexp.el`; the test runtime helpers must do the same.
+#[test]
+fn uncompiled_pcase_loads_only_with_loadup_eager_skip_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let lisp = crate::test_utils::workspace_root().join("lisp");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source_only_runtime = || {
+        let mut eval = crate::emacs_core::eval::Context::new();
+        eval.set_lexical_binding(true);
+        eval.set_variable(
+            "load-path",
+            crate::emacs_core::value::Value::list(vec![crate::emacs_core::value::Value::string(
+                dir.path().to_string_lossy().to_string(),
+            )]),
+        );
+        for name in [
+            "emacs-lisp/debug-early",
+            "emacs-lisp/byte-run",
+            "emacs-lisp/backquote",
+            "subr",
+        ] {
+            super::load_file(&mut eval, &dir.path().join(format!("{name}.el")))
+                .unwrap_or_else(|err| panic!("load {name}: {err:?}"));
+        }
+        eval
+    };
+    std::fs::create_dir_all(dir.path().join("emacs-lisp")).expect("mkdir emacs-lisp");
+    for name in [
+        "emacs-lisp/debug-early.el",
+        "emacs-lisp/byte-run.el",
+        "emacs-lisp/backquote.el",
+        "subr.el",
+        "emacs-lisp/macroexp.el",
+        "emacs-lisp/pcase.el",
+    ] {
+        std::fs::copy(lisp.join(name), dir.path().join(name))
+            .unwrap_or_else(|err| panic!("copy {name}: {err}"));
+    }
+
+    let mut plain = source_only_runtime();
+    super::load_file(&mut plain, &dir.path().join("emacs-lisp/macroexp.el"))
+        .expect("load macroexp.el");
+    let plain_load = plain
+        .eval_str(&format!(
+            "(condition-case err (progn (load {:?} nil t t) 'ok) (error err))",
+            dir.path().join("emacs-lisp/pcase.el").to_string_lossy()
+        ))
+        .expect("plain pcase.el load");
+    assert_eq!(
+        crate::emacs_core::print::print_value(&plain_load),
+        r#"(error "Eager macro-expansion failure: (void-function pcase)")"#
+    );
+
+    let mut eval = source_only_runtime();
+    crate::test_utils::load_gnu_macroexp_runtime(&mut eval);
+    let state = eval
+        .eval_str(
+            "(list (compiled-function-p (symbol-function 'macroexpand-all))
+                   (featurep 'pcase)
+                   (pcase 1 (1 'one))
+                   (pcase '(a . 2) (`(a . ,n) n))
+                   macroexp--pending-eager-loads)",
+        )
+        .expect("pcase after loadup sequence");
+    assert_eq!(
+        crate::emacs_core::print::print_value(&state),
+        "(nil t one 2 nil)"
+    );
+}
+
 /// The fallback is scoped to image construction and restored on exit.
 #[test]
 fn image_construction_scope_is_the_only_fallback_and_nests() {
