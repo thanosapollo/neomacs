@@ -247,6 +247,9 @@ impl RenderApp {
                     let primary = self.frame_windows.primary_window().unwrap();
                     primary.lifecycle.chrome().clone()
                 },
+                // Hints may have changed while the GPU was starting, after
+                // the window was created; apply the next request regardless.
+                applied_geometry_hints: None,
             });
 
         if let Some(state) = self.frame_windows.primary_window()
