@@ -610,8 +610,8 @@ fn decode_float_time(t: f64) -> Result<TicksHz, Flow> {
 
 /// GNU `decode_time_components` (`src/timefns.c:855`): combine the HIGH, LOW,
 /// USEC and PSEC components at resolution HZ (1, 10**6 or 10**12) into an exact
-/// `(TICKS . HZ)`. USEC/PSEC out-of-range values carry into higher-order
-/// components exactly as GNU does.
+/// `(TICKS . HZ)`. The caller accepts only fixnum USEC/PSEC, as required by
+/// GNU (857-858); out-of-range fixnums carry into higher-order components.
 fn decode_time_components(
     high: &Integer,
     low: &Integer,
@@ -720,17 +720,24 @@ fn decode_lisp_time(val: &Value) -> Result<DecodedLispTime, Flow> {
                 let low_car = low.cons_car();
                 let low_tail = low.cons_cdr();
                 if low_tail.is_cons() {
-                    usec = value_to_integer(&low_tail.cons_car()).ok_or_else(time_spec_invalid)?;
+                    usec = Integer::from(
+                        low_tail
+                            .cons_car()
+                            .as_fixnum()
+                            .ok_or_else(time_spec_invalid)?,
+                    );
                     let tail2 = low_tail.cons_cdr();
                     if tail2.is_cons() {
-                        psec = value_to_integer(&tail2.cons_car()).ok_or_else(time_spec_invalid)?;
+                        psec = Integer::from(
+                            tail2.cons_car().as_fixnum().ok_or_else(time_spec_invalid)?,
+                        );
                         hz = trillion_int();
                     } else {
                         hz = million_int();
                     }
                 } else if !low_tail.is_nil() {
                     // (HIGH LOW . USEC) dotted form.
-                    usec = value_to_integer(&low_tail).ok_or_else(time_spec_invalid)?;
+                    usec = Integer::from(low_tail.as_fixnum().ok_or_else(time_spec_invalid)?);
                     hz = million_int();
                 }
                 let high_i = value_to_integer(&high).ok_or_else(time_spec_invalid)?;
@@ -819,7 +826,7 @@ fn ticks_hz_hz_ticks(t: &TicksHz, hz_out: &Integer) -> Result<Integer, Flow> {
 
 /// GNU `time_arith` (`src/timefns.c:1127`): add (or subtract) two Lisp time
 /// values exactly and choose the GNU result representation.
-fn time_arith(a: &Value, b: &Value, subtract: bool) -> Result<Value, Flow> {
+fn time_arith(a: &Value, b: &Value, subtract: bool, output: LispTimeOutput) -> Result<Value, Flow> {
     let da = decode_lisp_time(a)?;
     let db = decode_lisp_time(b)?;
 
@@ -867,34 +874,47 @@ fn time_arith(a: &Value, b: &Value, subtract: bool) -> Result<Value, Flow> {
         (iticks, ihz)
     };
 
-    Ok(time_arith_to_lisp(ticks, hz, &da, &db))
+    Ok(time_arith_to_lisp(ticks, hz, &da, &db, output))
 }
 
 /// Select the result form, mirroring the final `return` of GNU `time_arith`
-/// (`src/timefns.c:1211`). `current-time-list` defaults to t in Neomacs, so an
-/// integer HZ != 1 yields the list form unless an input used `(TICKS . HZ)` or
-/// HZ does not divide a trillion.
+/// (`src/timefns.c:1205-1217`). HZ=1 still yields integer seconds regardless of
+/// `current-time-list`; otherwise its dynamic binding can force pair output.
 fn time_arith_to_lisp(
     ticks: Integer,
     hz: Integer,
     da: &DecodedLispTime,
     db: &DecodedLispTime,
+    output: LispTimeOutput,
 ) -> Value {
     if hz == 1 {
         return Value::make_integer(ticks);
     }
     let a_is_ticks_hz = da.form == TimeInputForm::TicksHz;
     let b_is_ticks_hz = db.form == TimeInputForm::TicksHz;
-    if a_is_ticks_hz || b_is_ticks_hz || !trillion_factor(&hz) {
+    if output == LispTimeOutput::TicksHz || a_is_ticks_hz || b_is_ticks_hz || !trillion_factor(&hz)
+    {
         Value::cons(Value::make_integer(ticks), Value::make_integer(hz))
     } else {
         ticks_hz_list4(&ticks, &hz)
     }
 }
 
-/// GNU `time_cmp` (`src/timefns.c:1250`): compare two exact time values by
-/// cross-multiplying ATICKS*BHZ vs BTICKS*AHZ.
+/// Compare object identity and fixnums before validating timestamps, including
+/// fixnum cars with eq cdrs, matching GNU `time_cmp` (`src/timefns.c:1250-1265`).
+/// Other operands compare exactly by cross-multiplying ATICKS*BHZ vs BTICKS*AHZ.
 fn time_cmp(a: &Value, b: &Value) -> Result<std::cmp::Ordering, Flow> {
+    if a.bits() == b.bits() {
+        return Ok(std::cmp::Ordering::Equal);
+    }
+    let (x, y) = if a.is_cons() && b.is_cons() && a.cons_cdr().bits() == b.cons_cdr().bits() {
+        (a.cons_car(), b.cons_car())
+    } else {
+        (*a, *b)
+    };
+    if let (Some(x), Some(y)) = (x.as_fixnum(), y.as_fixnum()) {
+        return Ok(x.cmp(&y));
+    }
     let da = decode_lisp_time(a)?;
     let db = decode_lisp_time(b)?;
     let lhs = &da.th.ticks * &db.th.hz;
@@ -1778,26 +1798,45 @@ pub(crate) fn builtin_float_time(args: Vec<Value>) -> EvalResult {
 }
 
 /// `(time-add A B)` -> integer seconds, `(HI LO US PS)`, or `(TICKS . HZ)`.
+#[cfg(test)]
 pub(crate) fn builtin_time_add(args: Vec<Value>) -> EvalResult {
     expect_args("time-add", &args, 2)?;
-    time_arith(&args[0], &args[1], false)
+    time_arith(&args[0], &args[1], false, LispTimeOutput::LegacyList)
+}
+
+/// Read `current-time-list` at call time, matching GNU `timefns.c:time_arith`
+/// (1205-1217), without caching or discarding the dynamic binding.
+pub(crate) fn builtin_time_add_in_context(eval: &mut Context, args: Vec<Value>) -> EvalResult {
+    expect_args("time-add", &args, 2)?;
+    time_arith(
+        &args[0],
+        &args[1],
+        false,
+        LispTimeOutput::from_context(eval)?,
+    )
 }
 
 /// `(time-subtract A B)` -> integer seconds, `(HI LO US PS)`, or `(TICKS . HZ)`.
+#[cfg(test)]
 pub(crate) fn builtin_time_subtract(args: Vec<Value>) -> EvalResult {
+    builtin_time_subtract_with_output(args, LispTimeOutput::LegacyList)
+}
+
+/// Read `current-time-list` for both arithmetic and the eq-zero shortcut,
+/// matching GNU `timefns.c:Ftime_subtract` (1236-1242) and `make_lisp_time`.
+pub(crate) fn builtin_time_subtract_in_context(eval: &mut Context, args: Vec<Value>) -> EvalResult {
     expect_args("time-subtract", &args, 2)?;
-    // GNU subtracts identical objects to a zero timestamp without validating,
-    // so `(time-subtract X X)` never errors (`src/timefns.c:1238`). The guard
-    // uses `BASE_EQ` (object identity), so compare bits, not structural equal.
+    builtin_time_subtract_with_output(args, LispTimeOutput::from_context(eval)?)
+}
+
+/// Return a clock-resolution zero for eq operands without decoding them,
+/// matching GNU `timefns.c:Ftime_subtract` (1236-1240), even for invalid times.
+fn builtin_time_subtract_with_output(args: Vec<Value>, output: LispTimeOutput) -> EvalResult {
+    expect_args("time-subtract", &args, 2)?;
     if args[0].bits() == args[1].bits() {
-        return Ok(TimeMicros {
-            secs: 0,
-            usecs: 0,
-            psecs: 0,
-        }
-        .to_list());
+        return Ok(make_lisp_time(0, 0, output));
     }
-    time_arith(&args[0], &args[1], true)
+    time_arith(&args[0], &args[1], true, output)
 }
 
 /// `(time-less-p A B)` -> t or nil

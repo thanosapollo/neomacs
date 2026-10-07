@@ -943,6 +943,119 @@ fn current_time_and_time_convert_respect_current_time_list() {
     assert_eq!(converted.cons_cdr().as_int(), Some(1));
 }
 
+/// Read dynamic `current-time-list` for arithmetic and restore nested bindings,
+/// matching GNU `timefns.c:time_arith` (1205-1217).
+#[test]
+fn time_arithmetic_respects_dynamic_current_time_list_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let results = bootstrap_eval(
+        r#"
+        (let ((current-time-list t))
+          (list (time-add '(0 1 0 0) '(0 1 0 0))
+                (let ((current-time-list nil))
+                  (list (time-add '(0 1 0 0) '(0 1 0 0))
+                        (time-subtract '(0 3 0 0) '(0 1 0 0))
+                        (let ((current-time-list t))
+                          (time-add '(0 1 0 0) '(0 1 0 0)))
+                        (time-add '(0 1 0 0) '(0 1 0 0))
+                        (time-add 1 2)))
+                (time-add '(0 1 0 0) '(0 1 0 0))))
+        "#,
+    );
+    assert_eq!(
+        results,
+        [
+            "OK ((0 2 0 0) ((2000000000000 . 1000000000000) (2000000000000 . 1000000000000) (0 2 0 0) (2000000000000 . 1000000000000) 3) (0 2 0 0))"
+        ]
+    );
+}
+
+/// Subtract eq objects without decoding, using clock-resolution zero rather
+/// than the input's resolution, matching GNU `timefns.c:Ftime_subtract`
+/// (1236-1240) and `make_lisp_time` (818-837).
+#[test]
+fn time_subtract_identical_objects_uses_clock_zero_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let results = bootstrap_eval(
+        r#"
+        (list
+          (let ((current-time-list t))
+            (mapcar (lambda (x) (time-subtract x x))
+                    (list nil 1 1.5 (cons 5 7) (list 0 1 0 0) 'bad)))
+          (let ((current-time-list nil))
+            (list (mapcar (lambda (x) (time-subtract x x))
+                          (list nil 1 1.5 (cons 5 7) (list 0 1 0 0) 'bad))
+                  (time-subtract (cons 5 7) (cons 5 7)))))
+        "#,
+    );
+    assert_eq!(
+        results,
+        [
+            "OK (((0 0 0 0) (0 0 0 0) (0 0 0 0) (0 0 0 0) (0 0 0 0) (0 0 0 0)) (((0 . 1000000000) (0 . 1000000000) (0 . 1000000000) (0 . 1000000000) (0 . 1000000000) (0 . 1000000000)) (0 . 7)))"
+        ]
+    );
+}
+
+/// Bypass validation only for eq objects or fixnum cars with eq cdrs,
+/// matching GNU `timefns.c:time_cmp` (1250-1265); retain the nil guard of
+/// `Ftime_equal_p` (1301-1303) and errors for non-eq cdrs/bignum cars.
+#[test]
+fn time_comparison_shared_invalid_cdr_matches_gnu() {
+    crate::test_utils::init_test_tracing();
+    let results = bootstrap_eval(
+        r#"
+        (let* ((tail (list 'bad))
+               (a (cons 1 tail)) (b (cons 2 tail))
+               (same (cons 1 tail)) (big (cons (expt 2 100) tail))
+               (distinct (cons 2 (list 'bad))))
+          (list (time-less-p '(1 . bad) '(2 . bad))
+                (time-equal-p '(1 . bad) '(1 . bad))
+                (time-less-p a b) (time-less-p b a)
+                (time-equal-p a same) (time-equal-p a b)
+                (time-less-p tail tail) (time-equal-p tail tail)
+                (condition-case e (time-less-p a distinct) (error e))
+                (condition-case e (time-equal-p a distinct) (error e))
+                (condition-case e (time-less-p big a) (error e))
+                (condition-case e (time-equal-p big a) (error e))
+                (time-equal-p nil 'bad)
+                (time-less-p most-negative-fixnum most-positive-fixnum)))
+        "#,
+    );
+    assert_eq!(
+        results,
+        [
+            r#"OK (t t t nil t nil nil t (error "Invalid time specification") (error "Invalid time specification") (error "Invalid time specification") (error "Invalid time specification") nil t)"#
+        ]
+    );
+}
+
+/// Reject bignum USEC/PSEC in proper and dotted legacy forms while allowing
+/// bignum HIGH/LOW, matching GNU `timefns.c:decode_time_components` (857-858,
+/// 905-906), `decode_lisp_time` (989-1018), and `time_spec_invalid` (358-360).
+#[test]
+fn legacy_time_subseconds_reject_bignums_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let results = bootstrap_eval(
+        r#"
+        (let ((big (expt 2 100)))
+          (list (condition-case e (time-add (list 0 0 big 0) 0) (error e))
+                (condition-case e (time-subtract (list 0 0 0 big) 0) (error e))
+                (condition-case e (time-convert (list 0 0 big) t) (error e))
+                (condition-case e (float-time (cons 0 (cons 0 big))) (error e))
+                (condition-case e (time-less-p (list 0 0 big 0) 0) (error e))
+                (condition-case e (time-equal-p (list 0 0 0 big) 0) (error e))
+                (time-convert (list big 0 0 0) 'integer)
+                (time-convert (list 0 big 0 0) 'integer)))
+        "#,
+    );
+    assert_eq!(
+        results,
+        [
+            r#"OK ((error "Invalid time specification") (error "Invalid time specification") (error "Invalid time specification") (error "Invalid time specification") (error "Invalid time specification") (error "Invalid time specification") 83076749736557242056487941267521536 1267650600228229401496703205376)"#
+        ]
+    );
+}
+
 #[test]
 fn make_lisp_time_uses_typed_output_representation() {
     let list = make_lisp_time(1_234_567_890, 123_456_789, LispTimeOutput::LegacyList);

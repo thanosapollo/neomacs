@@ -7304,12 +7304,12 @@ pub(crate) fn register_subrs(ctx: &mut crate::emacs_core::eval::Context) {
     // -- Time/date --
     ctx.register_subr(SubrSpec::new(
         "time-add",
-        NativeFn::ContextVec(|_ctx, args| crate::emacs_core::timefns::builtin_time_add(args)),
+        NativeFn::ContextVec(crate::emacs_core::timefns::builtin_time_add_in_context),
         SubrArity::new(2, Some(2)),
     ));
     ctx.register_subr(SubrSpec::new(
         "time-subtract",
-        NativeFn::ContextVec(|_ctx, args| crate::emacs_core::timefns::builtin_time_subtract(args)),
+        NativeFn::ContextVec(crate::emacs_core::timefns::builtin_time_subtract_in_context),
         SubrArity::new(2, Some(2)),
     ));
     ctx.register_subr(SubrSpec::new(
