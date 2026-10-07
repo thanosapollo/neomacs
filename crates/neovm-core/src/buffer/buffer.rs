@@ -5387,6 +5387,9 @@ impl LiveBuffers {
     }
 }
 
+/// A killed buffer's record, boxed so an empty map bucket costs a pointer.
+type DeadBufferRecord = Box<Buffer>;
+
 /// Owns every live buffer, tracks the current buffer, and hands out ids.
 #[derive(Clone)]
 pub struct BufferManager {
@@ -5397,7 +5400,13 @@ pub struct BufferManager {
     /// Killed buffer objects. GNU does not destroy the Lisp buffer object;
     /// it makes `BUFFER_LIVE_P` false while keeping slots like
     /// `last_name` and `filename` queryable.
-    dead_buffers: FxHashMap<BufferId, Buffer>,
+    ///
+    /// Records are boxed: the map keeps its high-water capacity after the
+    /// collector reclaims them, and an inline `Buffer` would make every
+    /// empty bucket cost a whole record (about 1.3 KB), so a burst of
+    /// temporary buffers between collections stayed resident for the life
+    /// of the session.
+    dead_buffers: FxHashMap<BufferId, DeadBufferRecord>,
     /// The base buffer object of each killed indirect buffer that has a
     /// record. GNU `mark_buffer` marks `base_buffer`, so a referenced dead
     /// indirect buffer keeps its (dead) base, whose record would otherwise
@@ -5939,7 +5948,7 @@ impl BufferManager {
 
     /// Immutable access to a killed buffer by id.
     pub fn get_dead(&self, id: BufferId) -> Option<&Buffer> {
-        self.dead_buffers.get(&id)
+        self.dead_buffers.get(&id).map(Box::as_ref)
     }
 
     /// How many killed buffers still have a record here.
@@ -5947,9 +5956,20 @@ impl BufferManager {
         self.dead_buffers.len()
     }
 
+    /// Entry bytes the killed-record map keeps reserved: usable capacity
+    /// times entry size, leaving out control bytes. The map does not shrink
+    /// when records are reclaimed, so this is set by the most killed buffers
+    /// ever awaiting collection at once.
+    #[cfg(test)]
+    pub(crate) fn dead_buffer_map_reserved_bytes(&self) -> usize {
+        self.dead_buffers.capacity() * std::mem::size_of::<(BufferId, DeadBufferRecord)>()
+    }
+
     /// Immutable access to a buffer object, live or killed.
     pub fn get_any(&self, id: BufferId) -> Option<&Buffer> {
-        self.buffers.get(&id).or_else(|| self.dead_buffers.get(&id))
+        self.buffers
+            .get(&id)
+            .or_else(|| self.dead_buffers.get(&id).map(Box::as_ref))
     }
 
     /// Mutable access to a buffer by id.
@@ -6227,7 +6247,7 @@ impl BufferManager {
         for killed_id in &killed_ids {
             let mut buf = self.buffers.remove(killed_id)?;
             buf.mark_killed_after_local_reset();
-            self.dead_buffers.insert(*killed_id, buf);
+            self.dead_buffers.insert(*killed_id, Box::new(buf));
         }
         // The buffer objects stop being roots: each killed record now lives
         // exactly as long as its object is referenced (`reclaim_dead_buffer`).
@@ -6255,7 +6275,7 @@ impl BufferManager {
 
     /// Return the last known name for a dead buffer id, if available.
     pub fn dead_buffer_last_name_value(&self, id: BufferId) -> Option<Value> {
-        self.dead_buffers.get(&id).map(Buffer::last_name_value)
+        self.dead_buffers.get(&id).map(|buffer| buffer.last_name_value())
     }
 
     /// Drop the record of a killed buffer whose object the collector freed.

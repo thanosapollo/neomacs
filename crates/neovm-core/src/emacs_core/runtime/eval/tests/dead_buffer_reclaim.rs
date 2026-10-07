@@ -108,6 +108,38 @@ fn temp_buffers_stay_flat(mut ev: Context, count: usize) {
     );
 }
 
+/// The killed-record map keeps the capacity of its largest burst after the
+/// collector empties it. That capacity must cost a pointer per bucket, not a
+/// whole buffer record: GNU frees a dead `struct buffer` outright, so a burst
+/// of temporary buffers leaves no per-buffer memory behind.
+#[test]
+fn a_burst_of_killed_buffers_leaves_no_record_sized_buckets_behind() {
+    let mut ev = Context::new();
+    let burst = 2_000;
+    let form = format!(
+        "(let ((gc-cons-threshold most-positive-fixnum))
+           (let ((i 0))
+             (while (< i {burst})
+               (let ((b (get-buffer-create (generate-new-buffer-name \" *temp*\"))))
+                 (save-current-buffer (set-buffer b) (insert \"x\"))
+                 (kill-buffer b))
+               (setq i (1+ i)))))"
+    );
+    ev.eval_str(&form).expect("temp-buffer burst");
+    assert!(
+        ev.buffers.dead_buffer_count() > burst / 2,
+        "the burst must accumulate killed records before collecting"
+    );
+    collect_twice(&mut ev);
+    assert_eq!(ev.buffers.dead_buffer_count(), 0, "records reclaimed");
+    let reserved = ev.buffers.dead_buffer_map_reserved_bytes();
+    assert!(
+        reserved <= burst * 64,
+        "the emptied killed-record map still reserves {reserved} bytes \
+         for a burst of {burst} buffers"
+    );
+}
+
 #[test]
 fn a_referenced_killed_buffer_stays_a_dead_buffer_across_gc() {
     referenced_killed_buffer_survives(Context::new());
