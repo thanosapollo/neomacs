@@ -657,6 +657,112 @@ fn format_percent_g_uses_gnu_fixed_precision_for_negative_exponents() {
     assert_eq!(result.as_utf8_str(), Some("0.00042 0.0042 42"));
 }
 
+/// GNU `styled_format` (editfns.c) hands the sign, space, plus and `#'
+/// flags to sprintf, then pads the field itself: zeros go after the sign
+/// (or the space standing for it) and only when the converted text starts
+/// with a digit, so infinities and NaNs are space-padded; sprintf signs
+/// non-finite values and negative zero by their sign bit; `%d' of a float
+/// prints it through `%.0f', whose leading non-digit is counted as a sign
+/// when adding precision zeros; and an ASCII `%c' is one byte wide.
+/// Expected values are GNU Emacs 32.0.50 output.
+#[test]
+fn format_padding_and_sign_flags_match_gnu_styled_format() {
+    crate::test_utils::init_test_tracing();
+
+    let inf = f64::INFINITY;
+    let nan = f64::NAN;
+    let cases: &[(&str, Value, &[u8])] = &[
+        // Zero padding goes after the space flag's sign position.
+        ("% 06.1f", Value::make_float(1.0), b" 001.0"),
+        ("% 06.1f", Value::make_float(1.5), b" 001.5"),
+        ("%06.1f", Value::make_float(-1.0), b"-001.0"),
+        ("% 05.1f", Value::make_float(-1.5), b"-01.5"),
+        ("%+06.1f", Value::make_float(1.5), b"+001.5"),
+        ("% 03g", Value::fixnum(0), b" 00"),
+        ("% 07.0e", Value::fixnum(1), b" 01e+00"),
+        ("% 0#8.0e", Value::fixnum(1), b" 01.e+00"),
+        // Infinities and NaNs ignore the zero flag.
+        ("%06f", Value::make_float(inf), b"   inf"),
+        ("%05e", Value::make_float(-inf), b" -inf"),
+        ("%05g", Value::make_float(-nan), b" -nan"),
+        ("%-06f|", Value::make_float(nan), b"nan   |"),
+        // Non-finite values take the plus and space flags.
+        ("%+f", Value::make_float(inf), b"+inf"),
+        ("% f", Value::make_float(nan), b" nan"),
+        ("%+e", Value::make_float(nan), b"+nan"),
+        ("%+06g", Value::make_float(inf), b"  +inf"),
+        // Negative zero keeps its sign under the plus and space flags.
+        ("%+.1f", Value::make_float(-0.0), b"-0.0"),
+        ("% g", Value::make_float(-0.0), b"-0"),
+        ("%+e", Value::make_float(-0.0), b"-0.000000e+00"),
+        // %d of a float goes through sprintf's %.0f.
+        ("%d", Value::make_float(-nan), b"-nan"),
+        ("%+d", Value::make_float(nan), b"+nan"),
+        ("% d", Value::make_float(inf), b" inf"),
+        ("%.3d", Value::make_float(inf), b"0inf"),
+        ("%.4d", Value::make_float(-inf), b"-0inf"),
+        ("%+.3d", Value::make_float(inf), b"+inf"),
+        ("%-6.3d|", Value::make_float(nan), b"0nan  |"),
+        ("%05d", Value::make_float(-inf), b" -inf"),
+        ("%.0d", Value::make_float(0.0), b"0"),
+        ("%2.0d", Value::make_float(-0.0), b" 0"),
+        ("%+d", Value::make_float(-0.0), b"+0"),
+        ("%.0d", Value::fixnum(0), b""),
+        // An ASCII %c is one byte, whatever its display width.
+        ("%.1c", Value::fixnum(0), b"\0"),
+        ("%2c", Value::fixnum(1), b" \x01"),
+        ("%-3c|", Value::fixnum(1), b"\x01  |"),
+        ("%1.0c|", Value::fixnum(1), b" |"),
+        ("%03c", Value::fixnum(65), b"  A"),
+    ];
+
+    let mut ctx = crate::emacs_core::eval::Context::new();
+    let mut mismatches = Vec::new();
+    for (fmt, arg, expected) in cases {
+        let got = builtin_format_wrapper_strict_slice(&mut ctx, &[Value::string(*fmt), *arg])
+            .expect("format should evaluate");
+        let got = got
+            .as_lisp_string()
+            .expect("format should return a string")
+            .as_bytes()
+            .to_vec();
+        if got != *expected {
+            mismatches.push(format!(
+                "{fmt}: got {:?}, GNU {:?}",
+                String::from_utf8_lossy(&got),
+                String::from_utf8_lossy(expected)
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// GNU `styled_format` converts a float for %o, %x, %X or %b through
+/// `double_to_integer`, which signals `overflow-error' for an infinity or
+/// a NaN.
+#[test]
+fn format_unsigned_conversions_of_non_finite_floats_signal_overflow_error() {
+    crate::test_utils::init_test_tracing();
+
+    let mut ctx = crate::emacs_core::eval::Context::new();
+    for fmt in ["%o", "%x", "%X", "%b", "%#5x"] {
+        for f in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -f64::NAN] {
+            let err = builtin_format_wrapper_strict_slice(
+                &mut ctx,
+                &[Value::string(fmt), Value::make_float(f)],
+            )
+            .expect_err("non-finite float must not convert to an integer");
+            match err.into_kind() {
+                crate::emacs_core::error::FlowKind::Signal(sig) => {
+                    assert_eq!(sig.symbol_name(), "overflow-error", "{fmt} {f}");
+                    assert!(sig.data.is_empty(), "{fmt} {f}");
+                }
+                other => panic!("expected overflow-error for {fmt} {f}, got {other:?}"),
+            }
+        }
+    }
+}
+
 #[test]
 fn format_rejects_uppercase_float_conversions() {
     // GNU `Fformat`/`doprnt` only treats lowercase e/f/g as float conversions
