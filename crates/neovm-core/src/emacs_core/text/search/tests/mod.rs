@@ -1199,7 +1199,7 @@ fn replace_match_cases_with_the_buffers_tables_like_gnu() {
     crate::test_utils::init_test_tracing();
     let result = crate::test_utils::runtime_startup_eval_one(
         r#"
-        (cl-flet ((run (setup matched newtext)
+        (let ((run (lambda (setup matched newtext)
                     (with-temp-buffer
                       (set-syntax-table (make-syntax-table))
                       (funcall setup)
@@ -1210,22 +1210,22 @@ fn replace_match_cases_with_the_buffers_tables_like_gnu() {
                               (progn (erase-buffer) (insert s) (goto-char (point-min))
                                      (search-forward matched)
                                      (replace-match newtext nil nil)
-                                     (buffer-string)))))))
+                                     (buffer-string))))))))
           (list
            ;; H made caseless: no capitalized initial, so no change.
-           (run (lambda ()
+           (funcall run (lambda ()
                   (let ((tbl (copy-case-table (standard-case-table))))
                     (set-case-syntax ?H "w" tbl)
                     (set-case-table tbl)))
                 "Hello" "world")
            ;; Word boundaries come from the syntax table.
-           (run (lambda () (modify-syntax-entry ?- "w")) "Hello" "foo-bar")
-           (run #'ignore "Hello" "foo-bar")
-           (run (lambda () (setq-local case-symbols-as-words t)) "Hello" "foo_bar")
+           (funcall run (lambda () (modify-syntax-entry ?- "w")) "Hello" "foo-bar")
+           (funcall run #'ignore "Hello" "foo-bar")
+           (funcall run (lambda () (setq-local case-symbols-as-words t)) "Hello" "foo_bar")
            ;; The prefix flag matters only in the buffer.
-           (run (lambda () (modify-syntax-entry ?' "w p")) "Hello" "'foo")
+           (funcall run (lambda () (modify-syntax-entry ?' "w p")) "Hello" "'foo")
            ;; Initials are titlecased.
-           (run #'ignore "École" "ǆemal")))
+           (funcall run #'ignore "École" "ǆemal")))
         "#,
     );
     assert_eq!(
