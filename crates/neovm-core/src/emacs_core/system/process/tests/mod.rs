@@ -9830,6 +9830,54 @@ fn read_process_output_max_limits_filter_chunks_and_snapshots_at_creation() {
 /// the read ceiling).  A read must still deliver only the bytes it got:
 /// a short read after a long one, or a small-`readmax' process after a
 /// large one, never sees what an earlier read left in the buffer.
+/// The read buffer is shared by every process, and a filter may read
+/// another process's output (`accept-process-output` inside a filter).  The
+/// outer chunk must already be its own string by then.
+#[test]
+fn nested_process_reads_inside_a_filter_keep_each_chunk_intact() {
+    crate::test_utils::init_test_tracing();
+    // A's filter feeds B (`cat') and waits for B's echo before keeping its
+    // own chunk, so B is read into the shared buffer while A's chunk is live.
+    let result = runtime_startup_eval_one(
+        r#"(let ((process-connection-type nil)
+                 (a-out nil) (b-out nil) (nested 0) a b)
+             (unwind-protect
+                 (progn
+                   (setq b (make-process
+                            :name "nested-read-b" :buffer nil :connection-type 'pipe
+                            :command '("cat")
+                            :filter (lambda (_ s) (push s b-out))))
+                   (setq a (make-process
+                            :name "nested-read-a" :buffer nil :connection-type 'pipe
+                            :command (list "/bin/sh" "-c"
+                                           "for i in 1 2 3; do printf %030d 0; sleep 0.1; done")
+                            :filter
+                            (lambda (_ s)
+                              (let ((want (+ 10 (length (apply #'concat b-out))))
+                                    (tries 0))
+                                (process-send-string b "BBBBBBBBBB")
+                                (while (and (< (length (apply #'concat b-out)) want)
+                                            (< (setq tries (1+ tries)) 50))
+                                  (accept-process-output b 0.1))
+                                (when (>= (length (apply #'concat b-out)) want)
+                                  (setq nested (1+ nested))))
+                              (push s a-out))))
+                   (while (process-live-p a)
+                     (accept-process-output a 0.1))
+                   (while (accept-process-output a 0))
+                   (let ((as (apply #'concat (reverse a-out)))
+                         (bs (apply #'concat (reverse b-out))))
+                     (list (length as) (string-match-p "\\`0*\\'" as)
+                           (string-match-p "\\`B*\\'" bs)
+                           (= (length bs) (* 10 nested))
+                           (= nested (length a-out))
+                           (> nested 0))))
+               (ignore-errors (delete-process a))
+               (ignore-errors (delete-process b))))"#,
+    );
+    assert_eq!(result, "OK (90 0 0 t t t)");
+}
+
 #[test]
 fn process_reads_share_a_buffer_without_leaking_earlier_bytes() {
     crate::test_utils::init_test_tracing();

@@ -20,7 +20,8 @@ impl crate::emacs_core::Context {
         // A keyboard macro's commands are not input arriving faster than
         // display: GNU's `read_char' returns the next macro event before it
         // reaches redisplay, so nothing repaints automatically between the
-        // commands of a macro (explicit `redisplay' calls still paint).
+        // commands of a macro.  (Explicit `redisplay' is a no-op inside a
+        // macro as well, in GNU `Fredisplay' and here.)
         if self.display_idle_maintenance_fn.is_none()
             || !pending
             || self.command_loop.is_executing_kbd_macro()
@@ -136,5 +137,48 @@ mod tests {
             1,
             "pending input still paints after the macro"
         );
+    }
+
+    /// The same rule through the real command loop: `execute-kbd-macro` runs
+    /// each macro command through `command_loop_1`, whose boundary service
+    /// would otherwise paint (typed input pending, frame deadline overdue).
+    #[test]
+    fn keyboard_macro_commands_run_without_automatic_repaints() {
+        let mut eval = crate::emacs_core::Context::new();
+        eval.eval_str("(setq inhibit-redisplay nil)").unwrap();
+        eval.display_idle_maintenance_fn = Some(Box::new(|_| (None, true)));
+        let paints = Rc::new(Cell::new(0));
+        let observed = paints.clone();
+        eval.redisplay_fn = Some(Box::new(move |_| observed.set(observed.get() + 1)));
+        // Typed input waiting in the frontend transport: macro events are
+        // read before it, so it stays pending for the whole macro.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        eval.input_rx = Some(rx);
+        tx.send(crate::keyboard::InputEvent::KeyPress {
+            key: KeyEvent::char('z'),
+            emacs_frame_id: 0,
+        })
+        .unwrap();
+        eval.command_loop.gui_display_deadline = Some(Instant::now() - Duration::from_secs(1));
+        let steps = eval
+            .eval_str(
+                r#"(progn
+                     (setq neo-kmacro-steps 0)
+                     (fset 'command-execute
+                           (lambda (command &optional _record _keys _special)
+                             (funcall command)))
+                     (fset 'neo-kmacro-step
+                           (lambda () (interactive)
+                             (setq neo-kmacro-steps (1+ neo-kmacro-steps))))
+                     (let ((global (make-sparse-keymap)))
+                       (use-global-map global)
+                       (define-key global "a" 'neo-kmacro-step)
+                       (execute-kbd-macro "aaaaaaaa"))
+                     neo-kmacro-steps)"#,
+            )
+            .unwrap();
+        assert_eq!(steps, Value::fixnum(8));
+        assert_eq!(paints.get(), 0);
+        assert!(eval.command_loop.gui_display_deadline.is_none());
     }
 }
