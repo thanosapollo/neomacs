@@ -85,6 +85,14 @@ pub struct WindowId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameId(pub u64);
 
+/// Presentation of the frame's requested menu/tool bars. Compact presentation
+/// replaces their pixel bands without changing their Lisp frame parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuiBarPresentation {
+    Separate,
+    Compact,
+}
+
 pub mod frame_alpha;
 
 /// Whether a logical frame selection may retarget existing focus redirections.
@@ -4113,6 +4121,8 @@ pub struct Frame {
     pub displays_chrome: bool,
     /// GNU `struct frame.title`: explicit title override, or nil.
     pub title: Value,
+    /// Retained projection policy, including while this frame is unselected.
+    gui_bar_presentation: GuiBarPresentation,
     /// Menu bar height in pixels.
     pub menu_bar_height: u32,
     /// Tool bar height in pixels.
@@ -4316,6 +4326,7 @@ impl Frame {
             // Set true only once an interactive frontend displays this frame.
             displays_chrome: false,
             title: Value::NIL,
+            gui_bar_presentation: GuiBarPresentation::Separate,
             menu_bar_height: 0,
             tool_bar_height: 0,
             compact_bar_height: 0,
@@ -4987,8 +4998,8 @@ impl Frame {
 
     /// Recompute `menu_bar_height` from the `menu-bar-lines` frame parameter.
     ///
-    /// Mirrors GNU `frame.c` (`x_set_menu_bar_lines` / TTY frame init at
-    /// frame.c:1307-1309): `FRAME_MENU_BAR_LINES (f) = NILP (Vmenu_bar_mode) ? 0 : 1`.
+    /// Mirrors GNU's internal menu-bar geometry. The mode supplies a default
+    /// at frame creation; subsequent geometry follows the frame parameter.
     /// On TTY the menu bar takes one character row, identical to GNU's
     /// behaviour, so the resulting pixel height is `lines * char_height`
     /// where `char_height` is 1 for TTY frames.
@@ -4998,13 +5009,16 @@ impl Frame {
     /// `sync_window_area_bounds()` here is enough to push the root window
     /// (and its mode line / minibuffer) down to make room.
     pub fn sync_menu_bar_height_from_parameters(&mut self) {
+        self.sync_bar_heights_from_parameters();
+    }
+
+    fn menu_bar_pixel_height_from_parameters(&self) -> u32 {
         let lines = self
             .known_frame_parameter_int(FrameParam::MenuBarLines)
             .unwrap_or(0)
             .max(0) as u32;
         let char_height = self.char_height.max(1.0).round() as u32;
-        self.menu_bar_height = lines.saturating_mul(char_height);
-        self.sync_window_area_bounds();
+        lines.saturating_mul(char_height)
     }
 
     /// GNU `FRAME_TOP_MARGIN(f)` (`frame.h:1132`) = `FRAME_MENU_BAR_LINES` +
@@ -5032,30 +5046,57 @@ impl Frame {
     /// GUI frames Neomacs follows that pixel model, scaled to the frame font
     /// pixels because our renderer works in physical frame pixels.
     pub fn sync_tool_bar_height_from_parameters(&mut self) {
-        let lines = self
-            .known_frame_parameter_int(FrameParam::ToolBarLines)
-            .unwrap_or(0)
-            .max(0) as u32;
-        let line_height = if self.effective_window_system().is_some() {
-            default_gui_tool_bar_line_height(self.font_pixel_size)
-        } else {
-            self.char_height.max(1.0).round() as u32
-        };
-        self.tool_bar_height = lines.saturating_mul(line_height);
-        self.sync_window_area_bounds();
+        self.sync_bar_heights_from_parameters();
+    }
+
+    fn tool_bar_pixel_height_from_parameters(&self) -> u32 {
+        self.gui_button_bar_pixel_height(
+            self.known_frame_parameter_int(FrameParam::ToolBarLines)
+                .unwrap_or(0),
+        )
     }
 
     pub fn sync_compact_bar_height_from_parameters(&mut self) {
-        let lines = self
-            .frame_parameter_int("compact-bar-lines")
-            .unwrap_or(0)
-            .max(0) as u32;
+        self.sync_bar_heights_from_parameters();
+    }
+
+    fn compact_bar_pixel_height_from_parameters(&self) -> u32 {
+        self.gui_button_bar_pixel_height(self.frame_parameter_int("compact-bar-lines").unwrap_or(0))
+    }
+
+    fn gui_button_bar_pixel_height(&self, lines: i64) -> u32 {
         let line_height = if self.effective_window_system().is_some() {
             default_gui_tool_bar_line_height(self.font_pixel_size)
         } else {
             self.char_height.max(1.0).round() as u32
         };
-        self.compact_bar_height = lines.saturating_mul(line_height);
+        (lines.max(0) as u32).saturating_mul(line_height)
+    }
+
+    /// Project requested frame-local bars into effective pixel geometry, then
+    /// reflow once. The read-only height helpers cannot overwrite parameters;
+    /// the exhaustive presentation choice cannot reserve both replacement and
+    /// original bands. Global Lisp modes are deliberately absent from this API.
+    pub fn sync_gui_bar_heights_from_parameters(&mut self, presentation: GuiBarPresentation) {
+        self.gui_bar_presentation = presentation;
+        self.sync_bar_heights_from_parameters();
+    }
+
+    /// Reproject bar geometry using this frame's retained presentation.
+    /// Parameter and font mutations must preserve the same exclusive bands.
+    pub fn sync_bar_heights_from_parameters(&mut self) {
+        match self.gui_bar_presentation {
+            GuiBarPresentation::Separate => {
+                self.menu_bar_height = self.menu_bar_pixel_height_from_parameters();
+                self.tool_bar_height = self.tool_bar_pixel_height_from_parameters();
+                self.compact_bar_height = 0;
+            }
+            GuiBarPresentation::Compact => {
+                self.menu_bar_height = 0;
+                self.tool_bar_height = 0;
+                self.compact_bar_height = self.compact_bar_pixel_height_from_parameters();
+            }
+        }
         self.sync_window_area_bounds();
     }
 
