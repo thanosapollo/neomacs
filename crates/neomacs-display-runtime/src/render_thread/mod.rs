@@ -40,6 +40,12 @@ mod terminal_commands;
 #[cfg(feature = "neo-term")]
 mod terminal_expansion;
 #[cfg(test)]
+#[path = "tests/legacy_frame_admission_test.rs"]
+mod legacy_frame_admission_test;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tests/legacy_ready_native_test.rs"]
+mod legacy_ready_native_test;
+#[cfg(test)]
 #[path = "tests/render_thread_test.rs"]
 mod tests;
 #[cfg(test)]

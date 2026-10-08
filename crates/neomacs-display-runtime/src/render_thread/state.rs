@@ -1110,6 +1110,7 @@ impl RenderApp {
                         ..WindowChrome::default()
                     },
                     geometry_hints: None,
+                    fullscreen: None,
                 },
                 render: GuiFrameRenderState::new_without_device(
                     0,

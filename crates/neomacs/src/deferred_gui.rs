@@ -567,6 +567,7 @@ fn display_host(
         font_sizing: display.font_sizing(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: HashMap::new(),
         last_window_titles: Mutex::new(HashMap::new()),
         font_metrics: None,
         primary_window_size,

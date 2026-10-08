@@ -240,6 +240,7 @@ fn recreated_device_has_no_old_pane_bindings_and_keeps_cpu_scene() {
             last_ime_cursor_area: None,
             chrome: Default::default(),
             geometry_hints: None,
+            fullscreen: None,
         },
         render,
     });

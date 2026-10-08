@@ -7281,9 +7281,15 @@ pub(crate) fn x_create_frame_impl(
                 .and_then(|host| host.gui_frame_metrics())
                 .map(
                     |(char_width, char_height, font_pixel_size, device_scale_factor)| {
+                        // Size every deferred frame like the first one.
+                        let (width_px, height_px) = crate::window::default_gui_frame_pixel_size(
+                            char_width,
+                            char_height,
+                            font_pixel_size,
+                        );
                         GuiFrameMetrics {
-                            width_px: 80 * char_width as u32,
-                            height_px: 40 * char_height as u32,
+                            width_px,
+                            height_px,
                             char_width,
                             char_height,
                             font_pixel_size,
@@ -7720,9 +7726,8 @@ pub(crate) fn delete_frame_owned(
         } => {}
     }
     if let Some(host) = eval.display_host.as_mut() {
-        // Lisp deletion has committed. A failed opacity notification must not
-        // skip native destruction or leave a deferred window lease live.
-        let opacity_result = host.retire_gui_frame_alpha(fid);
+        // Lisp deletion has committed. Retire the native identity before any
+        // fallible cosmetic notification, then attempt both and keep diagnostics.
         let destruction_result = if was_gui_child_frame {
             tracing::info!(
                 frame_id = fid.0,
@@ -7734,6 +7739,7 @@ pub(crate) fn delete_frame_owned(
         } else {
             Ok(())
         };
+        let opacity_result = host.retire_gui_frame_alpha(fid);
         let result = match (opacity_result, destruction_result) {
             (Err(opacity), Err(destruction)) => Err(format!(
                 "{opacity}; native GUI destruction failed: {destruction}"

@@ -421,7 +421,8 @@ pub enum WindowCommand {
         fullscreen: Option<WindowFullscreenMode>,
         visual: Option<VisualConfig>,
         adopt_primary: bool,
-        reply: Sender<Result<(), String>>,
+        // Deferred realization owns readiness; legacy ownership is admission-only.
+        reply: Option<Sender<Result<(), String>>>,
         live: std::sync::Arc<std::sync::atomic::AtomicBool>,
         deadline: std::time::Instant,
     },

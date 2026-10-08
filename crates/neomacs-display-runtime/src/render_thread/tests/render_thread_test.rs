@@ -82,6 +82,108 @@ fn deferred_gui_connection_only_services_saturation_and_later_frame() {
 }
 
 #[test]
+fn pending_gpu_legacy_full_staging_observes_later_shutdown_without_evaluator_lifetime() {
+    use crate::thread_comm::{ConfigCommand, LifecycleCommand};
+    let (emacs, render) = ThreadComms::new().split();
+    let mut app = make_test_app();
+    app.comms = render;
+    // This is the legacy bootstrap's exact lifetime policy, not a dropped
+    // evaluator channel standing in for an explicit shutdown command.
+    let initial = super::startup::InitialWindow::Ready {
+        size: super::startup::InitialWindowSize { width: 800, height: 600 },
+        evaluator: None,
+    };
+    assert!(matches!(initial, super::startup::InitialWindow::Ready { evaluator: None, .. }));
+    assert!(!app.comms.keep_alive_without_frames);
+    for index in 0..64 {
+        emacs.cmd_tx.try_send(RenderCommand::Config(ConfigCommand::SetExtraSpacing {
+            line_spacing: index as f32,
+            letter_spacing: 0.0,
+        })).unwrap();
+    }
+    assert!(!app.process_startup_commands());
+    assert_eq!(app.startup_commands.len(), 64);
+    assert!(app.comms.cmd_rx.is_empty());
+    assert!(app.gpu.is_none());
+    emacs.cmd_tx.try_send(RenderCommand::Lifecycle(LifecycleCommand::Shutdown)).unwrap();
+    // Exactly the next pending-GPU owner pass must observe the admitted command.
+    assert!(app.process_startup_commands());
+    assert!(app.lifecycle_flags.is_shutting_down());
+    assert!(app.gpu.is_none());
+    assert_eq!(app.startup_commands.len(), 64);
+    for (index, command) in app.startup_commands.iter().enumerate() {
+        assert!(matches!(command, RenderCommand::Config(ConfigCommand::SetExtraSpacing {
+            line_spacing, ..
+        }) if *line_spacing == index as f32));
+    }
+}
+
+#[test]
+fn deferred_gui_full_gpu_staging_services_later_cpu_frame_and_shutdown() {
+    use crate::thread_comm::{AssetCommand, ConfigCommand, LifecycleCommand};
+    let (emacs, render) = ThreadComms::new().split();
+    let mut app = make_test_app();
+    app.comms = render;
+    app.comms.keep_alive_without_frames = true;
+    app.retire_pending_primary();
+    assert!(app.frame_windows.primary_window().is_none());
+    for id in 0..64 {
+        emacs.cmd_tx.try_send(RenderCommand::Asset(AssetCommand::SurfaceFree { id })).unwrap();
+    }
+    assert!(!app.process_startup_commands());
+    assert_eq!(app.startup_commands.len(), 64);
+    assert!(app.comms.cmd_rx.is_empty());
+    // Another GPU prefix must not hide CPU lifecycle work behind full staging.
+    for id in 64..124 {
+        emacs.cmd_tx.try_send(RenderCommand::Asset(AssetCommand::SurfaceFree { id })).unwrap();
+    }
+    for line_spacing in [1.0, 2.0] {
+        emacs.cmd_tx.try_send(RenderCommand::Config(ConfigCommand::SetExtraSpacing {
+            line_spacing, letter_spacing: 3.0,
+        })).unwrap();
+    }
+    emacs.cmd_tx.try_send(RenderCommand::Window(WindowCommand::CreateWindow {
+        frame: FrameRef::Frame(0x43), width: 901, height: 603,
+        title: "later frame".into(),
+        geometry_hints: GuiFrameGeometryHints {
+            base_width: 0, base_height: 0, min_width: 1, min_height: 1,
+            width_inc: 1, height_inc: 1,
+        },
+    })).unwrap();
+    let (reply, ready) = crossbeam_channel::bounded(1);
+    emacs.cmd_tx.try_send(RenderCommand::Window(WindowCommand::AwaitFrameReady {
+        frame: FrameRef::Frame(0x43), reply,
+    })).unwrap();
+    assert!(matches!(
+        emacs.cmd_tx.try_send(RenderCommand::Asset(AssetCommand::SurfaceFree { id: 124 })),
+        Err(crossbeam_channel::TrySendError::Full(RenderCommand::Asset(AssetCommand::SurfaceFree { id: 124 })))
+    ));
+    assert!(!app.process_startup_commands());
+    assert_eq!(app.startup_commands.len(), 64);
+    assert_eq!(app.extra_line_spacing, 2.0);
+    assert_eq!(app.frame_windows.primary_event_frame_id(), 0x43);
+    assert_eq!((app.pending_content_size.width, app.pending_content_size.height), (901, 603));
+    assert!(app.gpu.is_none());
+    assert!(matches!(ready.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+    for id in 124..128 {
+        emacs.cmd_tx.try_send(RenderCommand::Asset(AssetCommand::SurfaceFree { id })).unwrap();
+    }
+    // Even full transport plus full staging cannot consume shutdown capacity.
+    emacs.cmd_tx.try_send(RenderCommand::Lifecycle(LifecycleCommand::Shutdown)).unwrap();
+    assert!(app.process_startup_commands());
+    assert!(app.lifecycle_flags.is_shutting_down());
+    assert!(app.gpu.is_none());
+    for (id, command) in app.startup_commands.iter().enumerate() {
+        assert!(matches!(command, RenderCommand::Asset(AssetCommand::SurfaceFree { id: actual }) if *actual == id as u32));
+    }
+    for id in 64..128 {
+        assert!(matches!(app.comms.cmd_rx.try_recv().unwrap(),
+            RenderCommand::Asset(AssetCommand::SurfaceFree { id: actual }) if actual == id));
+    }
+    assert!(app.comms.cmd_rx.is_empty());
+}
+
+#[test]
 fn deferred_gui_pending_primary_close_rejects_exact_frame_and_recreates() {
     let mut app = make_test_app();
     app.comms.keep_alive_without_frames = true;

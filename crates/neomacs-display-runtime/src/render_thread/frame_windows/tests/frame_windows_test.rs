@@ -503,6 +503,7 @@ fn zero_size_observation_stays_suspended_after_scale_refresh() {
             last_ime_cursor_area: None,
             chrome: Default::default(),
             geometry_hints: None,
+            fullscreen: None,
         },
         render: GuiFrameRenderState::new_without_device(
             42,
@@ -1583,6 +1584,7 @@ fn pending_window_stores_all_fields() {
         height: 1080,
         title: "My Emacs Frame".to_string(),
         geometry_hints: default_geometry_hints(),
+        fullscreen: None,
     };
 
     assert_eq!(pw.emacs_frame_id, 123);
@@ -1599,6 +1601,7 @@ fn pending_window_unicode_title() {
         height: 600,
         title: "Emacs \u{2014} \u{1F680} Neomacs".to_string(),
         geometry_hints: default_geometry_hints(),
+        fullscreen: None,
     };
 
     assert!(pw.title.contains('\u{2014}')); // em dash
