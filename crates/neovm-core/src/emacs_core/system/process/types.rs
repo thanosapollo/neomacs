@@ -8498,10 +8498,10 @@ impl super::super::eval::Context {
     /// loop and `send_process` hold the process in a C local (`proc`) while
     /// they decode output, run filters and sentinels, and wait on a
     /// connection or a full pipe; this side holds only an id there.  A
-    /// `:post-read-conversion`, filter, sentinel or timer that deletes one of
-    /// these processes and collects must not free the deleted record the
-    /// rest of the pass still reaches by id.  Ids without a record are left
-    /// alone, so no object is made for them.
+    /// `:pre-write-conversion`, `:post-read-conversion`, filter, sentinel or
+    /// timer that deletes one of these processes and collects must not free
+    /// the deleted record the rest of the pass still reaches by id. Ids without
+    /// a record are left alone, so no object is made for them.
     pub(super) fn with_processes_rooted<T>(
         &mut self,
         ids: &[ProcessId],

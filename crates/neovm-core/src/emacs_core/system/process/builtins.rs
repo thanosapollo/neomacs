@@ -4616,6 +4616,20 @@ fn encode_process_send_input_in_context(
     Ok(LispString::from_unibyte(encoded))
 }
 
+/// Keep the resolved process owned across pre-write Lisp, descriptor
+/// reacquisition, and the subsequent callback-capable send. A name/nil/buffer
+/// designator does not itself root the process if a hook deletes it.
+fn encode_and_send_process_input_in_context(
+    eval: &mut super::super::eval::Context,
+    id: ProcessId,
+    input: LispString,
+) -> Result<(), Flow> {
+    eval.with_processes_rooted(&[id], |eval| {
+        let encoded = encode_process_send_input_in_context(eval, id, input)?;
+        eval.send_process_input_reentrant(id, &encoded)
+    })
+}
+
 /// (process-send-string PROCESS STRING) -> nil
 pub(crate) fn builtin_process_send_string(
     eval: &mut super::super::eval::Context,
@@ -4643,8 +4657,7 @@ pub(crate) fn builtin_process_send_string(
     {
         return Err(signal_process_not_running_in_manager(&eval.processes, id));
     }
-    let encoded = encode_process_send_input_in_context(eval, id, input)?;
-    eval.send_process_input_reentrant(id, &encoded)?;
+    encode_and_send_process_input_in_context(eval, id, input)?;
     Ok(Value::NIL)
 }
 
@@ -5339,8 +5352,7 @@ pub(crate) fn builtin_process_send_region(
         buf.buffer_substring_lisp_string_range(region)
     };
 
-    let encoded = encode_process_send_input_in_context(eval, id, region_text)?;
-    eval.send_process_input_reentrant(id, &encoded)?;
+    encode_and_send_process_input_in_context(eval, id, region_text)?;
     Ok(Value::NIL)
 }
 

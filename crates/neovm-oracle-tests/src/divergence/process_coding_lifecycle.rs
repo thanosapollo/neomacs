@@ -115,6 +115,35 @@ fn proc_tty_name_nil() {
     );
 }
 
+const PROCESS_PRE_WRITE_LIFETIME_CASES: &str = include_str!(
+    "../../../neovm-core/src/emacs_core/runtime/eval/tests/process_pre_write_lifetime.el"
+);
+
+/// Qualify only under the approved process sandbox, in live/verify oracle mode.
+/// Compare the complete deleted/closed-send diagnostic, not just `error`, as
+/// well as weak-key ownership in the hook and reclamation after normal/unwind
+/// return. No GNU transcript is frozen here without executing the comparison.
+#[test]
+fn process_send_name_only_pre_write_deletion_and_unwind_match_gnu() {
+    return_if_neovm_enable_oracle_proptest_not_set!();
+    for primitive in ["process-send-string", "process-send-region"] {
+        for throwp in ["nil", "t"] {
+            assert_oracle_parity(&format!(
+                "(progn {PROCESS_PRE_WRITE_LIFETIME_CASES}
+                   (dps-pre-write-lifetime-setup {throwp})
+                   (garbage-collect)
+                   (garbage-collect)
+                   (dps-pre-write-lifetime-send '{primitive})
+                   (garbage-collect)
+                   (garbage-collect)
+                   (list dps-pre-write-inside-count dps-pre-write-inside-state
+                         dps-pre-write-cleanup-count dps-pre-write-result
+                         (hash-table-count dps-pre-write-weak)))"
+            ));
+        }
+    }
+}
+
 const PROCESS_SEND_ENCODING_CASES: &str =
     include_str!("../../../neomacs-gui-tests/fixtures/process-send-encoding-cases.el");
 
