@@ -294,6 +294,8 @@ Return a bounded printed value; effects are not rolled back on failure."
     (cancel-timer timer) (process-put peer 'send-timer nil))
   (when (and neomacs-mcp--active (eq peer (plist-get neomacs-mcp--active :peer)))
     (setf (plist-get neomacs-mcp--active :cancelled) t))
+  ;; Like `delete-process', never kill PEER's buffer: the listener's
+  ;; filter gives connections none, so any buffer is not ours.
   (when (process-live-p peer) (delete-process peer)))
 
 (defun neomacs-mcp--sentinel (peer _event)
@@ -478,7 +480,7 @@ This is cooperative admission, not a handler, serialization or send deadline."
   "Admit PEER from LISTENER, subject to the finite connection quota."
   (if (or (not (eq listener neomacs-mcp--listener))
           (>= (length neomacs-mcp--peers) neomacs-mcp--peer-limit))
-      (delete-process peer)
+      (neomacs-mcp--close peer)
     (push peer neomacs-mcp--peers)
     (process-put peer 'generation neomacs-mcp--generation)
     (process-put peer 'input (encode-coding-string "" 'no-conversion))
@@ -565,7 +567,11 @@ Loading the library alone never starts a listener."
   (cl-incf neomacs-mcp--generation)
   (let ((listener (make-network-process
                    :name "neomacs-mcp" :family 'local :service socket
-                   :server t :noquery t :coding 'no-conversion :log #'neomacs-mcp--accept)))
+                   :server t :noquery t :coding 'no-conversion
+                   ;; Like GNU `server-start': a listener with a filter
+                   ;; gives accepted connections, which inherit it, no buffer.
+                   :filter #'neomacs-mcp--filter :sentinel #'neomacs-mcp--sentinel
+                   :log #'neomacs-mcp--accept)))
     (setq neomacs-mcp--listener listener neomacs-mcp--socket socket
           neomacs-mcp--socket-identity (neomacs-mcp--socket-id socket))
     (add-hook 'kill-emacs-hook #'neomacs-mcp-stop)
