@@ -1380,6 +1380,9 @@ impl Context {
         let mut roots = EvalTempRootsToSequenceGuard::enter(self);
         let context = roots.context();
         let val_temp_slot = context.push_eval_temp_root_slot(Value::NIL);
+        // The original CHECK_LIST_END datum outlives the moving binding and
+        // tortoise roots. The owning guard keeps it through unbind_to too.
+        context.push_eval_temp_root(varlist);
         let init_result =
             context.ti_let_star_bindings(act, varlist, use_lexical, val_temp_slot, op);
         if let Err(error) = init_result {

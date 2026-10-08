@@ -443,6 +443,10 @@ impl Context {
         let val_temp_slot = context.push_eval_temp_root_slot(Value::NIL);
         let tortoise_slot = context.push_eval_temp_root_slot(varlist);
         let bindings_slot = context.push_eval_temp_root_slot(varlist);
+        // CHECK_LIST_END still needs the original head after both moving
+        // roots advance. An init may detach it from the form and run GC.
+        // Keep this root unchanged through signalling and unbind_to.
+        context.push_eval_temp_root(varlist);
         let init_result: Result<(), Flow> = (|| {
             let mut bindings = varlist;
             let mut cycle = crate::emacs_core::builtins::GnuTailCycle::new(varlist);
