@@ -17,6 +17,8 @@ use malachite::Integer;
 
 mod approx_window_text_test;
 
+mod window_text_buffer_test;
+
 #[cfg(test)]
 mod mode_line_prop_borrow_test;
 
