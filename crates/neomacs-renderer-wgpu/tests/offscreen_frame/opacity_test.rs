@@ -1,5 +1,8 @@
 //! Pixel regressions for GNU background-only and completed-picture opacity.
 
+#[path = "../support/child_result.rs"]
+mod child_result;
+
 #[test]
 fn pane_previous_patches_interpolate_complete_colored_pictures() {
     use neomacs_renderer_wgpu::{PaneBlit, PaneSource};
@@ -696,28 +699,12 @@ fn in_gpu_budget_child(exact: &str) -> bool {
         return true;
     }
     let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", exact, "--nocapture"])
+        .args(["--exact", exact, "--color", "never"])
+        .env_remove("RUST_TEST_NOCAPTURE")
         .env("NEOMACS_GPU_BUDGET_MB", "1")
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut results = stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix("test result: ok. "));
-    let counts = match (results.next(), results.next()) {
-        (Some(counts), None) => counts,
-        _ => "",
-    };
-    let count = |label: &str| {
-        counts
-            .split("; ")
-            .find_map(|part| part.strip_suffix(label)?.parse::<u32>().ok())
-    };
-    assert!(
-        out.status.success() && count(" passed") == Some(1) && count(" failed") == Some(0),
-        "budget child for {exact} did not run exactly one passing test\n{stdout}\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    child_result::assert_child_success(&out, exact);
     false
 }
 
