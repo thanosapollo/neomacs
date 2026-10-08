@@ -348,3 +348,48 @@ fn dbus_marshalling_short_dictionary_entry_reports_gnu_cons_type_error() {
         "consp",
     );
 }
+
+#[test]
+fn dbus_marshalling_depth_boundary_preserves_leaf_validation_before_append() {
+    crate::test_utils::init_test_tracing();
+    let wrap = |mut value, count| {
+        for _ in 0..count {
+            value = Value::list(vec![keyword(":variant"), value]);
+        }
+        value
+    };
+    // The empty array itself is the 64th container, unlike a basic leaf.
+    let message = marshal_argument(
+        ArgType::Variant,
+        wrap(Value::list(vec![keyword(":array")]), 63),
+    )
+    .expect("63 variants with an empty container leaf are permitted");
+    assert_eq!(message.iter_init().signature().to_string(), "v");
+
+    for (value, condition) in [
+        (wrap(Value::fixnum(7), 65), "dbus-error"),
+        (wrap(Value::string("bad\0leaf"), 64), "dbus-error"),
+        (wrap(keyword(":boolean"), 64), "dbus-error"),
+        (
+            wrap(
+                Value::list(vec![keyword(":variant"), keyword(":uint32"), Value::string("bad")]),
+                63,
+            ),
+            "wrong-type-argument",
+        ),
+    ] {
+        let mut message = dbus::Message::new_signal(
+            "/org/neomacs/Test", "org.neomacs.Test", "Types",
+        )
+        .expect("literal test header is valid");
+        let flow = super::super::types::append_arg(
+            &mut dbus::arg::IterAppend::new(&mut message), ArgType::Variant, value,
+        )
+        .expect_err("depth overflow and invalid basic leaves must be rejected");
+        assert!(
+            matches!(flow.kind(), crate::emacs_core::error::FlowRef::Signal(signal)
+                if signal.symbol_name() == condition)
+        );
+        assert_eq!(message.iter_init().arg_type(), ArgType::Invalid);
+    }
+}

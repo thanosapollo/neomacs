@@ -249,7 +249,8 @@ impl PreparedArgument {
     fn prepare(dtype: ArgType, object: Value, depth: usize) -> Result<Self, Flow> {
         // D-Bus limits total container nesting to 64. Check before traversing
         // Lisp data, including variants which do not grow their wire signature.
-        if depth >= 64 {
+        // A basic leaf after 64 containers adds no further container depth.
+        if depth > 64 || (depth == 64 && !is_basic(dtype)) {
             return Err(dbus_error("D-Bus container nesting exceeds 64"));
         }
         if is_basic(dtype) {

@@ -85,7 +85,7 @@ fn transaction(id: u64, live: Arc<AtomicBool>, adopt_primary: bool) -> RenderCom
         fullscreen: None,
         visual: None,
         adopt_primary,
-        reply,
+        reply: Some(reply),
         live,
         deadline: Instant::now() + Duration::from_secs(15),
     })

@@ -29,7 +29,7 @@ fn cancelled_gui_lease_and_opacity_refresh_survive_startup_transport() {
             fullscreen: None,
             visual: None,
             adopt_primary: false,
-            reply,
+            reply: Some(reply),
             live: Arc::clone(&live),
             deadline: Instant::now() + Duration::from_secs(1),
         }))
