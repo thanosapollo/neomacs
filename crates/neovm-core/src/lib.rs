@@ -18,6 +18,12 @@ pub mod tagged;
 #[cfg(test)]
 #[path = "tests/test_utils.rs"]
 pub mod test_utils;
+#[cfg(all(not(test), feature = "gc-retention-harness"))]
+#[path = "gc_retention_test_utils.rs"]
+pub(crate) mod test_utils;
+#[cfg(feature = "gc-retention-harness")]
+#[doc(hidden)]
+pub mod gc_retention_harness;
 pub mod window;
 
 // Curated facade: the front door for consumers of the Lisp engine. The
