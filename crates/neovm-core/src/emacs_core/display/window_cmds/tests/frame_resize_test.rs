@@ -1,6 +1,141 @@
 use super::*;
 
 #[test]
+fn set_frame_size_preserves_text_height_with_realized_gui_chrome() {
+    assert_set_frame_size_text_round_trip((16, 32, 16), false);
+}
+
+#[test]
+fn set_frame_size_preserves_text_height_without_gui_chrome() {
+    assert_set_frame_size_text_round_trip((0, 0, 0), false);
+}
+
+#[test]
+fn set_frame_size_preserves_text_height_pixelwise_with_identical_gui_chrome() {
+    assert_set_frame_size_text_round_trip((16, 32, 16), true);
+}
+
+fn assert_set_frame_size_text_round_trip(bars: (u32, u32, u32), pixelwise: bool) {
+    let mut eval = Context::new();
+    let buffer = eval.buffers.create_buffer("*text-height-contract*");
+    let fid = eval.frames.create_frame("height-contract", 800, 600, buffer);
+    assert_eq!(eval.frames.selected_frame().unwrap().id, fid);
+    let chrome = bars.0 + bars.1 + bars.2;
+    let (selected_window, minibuffer_window) = {
+        let frame = eval.frames.get_mut(fid).unwrap();
+        frame.set_window_system(Some(Value::symbol("x")));
+        frame.char_width = 8.0;
+        frame.char_height = 16.0;
+        for (key, value) in [
+            ("internal-border-width", Value::fixnum(0)),
+            ("border-width", Value::fixnum(0)),
+            ("compact-bar-lines", Value::fixnum(0)),
+            ("vertical-scroll-bars", Value::NIL),
+            ("horizontal-scroll-bars", Value::NIL),
+            ("left-fringe", Value::fixnum(0)),
+            ("right-fringe", Value::fixnum(0)),
+        ] {
+            frame.set_parameter(Value::symbol(key), value);
+        }
+        // Seed realized allocations, not merely positive bar-line parameters.
+        frame.displays_chrome = true;
+        frame.menu_bar_height = bars.0;
+        frame.tool_bar_height = bars.1;
+        frame.tab_bar_height = bars.2;
+        frame.compact_bar_height = 0;
+        frame.resize_pixelwise(800, 600);
+        assert_eq!(frame.internal_border_width(), 0);
+        assert_eq!((frame.char_width, frame.char_height), (8.0, 16.0));
+        assert_eq!(
+            (frame.menu_bar_height, frame.tool_bar_height, frame.tab_bar_height),
+            bars
+        );
+        assert_eq!(frame.minibuffer_leaf.as_ref().unwrap().bounds().height, 16.0);
+        assert_eq!(frame.root_window().bounds().y, chrome as f32);
+        assert_eq!(frame.root_window().bounds().height, (600 - chrome - 16) as f32);
+        assert!(frame.pending_gui_resize.is_none());
+        (frame.selected_window, frame.minibuffer_window)
+    };
+    let host = RecordingDisplayHost::new();
+    let requests = host.resized.clone();
+    eval.set_display_host(Box::new(host));
+    eval.eval_str(if pixelwise {
+        "(set-frame-size (selected-frame) 640 384 t)"
+    } else {
+        "(set-frame-size (selected-frame) 80 24)"
+    })
+    .unwrap();
+    assert_eq!(requests.borrow().len(), 1);
+    let request = requests.borrow()[0].clone();
+    assert_eq!(request.frame_id, fid);
+    assert_eq!(
+        (request.geometry_hints.width_inc, request.geometry_hints.height_inc),
+        (8, 16)
+    );
+    assert!(request.width > request.geometry_hints.min_width);
+    assert!(request.height > request.geometry_hints.min_height);
+    {
+        let frame = eval.frames.get(fid).unwrap();
+        assert_eq!((frame.width, frame.height), (800, 600));
+        let pending = frame.pending_gui_resize.expect("host request retains intent");
+        assert_eq!((pending.width_cols, pending.total_lines), (80, 24));
+        assert!(!pending.is_queued());
+    }
+    eprintln!(
+        "captured frame={fid:?} chrome={chrome} pixelwise={pixelwise} host={}x{}",
+        request.width, request.height
+    );
+    // Apply the SAME actual outgoing request before checking the size oracle.
+    // Never fabricate the desired 640x448 allocation as an acknowledgement.
+    eval.apply_resize_input_event(
+        request.width,
+        request.height,
+        1.0,
+        request.frame_id.0,
+        false,
+    )
+    .expect("exact captured native acknowledgement");
+    {
+        let frame = eval.frames.get(fid).unwrap();
+        assert_eq!((frame.width, frame.height), (request.width, request.height));
+        assert_eq!((frame.char_width, frame.char_height), (8.0, 16.0));
+        assert_eq!(
+            (frame.menu_bar_height, frame.tool_bar_height, frame.tab_bar_height),
+            bars
+        );
+        assert!(frame.displays_chrome);
+        assert_eq!(frame.compact_bar_height, 0);
+        assert_eq!(frame.internal_border_width(), 0);
+        assert_eq!(frame.minibuffer_leaf.as_ref().unwrap().bounds().height, 16.0);
+        assert_eq!(frame.selected_window, selected_window);
+        assert_eq!(frame.minibuffer_window, minibuffer_window);
+        assert!(frame.pending_gui_resize.is_none());
+    }
+    assert_eq!(eval.frames.selected_frame().unwrap().id, fid);
+    let text_width = eval.eval_str("(frame-text-width)").unwrap().as_int();
+    let text_cols = eval.eval_str("(frame-text-cols)").unwrap().as_int();
+    let text_height = eval.eval_str("(frame-text-height)").unwrap().as_int();
+    let text_lines = eval.eval_str("(frame-text-lines)").unwrap().as_int();
+    eprintln!(
+        "acknowledged frame={fid:?} text_width={text_width:?} text_cols={text_cols:?} \
+         text_height={text_height:?} text_lines={text_lines:?}"
+    );
+    assert_eq!(requests.borrow().len(), 1, "readback must not send another resize");
+    assert_eq!(
+        (request.width, request.height, text_width, text_cols, text_height, text_lines),
+        (640, 384 + chrome, Some(640), Some(80), Some(384), Some(24)),
+        "chrome={chrome}, pixelwise={pixelwise}: preserve requested FRAME TEXT size"
+    );
+    let frame = eval.frames.get(fid).unwrap();
+    assert_eq!(frame.root_window().bounds().y, chrome as f32);
+    assert_eq!(frame.root_window().bounds().width, 640.0);
+    // FRAME TEXT includes the unchanged 16px minibuffer, not just the root.
+    assert_eq!(frame.root_window().bounds().height, 368.0);
+    assert_eq!(frame.minibuffer_leaf.as_ref().unwrap().bounds().height, 16.0);
+    assert!(frame.pending_gui_resize.is_none());
+}
+
+#[test]
 fn overlapping_native_observations_keep_the_latest_requested_grid_for_font_changes() {
     let mut eval = Context::new();
     let buffer = eval.buffers.create_buffer("*overlapping-resize*");
