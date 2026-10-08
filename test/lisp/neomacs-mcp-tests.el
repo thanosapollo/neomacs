@@ -229,6 +229,122 @@ checking type, owner and deletion identity on one stat keeps it."
         (neomacs-mcp-stop)
         (delete-directory root t)))))
 
+(defun neomacs-mcp-test--pump (predicate)
+  "Accept process output until PREDICATE returns non-nil."
+  (with-timeout (10 (ert-fail "Condition not reached within 10 seconds"))
+    (while (not (funcall predicate))
+      (accept-process-output nil 0.05))))
+
+(ert-deftest neomacs-mcp-connections-leave-no-buffers ()
+  "Accepted, rejected and stopped connections leave no buffer behind.
+Like GNU `server-start', the listener has a filter, so
+`server_accept_connection' gives accepted connections none."
+  (let* ((root (make-temp-file "neomacs-mcp-buffers-" t))
+         (socket (expand-file-name "mcp" root))
+         (line (concat (json-serialize
+                        (neomacs-mcp--object
+                         "jsonrpc" "2.0" "id" 1 "method" "initialize" "params"
+                         (neomacs-mcp--object
+                          "protocolVersion" "2025-06-18"
+                          "capabilities" (neomacs-mcp--object)
+                          "clientInfo" (neomacs-mcp--object))))
+                       "\n"))
+         (replies 0)
+         (before (buffer-list))
+         clients)
+    (cl-flet ((connect ()
+                (let ((client (make-network-process
+                               :name "neomacs-mcp-ert-client" :family 'local
+                               :service socket :coding 'utf-8 :noquery t
+                               :filter (lambda (_ chunk)
+                                         (cl-incf replies (cl-count ?\n chunk))))))
+                  (push client clients)
+                  (process-send-string client line)
+                  client))
+              (new-buffers ()
+                ;; GNU creates internal buffers such as
+                ;; " *code-conversion-work*" lazily; they are not per-connection.
+                (cl-remove-if (lambda (buffer)
+                                (or (memq buffer before)
+                                    (string-prefix-p " " (buffer-name buffer))))
+                              (buffer-list))))
+      (unwind-protect
+          (progn
+            (neomacs-mcp-start socket)
+            (dotimes (i 3)
+              (let ((client (connect)))
+                (neomacs-mcp-test--pump (lambda () (= replies (1+ i))))
+                (should (= 1 (length neomacs-mcp--peers)))
+                (delete-process client)
+                (neomacs-mcp-test--pump (lambda () (null neomacs-mcp--peers)))
+                (should-not (new-buffers))))
+            ;; Fill the quota, then one more connection is rejected.  Wait
+            ;; for each accept: a connect beyond the listen backlog blocks.
+            (setq replies 0 clients nil)
+            (dotimes (i (1+ neomacs-mcp--peer-limit))
+              (connect)
+              (neomacs-mcp-test--pump
+               (lambda () (or (= (length neomacs-mcp--peers) (1+ i))
+                              (cl-some (lambda (c) (not (process-live-p c))) clients)))))
+            (neomacs-mcp-test--pump
+             (lambda () (and (= replies neomacs-mcp--peer-limit)
+                             (= 1 (cl-count-if-not #'process-live-p clients)))))
+            (should (= neomacs-mcp--peer-limit (length neomacs-mcp--peers)))
+            (should-not (cl-some #'process-buffer neomacs-mcp--peers))
+            (should-not (new-buffers))
+            (mapc #'delete-process clients)
+            (neomacs-mcp-test--pump (lambda () (null neomacs-mcp--peers)))
+            (should-not (new-buffers))
+            ;; Stopping with connections still open leaves none either.
+            (setq replies 0 clients nil)
+            (dotimes (_ 2) (connect))
+            (neomacs-mcp-test--pump (lambda () (= replies 2)))
+            (neomacs-mcp-stop)
+            (should-not neomacs-mcp--peers)
+            (should-not (new-buffers)))
+        (mapc #'delete-process clients)
+        (neomacs-mcp-stop)
+        (delete-directory root t)))))
+
+(ert-deftest neomacs-mcp-close-keeps-adopted-user-buffers ()
+  "Closing a connection never kills a buffer it merely adopted.
+A connection accepted by an earlier version of this library, whose
+listener had no filter, adopted any existing buffer named like the
+listener, as `server_accept_connection' uses `get-buffer-create'.
+Like `delete-process', retiring it must leave that buffer alone."
+  (let* ((root (make-temp-file "neomacs-mcp-adopt-" t))
+         (socket (expand-file-name "mcp" root))
+         (buffers (list (generate-new-buffer "neomacs-mcp <1>")
+                        (generate-new-buffer "neomacs-mcp <2>")))
+         clients)
+    (dolist (buffer buffers)
+      (with-current-buffer buffer (insert "User draft: preserve me.\n")))
+    (unwind-protect
+        (progn
+          (neomacs-mcp-start socket)
+          (dotimes (i 2)
+            (push (make-network-process
+                   :name "neomacs-mcp-ert-client" :family 'local
+                   :service socket :noquery t :filter #'ignore)
+                  clients)
+            (neomacs-mcp-test--pump (lambda () (= (length neomacs-mcp--peers) (1+ i))))
+            (set-process-buffer (cl-find-if-not #'process-buffer neomacs-mcp--peers)
+                                (nth i buffers)))
+          ;; One peer disconnects; the other is retired by stop.
+          (delete-process (cadr clients))
+          (neomacs-mcp-test--pump (lambda () (= 1 (length neomacs-mcp--peers))))
+          (neomacs-mcp-stop)
+          (should-not neomacs-mcp--peers)
+          (dolist (buffer buffers)
+            (should (buffer-live-p buffer))
+            (should (buffer-modified-p buffer))
+            (should (equal "User draft: preserve me.\n"
+                           (with-current-buffer buffer (buffer-string))))))
+      (mapc #'delete-process clients)
+      (neomacs-mcp-stop)
+      (mapc #'kill-buffer buffers)
+      (delete-directory root t))))
+
 (ert-deftest neomacs-mcp-filter-never-evaluates ()
   (let ((calls nil))
     (cl-letf (((symbol-function 'neomacs-mcp--enqueue)
