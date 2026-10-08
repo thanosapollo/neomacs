@@ -249,23 +249,44 @@ fn standard_word_predicate(code: u32) -> bool {
         == crate::emacs_core::syntax::SyntaxClass::Word
 }
 
+/// GNU unibyte object casing falls back to the ASCII Unicode property when
+/// an ASCII input maps outside 0..=255. Buffer casing instead keeps the low
+/// byte (`do_casify_unibyte_region`), including replace-match after insertion.
+/// High input bytes are raw-byte characters, not Latin-1 case-table indices.
+pub(crate) fn casify_unibyte_string(
+    text: &LispString,
+    which: CaseMap,
+    casetab: &CaseTableOverride,
+    target: CaseTarget,
+) -> LispString {
+    let bytes = text
+        .as_bytes()
+        .iter()
+        .map(|&byte| {
+            let code = crate::emacs_core::emacs_char::unibyte_to_char(byte) as i64;
+            let ascii = if which == CaseMap::Down {
+                byte.to_ascii_lowercase()
+            } else {
+                byte.to_ascii_uppercase()
+            };
+            let mapped = casetab.map(which, code).unwrap_or(ascii as i64);
+            if target == CaseTarget::String && byte.is_ascii() && mapped >= 0x100 {
+                ascii
+            } else {
+                make_char_unibyte(mapped)
+            }
+        })
+        .collect();
+    LispString::from_unibyte(bytes)
+}
+
 fn downcase_lisp_string_emacs_compat(
     text: &LispString,
     is_word: impl Fn(u32) -> bool,
     casetab: &CaseTableOverride,
 ) -> LispString {
     if !text.is_multibyte() {
-        let bytes = text
-            .as_bytes()
-            .iter()
-            .map(|&byte| {
-                casetab
-                    .map(CaseMap::Down, byte as i64)
-                    .map(|m| m as u8)
-                    .unwrap_or_else(|| byte.to_ascii_lowercase())
-            })
-            .collect();
-        return LispString::from_unibyte(bytes);
+        return casify_unibyte_string(text, CaseMap::Down, casetab, CaseTarget::Buffer);
     }
 
     // Greek capital sigma down-cases to its final form ς at the end of a word
@@ -304,19 +325,13 @@ fn downcase_lisp_string_emacs_compat(
     LispString::from_emacs_bytes(out)
 }
 
-fn upcase_lisp_string_emacs_compat(text: &LispString, casetab: &CaseTableOverride) -> LispString {
+fn upcase_lisp_string_emacs_compat(
+    text: &LispString,
+    casetab: &CaseTableOverride,
+    target: CaseTarget,
+) -> LispString {
     if !text.is_multibyte() {
-        let bytes = text
-            .as_bytes()
-            .iter()
-            .map(|&byte| {
-                casetab
-                    .map(CaseMap::Up, byte as i64)
-                    .map(|m| m as u8)
-                    .unwrap_or_else(|| byte.to_ascii_uppercase())
-            })
-            .collect();
-        return LispString::from_unibyte(bytes);
+        return casify_unibyte_string(text, CaseMap::Up, casetab, target);
     }
 
     let mut out = Vec::with_capacity(text.sbytes());
@@ -1064,7 +1079,9 @@ where
     let casetab = CaseTableOverride::none();
     match replace_match_case_action_lisp(matched, is_word_char) {
         ReplaceMatchCaseAction::NoChange => replacement.clone(),
-        ReplaceMatchCaseAction::AllCaps => upcase_lisp_string_emacs_compat(replacement, &casetab),
+        ReplaceMatchCaseAction::AllCaps => {
+            upcase_lisp_string_emacs_compat(replacement, &casetab, CaseTarget::String)
+        }
         ReplaceMatchCaseAction::CapInitial => {
             // replace-match's case adjustment has no buffer syntax table in
             // scope, so word boundaries here follow the Unicode-alphanumeric
@@ -1100,7 +1117,9 @@ pub(crate) fn apply_replace_match_case_lisp_cased(
     );
     match action {
         ReplaceMatchCaseAction::NoChange => replacement.clone(),
-        ReplaceMatchCaseAction::AllCaps => upcase_lisp_string_emacs_compat(replacement, casetab),
+        ReplaceMatchCaseAction::AllCaps => {
+            upcase_lisp_string_emacs_compat(replacement, casetab, target)
+        }
         // GNU applies `Fupcase_initials` to a string replacement and
         // `Fupcase_initials_region` to a buffer one.
         ReplaceMatchCaseAction::CapInitial => capitalize_like_gnu(
@@ -1231,7 +1250,7 @@ pub(crate) fn builtin_upcase_region(
 ) -> EvalResult {
     let casetab = CaseTableOverride::for_current_buffer(ctx)?;
     casify_region_in_state(ctx, args, "upcase-region", move |s| {
-        upcase_lisp_string_emacs_compat(s, &casetab)
+        upcase_lisp_string_emacs_compat(s, &casetab, CaseTarget::Buffer)
     })
 }
 
@@ -1287,7 +1306,7 @@ pub(crate) fn builtin_downcase_word(
 pub(crate) fn builtin_upcase_word(ctx: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     let casetab = CaseTableOverride::for_current_buffer(ctx)?;
     casify_word_in_state(ctx, args, "upcase-word", move |s| {
-        upcase_lisp_string_emacs_compat(s, &casetab)
+        upcase_lisp_string_emacs_compat(s, &casetab, CaseTarget::Buffer)
     })
 }
 
@@ -1336,3 +1355,7 @@ pub(crate) fn builtin_char_resolve_modifiers(args: Vec<Value>) -> EvalResult {
 #[cfg(test)]
 #[path = "tests/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/r014_unibyte.rs"]
+mod r014_unibyte_tests;

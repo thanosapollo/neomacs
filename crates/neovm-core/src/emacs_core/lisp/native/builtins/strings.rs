@@ -970,6 +970,15 @@ fn transform_string_case(
     casetab: &super::super::casetab::CaseTableOverride,
 ) -> crate::heap_types::LispString {
     use super::super::casetab::CaseMap;
+    if !s.is_multibyte() {
+        let which = if upcase { CaseMap::Up } else { CaseMap::Down };
+        return crate::emacs_core::casefiddle::casify_unibyte_string(
+            s,
+            which,
+            casetab,
+            crate::emacs_core::casefiddle::CaseTarget::String,
+        );
+    }
     // Greek capital sigma down-cases to the final form ς at the end of a word
     // (GNU `casefiddle.c` `case_character`): when the preceding character is a
     // word constituent and the following one is not.
