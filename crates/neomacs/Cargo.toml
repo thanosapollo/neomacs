@@ -71,11 +71,6 @@ path = "src/main.rs"
 test = false
 
 [[bin]]
-name = "mock-display"
-path = "src/bin/mock-display.rs"
-test = false
-
-[[bin]]
 name = "neomacsclient"
 path = "src/bin/neomacsclient.rs"
 test = false
