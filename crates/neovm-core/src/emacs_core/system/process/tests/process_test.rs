@@ -3005,6 +3005,362 @@ fn process_send_string_test() {
     assert_eq!(results[1], "OK nil");
 }
 
+#[cfg(unix)]
+fn process_send_encoded_bytes(coding: &str, sends: &str) -> String {
+    process_send_encoded_bytes_with_creation_inhibition(coding, sends, "nil")
+}
+
+#[cfg(unix)]
+fn process_send_encoded_bytes_with_creation_inhibition(
+    coding: &str,
+    sends: &str,
+    creation_inhibit: &str,
+) -> String {
+    let od = find_bin("od");
+    let result = eval_one(&format!(
+        r#"(let* ((output "")
+                  (p (let ((inhibit-eol-conversion {creation_inhibit}))
+                       (make-process :name "issue510-encoding"
+                                   :command '("{od}" "-An" "-tx1")
+                                   :coding '(binary . {coding})
+                                   :connection-type 'pipe
+                                   :filter (lambda (_p text)
+                                             (setq output (concat output text))))))
+                  (deadline (+ (float-time) 5)))
+             (unwind-protect
+                 (progn
+                   {sends}
+                   (process-send-eof p)
+                   (while (and (process-live-p p) (< (float-time) deadline))
+                     (accept-process-output p 0.1))
+                   (accept-process-output p 0.1)
+                   (mapcar (lambda (hex) (string-to-number hex 16))
+                           (split-string output)))
+               (delete-process p)))"#,
+    ));
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_nested_raw_hook_keeps_live_descriptor_coding() {
+    let result = process_send_encoded_bytes(
+        "iso-2022-jp",
+        r#"(defvar issue510-hook-process nil)
+           (defvar issue510-in-hook nil)
+           (setq issue510-hook-process p)
+           (defun issue510-raw-pre-write (_from _to)
+             (unless issue510-in-hook
+               (let ((issue510-in-hook t))
+                 (process-send-string issue510-hook-process (unibyte-string 88)))))
+           (define-coding-system 'issue510-raw-iso "Nested raw process encoding"
+             :coding-type 'iso-2022 :mnemonic ?J
+             :designation [(ascii japanese-jisx0208-1978 japanese-jisx0208 latin-jisx0201) nil nil nil]
+             :flags '(short ascii-at-eol ascii-at-cntl 7-bit designation)
+             :charset-list '(ascii japanese-jisx0208 japanese-jisx0208-1978 latin-jisx0201)
+             :pre-write-conversion 'issue510-raw-pre-write)
+           (set-process-coding-system p 'binary 'issue510-raw-iso)
+           (process-send-string p "か")
+           (process-send-string p "ん")"#,
+    );
+    assert_eq!(result, "OK (88 227 129 139 88 227 130 147)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_binary_keeps_installed_coding_between_raw_sends() {
+    let cat = find_bin("cat");
+    let result = eval_one(&format!(
+        r#"(let ((p (make-process :name "issue510-binary-coding" :command '("{cat}")
+                    :coding '(binary . binary) :connection-type 'pipe :filter #'ignore))
+                 (seen nil))
+             (unwind-protect
+                 (progn
+                   (dotimes (_ 2)
+                     (process-send-string p (unibyte-string 65))
+                     (push last-coding-system-used seen))
+                   (nreverse seen))
+               (delete-process p)))"#,
+    ));
+    assert_eq!(result, "OK (binary binary)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_raw_eol_inhibition_is_captured_at_creation() {
+    let result = process_send_encoded_bytes_with_creation_inhibition(
+        "raw-text-dos",
+        r#"(let ((inhibit-eol-conversion nil))
+             (process-send-string p (unibyte-string 65 10)))"#,
+        "t",
+    );
+    assert_eq!(result, "OK (65 10)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_raw_eol_inhibition_is_captured_at_reassignment() {
+    let result = process_send_encoded_bytes(
+        "raw-text-dos",
+        r#"(let ((inhibit-eol-conversion t))
+             (set-process-coding-system p 'binary 'raw-text-dos))
+           (let ((inhibit-eol-conversion nil))
+             (process-send-string p (unibyte-string 65 10)))"#,
+    );
+    assert_eq!(result, "OK (65 10)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_encodes_japanese_euc_jp_bytes() {
+    let result = process_send_encoded_bytes("euc-jp", r#"(process-send-string p "かんじ")"#);
+    // GNU send_process encodes through the registered EUC-JP charset table.
+    assert_eq!(result, "OK (164 171 164 243 164 184)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_preserves_iso2022_state_between_chunks() {
+    let result = process_send_encoded_bytes(
+        "iso-2022-jp",
+        r#"(process-send-string p "か")
+           (process-send-string p "ん")
+           (process-send-string p "じ")"#,
+    );
+    // GNU emits ESC $ B once and retains the JIS designation across sends.
+    assert_eq!(result, "OK (27 36 66 36 43 36 115 36 56)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_runs_legacy_pre_write_conversion() {
+    let result = process_send_encoded_bytes(
+        "shift_jis",
+        r#"(defun issue510-pre-write (_from to) (goto-char to) (insert "Z"))
+           (define-coding-system 'issue510-hook-sjis "Process hook regression"
+              :coding-type 'shift-jis :mnemonic ?S
+              :charset-list '(ascii katakana-jisx0201 japanese-jisx0208)
+              :pre-write-conversion 'issue510-pre-write)
+           (set-process-coding-system p 'binary 'issue510-hook-sjis)
+           (process-send-string p "か")"#,
+    );
+    assert_eq!(result, "OK (130 169 90)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_reentrant_hook_uses_live_iso2022_state() {
+    let result = process_send_encoded_bytes(
+        "iso-2022-jp",
+        r#"(defvar issue510-hook-process nil)
+           (defvar issue510-in-hook nil)
+           (setq issue510-hook-process p)
+           (defun issue510-nested-pre-write (_from _to)
+             (unless issue510-in-hook
+               (let ((issue510-in-hook t))
+                 (process-send-string issue510-hook-process "ん"))))
+           (define-coding-system 'issue510-nested-iso "Nested process encoding"
+             :coding-type 'iso-2022 :mnemonic ?J
+             :designation [(ascii japanese-jisx0208-1978 japanese-jisx0208 latin-jisx0201) nil nil nil]
+             :flags '(short ascii-at-eol ascii-at-cntl 7-bit designation)
+             :charset-list '(ascii japanese-jisx0208 japanese-jisx0208-1978 latin-jisx0201)
+             :pre-write-conversion 'issue510-nested-pre-write)
+           (set-process-coding-system p 'binary 'issue510-nested-iso)
+           (process-send-string p "か")
+           (process-send-string p "じ")"#,
+    );
+    assert_eq!(result, "OK (27 36 66 36 115 36 43 36 115 36 56)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_reselects_coding_changed_by_pre_write_hook() {
+    let result = process_send_encoded_bytes(
+        "shift_jis",
+        r#"(defvar issue510-hook-process nil)
+           (setq issue510-hook-process p)
+           (defun issue510-changing-pre-write (_from _to)
+             (set-process-coding-system issue510-hook-process 'binary 'utf-8))
+           (define-coding-system 'issue510-changing-sjis "Changed process encoding"
+             :coding-type 'shift-jis :mnemonic ?S
+             :charset-list '(ascii katakana-jisx0201 japanese-jisx0208)
+             :pre-write-conversion 'issue510-changing-pre-write)
+           (set-process-coding-system p 'binary 'issue510-changing-sjis)
+           (process-send-string p "か")
+           (process-send-string p "ん")"#,
+    );
+    assert_eq!(result, "OK (227 129 139 227 130 147)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_reassigning_same_coding_resets_iso2022_state() {
+    let result = process_send_encoded_bytes(
+        "iso-2022-jp",
+        r#"(process-send-string p "か")
+           (set-process-coding-system p 'binary 'iso-2022-jp)
+           (process-send-string p "ん")"#,
+    );
+    assert_eq!(result, "OK (27 36 66 36 43 27 36 66 36 115)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_reports_coding_before_raw_transition() {
+    let cat = find_bin("cat");
+    let result = eval_one(&format!(
+        r#"(let ((p (make-process :name "issue510-last-coding"
+                                  :command '("{cat}") :coding '(binary . euc-jp-dos)
+                                  :connection-type 'pipe :filter #'ignore))
+                 (observed nil))
+             (unwind-protect
+                 (progn
+                   (dolist (text (list (unibyte-string 164 171) (unibyte-string 10) "か"))
+                     (process-send-string p text)
+                     (push last-coding-system-used observed))
+                   (nreverse observed))
+               (delete-process p)))"#,
+    ));
+    assert_eq!(result, "OK (euc-jp-dos raw-text-dos euc-jp-dos)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_preserves_pre_write_changes_after_error() {
+    for failure in [
+        "(error \"hook failure\")",
+        "(signal 'quit nil)",
+        "(throw 'issue510-unmatched nil)",
+    ] {
+        let actions = r#"(defun issue510-failing-pre-write (_from _to)
+             (goto-char (point-max)) (insert "Z") FAILURE)
+           (define-coding-system 'issue510-failing-sjis "Failing process hook"
+             :coding-type 'shift-jis :mnemonic ?S
+             :charset-list '(ascii katakana-jisx0201 japanese-jisx0208)
+             :pre-write-conversion 'issue510-failing-pre-write)
+           (set-process-coding-system p 'binary 'issue510-failing-sjis)
+           (process-send-string p "か")"#
+            .replace("FAILURE", failure);
+        let result = process_send_encoded_bytes("shift_jis", &actions);
+        assert_eq!(result, "OK (130 169 90)", "{failure}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_pre_write_matched_throw_aborts_outer_send() {
+    let result = process_send_encoded_bytes(
+        "shift_jis",
+        r#"(defun issue510-throwing-pre-write (_from _to)
+             (insert "Z") (throw 'issue510-matched 'escaped))
+           (define-coding-system 'issue510-throwing-sjis "Throwing process hook"
+             :coding-type 'shift-jis :mnemonic ?S
+             :charset-list '(ascii katakana-jisx0201 japanese-jisx0208)
+             :pre-write-conversion 'issue510-throwing-pre-write)
+           (set-process-coding-system p 'binary 'issue510-throwing-sjis)
+           (unless (eq (catch 'issue510-matched (process-send-string p "か")) 'escaped)
+             (error "pre-write throw did not reach catch"))
+           (process-send-string p (unibyte-string 88))"#,
+    );
+    assert_eq!(result, "OK (88)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_retains_raw_eol_state_until_multibyte_transition() {
+    let result = process_send_encoded_bytes(
+        "euc-jp-dos",
+        r#"(let ((inhibit-eol-conversion t))
+             (process-send-string p (unibyte-string 65 10)))
+           (let ((inhibit-eol-conversion nil))
+             (process-send-string p (unibyte-string 66 10))
+             (process-send-string p "か\n"))"#,
+    );
+    assert_eq!(result, "OK (65 10 66 10 164 171 13 10)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_latches_raw_eol_inhibition_after_enabled_send() {
+    let result = process_send_encoded_bytes(
+        "euc-jp-dos",
+        r#"(let ((inhibit-eol-conversion nil))
+             (process-send-string p (unibyte-string 65 10)))
+           (let ((inhibit-eol-conversion t))
+             (process-send-string p (unibyte-string 66 10)))
+           (let ((inhibit-eol-conversion nil))
+             (process-send-string p (unibyte-string 67 10))
+             (process-send-string p "か\n"))"#,
+    );
+    assert_eq!(result, "OK (65 13 10 66 10 67 10 164 171 13 10)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_emits_utf8_signature_once_per_stream() {
+    let result = process_send_encoded_bytes(
+        "utf-8-with-signature",
+        r#"(process-send-string p "か") (process-send-string p "ん")"#,
+    );
+    assert_eq!(result, "OK (239 187 191 227 129 139 227 130 147)");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_restarts_utf8_signature_after_raw_input() {
+    let result = process_send_encoded_bytes(
+        "utf-8-with-signature",
+        r#"(process-send-string p "か")
+           (process-send-string p (unibyte-string 88))
+           (process-send-string p "ん")"#,
+    );
+    assert_eq!(
+        result,
+        "OK (239 187 191 227 129 139 88 239 187 191 227 130 147)"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn process_send_string_sends_euc_jp_dictionary_query_over_tcp() {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("dictionary connection failed: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = [0; 8];
+        stream.read_exact(&mut bytes).unwrap();
+        bytes
+    });
+    let result = eval_one(&format!(
+        r#"(let ((p (make-network-process :name "issue510-dictionary"
+                       :host "127.0.0.1" :service {port} :family 'ipv4
+                       :coding '(utf-8 . euc-jp) :filter #'ignore)))
+             (unwind-protect
+                 (process-send-string p "1かんじ ")
+               (delete-process p)))"#,
+    ));
+    let bytes = server.join().expect("dictionary server completed");
+    assert_eq!(result, "OK nil");
+    assert_eq!(bytes, [49, 164, 171, 164, 243, 164, 184, 32]);
+}
+
 #[test]
 fn process_send_string_reenters_wait_and_runs_filter_when_write_blocks() {
     crate::test_utils::init_test_tracing();
@@ -15644,5 +16000,68 @@ fn epipe_on_send_leaves_the_real_child_status_for_the_next_wait_to_reap() {
 " exit 7)) nil deleted)"#,
         "the sentinel runs once with the child's real status, and \
          `delete-exited-processes' removes the process afterwards"
+    );
+}
+
+/// GNU's documented idle-timer contract (Elisp manual, "Idle Timers"): an
+/// idle timer fires "when SECS seconds have elapsed since the last user
+/// command was finished, **even if subprocess output has been accepted**"
+/// in the meantime.  A chatty subprocess (language server, flycheck, the
+/// reporter's Doom setup in issue #476) must never reset the idle epoch:
+/// process activity interrupts the wait, services its output, and the
+/// epoch keeps its original start.  Issue #476 reported idle timers that
+/// never fired under such a config; this pins the invariant they depend on.
+/// The callback must fire before the terminating keypress; this test does
+/// not assert an exact wall-clock firing time.
+#[test]
+fn subprocess_output_during_idle_does_not_reset_the_idle_epoch() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = crate::test_utils::runtime_startup_context();
+    ev.eval_str(
+        r#"(progn
+           (setq vm-chatter-idle-fired nil)
+           (run-with-idle-timer 0.05 nil
+             (lambda () (setq vm-chatter-idle-fired 'done)))
+           (start-process "chatter" "*vm-chatter*"
+                          "sh" "-c"
+                          "i=0; while [ $i -lt 100 ]; do echo tick; sleep 0.01; i=$((i + 1)); done"))"#,
+    )
+    .expect("schedule idle timer and chatty subprocess");
+
+    let (tx, rx) = crossbeam_channel::unbounded();
+    ev.input_rx = Some(rx);
+    let _tx_keepalive = tx.clone();
+    let notifier = ev.wait_notifier();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        tx.send(crate::keyboard::InputEvent::key_press(
+            crate::keyboard::KeyEvent::char('a'),
+        ))
+        .expect("send keypress");
+        if let Some(notifier) = notifier {
+            notifier.notify().expect("wake command-input wait");
+        }
+    });
+
+    let event = ev.read_char();
+    let idle_fired = ev.eval_symbol("vm-chatter-idle-fired");
+    let ticks = ev.eval_str(
+        r#"(with-current-buffer "*vm-chatter*"
+            (count-matches "^tick" (point-min) (point-max)))"#,
+    );
+    sender.join().expect("input sender should finish");
+    ev.eval_str(r#"(delete-process "chatter")"#)
+        .expect("stop and reap the bounded chatter subprocess");
+    let event = event.expect("read_char returns the queued keypress");
+    assert_eq!(event, Value::fixnum('a' as i64));
+    assert_eq!(
+        idle_fired.expect("idle timer flag should be bound"),
+        Value::symbol("done"),
+        "subprocess output must not reset the idle epoch (Elisp manual, Idle Timers)",
+    );
+    let ticks = ticks.expect("count delivered process output");
+    assert!(
+        ticks.as_fixnum().unwrap_or(0) > 0,
+        "chatty process should have delivered output during the wait",
     );
 }

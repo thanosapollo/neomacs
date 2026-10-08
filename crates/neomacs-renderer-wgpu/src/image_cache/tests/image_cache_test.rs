@@ -52,6 +52,7 @@ fn decode_toolbar_pixels(data: &[u8]) -> Vec<u8> {
             .with_background_policy(neomacs_display_protocol::ImageBackgroundPolicy::Transparent),
         ImageRealization::with_device_scale(1.0, 1.0),
         ImageMaskPolicy::Preserve,
+        ImageAnimationPolicy::disabled(),
         ImageFrameIndex::default(),
         crate::svg::SvgResourceContext::Isolated,
         &ImageSequenceCache::new(),
@@ -172,6 +173,7 @@ fn decoder_worker_survives_a_panicking_request() {
             realization: ImageRealization::with_device_scale(1.0, 1.0),
             colors: ImageColorContext::default(),
             mask: ImageMaskPolicy::default(),
+            animation: ImageAnimationPolicy::disabled(),
             frame: ImageFrameIndex::default(),
             identity: test_load_identity(),
         })
@@ -189,6 +191,7 @@ fn decoder_worker_survives_a_panicking_request() {
             realization: ImageRealization::with_device_scale(1.0, 1.0),
             colors: ImageColorContext::default(),
             mask: ImageMaskPolicy::default(),
+            animation: ImageAnimationPolicy::disabled(),
             frame: ImageFrameIndex::default(),
             identity: test_load_identity(),
         })
@@ -1811,6 +1814,7 @@ fn decode_with_bands(
         ImageColorContext::default(),
         ImageRealization::with_device_scale(scale, scale),
         ImageMaskPolicy::Preserve,
+        ImageAnimationPolicy::disabled(),
         ImageFrameIndex::default(),
         crate::svg::SvgResourceContext::Isolated,
         &ImageSequenceCache::new(),
@@ -2005,6 +2009,7 @@ fn every_band_lands_in_the_raster_the_finished_upload_resolves() {
             ImageColorContext::default(),
             realization,
             ImageMaskPolicy::Preserve,
+            ImageAnimationPolicy::disabled(),
             ImageFrameIndex::default(),
             crate::svg::SvgResourceContext::Isolated,
             &ImageSequenceCache::new(),
@@ -2086,6 +2091,7 @@ fn a_rotation_or_a_rewriting_mask_decodes_the_whole_image() {
             ImageColorContext::default(),
             ImageRealization::default(),
             mask,
+            ImageAnimationPolicy::disabled(),
             ImageFrameIndex::default(),
             crate::svg::SvgResourceContext::Isolated,
             &ImageSequenceCache::new(),
@@ -2237,6 +2243,7 @@ fn a_source_below_the_threshold_keeps_the_whole_image_paths_filter() {
         ImageColorContext::default(),
         ImageRealization::default(),
         ImageMaskPolicy::Preserve,
+        ImageAnimationPolicy::disabled(),
         ImageFrameIndex::default(),
         crate::svg::SvgResourceContext::Isolated,
         &ImageSequenceCache::new(),
@@ -2281,6 +2288,7 @@ fn the_rows_a_band_hands_over_are_the_rows_the_finished_image_holds() {
         ImageColorContext::default(),
         ImageRealization::default(),
         ImageMaskPolicy::Preserve,
+        ImageAnimationPolicy::disabled(),
         ImageFrameIndex::default(),
         crate::svg::SvgResourceContext::Isolated,
         &ImageSequenceCache::new(),
@@ -2647,6 +2655,8 @@ fn a_jpeg_below_the_threshold_publishes_no_bands() {
 
 #[path = "decode_diagnostic_test.rs"]
 mod decode_diagnostic;
+#[path = "svg_forms_test.rs"]
+mod svg_forms;
 
 /// A diagnostic for tests that only exercise scheduling, not wording.
 fn test_diagnostic() -> neomacs_display_protocol::image_diagnostic::ImageDiagnostic {
@@ -2659,4 +2669,47 @@ fn test_load_identity() -> neomacs_display_protocol::image_diagnostic::ImageLoad
         ImageFormatName::Png,
         ImageDiagnosticSubject::File(String::new()),
     )
+}
+
+/// REGRESSION (PR #474 review): sequence identity follows the resolve
+/// source, not the animation policy, so an entry an earlier `:animation`
+/// load warmed would serve animated pixels to a later policy-off request
+/// on a cache hit — an order-dependent break of the GNU-compatible
+/// default. The decode gate must consult the policy before the cache.
+#[test]
+fn disabled_animation_policy_never_serves_a_warmed_computed_sequence() {
+    // Base `r="0"` draws nothing; the t=0 sample (r=4) draws the circle,
+    // so animated-vs-static is directly observable in the pixels.
+    let animated = br##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="0" fill="#ffffff"><animate attributeName="r" values="4;1" dur="1s" repeatCount="indefinite"/></circle></svg>"##;
+    let decode = |cache: &ImageSequenceCache, policy| {
+        ImageCache::decode_data(
+            EncodedBytes::copy_of(animated),
+            ImageSizeSpec::default(),
+            ImageRotation::None,
+            ImageColorContext::default(),
+            ImageRealization::default(),
+            ImageMaskPolicy::Preserve,
+            policy,
+            ImageFrameIndex::default(),
+            crate::svg::SvgResourceContext::Isolated,
+            cache,
+            ImageSequenceId::new(914).expect("non-zero test sequence"),
+            None,
+        )
+        .expect("decode animated SVG")
+    };
+
+    // Warm the sequence with an enabled request, then ask for the same
+    // source under the disabled policy: it must get the static base, not
+    // the warmed t=0 slot — and exactly what a cold cache would produce.
+    let warmed = decode(
+        &ImageSequenceCache::new(),
+        ImageAnimationPolicy::enabled(Some(4)),
+    );
+    let shared = ImageSequenceCache::new();
+    let _ = decode(&shared, ImageAnimationPolicy::enabled(Some(4)));
+    let disabled_after = decode(&shared, ImageAnimationPolicy::disabled());
+    let cold_disabled = decode(&ImageSequenceCache::new(), ImageAnimationPolicy::disabled());
+    assert_ne!(warmed.rgba, disabled_after.rgba);
+    assert_eq!(cold_disabled.rgba, disabled_after.rgba);
 }

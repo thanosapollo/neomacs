@@ -506,6 +506,10 @@ pub enum AssetCommand {
         /// Colors used by face-sensitive image formats and image-cache identity.
         colors: ImageColorContext,
         mask: ImageMaskPolicy,
+        /// Whether the renderer may materialize animation this source
+        /// computes itself (SVG SMIL). The disabled default is GNU's
+        /// behavior: one static frame.
+        animation: neomacs_display_protocol::ImageAnimationPolicy,
         frame: neomacs_display_protocol::ImageFrameIndex,
         sequence: neomacs_display_protocol::ImageSequenceId,
         /// The looking frame's resolved GNU `max-image-size`
@@ -530,6 +534,8 @@ pub enum AssetCommand {
         /// Colors used by face-sensitive image formats and image-cache identity.
         colors: ImageColorContext,
         mask: ImageMaskPolicy,
+        /// See [`AssetCommand::ImageLoadFile::animation`].
+        animation: neomacs_display_protocol::ImageAnimationPolicy,
         frame: neomacs_display_protocol::ImageFrameIndex,
         sequence: neomacs_display_protocol::ImageSequenceId,
         /// See [`AssetCommand::ImageLoadFile::limit`].
