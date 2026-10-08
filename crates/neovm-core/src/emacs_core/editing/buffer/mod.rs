@@ -12,6 +12,7 @@ use crate::buffer::{
     EmacsByteRange, LispBytePos1, LispCharPos1, TextChange, TextEditRange, TextExtent,
     TextPositionAnchor,
 };
+use crate::emacs_core::emacs_char::EmacsChar;
 use crate::emacs_core::filelock;
 use crate::emacs_core::misc;
 use crate::emacs_core::value::{
@@ -1126,31 +1127,56 @@ fn resolve_lisp_range_with_buffer_defaults(
     Ok((LispCharPos1::new(start), LispCharPos1::new(end)))
 }
 
+/// A call-local argument policy; it holds no shared or mutator state.
+#[derive(Clone, Copy, Debug)]
+enum BufferDesignatorDefault {
+    Current,
+    Required,
+}
+
 pub(crate) fn resolve_buffer_designator_allow_nil_current_in_manager(
     buffers: &BufferManager,
     arg: &Value,
 ) -> Result<Option<BufferId>, Flow> {
+    resolve_buffer_designator_in_manager(buffers, arg, BufferDesignatorDefault::Current).map(Some)
+}
+
+fn resolve_buffer_designator_in_manager(
+    buffers: &BufferManager,
+    arg: &Value,
+    default: BufferDesignatorDefault,
+) -> Result<BufferId, Flow> {
     match arg.kind() {
-        ValueKind::Nil => buffers
-            .current_buffer()
-            .map(|buf| Some(buf.id))
-            .ok_or_else(|| signal("error", vec![Value::string("No current buffer")])),
+        ValueKind::Nil => match default {
+            BufferDesignatorDefault::Current => {
+                buffers.current_buffer().map(|buf| buf.id).ok_or_else(|| {
+                    signal(
+                        LispCondition::Error,
+                        vec![Value::string("No current buffer")],
+                    )
+                })
+            }
+            BufferDesignatorDefault::Required => Err(signal(
+                LispCondition::WrongTypeArgument,
+                vec![Value::symbol("stringp"), *arg],
+            )),
+        },
         ValueKind::Veclike(VecLikeType::Buffer) => {
             let id = arg.as_buffer_id().unwrap();
             if buffers.get(id).is_some() {
-                Ok(Some(id))
+                Ok(id)
             } else {
                 Err(signal(
-                    "error",
+                    LispCondition::Error,
                     vec![Value::string("Selecting deleted buffer")],
                 ))
             }
         }
         ValueKind::String => {
             let name = expect_buffer_name_string(arg)?;
-            buffers.find_buffer_by_name(&name).map(Some).ok_or_else(|| {
+            buffers.find_buffer_by_name(&name).ok_or_else(|| {
                 signal(
-                    "error",
+                    LispCondition::Error,
                     vec![Value::string(format!("No buffer named {name}"))],
                 )
             })
@@ -1443,7 +1469,11 @@ pub(crate) fn builtin_buffer_swap_text(
     buffers
         .swap_buffer_text(current_id, other_id)
         .map(|()| Value::NIL)
-        .map_err(|err| signal("error", vec![Value::string(err.message())]))
+        .map_err(|err| {
+            eval.signal_c_error(crate::emacs_core::errors::CErrorMessage::from(
+                err.message(),
+            ))
+        })
 }
 
 pub(crate) fn builtin_insert_buffer_substring(
@@ -1451,8 +1481,12 @@ pub(crate) fn builtin_insert_buffer_substring(
     args: Vec<Value>,
 ) -> EvalResult {
     expect_args_range("insert-buffer-substring", &args, 1, 3)?;
-    let buffer_id =
-        resolve_buffer_designator_allow_nil_current_in_manager(&eval.buffers, &args[0])?;
+    // GNU editfns.c:1728 resolves a required BUFFER through get-buffer.
+    let buffer_id = Some(resolve_buffer_designator_in_manager(
+        &eval.buffers,
+        &args[0],
+        BufferDesignatorDefault::Required,
+    )?);
     let (default_start, default_end) = buffer_id
         .and_then(|id| {
             eval.buffers.get(id).map(|buf| {
@@ -4078,6 +4112,39 @@ pub(crate) fn builtin_insert_byte(eval: &mut super::eval::Context, args: Vec<Val
     Ok(Value::NIL)
 }
 
+/// Validated substitution characters in the buffer's encoding domain.
+/// Values are immutable and local to the active mutator's edit call.
+#[derive(Clone, Copy, Debug)]
+enum SubstitutionCharacters {
+    Unibyte { from: u8, to: u8 },
+    Multibyte { from: EmacsChar, to: EmacsChar },
+}
+
+static_assertions::assert_impl_all!(SubstitutionCharacters: Send, Sync);
+
+impl SubstitutionCharacters {
+    fn for_buffer(buf: &Buffer, from: EmacsChar, to: EmacsChar) -> Self {
+        if buf.get_multibyte() {
+            Self::Multibyte { from, to }
+        } else {
+            Self::Unibyte {
+                from: from.code() as u8,
+                to: to.code() as u8,
+            }
+        }
+    }
+
+    fn codes(self) -> (EmacsChar, EmacsChar) {
+        match self {
+            Self::Unibyte { from, to } => (
+                EmacsChar::from_code_unchecked(u32::from(from)),
+                EmacsChar::from_code_unchecked(u32::from(to)),
+            ),
+            Self::Multibyte { from, to } => (from, to),
+        }
+    }
+}
+
 pub(crate) fn builtin_subst_char_in_region(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
@@ -4086,20 +4153,30 @@ pub(crate) fn builtin_subst_char_in_region(
 
     let start = expect_integer_or_marker_in_buffers(&eval.buffers, &args[0])?;
     let end = expect_integer_or_marker_in_buffers(&eval.buffers, &args[1])?;
-    let from_code = expect_character_code(&args[2])?;
-    let to_code = expect_character_code(&args[3])?;
+    // The Lisp boundary has checked both codes against EmacsChar::MAX.
+    let from_code = EmacsChar::from_code_unchecked(expect_character_code(&args[2])? as u32);
+    let to_code = EmacsChar::from_code_unchecked(expect_character_code(&args[3])? as u32);
     let noundo = args.get(4).is_some_and(|value| !value.is_nil());
 
-    let current_id = eval
-        .buffers
-        .current_buffer_id()
-        .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
-    let target_multibyte = eval
-        .buffers
-        .get(current_id)
-        .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?
-        .get_multibyte();
-    let from_bytes = encode_char_code_for_buffer_bytes(from_code as u32, target_multibyte)
+    let current_id = eval.buffers.current_buffer_id().ok_or_else(|| {
+        signal(
+            LispCondition::Error,
+            vec![Value::string("No current buffer")],
+        )
+    })?;
+    let buffer = eval.buffers.get(current_id).ok_or_else(|| {
+        signal(
+            LispCondition::Error,
+            vec![Value::string("No current buffer")],
+        )
+    })?;
+    let target_multibyte = buffer.get_multibyte();
+    // GNU editfns.c:2340-2345 assigns both character codes to unsigned
+    // bytes in a unibyte buffer. Carry normalized codes through both scans
+    // and the storage edit; encoding only TOCHAR leaves FROMCHAR unmatched.
+    let (from_code, to_code) =
+        SubstitutionCharacters::for_buffer(buffer, from_code, to_code).codes();
+    let from_bytes = encode_char_code_for_buffer_bytes(from_code.code(), target_multibyte)
         .ok_or_else(|| {
             signal(
                 LispCondition::WrongTypeArgument,
@@ -4107,7 +4184,7 @@ pub(crate) fn builtin_subst_char_in_region(
             )
         })?;
     let to_bytes =
-        encode_char_code_for_buffer_bytes(to_code as u32, target_multibyte).ok_or_else(|| {
+        encode_char_code_for_buffer_bytes(to_code.code(), target_multibyte).ok_or_else(|| {
             signal(
                 LispCondition::WrongTypeArgument,
                 vec![Value::symbol("characterp"), args[3]],
@@ -4119,12 +4196,11 @@ pub(crate) fn builtin_subst_char_in_region(
     // Unicode but diverge for raw bytes (C0/C1 overlong vs PUA sentinel)
     // and nonunicode codepoints.
     if from_bytes.len() != to_bytes.len() {
-        return Err(signal(
-            "error",
-            vec![Value::string(
+        return Err(
+            eval.signal_c_error(crate::emacs_core::errors::CErrorMessage::from(
                 "Characters in `subst-char-in-region' have different byte-lengths",
-            )],
-        ));
+            )),
+        );
     }
 
     let Some((range, changed_range)) = subst_char_in_region_scan(
@@ -4171,7 +4247,7 @@ pub(crate) fn builtin_subst_char_in_region(
         current_id,
         range,
         changed_range_through_end,
-        from_code as u32,
+        from_code.code(),
         &to_bytes,
         noundo,
     );
@@ -4187,15 +4263,17 @@ fn subst_char_in_region_scan(
     current_id: BufferId,
     start: i64,
     end: i64,
-    from_code: i64,
-    to_code: i64,
+    from_code: EmacsChar,
+    to_code: EmacsChar,
     to_bytes: &[u8],
     args: &[Value],
 ) -> Result<Option<(TextEditRange, TextEditRange)>, Flow> {
-    let buf = eval
-        .buffers
-        .get(current_id)
-        .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
+    let buf = eval.buffers.get(current_id).ok_or_else(|| {
+        signal(
+            LispCondition::Error,
+            vec![Value::string("No current buffer")],
+        )
+    })?;
     let point_min = buf.point_min_lisp_char_pos().as_i64();
     let point_max = buf.point_max_lisp_char_pos().as_i64();
     if start < point_min || start > point_max || end < point_min || end > point_max {
@@ -4212,7 +4290,7 @@ fn subst_char_in_region_scan(
         return Ok(None);
     }
     Ok(buf
-        .subst_char_changed_range(range, from_code as u32, to_bytes)
+        .subst_char_changed_range(range, from_code.code(), to_bytes)
         .map(|changed_range| (range, changed_range)))
 }
 
@@ -4815,14 +4893,30 @@ pub(crate) fn builtin_char_after(eval: &mut super::eval::Context, args: Vec<Valu
 pub(crate) fn builtin_char_after_1(eval: &mut super::eval::Context, pos: Value) -> EvalResult {
     let args: [Value; 1] = [pos];
     expect_max_args("char-after", &args, 1)?;
-    let buf = eval
-        .buffers
-        .current_buffer()
-        .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
+    let buf = eval.buffers.current_buffer().ok_or_else(|| {
+        signal(
+            LispCondition::Error,
+            vec![Value::string("No current buffer")],
+        )
+    })?;
     let accessible = buf.accessible_emacs_byte_region();
     let byte_pos = if args.is_empty() || args[0].is_nil() {
         let point = buf.point_emacs_byte_pos();
         accessible.contains(point).then_some(point)
+    } else if pos.is_marker() {
+        // GNU editfns.c:1052-1057/1085-1090 uses the marker's own byte
+        // position even when its buffer differs from the current buffer.
+        let location = super::marker::marker_location_or_signal(&eval.buffers, pos)?;
+        let byte_pos = location.byte_pos();
+        if !accessible.contains(byte_pos) {
+            return Ok(Value::NIL);
+        }
+        let code = if location.buffer() == buf.id {
+            buf.char_code_after_emacs_byte_pos(byte_pos)
+        } else {
+            buf.char_code_after_foreign_marker_byte_pos(byte_pos)
+        };
+        return Ok(code.map_or(Value::NIL, |code| Value::fixnum(i64::from(code))));
     } else {
         let pos = expect_integer_or_marker_in_buffers(&eval.buffers, &args[0])?;
         if pos <= 0 {
@@ -4853,16 +4947,25 @@ pub(crate) fn builtin_char_before(eval: &mut super::eval::Context, args: Vec<Val
 pub(crate) fn builtin_char_before_1(eval: &mut super::eval::Context, pos: Value) -> EvalResult {
     let args: [Value; 1] = [pos];
     expect_max_args("char-before", &args, 1)?;
-    let buf = eval
-        .buffers
-        .current_buffer()
-        .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
+    let buf = eval.buffers.current_buffer().ok_or_else(|| {
+        signal(
+            LispCondition::Error,
+            vec![Value::string("No current buffer")],
+        )
+    })?;
     let accessible = buf.accessible_emacs_byte_region();
     let byte_pos = if args.is_empty() || args[0].is_nil() {
         let point = buf.point_emacs_byte_pos();
         accessible
             .contains_preceding_char_boundary(point)
             .then_some(point)
+    } else if pos.is_marker() {
+        // GNU editfns.c:1052-1057/1085-1090 uses the marker's own byte
+        // position even when its buffer differs from the current buffer.
+        let byte_pos = super::marker::marker_location_or_signal(&eval.buffers, pos)?.byte_pos();
+        accessible
+            .contains_preceding_char_boundary(byte_pos)
+            .then_some(byte_pos)
     } else {
         let pos = expect_integer_or_marker_in_buffers(&eval.buffers, &args[0])?;
         if pos <= 0 {
@@ -5708,5 +5811,5 @@ pub(crate) fn builtin_overlay_properties_in_buffers(
 }
 
 #[cfg(test)]
-#[path = "tests/mod.rs"]
+#[path = "tests/buffer_test.rs"]
 mod tests;

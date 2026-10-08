@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use crate::image_bands::{
-    BandFilling, BandSource, BandStep, DecodedBand, RasterBand, RowRange, TextureRows,
-    classify_alpha,
+    BandFilling, BandSource, BandStep, BandedDecoder, DecodedBand, RasterBand, RowRange,
+    TextureRows, classify_alpha,
 };
 use crate::image_sequence::{ImageSequenceCache, ImageSequenceResolution};
 
@@ -2529,4 +2529,5 @@ impl ImageCache {
 }
 
 #[cfg(test)]
+#[path = "image_cache/tests/image_cache_test.rs"]
 mod tests;

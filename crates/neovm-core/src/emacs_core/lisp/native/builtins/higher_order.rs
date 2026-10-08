@@ -21,7 +21,7 @@ fn sort_capture_enabled() -> bool {
 type MapResultVec = SmallVec<[Value; 8]>;
 
 #[cfg(test)]
-#[path = "tests/higher_order_capture.rs"]
+#[path = "tests/higher_order_capture_test.rs"]
 mod higher_order_capture;
 
 pub(crate) fn gnu_mapconcat_unfilled_slot_value() -> Value {
@@ -363,11 +363,11 @@ where
 }
 
 #[cfg(test)]
-#[path = "tests/map_resume.rs"]
+#[path = "tests/map_resume_test.rs"]
 mod map_resume;
 
 #[cfg(test)]
-#[path = "tests/map_resume_capture.rs"]
+#[path = "tests/map_resume_capture_test.rs"]
 mod map_resume_capture;
 
 #[inline]
@@ -391,20 +391,23 @@ pub(crate) fn builtin_apply_slice(eval: &mut super::eval::Context, args: &[Value
     }
 
     let last = args[args.len() - 1];
-    // GNU `Fapply` takes `list_length (spread_arg)` first: a circular spread
-    // list signals `circular-list` rather than growing the argument vector.
-    if last.is_cons() {
-        super::cons_list::proper_list_length_or_signal(last)?;
-    }
+    // GNU Fapply measures the spread list with `list_length` before copying
+    // it (eval.c:2818-2828).  No Lisp runs between that pass and the copy, so
+    // copying while taking the same FOR_EACH_TAIL steps signals the same
+    // `circular-list` or `listp` condition, with the same data, before the
+    // function is called -- in one walk instead of two.
+    let mut cycle = super::cons_list::GnuTailCycle::new(last);
     let mut call_args = LispArgVec::new();
-
-    if args.len() == 1 {
-        let mut cursor = last;
-        let func = match cursor.kind() {
+    let mut cursor = last;
+    let func = if args.len() == 1 {
+        match cursor.kind() {
             ValueKind::Nil => args[0],
             ValueKind::Cons => {
                 let func = cursor.cons_car();
                 cursor = cursor.cons_cdr();
+                if cursor.is_cons() {
+                    cycle.check(cursor)?;
+                }
                 func
             }
             _ => {
@@ -413,38 +416,25 @@ pub(crate) fn builtin_apply_slice(eval: &mut super::eval::Context, args: &[Value
                     vec![Value::symbol("listp"), last],
                 ));
             }
-        };
-        while cursor.is_cons() {
-            call_args.push(cursor.cons_car());
-            cursor = cursor.cons_cdr();
         }
-        if !cursor.is_nil() {
-            return Err(signal(
-                LispCondition::WrongTypeArgument,
-                vec![Value::symbol("listp"), cursor],
-            ));
-        }
-        eval.apply_from_lisp_funcall(func, call_args)
     } else {
         call_args.extend_from_slice(&args[1..args.len() - 1]);
-        let mut cursor = last;
-        loop {
-            match cursor.kind() {
-                ValueKind::Nil => break,
-                ValueKind::Cons => {
-                    call_args.push(cursor.cons_car());
-                    cursor = cursor.cons_cdr();
-                }
-                _ => {
-                    return Err(signal(
-                        LispCondition::WrongTypeArgument,
-                        vec![Value::symbol("listp"), cursor],
-                    ));
-                }
-            }
+        args[0]
+    };
+    while cursor.is_cons() {
+        call_args.push(cursor.cons_car());
+        cursor = cursor.cons_cdr();
+        if cursor.is_cons() {
+            cycle.check(cursor)?;
         }
-        eval.apply_from_lisp_funcall(args[0], call_args)
     }
+    if !cursor.is_nil() {
+        return Err(signal(
+            LispCondition::WrongTypeArgument,
+            vec![Value::symbol("listp"), cursor],
+        ));
+    }
+    eval.apply_from_lisp_funcall(func, call_args)
 }
 
 pub(crate) fn builtin_funcall_slice(eval: &mut super::eval::Context, args: &[Value]) -> EvalResult {
@@ -1877,9 +1867,9 @@ fn merge_hi(
 
 #[cfg(test)]
 #[cfg(feature = "jit")]
-#[path = "tests/higher_order_callback_policy.rs"]
+#[path = "tests/higher_order_callback_policy_test.rs"]
 mod higher_order_callback_policy;
 
 #[cfg(all(test, feature = "jit"))]
-#[path = "tests/mapcar_activation.rs"]
+#[path = "tests/mapcar_activation_test.rs"]
 mod mapcar_activation;

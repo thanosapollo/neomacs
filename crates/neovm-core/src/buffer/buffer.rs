@@ -3835,6 +3835,39 @@ impl Buffer {
         self.text.char_code_at_emacs_byte_pos(pos)
     }
 
+    /// Read at a marker byte coordinate originating in another buffer.
+    ///
+    /// GNU editfns.c:1052-1072 reuses that byte coordinate in the current
+    /// buffer. At a continuation byte it violates character.h:382's decoder
+    /// precondition, so GNU provides no stable result there. Keep the normal
+    /// character-boundary API strict and use bounded safe decoding for this
+    /// input. This pure read retains no borrowed storage across callbacks.
+    pub(crate) fn char_code_after_foreign_marker_byte_pos(&self, pos: EmacsBytePos) -> Option<u32> {
+        let end = self.total_emacs_byte_end_pos();
+        if pos >= end {
+            return None;
+        }
+        let lead = self.text.byte_at_emacs_byte_pos(pos);
+        if !self.get_multibyte() || (lead & 0xC0) != 0x80 {
+            return self.char_code_after_emacs_byte_pos(pos);
+        }
+        self.decode_foreign_marker_bytes(pos, end)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn decode_foreign_marker_bytes(&self, pos: EmacsBytePos, end: EmacsBytePos) -> Option<u32> {
+        let available = end.saturating_offset_from(pos).get();
+        let mut bytes = [0; crate::emacs_core::emacs_char::MAX_MULTIBYTE_LENGTH];
+        let length = available.min(bytes.len());
+        for (offset, byte) in bytes[..length].iter_mut().enumerate() {
+            *byte = self
+                .text
+                .byte_at_emacs_byte_pos(pos.add_len(EmacsByteLen::new(offset)));
+        }
+        Some(crate::emacs_core::emacs_char::string_char(&bytes[..length]).0)
+    }
+
     /// Character immediately before Emacs byte position `pos`, or `None`.
     pub fn char_before_emacs_byte_pos(&self, pos: EmacsBytePos) -> Option<char> {
         self.char_code_before_emacs_byte_pos(pos)
@@ -6134,11 +6167,17 @@ impl BufferManager {
         buffer_id: BufferId,
     ) -> Option<()> {
         let markers = self.buffers.get(&buffer_id)?.state_markers?;
-        let pt = self.marker_emacs_byte_pos(buffer_id, markers.pt_marker)?;
-        let begv = self.marker_emacs_byte_pos(buffer_id, markers.begv_marker)?;
-        let zv = self.marker_emacs_byte_pos(buffer_id, markers.zv_marker)?;
+        let pt = self.marker_anchor_position(buffer_id, markers.pt_marker)?;
+        let begv = self.marker_anchor_position(buffer_id, markers.begv_marker)?;
+        let zv = self.marker_anchor_position(buffer_id, markers.zv_marker)?;
         let buffer = self.buffers.get_mut(&buffer_id)?;
-        buffer.set_accessible_region_and_point_from_emacs_bytes(EmacsByteRange::new(begv, zv), pt);
+        // GNU buffer.c:795-802 restores the three paired coordinates
+        // independently. Transposition moves the state markers along with
+        // the text (editfns.c:4500-4523), so saved point can lie outside the
+        // saved accessible region. This is full-text state restoration,
+        // not explicit narrowing or goto-char: neither anchor is clamped.
+        buffer.set_accessible_region_anchors_unchecked(begv, zv);
+        buffer.set_point_anchor_unchecked(pt);
         Some(())
     }
 
@@ -7875,4 +7914,5 @@ impl GcTrace for BufferManager {
 // ===========================================================================
 
 #[cfg(test)]
+#[path = "buffer/tests/buffer_test.rs"]
 mod tests;

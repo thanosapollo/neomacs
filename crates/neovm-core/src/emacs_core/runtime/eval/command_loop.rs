@@ -3452,9 +3452,9 @@ impl Context {
 
 #[cfg(test)]
 #[cfg(debug_assertions)]
-#[path = "tests/gc_heap_mut_closure.rs"]
+#[path = "tests/gc_heap_mut_closure_test.rs"]
 mod gc_heap_mut_closure_tests;
 
 #[cfg(test)]
-#[path = "tests/chrome_transitions.rs"]
+#[path = "tests/chrome_transitions_test.rs"]
 mod chrome_transition_tests;

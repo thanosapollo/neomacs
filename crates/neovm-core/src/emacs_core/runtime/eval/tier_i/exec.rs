@@ -35,6 +35,7 @@
 //! environment, which is `assq`'s answer; with no lexically bound candidate
 //! the tree walker's lookup runs.
 
+use super::super::special_forms::EvalTempRootsToSequenceGuard;
 use super::compile::{
     AliasTarget, CondClause, FormNode, LetOp, Node, Op, Seq, SetqPair, Slot, VarNode,
     is_lazy_leaf_subr,
@@ -1176,24 +1177,36 @@ impl Context {
         }
 
         let varlist = tail.cons_car();
+        // GNU Flet (eval.c:1151) validates before any initializer runs.
+        let varlist_len = self.value_list_len_or_error(varlist)?;
         let body = tail.cons_cdr();
-        let nvars = self.value_list_len_or_error(varlist)?;
         let mut lexical_bindings: SmallVec<[(SymId, Value, Option<Slot>); 8]> = SmallVec::new();
         let mut dynamic_sym_ids = LetBindingVec::new();
         let mut dynamic_slots: SmallVec<[Slot; 8]> = SmallVec::new();
         let use_lexical = self.lexical_binding();
         let mut constant_binding_error: Option<String> = None;
-        let temps_base = self.bc_buf.len();
+        let mut roots = EvalTempRootsToSequenceGuard::enter(self);
+        let context = roots.context();
+        let bindings_slot = context.push_eval_temp_root_slot(varlist);
+        let temps_base = context.bc_buf.len();
         if varlist.bits() != op.varlist.bits() {
-            self.ti_untrust(act);
+            context.ti_untrust(act);
         }
         let mut bindings = varlist;
         let mut index = 0;
 
-        while index < nvars && bindings.is_cons() {
+        // Callbacks may mutate the spine after validation. GNU eval.c:1158
+        // visits at most the original length and stops when it reaches an atom.
+        for _ in 0..varlist_len {
+            if !bindings.is_cons() {
+                break;
+            }
             let element = bindings.cons_car();
-            let binding = self.unwrap_symbol(element);
+            let binding = context.unwrap_symbol(element);
             bindings = bindings.cons_cdr();
+            // GNU advances before the initializer. A callback may detach this
+            // next cons, so the live cursor must remain rooted across GC.
+            context.set_eval_temp_root_slot(bindings_slot, bindings);
             let compiled = op.bindings.get(index);
             index += 1;
             if let Some(id) = binding.as_symbol_id() {
@@ -1201,18 +1214,18 @@ impl Context {
                     .filter(|c| c.element.bits() == element.bits() && c.sym == id)
                     .map(|c| c.slot);
                 if slot.is_none() {
-                    self.ti_untrust(act);
+                    context.ti_untrust(act);
                 }
                 // A bare binder binds nil, which is never a keyword's own value.
-                if let Some(name) = let_constant_error_name(&self.obarray, id, Value::NIL) {
+                if let Some(name) = let_constant_error_name(&context.obarray, id, Value::NIL) {
                     if constant_binding_error.is_none() {
                         constant_binding_error = Some(name);
                     }
                     continue;
                 }
                 if use_lexical
-                    && !self.obarray.is_special_id(id)
-                    && !self.ti_declared_special(act, id)
+                    && !context.obarray.is_special_id(id)
+                    && !context.ti_declared_special(act, id)
                 {
                     lexical_bindings.push((id, Value::NIL, slot));
                 } else {
@@ -1222,15 +1235,15 @@ impl Context {
                 continue;
             }
             if !binding.is_cons() {
-                self.bc_buf.truncate(temps_base);
+                context.bc_buf.truncate(temps_base);
                 return Err(signal(
                     LispCondition::WrongTypeArgument,
                     vec![Value::symbol("listp"), binding],
                 ));
             }
-            let head = self.unwrap_symbol(binding.cons_car());
+            let head = context.unwrap_symbol(binding.cons_car());
             let Some(id) = head.as_symbol_id() else {
-                self.bc_buf.truncate(temps_base);
+                context.bc_buf.truncate(temps_base);
                 return Err(signal(
                     LispCondition::WrongTypeArgument,
                     vec![Value::symbol("symbolp"), head],
@@ -1238,7 +1251,7 @@ impl Context {
             };
             let compiled = compiled.filter(|c| c.element.bits() == element.bits() && c.sym == id);
             if compiled.is_none() {
-                self.ti_untrust(act);
+                context.ti_untrust(act);
             }
             let mut value_tail = binding.cons_cdr();
             let value = if value_tail.is_nil() {
@@ -1247,9 +1260,9 @@ impl Context {
                 let init_form = value_tail.cons_car();
                 value_tail = value_tail.cons_cdr();
                 if !value_tail.is_nil() {
-                    self.bc_buf.truncate(temps_base);
+                    context.bc_buf.truncate(temps_base);
                     return Err(signal(
-                        "error",
+                        LispCondition::Error,
                         vec![
                             Value::string("`let' bindings can have only one value-form"),
                             binding,
@@ -1257,29 +1270,31 @@ impl Context {
                     ));
                 }
                 let init = match compiled.and_then(|c| c.init.as_ref()) {
-                    Some(node) => self.ti_child(act, init_form, node),
-                    None => self.ti_eval_island(act, init_form),
+                    Some(node) => context.ti_child(act, init_form, node),
+                    None => context.ti_eval_island(act, init_form),
                 };
                 match init {
                     Ok(value) => value,
                     Err(err) => {
-                        self.bc_buf.truncate(temps_base);
+                        context.bc_buf.truncate(temps_base);
                         return Err(err);
                     }
                 }
             } else {
-                self.bc_buf.truncate(temps_base);
-                return Err(self.listp_error(binding));
+                context.bc_buf.truncate(temps_base);
+                return Err(context.listp_error(binding));
             };
-            self.bc_buf.push(value);
-            if let Some(name) = let_constant_error_name(&self.obarray, id, value) {
+            context.bc_buf.push(value);
+            if let Some(name) = let_constant_error_name(&context.obarray, id, value) {
                 if constant_binding_error.is_none() {
                     constant_binding_error = Some(name);
                 }
                 continue;
             }
             let slot = compiled.map(|c| c.slot);
-            if use_lexical && !self.obarray.is_special_id(id) && !self.ti_declared_special(act, id)
+            if use_lexical
+                && !context.obarray.is_special_id(id)
+                && !context.ti_declared_special(act, id)
             {
                 lexical_bindings.push((id, value, slot));
             } else {
@@ -1288,23 +1303,23 @@ impl Context {
             }
         }
         if let Some(name) = constant_binding_error {
-            self.bc_buf.truncate(temps_base);
+            context.bc_buf.truncate(temps_base);
             return Err(signal(
                 LispCondition::SettingConstant,
                 vec![Value::symbol(name)],
             ));
         }
         if index != op.bindings.len() {
-            self.ti_untrust(act);
+            context.ti_untrust(act);
         }
 
         // As `sf_let_value_named`: nothing below can collect until the
         // environment is installed (only conses are allocated).
-        self.bc_buf.truncate(temps_base);
-        let lexenv_at_entry = self.lexenv;
-        let specpdl_count = self.specpdl.len();
+        context.bc_buf.truncate(temps_base);
+        let lexenv_at_entry = context.lexenv;
+        let specpdl_count = context.specpdl.len();
         if use_lexical {
-            self.push_specpdl_with(|| SpecBinding::LexicalEnv {
+            context.push_specpdl_with(|| SpecBinding::LexicalEnv {
                 old_lexenv: lexenv_at_entry,
             });
         }
@@ -1313,34 +1328,29 @@ impl Context {
             let binding_pair = Value::make_cons(lexenv_binding_symbol_value(*sym_id), *val);
             new_lexenv = Value::make_cons(binding_pair, new_lexenv);
             if let Some(slot) = slot {
-                self.tier_i.slots[act.base + usize::from(*slot)] = binding_pair;
+                context.tier_i.slots[act.base + usize::from(*slot)] = binding_pair;
             }
         }
         for slot in &dynamic_slots {
-            self.tier_i.slots[act.base + usize::from(*slot)] = Value::NIL;
+            context.tier_i.slots[act.base + usize::from(*slot)] = Value::NIL;
         }
-        self.lexenv = new_lexenv;
+        context.lexenv = new_lexenv;
 
-        let temp_scope = self.save_eval_temp_roots();
         for value in lexical_bindings
             .iter()
             .map(|(_, value, _)| value)
             .chain(dynamic_sym_ids.iter().map(|(_, value)| value))
         {
-            self.push_eval_temp_root(*value);
+            context.push_eval_temp_root(*value);
         }
         for (sym_id, value) in &dynamic_sym_ids {
-            if let Err(flow) = self.try_specbind(*sym_id, *value) {
-                let result = self.unbind_to_with_result(specpdl_count, Err(flow));
-                self.restore_eval_temp_roots_to_sequence(temp_scope);
-                return result;
+            if let Err(flow) = context.try_specbind(*sym_id, *value) {
+                return context.unbind_to_with_result(specpdl_count, Err(flow));
             }
         }
 
-        let result = self.ti_progn(act, body, &op.body);
-        let result = self.unbind_lexenv_frame(specpdl_count, result);
-        self.restore_eval_temp_roots_to_sequence(temp_scope);
-        result
+        let result = context.ti_progn(act, body, &op.body);
+        context.unbind_lexenv_frame(specpdl_count, result)
     }
 
     /// `sf_let_star_value_named`.
@@ -1367,38 +1377,35 @@ impl Context {
             self.ti_untrust(act);
         }
 
-        let temp_scope = self.save_eval_temp_roots();
-        let val_temp_slot = self.push_eval_temp_root_slot(Value::NIL);
+        let mut roots = EvalTempRootsToSequenceGuard::enter(self);
+        let context = roots.context();
+        let val_temp_slot = context.push_eval_temp_root_slot(Value::NIL);
         let init_result =
-            self.ti_let_star_bindings(act, tail, varlist, use_lexical, val_temp_slot, op);
+            context.ti_let_star_bindings(act, varlist, use_lexical, val_temp_slot, op);
         if let Err(error) = init_result {
-            let result = self.unbind_to_with_result(specpdl_count, Err(error));
-            self.restore_eval_temp_roots_to_sequence(temp_scope);
-            return result;
+            return context.unbind_to_with_result(specpdl_count, Err(error));
         }
 
-        let result = self.ti_progn(act, body, &op.body);
-        let result = self.unbind_to_with_result(specpdl_count, result);
-        self.restore_eval_temp_roots_to_sequence(temp_scope);
-        result
+        let result = context.ti_progn(act, body, &op.body);
+        context.unbind_to_with_result(specpdl_count, result)
     }
 
     /// The binding loop of `sf_let_star_value_named`.
     fn ti_let_star_bindings(
         &mut self,
         act: &Act,
-        tail: Value,
         varlist: Value,
         use_lexical: bool,
         val_temp_slot: usize,
         op: &LetOp,
     ) -> Result<(), Flow> {
-        let bindings_temp_slot = self.push_eval_temp_root_slot(varlist);
-        let tortoise_temp_slot = self.push_eval_temp_root_slot(varlist);
+        let tortoise_slot = self.push_eval_temp_root_slot(varlist);
+        let bindings_slot = self.push_eval_temp_root_slot(varlist);
         let mut bindings = varlist;
+        let mut cycle = crate::emacs_core::builtins::GnuTailCycle::new(varlist);
         let mut index = 0;
-        let mut cycle = crate::emacs_core::builtins::ForEachTail::new(varlist);
         while bindings.is_cons() {
+            self.set_eval_temp_root_slot(bindings_slot, bindings);
             let element = bindings.cons_car();
             let binding = self.unwrap_symbol(element);
             let compiled = op.bindings.get(index);
@@ -1431,7 +1438,7 @@ impl Context {
                     value_tail = value_tail.cons_cdr();
                     if !value_tail.is_nil() {
                         return Err(signal(
-                            "error",
+                            LispCondition::Error,
                             vec![
                                 Value::string("`let' bindings can have only one value-form"),
                                 binding,
@@ -1476,16 +1483,18 @@ impl Context {
                 }
                 self.try_specbind(id, value)?;
             }
+            // FOR_EACH_TAIL advances after initialization and binding; both
+            // the current cons and tortoise survive callback-triggered GC.
             bindings = bindings.cons_cdr();
-            cycle.step(bindings)?;
-            self.set_eval_temp_root_slot(bindings_temp_slot, bindings);
-            self.set_eval_temp_root_slot(tortoise_temp_slot, cycle.tortoise());
+            cycle.check(bindings)?;
+            self.set_eval_temp_root_slot(tortoise_slot, cycle.tortoise());
         }
         if !bindings.is_nil() {
-            // GNU `CHECK_LIST_END (varlist, XCAR (args))`.
+            // GNU CHECK_LIST_END reports the original variable list, not the
+            // dotted ending found by a fresh list-length traversal.
             return Err(signal(
                 LispCondition::WrongTypeArgument,
-                vec![Value::symbol("listp"), tail.cons_car()],
+                vec![Value::symbol("listp"), varlist],
             ));
         }
         if index != op.bindings.len() {

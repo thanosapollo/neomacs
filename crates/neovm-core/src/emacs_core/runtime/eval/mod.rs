@@ -1105,9 +1105,13 @@ pub(crate) enum SpecBinding {
     /// For VM: forms is a callable (bytecode fn), unbind_to calls apply.
     UnwindProtect { forms: Value, lexenv: Value },
     /// save-excursion state. Matches GNU SPECPDL_UNWIND_EXCURSION.
+    /// The owning evaluator's mutator records the original IDs for diagnostics
+    /// and retains their payload slots to preserve the specpdl layout. Restore
+    /// follows the traced marker's live location (GNU editfns.c:792-803), since
+    /// buffer-swap-text can move it away from these recording-time identities.
     SaveExcursion {
-        buffer_id: crate::buffer::BufferId,
-        marker_id: u64,
+        _saved_buffer_id: crate::buffer::BufferId,
+        _saved_marker_id: u64,
         marker: Value,
     },
     /// save-current-buffer state. Matches GNU record_unwind_current_buffer.
@@ -1997,6 +2001,7 @@ cached_symbol_id!(closure_symbol, "closure");
 cached_symbol_id!(declare_symbol, "declare");
 cached_symbol_id!(macro_symbol, "macro");
 cached_symbol_id!(max_lisp_eval_depth_symbol, "max-lisp-eval-depth");
+cached_symbol_id!(frame_alpha_lower_limit_symbol, "frame-alpha-lower-limit");
 cached_symbol_id!(byte_code_literal_symbol, "byte-code-literal");
 cached_symbol_id!(byte_code_symbol, "byte-code");
 cached_symbol_id!(input_decode_map_symbol, "input-decode-map");
@@ -2090,7 +2095,7 @@ fn install_core_eval_symbols(obarray: &mut Obarray, reset_runtime_values: bool) 
         print_symbols_bare_symbol,
         max_lisp_eval_depth_symbol(),
         buffer_undo_list_symbol(),
-        intern("frame-alpha-lower-limit"),
+        frame_alpha_lower_limit_symbol(),
     ] {
         obarray.mark_runtime_projected_id(projected);
     }
@@ -4629,7 +4634,7 @@ impl Context {
             self.symbols_with_pos_enabled = value.is_truthy();
         } else if sym_id == self.print_symbols_bare_symbol {
             self.print_symbols_bare = value.is_truthy();
-        } else if sym_id == intern("frame-alpha-lower-limit") {
+        } else if sym_id == frame_alpha_lower_limit_symbol() {
             let limit = crate::window::frame_alpha::lower_limit(value);
             if let Some(host) = self.display_host.as_mut() {
                 host.set_gui_frame_alpha_lower_limit(limit);
@@ -7745,47 +7750,47 @@ pub(crate) use form_head_cache::FormHeadCache;
 use form_head_cache::{FormHead, HeadClass};
 
 #[cfg(test)]
-#[path = "tests/mod.rs"]
+#[path = "tests/eval_test.rs"]
 mod tests;
 
 // task3-jitcrash-diag: diagnostic repros for the pre-existing JIT
 // heap-corruption crash (no fix here).
 #[cfg(test)]
-#[path = "tests/jit_crash_repro.rs"]
+#[path = "tests/jit_crash_repro_test.rs"]
 mod jit_crash_repro_tests;
 
 // JIT call seam slice C1: the interpreter's direct entry into armed leaves.
 #[cfg(test)]
-#[path = "tests/jit_leaf_slot.rs"]
+#[path = "tests/jit_leaf_slot_test.rs"]
 mod jit_leaf_slot_tests;
 
 // Baseline known-fixnum analysis must honour Float feedback (silent-miscompile regression).
 #[cfg(test)]
-#[path = "tests/jit_known_fixnum_float.rs"]
+#[path = "tests/jit_known_fixnum_float_test.rs"]
 mod jit_known_fixnum_float_tests;
 #[cfg(test)]
-#[path = "tests/jit_mir_known_fixnum_float.rs"]
+#[path = "tests/jit_mir_known_fixnum_float_test.rs"]
 mod jit_mir_known_fixnum_float_tests;
 // Unboxed float slots on GNU's own nbody `elb-applyforces` bytecode.
 #[cfg(test)]
-#[path = "tests/jit_flonum_nbody.rs"]
+#[path = "tests/jit_flonum_nbody_test.rs"]
 mod jit_flonum_nbody_tests;
 // `setq` of a special variable: the plain-cell fast path and every shape it must refuse.
 #[cfg(test)]
-#[path = "tests/apply1_bytecode.rs"]
+#[path = "tests/apply1_bytecode_test.rs"]
 mod apply1_bytecode_tests;
 #[cfg(test)]
-#[path = "tests/apply2_bytecode.rs"]
+#[path = "tests/apply2_bytecode_test.rs"]
 mod apply2_bytecode_tests;
 #[cfg(test)]
-#[path = "tests/varset_plain_fast_path.rs"]
+#[path = "tests/varset_plain_fast_path_test.rs"]
 mod varset_plain_fast_path_tests;
 // Every variable shape through bytecode read/setq/let/unbind, both engines.
 #[cfg(test)]
-#[path = "tests/cconv_memo.rs"]
+#[path = "tests/cconv_memo_test.rs"]
 mod cconv_memo_tests;
 #[cfg(test)]
-#[path = "tests/var_fast.rs"]
+#[path = "tests/var_fast_test.rs"]
 mod var_fast_tests;
 // A form whose argument list is circular signals like GNU, never loops.
 #[cfg(test)]
@@ -7793,11 +7798,11 @@ mod var_fast_tests;
 mod circular_forms_tests;
 
 #[cfg(test)]
-#[path = "tests/builtin_vars.rs"]
+#[path = "tests/builtin_vars_test.rs"]
 mod builtin_vars_tests;
 
 #[cfg(test)]
-#[path = "tests/gc_sweep_cap.rs"]
+#[path = "tests/gc_sweep_cap_test.rs"]
 mod gc_sweep_cap_tests;
 
 #[cfg(test)]
@@ -7809,38 +7814,38 @@ mod dead_buffer_reclaim_tests;
 mod deleted_process_reclaim_tests;
 
 #[cfg(test)]
-#[path = "tests/gc_forced_first_cycle.rs"]
+#[path = "tests/gc_forced_first_cycle_test.rs"]
 mod gc_forced_first_cycle_tests;
 
 #[cfg(test)]
-#[path = "tests/gc_root_ownership.rs"]
+#[path = "tests/gc_root_ownership_test.rs"]
 mod gc_root_ownership_tests;
 
 #[cfg(test)]
-#[path = "tests/gc_tls_ownership.rs"]
+#[path = "tests/gc_tls_ownership_test.rs"]
 mod gc_tls_ownership_tests;
 
 #[cfg(test)]
-#[path = "tests/gc_tls_migration_proofs.rs"]
+#[path = "tests/gc_tls_migration_proofs_test.rs"]
 mod gc_tls_migration_proof_tests;
 
 // The attention word: every writer of its inputs keeps it derived.
 #[cfg(test)]
-#[path = "tests/attention.rs"]
+#[path = "tests/attention_test.rs"]
 mod attention_word_tests;
 
 #[cfg(test)]
-#[path = "tests/idle_redisplay.rs"]
+#[path = "tests/idle_redisplay_test.rs"]
 mod idle_redisplay_tests;
 
 #[cfg(test)]
-#[path = "tests/redisplay_mode_line_flow.rs"]
+#[path = "tests/redisplay_mode_line_flow_test.rs"]
 mod redisplay_mode_line_flow_tests;
 
 // The debug leaf guard: GC safe points, Lisp entries and binding pushes
 // refuse to run under a leaf builtin, and leaves leave state untouched.
 #[cfg(all(test, debug_assertions))]
-#[path = "tests/leaf_guard.rs"]
+#[path = "tests/leaf_guard_test.rs"]
 mod leaf_guard_tests;
 
 /// Allocator for [`Context::context_instance_id`].
