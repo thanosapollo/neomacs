@@ -6,8 +6,10 @@
 //! datum is the cons where the walk met its tortoise.
 //!
 //! Each case evaluates to `(CONDITION DATUM-IS-EXPECTED-CONS ...)`; the
-//! expected strings are GNU 32.0.50's output for the same forms.  The cases
-//! run on a worker thread so a regression fails here instead of hanging.
+//! expected strings are GNU's output for the same forms on the emacs-31.1
+//! `FOR_EACH_TAIL` Brent schedule (checked with GNU 30.2, whose lisp.h walk
+//! and `let`/`let*` are unchanged in 31.1).  The cases run on a worker
+//! thread so a regression fails here instead of hanging.
 
 use crate::emacs_core::eval::{TierIEvent, TierIMode};
 use crate::emacs_core::print::print_value;
@@ -236,7 +238,7 @@ fn circular_form_let_and_let_star_varlists_signal_circular_list() {
                (setcdr (cdr c) c) (setq fix15-n 0)
                (condition-case e (eval (list 'let* c 'a) t)
                  (error (list (car e) (eq (cadr e) c) fix15-n))))",
-            "(circular-list t 1)",
+            "(circular-list t 2)",
         ),
         (
             "(condition-case e (eval '(let ((a (error \"init\")) . 3) a) t) (error e))",

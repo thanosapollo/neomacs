@@ -9861,16 +9861,15 @@ fn apply_and_concat_signal_circular_list_like_gnu() {
 }
 
 /// GNU `list_length` (behind `length`, `mapcar`'s `Flength`, `Fapply` and
-/// `concat`) walks with `FOR_EACH_TAIL`, whose tortoise stays on the head
-/// for the first 4096 steps and then jumps to the tail at each power of two
-/// (lisp.h `FOR_EACH_TAIL_STEP_CYCLEP`); `circular-list`'s datum is the
-/// tail that met it. So a cycle through the head reports the original list
-/// (`eq`), while a prefixed or long cycle reports a later cons. For each
-/// shape (PREFIX CYCLE) the row holds, per caller, the index of the
-/// signalled cons, whether it is `eq` to the list and the datum count.
-/// Callers: interpreted `length`, `apply` alone and with a fixed argument,
-/// `concat`, `mapcar`, then GNU-compiled `concat` (Bconcat2), `apply`
-/// (Bcall) and `length` (Blength). Expected value from GNU 32.0.50.
+/// `concat`) walks with `FOR_EACH_TAIL`, whose emacs-31.1 Brent schedule
+/// (lisp.h `FOR_EACH_TAIL_INTERNAL`) moves the tortoise to the tail after
+/// 2, 4, 8, ... steps; `circular-list`'s datum is the tail that met it.
+/// Every caller must report the same cons. For each shape (PREFIX CYCLE)
+/// the row holds, per caller, the index of the signalled cons, whether it
+/// is `eq` to the list and the datum count. Callers: interpreted `length`,
+/// `apply` alone and with a fixed argument, `concat`, `mapcar`, then
+/// GNU-compiled `concat` (Bconcat2), `apply` (Bcall) and `length`
+/// (Blength). Expected value from GNU 30.2, whose walk 31.1 keeps.
 #[test]
 fn list_length_callers_signal_gnu_circular_list_data() {
     crate::test_utils::init_test_tracing();
@@ -9912,13 +9911,13 @@ fn list_length_callers_signal_gnu_circular_list_data() {
         "({})",
         [
             "(0 t 1)",
-            "(0 t 1)",
             "(2 nil 1)",
-            "(4 nil 1)",
-            "(3192 nil 1)",
-            "(3192 nil 1)",
+            "(2 nil 1)",
+            "(2 nil 1)",
+            "(3190 nil 1)",
+            "(3190 nil 1)",
             "(4096 nil 1)",
-            "(4097 nil 1)",
+            "(4098 nil 1)",
         ]
         .map(row)
         .join(" ")
