@@ -852,7 +852,7 @@ fn capitalize_with_word_pred(
 }
 
 /// Pure form (used by tests); word boundaries follow the standard syntax table.
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn builtin_capitalize(args: Vec<Value>) -> EvalResult {
     capitalize_with_word_pred(args, standard_word_predicate, &CaseTableOverride::none())
 }
@@ -902,7 +902,7 @@ fn upcase_initials_with_word_pred(
 }
 
 /// Pure form (used by tests); word boundaries follow the standard syntax table.
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn builtin_upcase_initials(args: Vec<Value>) -> EvalResult {
     upcase_initials_with_word_pred(args, standard_word_predicate, &CaseTableOverride::none())
 }

@@ -845,7 +845,7 @@ pub(crate) fn builtin_number_to_string(
 }
 
 /// Dispatched form: honors the current buffer's case table (`set-case-table`).
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn builtin_upcase_in_state(
     eval: &mut crate::emacs_core::eval::Context,
     args: Vec<Value>,
@@ -1223,7 +1223,7 @@ pub(crate) fn builtin_downcase(args: Vec<Value>) -> EvalResult {
 
 /// Dispatched form: applies the Greek final-sigma rule via the buffer syntax
 /// table (honoring `case-symbols-as-words`) and the current case table.
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn builtin_downcase_in_state(
     eval: &mut crate::emacs_core::eval::Context,
     args: Vec<Value>,

@@ -169,6 +169,14 @@ vm-profile = []
 # Typed differential-fuzzing seam used by the independent cargo-fuzz package.
 # Kept out of production and ordinary dependency builds.
 fuzzing = []
+# Narrow native #68 integration fixture seam; never enabled by default.
+# Does not enable the crate-wide unit-test tree or change case conversion.
+case68-test-support = []
+
+[[test]]
+name = "case68_native"
+path = "tests/case68_native.rs"
+required-features = ["case68-test-support"]
 
 [dev-dependencies]
 static_assertions.workspace = true

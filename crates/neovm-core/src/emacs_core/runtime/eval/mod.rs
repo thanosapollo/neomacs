@@ -7682,7 +7682,9 @@ mod specpdl;
 mod builtin_vars;
 pub(crate) use builtin_vars::builtin_frontend_on;
 #[cfg(test)]
-pub(crate) use builtin_vars::{parse_builtin_frontend_knob, set_builtin_frontend_for_test};
+pub(crate) use builtin_vars::parse_builtin_frontend_knob;
+#[cfg(any(test, feature = "case68-test-support"))]
+pub(crate) use builtin_vars::set_builtin_frontend_for_test;
 pub(crate) mod native_stack;
 #[cfg(unix)]
 pub use native_stack::raise_main_stack_rlimit;

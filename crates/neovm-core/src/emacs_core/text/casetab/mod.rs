@@ -301,7 +301,7 @@ fn make_standard_case_table_value() -> Value {
 /// does (`lisp/case-table.el`): downcase[UC]=LC, downcase[LC]=LC, upcase[UC]=UC,
 /// upcase[LC]=UC. The canon/eqv extras are left nil so they are recomputed from
 /// the down/up tables by `ensure_case_table_derived_slots` (GNU `set_case_table`).
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn make_case_table_with_pair(uc: i64, lc: i64) -> Value {
     let mut downcase_pairs = Vec::with_capacity(128);
     let mut upcase_pairs = Vec::with_capacity(128);

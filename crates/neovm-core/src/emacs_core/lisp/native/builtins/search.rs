@@ -1196,7 +1196,7 @@ pub(crate) fn builtin_search_backward_with_state(
     buffer_byte_to_char_result_in_manager(buffers, current_id, end)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn builtin_re_search_forward(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
@@ -2632,7 +2632,7 @@ pub(crate) fn builtin_match_beginning_with_state(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn builtin_match_beginning(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
@@ -2684,7 +2684,7 @@ pub(crate) fn builtin_match_end_with_state(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn builtin_match_end(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     expect_args("match-end", &args, 1)?;
     let arg = |i: usize| args.get(i).copied().unwrap_or(Value::NIL);
@@ -3554,7 +3554,7 @@ mod search_frontend_tests;
 #[path = "search/tests/gc_tls_ownership.rs"]
 mod gc_tls_ownership;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 thread_local! {
     /// Test hook: calls a U2.8 front-end fast path answered.
     pub(crate) static FRONTEND_FAST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3562,6 +3562,6 @@ thread_local! {
 
 #[inline(always)]
 fn note_frontend_fast_call() {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "case68-test-support"))]
     FRONTEND_FAST_CALLS.with(|calls| calls.set(calls.get() + 1));
 }
