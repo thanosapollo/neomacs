@@ -20,6 +20,52 @@ use std::ffi::CString;
 use std::ptr;
 
 #[cfg(unix)]
+fn fontset_patterns(fontset: &FcFontSetGuard) -> &[*mut fontconfig_sys::FcPattern] {
+    assert!(!fontset.0.is_null());
+    let nfont = unsafe { (*fontset.0).nfont };
+    assert!(nfont >= 0);
+    // An empty native set may have a null array; even a zero-length Rust slice
+    // requires a non-null pointer.
+    if nfont == 0 {
+        return &[];
+    }
+    let patterns = unsafe { (*fontset.0).fonts };
+    assert!(!patterns.is_null());
+    // The guard keeps the set and its pattern array alive for this borrow.
+    unsafe { std::slice::from_raw_parts(patterns, nfont as usize) }
+}
+
+#[cfg(unix)]
+#[test]
+fn fontset_patterns_accepts_empty_native_set() {
+    let fontset = FcFontSetGuard(unsafe { fontconfig_sys::FcFontSetCreate() });
+    assert!(!fontset.0.is_null());
+    assert_eq!(unsafe { (*fontset.0).nfont }, 0);
+    assert!(unsafe { (*fontset.0).fonts }.is_null());
+    assert!(fontset_patterns(&fontset).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn fontset_patterns_preserves_native_insertion_order() {
+    let fontset = FcFontSetGuard(unsafe { fontconfig_sys::FcFontSetCreate() });
+    assert!(!fontset.0.is_null());
+    let mut expected = Vec::new();
+    for _ in 0..3 {
+        let pattern = FcPatternGuard(unsafe { fontconfig_sys::FcPatternCreate() });
+        assert!(!pattern.0.is_null());
+        assert_ne!(
+            unsafe { fontconfig_sys::FcFontSetAdd(fontset.0, pattern.0) },
+            0
+        );
+        expected.push(pattern.0);
+        // FcFontSetAdd transfers ownership to the set on success.
+        std::mem::forget(pattern);
+    }
+    assert_eq!(fontset_patterns(&fontset), expected.as_slice());
+}
+
+#[cfg(unix)]
 #[test]
 fn identical_native_candidate_queries_are_reused_until_catalog_changes() {
     if fontconfig_handle().is_none() {
@@ -192,8 +238,7 @@ fn registry_charset_queries_keep_gnu_fontconfig_candidate_order() {
     let fontset = unsafe { fontconfig_sys::FcFontList(ptr::null_mut(), pattern.0, object_set.0) };
     assert!(!fontset.is_null());
     let fontset = FcFontSetGuard(fontset);
-    let fonts =
-        unsafe { std::slice::from_raw_parts((*fontset.0).fonts, (*fontset.0).nfont as usize) };
+    let fonts = fontset_patterns(&fontset);
     let expected: Vec<(String, String)> = fonts
         .iter()
         .take(8)
@@ -232,8 +277,7 @@ fn registry_candidates_preserve_coverage_for_required_character_filtering() {
         fontconfig_sys::FcFontList(ptr::null_mut(), pattern.0, objects.0)
     });
     assert!(!fonts.0.is_null());
-    let patterns =
-        unsafe { std::slice::from_raw_parts((*fonts.0).fonts, (*fonts.0).nfont as usize) };
+    let patterns = fontset_patterns(&fonts);
     for ch in ['好', '\u{10ffff}'] {
         let expected: Vec<_> = patterns
             .iter()
@@ -724,8 +768,7 @@ fn required_character_discovery_preserves_postfiltered_candidate_order() {
             fontconfig_sys::FcFontList(ptr::null_mut(), pattern.0, objects.0)
         });
         assert!(!fonts.0.is_null());
-        let patterns =
-            unsafe { std::slice::from_raw_parts((*fonts.0).fonts, (*fonts.0).nfont as usize) };
+        let patterns = fontset_patterns(&fonts);
         for ch in ['a', 'é', '\u{301}', '好', 'ש', 'س', '👩', '\u{10ffff}'] {
             let expected: Vec<_> = patterns
                 .iter()
