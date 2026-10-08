@@ -117,6 +117,8 @@ dbus = { version = "0.9", default-features = false }
 
 [features]
 default = ["jit", "sqlite", "flow-word"]
+# Focused real-runtime integration harness; production defaults stay enabled.
+gc-retention-harness = []
 # P0.12 one-word owning Flow carrier (default on since batch 19: every
 # elisp-benchmarks and board row measured fewer instructions). Build with
 # --no-default-features --features jit,sqlite for the two-word enum carrier.
@@ -182,6 +184,11 @@ syn = { version = "3.0.3", features = ["full", "visit"] }
 [build-dependencies]
 pkg-config.workspace = true
 sha2.workspace = true
+
+[[test]]
+name = "gc_retention_native"
+path = "tests/gc_retention_native.rs"
+required-features = ["gc-retention-harness"]
 
 [[test]]
 name = "compat_all"

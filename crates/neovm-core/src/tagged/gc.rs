@@ -1899,7 +1899,7 @@ impl TaggedHeap {
     /// Test-only scalar snapshot; never follows a Value or changes collector state.
     /// The address must come from a freshly re-looked-up live weak entry, not a
     /// pointer retained across collection. Image identity and roots remain unknown.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "gc-retention-harness"))]
     pub(crate) fn retention_discriminator_phase_for_test(
         &self,
         address: Option<usize>,
