@@ -40,7 +40,9 @@ fn native_settlement_actual_dequeues_preserve_idle_and_dispatch_status_before_le
                         SpecialInputServiceOutcome::default()
                     );
                 } else {
-                    let event = eval.drain_ready_input_event_for_read_char().unwrap();
+                    let event = eval
+                        .drain_ready_input_event_for_read_char(IdleTransitionPolicy::Manage)
+                        .unwrap();
                     assert_eq!(eval.command_loop.idle_start_time, start);
                     assert!(
                         eval.handle_read_char_input_event(

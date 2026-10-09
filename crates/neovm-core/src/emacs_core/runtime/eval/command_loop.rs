@@ -2516,6 +2516,9 @@ impl Context {
     ) {
         let start_t0 = std::time::Instant::now();
         let (obsnap_us, roots_breakdown, ob_slots, ob_chunks);
+        // SAFETY: heap_ptr is this Context's owned heap, exclusively admitted
+        // to the start handshake. No Lisp callback or allocation safepoint
+        // runs during capture, seeding or publication of the marker job.
         unsafe {
             (*heap_ptr).concurrent_begin();
             // CONCURRENT OBARRAY SCAN (Stage 1b). Capture the obarray chunk snapshot
@@ -2528,7 +2531,12 @@ impl Context {
             // symbol cells the GC thread now owns (the BLV pool + non-obarray roots
             // still seed normally).
             let obsnap_t0 = std::time::Instant::now();
-            let snap = self.obarray.scan_snapshot();
+            // SAFETY: start runs on the sole heap/obarray writer without Lisp
+            // callbacks. SATB, retirement and seqlock writes govern the cycle;
+            // explicit finish or abandonment retains the reader's storage.
+            let world =
+                crate::tagged::gc::scan_contract::SingleMutatorWorld::from_heap(&mut *heap_ptr);
+            let snap = self.obarray.scan_snapshot(&world);
             obsnap_us = obsnap_t0.elapsed().as_micros() as u64;
             ob_slots = snap.n_slots();
             ob_chunks = snap.n_chunks();
@@ -2692,11 +2700,12 @@ impl Context {
             .unwrap_or(0);
         if std::env::var("NEOVM_GC_TRACE").as_deref() == Ok("1") {
             let stats = self.tagged_heap.sweep_stats();
+            let (leaf_claimed, hash_claimed) = self.tagged_heap.last_concurrent_claim_counts();
             let hs = self.tagged_heap.handshake_stats();
             eprintln!(
                 "NEOVM_GC concurrent_termination {}us [roots={roots_us}us drain={drain_us}us \
                  fold={}us deferred={} satb={} str_claimed={} f_claimed={} sub_dropped={} \
-                 v_claimed={} bc_claimed={} kinds[{}] join={}us \
+                 v_claimed={} bc_claimed={} leaf_claimed={} ht_claimed={} kinds[{}] join={}us \
                  runtime={}us({}) remembered={}us({}) ctxroots={}us newsyms={newsyms_us}us({}) \
                  finalizer={}us weak={}us unchain={}us groups[{}] probes[{}]]",
                 term_t0.elapsed().as_micros(),
@@ -2708,6 +2717,8 @@ impl Context {
                 stats.last_concurrent_subr_dropped,
                 stats.last_concurrent_vec_claimed,
                 stats.last_concurrent_bc_claimed,
+                leaf_claimed,
+                hash_claimed,
                 stats.last_termination_kinds,
                 hs.last_term_join_us,
                 hs.last_term_runtime_us,
@@ -3452,9 +3463,9 @@ impl Context {
 
 #[cfg(test)]
 #[cfg(debug_assertions)]
-#[path = "tests/gc_heap_mut_closure.rs"]
+#[path = "tests/gc_heap_mut_closure_test.rs"]
 mod gc_heap_mut_closure_tests;
 
 #[cfg(test)]
-#[path = "tests/chrome_transitions.rs"]
+#[path = "tests/chrome_transitions_test.rs"]
 mod chrome_transition_tests;

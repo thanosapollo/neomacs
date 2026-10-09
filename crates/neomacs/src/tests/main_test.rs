@@ -58,10 +58,10 @@ use neovm_core::emacs_core::eval::{
 };
 use neovm_core::emacs_core::image_catalog::{AxisSize, ImageRotation, ImageSizeSpec};
 use neovm_core::emacs_core::image_catalog::{
-    EncodedBytes, ImageAnimationInvalidation, ImageCatalog, ImageColorContext, ImageDataSource,
-    ImageFrameIndex, ImageId, ImageLoadAttempt, ImageLoadIdentity, ImageLoadToken, ImageLookup,
-    ImageResolveRequest, ImageResolveSource, ImageSizeLimit, ImageSpecIdentity,
-    ResolvedImageMetadata,
+    EncodedBytes, ImageAnimationInvalidation, ImageAnimationPolicy, ImageCatalog,
+    ImageColorContext, ImageDataSource, ImageFileName, ImageFrameIndex, ImageId, ImageLoadAttempt,
+    ImageLoadIdentity, ImageLoadToken, ImageLookup, ImageResolveRequest, ImageResolveSource,
+    ImageSizeLimit, ImageSpecIdentity, ResolvedImageMetadata,
 };
 use neovm_core::emacs_core::intern::intern;
 use neovm_core::emacs_core::load::{
@@ -89,8 +89,10 @@ use std::time::{Duration, Instant};
 mod platform_fonts;
 
 #[cfg(test)]
-#[path = "frame_snapshot_policy.rs"]
+#[path = "frame_snapshot_policy_test.rs"]
 mod frame_snapshot_policy;
+#[path = "legacy_frame_admission_test.rs"]
+mod legacy_frame_admission;
 
 fn gui_display() -> BootstrapDisplayConfig {
     let observation = neomacs_display_protocol::DisplayObservation::X11(
@@ -2316,6 +2318,43 @@ fn assert_selected_frame_matches_materialized_default_metrics(eval: &Context) {
 }
 
 #[test]
+fn ordinary_display_host_full_startup_admission_returns_error() {
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(1);
+    cmd_tx.try_send(RenderCommand::Config(ConfigCommand::SetShowFps { enabled: true })).unwrap();
+    let host = PrimaryWindowDisplayHost {
+        frame_opacity: Default::default(),
+        deferred_frame: None,
+        resources: Default::default(),
+        system_fonts: Default::default(),
+        tooltip_client: Default::default(),
+        cmd_tx: cmd_tx.clone(),
+        render_waker: None,
+        font_sizing: FontSizing::gnu_x11_fallback(),
+        primary_window_adopted: false,
+        primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
+        last_window_titles: Mutex::new(std::collections::HashMap::new()),
+        font_metrics: None,
+        primary_window_size: shared_primary_window_size(800, 600),
+        image_catalog: test_image_catalog(&cmd_tx, Arc::new(ImageRenderState::default())),
+        #[cfg(feature = "video")]
+        resolved_videos: Mutex::new(super::super::ResolvedVideoRegistry::default()),
+        resolved_webkits: Mutex::new(std::collections::HashMap::new()),
+        resolved_surfaces: Mutex::new(super::super::ResolvedSurfaceMemo::default()),
+        render_capabilities: Arc::new(SharedRenderCapabilities::default()),
+        requested_frame_shader: Mutex::new(None),
+        #[cfg(feature = "neo-term")]
+        terminal_state: super::super::TerminalHostState::new(new_shared_terminals()),
+    };
+    assert!(host.send_render_command(
+        RenderCommand::Config(ConfigCommand::SetShowFps { enabled: false }),
+        "startup admission",
+    ).is_err());
+    assert!(matches!(cmd_rx.try_recv().unwrap(), RenderCommand::Config(ConfigCommand::SetShowFps { enabled: true })));
+    assert!(cmd_rx.try_recv().is_err());
+}
+
+#[test]
 fn opening_gui_frame_adoption_does_not_push_stale_window_size() {
     let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
     let mut host = PrimaryWindowDisplayHost {
@@ -2329,6 +2368,7 @@ fn opening_gui_frame_adoption_does_not_push_stale_window_size() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2365,33 +2405,16 @@ fn opening_gui_frame_adoption_does_not_push_stale_window_size() {
     .expect("adopt opening gui frame");
 
     let commands: Vec<_> = cmd_rx.try_iter().collect();
-    assert_eq!(commands.len(), 3);
-    assert!(
-        commands.iter().any(
-            |cmd| matches!(cmd, RenderCommand::Window(WindowCommand::SetWindowTitle { title }) if title == "Neomacs")
-        )
-    );
-    assert!(commands.iter().any(|cmd| matches!(
-        cmd,
-        RenderCommand::Window(WindowCommand::SetFrameGeometryHints {
-            frame: FrameRef::Primary,
-            geometry_hints,
-        }) if *geometry_hints
-            == GuiFrameGeometryHints {
-                base_width: 24,
-                base_height: 16,
-                min_width: 24,
-                min_height: 16,
-                width_inc: 8,
-                height_inc: 16,
-            }
-    )));
-    assert!(commands.iter().any(|cmd| matches!(
-        cmd,
-        RenderCommand::Window(WindowCommand::AdoptPrimaryFrame {
-            frame: FrameRef::Frame(0x100000001),
-        })
-    )));
+    assert_eq!(commands.len(), 1);
+    assert!(matches!(&commands[0],
+        RenderCommand::Window(WindowCommand::RealizeFrame {
+            frame: FrameRef::Frame(0x100000001), title, geometry_hints,
+            width: 960, height: 640, adopt_primary: true, fullscreen: None, ..
+        }) if title == "Neomacs" && *geometry_hints == GuiFrameGeometryHints {
+            base_width: 24, base_height: 16, min_width: 24, min_height: 16,
+            width_inc: 8, height_inc: 16,
+        }
+    ));
     assert!(host.primary_window_adopted);
     assert_eq!(host.primary_frame_id, Some(FrameId(0x100000001)));
 }
@@ -2410,6 +2433,7 @@ fn opening_gui_frame_adoption_applies_fullscreen_mode() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2448,9 +2472,10 @@ fn opening_gui_frame_adoption_applies_fullscreen_mode() {
     let commands: Vec<_> = cmd_rx.try_iter().collect();
     assert!(commands.iter().any(|cmd| matches!(
         cmd,
-        RenderCommand::Window(WindowCommand::SetWindowFullscreen {
-            frame: FrameRef::Primary,
-            mode: WindowFullscreenMode::Maximized,
+        RenderCommand::Window(WindowCommand::RealizeFrame {
+            frame: FrameRef::Frame(0x100000001),
+            fullscreen: Some(WindowFullscreenMode::Maximized),
+            adopt_primary: true, ..
         })
     )));
 }
@@ -2469,6 +2494,7 @@ fn primary_display_host_destroy_gui_frame_routes_primary_and_secondary_windows()
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: true,
         primary_frame_id: Some(FrameId(0x100000001)),
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::from([
             (FrameId(0x100000001), LispString::from_utf8("primary")),
             (FrameId(0x100000002), LispString::from_utf8("secondary")),
@@ -2486,25 +2512,19 @@ fn primary_display_host_destroy_gui_frame_routes_primary_and_secondary_windows()
         terminal_state: super::super::TerminalHostState::new(new_shared_terminals()),
     };
 
+    let primary = Arc::new(AtomicBool::new(true));
+    let secondary = Arc::new(AtomicBool::new(true));
+    host.legacy_frame_leases.insert(FrameId(0x100000001), primary.clone());
+    host.legacy_frame_leases.insert(FrameId(0x100000002), secondary.clone());
     neovm_core::emacs_core::DisplayHost::destroy_gui_frame(&mut host, FrameId(0x100000002))
         .expect("destroy secondary frame");
+    assert!(!secondary.load(std::sync::atomic::Ordering::Acquire));
+    assert!(primary.load(std::sync::atomic::Ordering::Acquire));
     neovm_core::emacs_core::DisplayHost::destroy_gui_frame(&mut host, FrameId(0x100000001))
         .expect("destroy primary frame");
-
-    let commands: Vec<_> = cmd_rx.try_iter().collect();
-    assert_eq!(commands.len(), 2);
-    assert!(matches!(
-        commands[0],
-        RenderCommand::Window(WindowCommand::DestroyWindow {
-            frame: FrameRef::Frame(0x100000002),
-        })
-    ));
-    assert!(matches!(
-        commands[1],
-        RenderCommand::Window(WindowCommand::DestroyWindow {
-            frame: FrameRef::Primary
-        })
-    ));
+    assert!(!primary.load(std::sync::atomic::Ordering::Acquire));
+    assert!(host.legacy_frame_leases.is_empty());
+    assert!(cmd_rx.try_recv().is_err(), "cancellation consumes no FIFO slot");
     assert_eq!(host.primary_frame_id, None);
     let cached_titles = host.last_window_titles.lock().expect("title cache");
     assert!(cached_titles.is_empty());
@@ -2524,6 +2544,7 @@ fn primary_display_host_popup_menu_routes_primary_and_secondary_frames() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: true,
         primary_frame_id: Some(FrameId(0x100000001)),
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2610,6 +2631,7 @@ fn primary_image_catalog_lookup_returns_pending_without_waiting_for_render_threa
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2627,7 +2649,7 @@ fn primary_image_catalog_lookup_returns_pending_without_waiting_for_render_threa
     let image_path = repo_root.join("test/data/image/blank-100x200.png");
     let request = ImageResolveRequest {
         spec: test_image_spec_identity(image_path.to_str().expect("utf8 path")),
-        source: ImageResolveSource::File(LispString::from_utf8(
+        source: ImageResolveSource::File(ImageFileName::from_utf8(
             image_path.to_str().expect("utf8 path"),
         )),
         identity: test_file_image_identity(image_path.to_str().expect("utf8 path")),
@@ -2636,6 +2658,7 @@ fn primary_image_catalog_lookup_returns_pending_without_waiting_for_render_threa
         colors: ImageColorContext::default(),
         mask: Default::default(),
         frame: ImageFrameIndex::new(3),
+        animation: ImageAnimationPolicy::disabled(),
         realization: Default::default(),
     };
 
@@ -2714,6 +2737,7 @@ fn animation_frames_share_sequence_identity_and_retirement_advances_generation()
         colors: ImageColorContext::default(),
         mask: Default::default(),
         frame: ImageFrameIndex::new(0),
+        animation: ImageAnimationPolicy::disabled(),
         realization: Default::default(),
     };
 
@@ -2763,6 +2787,7 @@ fn primary_image_catalog_does_not_block_on_render_command_backpressure() {
         rotation: ImageRotation::None,
         colors: ImageColorContext::default(),
         mask: Default::default(),
+        animation: ImageAnimationPolicy::disabled(),
         frame: Default::default(),
         realization: Default::default(),
     };
@@ -2780,6 +2805,7 @@ fn primary_image_catalog_does_not_block_on_render_command_backpressure() {
             font_sizing: FontSizing::gnu_x11_fallback(),
             primary_window_adopted: false,
             primary_frame_id: None,
+            legacy_frame_leases: Default::default(),
             last_window_titles: Mutex::new(std::collections::HashMap::new()),
             font_metrics: None,
             primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2844,6 +2870,7 @@ fn primary_image_catalog_does_not_wait_for_renderer_metadata_lock() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2867,6 +2894,7 @@ fn primary_image_catalog_does_not_wait_for_renderer_metadata_lock() {
         rotation: ImageRotation::None,
         colors: ImageColorContext::default(),
         mask: Default::default(),
+        animation: ImageAnimationPolicy::disabled(),
         frame: Default::default(),
         realization: Default::default(),
     };
@@ -2912,6 +2940,7 @@ fn primary_display_host_expands_tilde_in_image_file_before_render_command() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2927,12 +2956,13 @@ fn primary_display_host_expands_tilde_in_image_file_before_render_command() {
     };
     let request = ImageResolveRequest {
         spec: test_image_spec_identity("~/Pictures/Pik.png"),
-        source: ImageResolveSource::File(LispString::from_utf8("~/Pictures/Pik.png")),
+        source: ImageResolveSource::File(ImageFileName::from_utf8("~/Pictures/Pik.png")),
         identity: test_file_image_identity("~/Pictures/Pik.png"),
         size: ImageSizeSpec::new(AxisSize::AtMost(0), AxisSize::AtMost(24)),
         rotation: ImageRotation::None,
         colors: ImageColorContext::default(),
         mask: Default::default(),
+        animation: ImageAnimationPolicy::disabled(),
         frame: Default::default(),
         realization: Default::default(),
     };
@@ -3004,6 +3034,7 @@ fn primary_display_host_resolve_image_sync_returns_cached_decode_failure_promptl
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3027,6 +3058,7 @@ fn primary_display_host_resolve_image_sync_returns_cached_decode_failure_promptl
         rotation: ImageRotation::None,
         colors: ImageColorContext::default(),
         mask: Default::default(),
+        animation: ImageAnimationPolicy::disabled(),
         frame: Default::default(),
         realization: Default::default(),
     };
@@ -3098,6 +3130,7 @@ fn primary_display_host_request_video_queues_create_once_with_stable_id() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3186,6 +3219,7 @@ fn primary_display_host_request_video_preserves_uri_source() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3237,6 +3271,7 @@ fn primary_display_host_routes_one_typed_video_session_lifecycle() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3298,6 +3333,7 @@ fn primary_display_host_request_webkit_queues_create_and_load_once_with_stable_i
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3354,6 +3390,7 @@ fn primary_display_host_preserves_file_navigation_as_a_typed_path() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3400,6 +3437,7 @@ fn primary_display_host_xwidget_lifecycle_uses_explicit_xwidget_id() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3476,6 +3514,7 @@ fn bootstrap_gui_frame_adoption_routes_future_resizes_to_primary_window() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(843, 489),
@@ -3498,24 +3537,21 @@ fn bootstrap_gui_frame_adoption_routes_future_resizes_to_primary_window() {
     assert!(
         commands.iter().any(|cmd| matches!(
             cmd,
-            RenderCommand::Window(WindowCommand::SetWindowTitle { .. })
+            RenderCommand::Window(WindowCommand::RealizeFrame { .. })
         )),
         "expected bootstrap adoption to set the primary window title, got {commands:?}"
     );
     assert!(
         commands.iter().any(|cmd| matches!(
             cmd,
-            RenderCommand::Window(WindowCommand::SetFrameGeometryHints {
-                frame: FrameRef::Primary,
-                ..
-            })
+            RenderCommand::Window(WindowCommand::RealizeFrame { adopt_primary: true, .. })
         )),
         "expected bootstrap adoption to publish primary window geometry hints, got {commands:?}"
     );
     assert!(
         commands.iter().any(|cmd| matches!(
             cmd,
-            RenderCommand::Window(WindowCommand::AdoptPrimaryFrame { .. })
+            RenderCommand::Window(WindowCommand::RealizeFrame { adopt_primary: true, .. })
         )),
         "expected bootstrap adoption to publish the primary frame identity, got {commands:?}"
     );
@@ -3546,6 +3582,7 @@ fn primary_window_resize_does_not_wait_for_host_acknowledgement() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: true,
         primary_frame_id: Some(FrameId(0x100000001)),
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: Arc::clone(&shared),
@@ -3615,6 +3652,7 @@ fn primary_window_display_host_forwards_visual_config_to_renderer() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: true,
         primary_frame_id: Some(FrameId(0x100000001)),
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(843, 489),
@@ -3691,6 +3729,7 @@ fn primary_window_display_host_round_trips_clipboard_requests_through_renderer()
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: true,
         primary_frame_id: Some(FrameId(0x100000001)),
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(843, 489),
@@ -3765,6 +3804,7 @@ fn redisplay_title_sync_formats_frame_title_format_for_primary_window() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(843, 489),
@@ -3816,6 +3856,7 @@ fn frame_host_title_formats_the_restored_runtime_system_name() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(843, 489),
@@ -5435,6 +5476,150 @@ fn gnu_startup_keeps_single_row_minibuffer() {
 }
 
 #[test]
+fn gui_created_frame_seeds_bar_defaults_before_redisplay() {
+    let mut eval = create_bootstrap_evaluator_cached_with_features(&["neomacs"]).unwrap();
+    bootstrap_runtime_gui_startup(&mut eval);
+    run_gnu_startup(&mut eval);
+    for (modes, defaults, explicit, expected) in [
+        ("t", "nil", "nil", "(1 1)"),
+        ("nil", "nil", "nil", "(0 0)"),
+        (
+            "t",
+            "'((menu-bar-lines . 0) (tool-bar-lines . 2))",
+            "nil",
+            "(0 2)",
+        ),
+        (
+            "t",
+            "'((menu-bar-lines . 0) (tool-bar-lines . 2))",
+            "'((menu-bar-lines . 1) (tool-bar-lines . 0))",
+            "(1 0)",
+        ),
+    ] {
+        let result = eval
+            .eval_str(&format!(
+                "(let ((menu-bar-mode {modes}) (tool-bar-mode {modes})
+            (default-frame-alist {defaults}))
+            (let ((frame (x-create-frame {explicit})))
+              (list (frame-parameter frame 'menu-bar-lines)
+                    (frame-parameter frame 'tool-bar-lines))))"
+            ))
+            .unwrap();
+        assert_eq!(print_value_with_eval(&eval, &result), expected);
+    }
+}
+
+#[test]
+fn gui_redisplay_preserves_explicit_frame_bar_parameters() {
+    let mut eval = create_bootstrap_evaluator_cached_with_features(&["neomacs"])
+        .expect("cached bootstrap evaluator");
+    let frame_id = bootstrap_runtime_gui_startup(&mut eval);
+    run_gnu_startup(&mut eval);
+    eval.eval_str("(set-frame-parameter nil 'menu-bar-lines 0)")
+        .expect("hide this frame's menu without changing the global mode");
+    for _ in 0..3 {
+        sync_selected_gui_chrome_state(&mut eval);
+        let result = eval
+            .eval_str("(list (frame-parameter nil 'menu-bar-lines) menu-bar-mode)")
+            .unwrap();
+        assert_eq!(print_value_with_eval(&eval, &result), "(0 t)");
+        assert_eq!(
+            eval.frame_manager().get(frame_id).unwrap().menu_bar_height,
+            0
+        );
+    }
+}
+
+#[test]
+fn gui_redisplay_keeps_local_bar_requests_independent_of_global_modes() {
+    let mut eval = create_bootstrap_evaluator_cached_with_features(&["neomacs"]).unwrap();
+    let frame_id = bootstrap_runtime_gui_startup(&mut eval);
+    run_gnu_startup(&mut eval);
+    eval.eval_str(
+        "(progn (menu-bar-mode -1) (tool-bar-mode -1)
+                         (set-frame-parameter nil 'menu-bar-lines 1)
+                         (set-frame-parameter nil 'tool-bar-lines 2))",
+    )
+    .unwrap();
+    sync_selected_gui_chrome_state(&mut eval);
+    let result = eval
+        .eval_str(
+            "(list (frame-parameter nil 'menu-bar-lines)
+        (frame-parameter nil 'tool-bar-lines) menu-bar-mode tool-bar-mode)",
+        )
+        .unwrap();
+    assert_eq!(print_value_with_eval(&eval, &result), "(1 2 nil nil)");
+    let frame = eval.frame_manager().get(frame_id).unwrap();
+    assert_eq!(frame.menu_bar_height, frame.char_height.round() as u32);
+    assert_eq!(
+        frame.tool_bar_height,
+        2 * default_gui_tool_bar_line_height(frame.font_pixel_size)
+    );
+}
+
+#[test]
+fn gui_compact_bar_round_trip_preserves_frame_bar_requests() {
+    let mut eval = create_bootstrap_evaluator_cached_with_features(&["neomacs"]).unwrap();
+    let frame_id = bootstrap_runtime_gui_startup(&mut eval);
+    run_gnu_startup(&mut eval);
+    eval.eval_str("(modify-frame-parameters nil '((menu-bar-lines . 0) (tool-bar-lines . 2)))")
+        .unwrap();
+    for compact in [true, false, true, false] {
+        eval.set_variable(
+            "compact-bar-mode",
+            if compact { Value::T } else { Value::NIL },
+        );
+        sync_selected_gui_chrome_state(&mut eval);
+        let result = eval
+            .eval_str(
+                "(list (frame-parameter nil 'menu-bar-lines)
+            (frame-parameter nil 'tool-bar-lines))",
+            )
+            .unwrap();
+        assert_eq!(print_value_with_eval(&eval, &result), "(0 2)");
+        let frame = eval.frame_manager().get(frame_id).unwrap();
+        let line_height = default_gui_tool_bar_line_height(frame.font_pixel_size);
+        assert_eq!(frame.menu_bar_height, 0);
+        assert_eq!(
+            frame.tool_bar_height,
+            if compact { 0 } else { 2 * line_height }
+        );
+        assert_eq!(
+            frame.compact_bar_height,
+            if compact { line_height } else { 0 }
+        );
+    }
+}
+
+#[test]
+fn unselected_compact_frame_keeps_geometry_when_parameters_change() {
+    let mut eval = create_bootstrap_evaluator_cached_with_features(&["neomacs"]).unwrap();
+    let frame_id = bootstrap_runtime_gui_startup(&mut eval);
+    run_gnu_startup(&mut eval);
+    eval.eval_str("(setq compact-test-frame (selected-frame))")
+        .unwrap();
+    eval.set_variable("compact-bar-mode", Value::T);
+    sync_selected_gui_chrome_state(&mut eval);
+    let top = eval
+        .frame_manager()
+        .get(frame_id)
+        .unwrap()
+        .root_window()
+        .bounds()
+        .y;
+    assert!(top > 0.0);
+    eval.eval_str("(select-frame (make-frame '((name . \"other\"))))")
+        .unwrap();
+    eval.eval_str("(set-frame-parameter compact-test-frame 'name \"renamed\")")
+        .unwrap();
+    let frame = eval.frame_manager().get(frame_id).unwrap();
+    assert_eq!(frame.root_window().bounds().y, top);
+    assert_eq!(frame.menu_bar_height, 0);
+    assert_eq!(frame.tool_bar_height, 0);
+    assert_eq!(frame.compact_bar_height as f32, top);
+}
+
+#[test]
 fn bootstrap_gui_frame_seeds_live_menu_and_tool_bar_rows() {
     let mut eval = create_bootstrap_evaluator_cached_with_features(&["neomacs"])
         .expect("cached bootstrap evaluator");
@@ -5537,8 +5722,8 @@ fn sync_selected_gui_chrome_state_uses_compact_bar_as_separate_gui_chrome() {
         .frame_manager()
         .selected_frame()
         .expect("selected frame after compact chrome sync");
-    assert_eq!(frame.frame_parameter_int("menu-bar-lines"), Some(0));
-    assert_eq!(frame.frame_parameter_int("tool-bar-lines"), Some(0));
+    assert_eq!(frame.frame_parameter_int("menu-bar-lines"), Some(1));
+    assert_eq!(frame.frame_parameter_int("tool-bar-lines"), Some(1));
     assert_eq!(frame.frame_parameter_int("compact-bar-lines"), Some(1));
     assert_eq!(frame.menu_bar_height, 0);
     assert_eq!(frame.tool_bar_height, 0);
@@ -6771,6 +6956,7 @@ fn primary_display_host_reports_quality_policy_frame_shader_suppression() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 900),
@@ -6854,6 +7040,7 @@ fn primary_display_host_routes_typed_terminal_requests_to_the_renderer() {
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 900),

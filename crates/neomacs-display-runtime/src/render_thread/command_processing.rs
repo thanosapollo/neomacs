@@ -3,23 +3,29 @@ use crate::thread_comm::{ClipboardCommand, LifecycleCommand, RenderCommand, Wind
 
 impl RenderApp {
     /// During connection-only/GPU startup, configuration and frame lifecycle
-    /// live in CPU state. Other commands retain order in bounded staging. When
-    /// staging is full, extract only the same CPU commands from the transport;
-    /// GPU assets remain in place and both queue capacities stay unchanged.
+    /// live in CPU state. Other commands retain order in a bounded staging queue;
+    /// full staging stops GPU admission to the owner, not shutdown or daemon
+    /// CPU work. Limit each pass as well as both queues to 64 ordinary commands.
     pub(super) fn process_startup_commands(&mut self) -> bool {
+        if self.comms.cmd_rx.take_shutdown() {
+            self.lifecycle_flags
+                .request_shutdown(super::state::RenderShutdownReason::EvaluatorShutdown);
+            return true;
+        }
         self.retire_cancelled_frames();
-        // A finite pass cannot be monopolized by a concurrent producer.
         for _ in 0..64 {
-            let command = if self.startup_commands.len() < 64 {
-                self.comms.cmd_rx.try_recv()
-            } else if self.comms.keep_alive_without_frames {
-                self.comms.cmd_rx.try_recv_startup()
-            } else {
+            let Ok(command) = self.comms.cmd_rx.try_recv_startup_for(
+                self.startup_commands.len() == 64,
+                self.comms.keep_alive_without_frames,
+            ) else {
                 break;
             };
-            let Ok(command) = command else {
-                break;
-            };
+            // Frame transactions and their cancellation are CPU lifecycle,
+            // including the legacy owner held behind pending GPU preparation.
+            if let RenderCommand::Window(command @ WindowCommand::RealizeFrame { .. }) = command {
+                self.handle_window(command);
+                continue;
+            }
             if !self.comms.keep_alive_without_frames {
                 if matches!(
                     command,
@@ -44,12 +50,13 @@ impl RenderApp {
                 other => self.startup_commands.push_back(other),
             }
         }
+        self.retire_cancelled_frames();
         false
     }
 
     pub(super) fn startup_control_flow(&self) -> winit::event_loop::ControlFlow {
         if (self.startup_commands.len() < 64 && !self.comms.cmd_rx.is_empty())
-            || (self.comms.keep_alive_without_frames && self.comms.cmd_rx.has_startup_command())
+            || (self.comms.cmd_rx.has_startup_command_for(self.comms.keep_alive_without_frames))
         {
             winit::event_loop::ControlFlow::Poll
         } else {
@@ -67,6 +74,11 @@ impl RenderApp {
         &mut self,
         _waker: Option<winit::event_loop::EventLoopProxy>,
     ) -> bool {
+        if self.comms.cmd_rx.take_shutdown() {
+            self.lifecycle_flags
+                .request_shutdown(super::state::RenderShutdownReason::EvaluatorShutdown);
+            return true;
+        }
         self.retire_cancelled_frames();
         let mut should_exit = false;
 
@@ -102,6 +114,7 @@ impl RenderApp {
             }
         }
 
+        self.retire_cancelled_frames();
         should_exit
     }
 

@@ -1110,6 +1110,7 @@ impl RenderApp {
                         ..WindowChrome::default()
                     },
                     geometry_hints: None,
+                    fullscreen: None,
                 },
                 render: GuiFrameRenderState::new_without_device(
                     0,
@@ -1212,4 +1213,5 @@ impl RenderApp {
 }
 
 #[cfg(test)]
+#[path = "state/tests/state_test.rs"]
 mod tests;

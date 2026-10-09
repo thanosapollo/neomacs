@@ -1221,8 +1221,8 @@ impl Context {
         // copying it with wide loads stalled on the preceding narrow stores.
         self.specpdl.reserve(1);
         self.specpdl.spare_capacity_mut()[0].write(SpecBinding::SaveExcursion {
-            buffer_id,
-            marker_id,
+            _saved_buffer_id: buffer_id,
+            _saved_marker_id: marker_id,
             marker,
         });
         // SAFETY: reserve ensured a spare slot and write initialized it above.
@@ -1590,9 +1590,12 @@ impl Context {
                         break;
                     }
                     self.specpdl.pop();
-                    // `UNBOUND` stored to a plain cell is `makunbound`.
-                    self.obarray
+                    // `UNBOUND` stored to a plain cell is `makunbound`. The
+                    // cell was plain one check ago and nothing ran since.
+                    let restored = self
+                        .obarray
                         .store_plain_value_id(sym_id, old_value.as_plain());
+                    debug_assert!(restored.is_ok(), "the cell left the plain arm unseen");
                     self.sync_cached_runtime_binding_by_id(
                         sym_id,
                         old_value.get().unwrap_or(Value::NIL),

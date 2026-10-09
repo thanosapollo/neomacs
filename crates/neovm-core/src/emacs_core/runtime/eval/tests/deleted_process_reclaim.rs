@@ -400,6 +400,65 @@ fn sending_to_a_process_deleted_while_it_connects_says_not_running() {
     }
 }
 
+const PRE_WRITE_LIFETIME_CASES: &str = include_str!("process_pre_write_lifetime.el");
+
+// All process fixtures, including pipe-only ones, require the process sandbox.
+#[test]
+fn name_only_pre_write_deletion_keeps_the_process_until_send_returns() {
+    pre_write_deletion_keeps_the_process(false);
+}
+
+#[test]
+fn name_only_pre_write_deletion_keeps_the_process_until_send_unwinds() {
+    pre_write_deletion_keeps_the_process(true);
+}
+
+fn pre_write_deletion_keeps_the_process(throwp: bool) {
+    for primitive in ["process-send-string", "process-send-region"] {
+        let mut ev = crate::test_utils::runtime_startup_context();
+        ev.eval_str(PRE_WRITE_LIFETIME_CASES)
+            .expect("pre-write lifetime definitions");
+        ev.eval_str(&format!(
+            "(dps-pre-write-lifetime-setup {})",
+            if throwp { "t" } else { "nil" }
+        ))
+        .expect("name-only process setup");
+        // Drop setup evaluation residue before the callback. Only the live
+        // registry and weak-key table know the process; an id is not a GC root.
+        collect_twice(&mut ev);
+        let id = ev.processes.find_by_name("dps-pre-write").unwrap();
+        let objects_before = process_objects(&mut ev);
+        let deleted_before = ev.processes.deleted_process_count();
+
+        let result = eval_ok(
+            &mut ev,
+            &format!("(dps-pre-write-lifetime-send '{primitive})"),
+        );
+        // Preserve the existing send helper's missing-live-record diagnostic.
+        // This is a source-derived local assertion, not a measured GNU result;
+        // the shared oracle fixture compares the full diagnostic separately.
+        let expected = if throwp {
+            "OK (1 (t closed \"dps-pre-write\" t) 1 escaped)"
+        } else {
+            "OK (1 (t closed \"dps-pre-write\" t) 1 (error \"Process not found\"))"
+        };
+        assert_eq!(result, expected, "{primitive}, throw={throwp}");
+
+        collect_twice(&mut ev);
+        assert_eq!(
+            eval_ok(&mut ev, "(hash-table-count dps-pre-write-weak)"),
+            "OK 0",
+            "{primitive}, throw={throwp}: send root leaked"
+        );
+        assert!(
+            ev.processes.get_any(id).is_none(),
+            "{primitive}, throw={throwp}: deleted record survived the send"
+        );
+        assert_eq!(ev.processes.deleted_process_count(), deleted_before);
+        assert_eq!(process_objects(&mut ev), objects_before - 1);
+    }
+}
+
 /// GNU runs a filter with the match data saved and restores it afterwards,
 /// keeping the searched buffer object meanwhile. A filter that replaces
 /// the match data and collects leaves the saved copy the only holder of a

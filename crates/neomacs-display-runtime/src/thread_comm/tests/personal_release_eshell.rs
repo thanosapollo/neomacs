@@ -52,7 +52,7 @@ fn eshell_exact_invocation_survives_cancelled_gui_and_opacity_startup_extraction
             fullscreen: None,
             visual: None,
             adopt_primary: false,
-            reply,
+            reply: Some(reply),
             live: Arc::clone(&live),
             deadline: Instant::now() + Duration::from_secs(1),
         }))

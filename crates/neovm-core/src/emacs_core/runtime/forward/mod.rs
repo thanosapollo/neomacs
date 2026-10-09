@@ -69,7 +69,7 @@ use super::value::Value;
 use crate::buffer::buffer::BufferSlotPredicateError;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Discriminant for [`LispFwd`]. Mirrors GNU `enum Lisp_Fwd_Type`
 /// (`src/lisp.h:3046-3055`). Always read the first field of any `*Fwd`
@@ -106,12 +106,93 @@ impl LispFwdType {
 /// dispatch code can read the discriminant from a `*const LispFwd`
 /// without knowing the concrete type. Mirrors GNU `lispfwd` (`lisp.h:760`)
 /// + the `type` field on each `Lisp_*fwd` body (`lisp.h:3060-3094`).
+///
+/// # Invariant
+///
+/// A `&LispFwd` always addresses the header of a live descriptor of the
+/// family its [`ty`](Self::ty) names. That is what makes [`Self::slot`] --
+/// the one place the header is re-cast to its body -- sound, and it holds by
+/// construction:
+/// - the header's field is private, so no code outside this module can build
+///   one;
+/// - it is neither `Copy` nor `Clone` (pinned below), so a header cannot be
+///   lifted out of its descriptor and re-read without the body after it;
+/// - every body's `ty` is private too and set only by its allocator, and the
+///   only way from a body to a `&LispFwd` is [`FwdDescriptor::header`].
+///
+/// A symbol's `Forwarded` value cell holds such a reference, which is why
+/// that cell cannot be made to point at anything but a real descriptor.
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 pub struct LispFwd {
-    pub ty: LispFwdType,
-    // The body fields differ per variant. Code that has a `*const LispFwd`
-    // matches on `ty` and re-casts to the concrete `Lisp*Fwd` pointer.
+    ty: LispFwdType,
+    // The body fields differ per variant; `slot` reads them.
+}
+
+static_assertions::assert_not_impl_any!(LispFwd: Copy, Clone);
+
+/// A descriptor body that begins with a [`LispFwd`] header (GNU's `struct
+/// Lisp_Intfwd`, `Lisp_Boolfwd`, ...): the safe upcast every installer uses
+/// instead of a pointer cast. Sealed: only this module's five bodies are
+/// descriptors.
+pub trait FwdDescriptor: sealed::Sealed {
+    /// The family every value of this body carries in its header.
+    const TYPE: LispFwdType;
+
+    /// The header this body starts with.
+    fn header(&self) -> &LispFwd;
+}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+macro_rules! fwd_descriptor {
+    ($body:ty, $family:ident) => {
+        impl sealed::Sealed for $body {}
+
+        impl FwdDescriptor for $body {
+            const TYPE: LispFwdType = LispFwdType::$family;
+
+            #[inline(always)]
+            fn header(&self) -> &LispFwd {
+                debug_assert_eq!(self.ty, Self::TYPE);
+                // SAFETY: the body is `#[repr(C)]` and its first field is
+                // the `LispFwdType` a `LispFwd` consists of, so the body's
+                // address is a valid header address; the returned borrow
+                // has the body's lifetime.
+                unsafe { &*std::ptr::from_ref(self).cast::<LispFwd>() }
+            }
+        }
+
+        const _: () = assert!(std::mem::offset_of!($body, ty) == 0);
+    };
+}
+
+fwd_descriptor!(LispIntFwd, Int);
+fwd_descriptor!(LispBoolFwd, Bool);
+fwd_descriptor!(LispObjFwd, Obj);
+fwd_descriptor!(LispBufferObjFwd, BufferObj);
+fwd_descriptor!(LispKboardObjFwd, KboardObj);
+
+/// A descriptor resolved to its family: GNU's `XFWDTYPE` switch together with
+/// the `XINTFWD` / `XBOOLFWD` / `XOBJFWD` / `XBUFFER_OBJFWD` /
+/// `XKBOARD_OBJFWD` casts it guards, as one exhaustive value.
+///
+/// [`LispFwd::slot`] is the only producer, so a caller matching on this can
+/// neither forget a family nor read a body as the wrong one.
+#[derive(Clone, Copy, Debug)]
+pub enum ForwardSlot<'a> {
+    /// `Lisp_Intfwd`.
+    Int(&'a LispIntFwd),
+    /// `Lisp_Boolfwd`.
+    Bool(&'a LispBoolFwd),
+    /// `Lisp_Objfwd`.
+    Obj(&'a LispObjFwd),
+    /// `Lisp_Buffer_Objfwd`.
+    BufferObj(&'a LispBufferObjFwd),
+    /// `Lisp_Kboard_Objfwd`.
+    KboardObj(&'a LispKboardObjFwd),
 }
 
 /// A value one forward type has accepted, in the form that type stores.
@@ -153,28 +234,50 @@ impl ForwardStore {
 }
 
 impl LispFwd {
+    /// The descriptor family the header names.
+    #[inline(always)]
+    pub fn ty(&self) -> LispFwdType {
+        self.ty
+    }
+
+    /// The descriptor resolved to its family (see [`ForwardSlot`]).
+    #[inline]
+    pub fn slot(&self) -> ForwardSlot<'_> {
+        let header = std::ptr::from_ref(self);
+        // SAFETY: by the type's invariant `self` heads a live descriptor of
+        // the family `ty` names, and every body is `#[repr(C)]` with that
+        // header first (`fwd_descriptor!`), so the cast names the body the
+        // header was allocated with. The borrow keeps `self`'s lifetime.
+        unsafe {
+            match self.ty {
+                LispFwdType::Int => ForwardSlot::Int(&*header.cast::<LispIntFwd>()),
+                LispFwdType::Bool => ForwardSlot::Bool(&*header.cast::<LispBoolFwd>()),
+                LispFwdType::Obj => ForwardSlot::Obj(&*header.cast::<LispObjFwd>()),
+                LispFwdType::BufferObj => {
+                    ForwardSlot::BufferObj(&*header.cast::<LispBufferObjFwd>())
+                }
+                LispFwdType::KboardObj => {
+                    ForwardSlot::KboardObj(&*header.cast::<LispKboardObjFwd>())
+                }
+            }
+        }
+    }
+
     /// GNU `store_symval_forwarding` (`src/data.c:1469-1530`): the one switch
     /// on the forward type that decides whether an assignment is allowed and
     /// what the slot will hold.
-    ///
-    /// # Safety
-    ///
-    /// `self` must be the header of a live descriptor of the variant its `ty`
-    /// names -- the invariant every `install_*fwd` upholds by leaking a
-    /// `'static` descriptor and never re-tagging the symbol.
     pub fn store(&self, newval: Value) -> Result<ForwardStore, ForwardStoreError> {
-        match self.ty {
-            LispFwdType::Int => Ok(ForwardStore::Int(LispInteger::check(newval)?)),
-            LispFwdType::Bool => Ok(ForwardStore::Bool(!newval.is_nil())),
-            LispFwdType::BufferObj => {
+        match self.slot() {
+            ForwardSlot::Int(_) => Ok(ForwardStore::Int(LispInteger::check(newval)?)),
+            ForwardSlot::Bool(_) => Ok(ForwardStore::Bool(!newval.is_nil())),
+            ForwardSlot::BufferObj(buf_fwd) => {
                 // GNU checks the predicate only for a non-nil value
                 // (`data.c:1520-1521`); `BufferSlotPredicate::check` already
                 // encodes that bypass.
-                let buf_fwd = unsafe { &*(self as *const Self as *const LispBufferObjFwd) };
                 buf_fwd.predicate.check(newval)?;
                 Ok(ForwardStore::Object(newval))
             }
-            LispFwdType::Obj | LispFwdType::KboardObj => Ok(ForwardStore::Object(newval)),
+            ForwardSlot::Obj(_) | ForwardSlot::KboardObj(_) => Ok(ForwardStore::Object(newval)),
         }
     }
 
@@ -185,24 +288,12 @@ impl LispFwd {
     /// does not have (the current buffer's slot array), so it is the only one
     /// that answers `None`.
     pub fn load(&self) -> Option<Value> {
-        match self.ty {
-            LispFwdType::Int => {
-                let int_fwd = unsafe { &*(self as *const Self as *const LispIntFwd) };
-                Some(int_fwd.get())
-            }
-            LispFwdType::Bool => {
-                let bool_fwd = unsafe { &*(self as *const Self as *const LispBoolFwd) };
-                Some(Value::bool_val(bool_fwd.get()))
-            }
-            LispFwdType::Obj => {
-                let obj_fwd = unsafe { &*(self as *const Self as *const LispObjFwd) };
-                Some(obj_fwd.get())
-            }
-            LispFwdType::KboardObj => {
-                let kbd_fwd = unsafe { &*(self as *const Self as *const LispKboardObjFwd) };
-                Some(kbd_fwd.get())
-            }
-            LispFwdType::BufferObj => None,
+        match self.slot() {
+            ForwardSlot::Int(int_fwd) => Some(int_fwd.get()),
+            ForwardSlot::Bool(bool_fwd) => Some(Value::bool_val(bool_fwd.get())),
+            ForwardSlot::Obj(obj_fwd) => Some(obj_fwd.get()),
+            ForwardSlot::KboardObj(kbd_fwd) => Some(kbd_fwd.get()),
+            ForwardSlot::BufferObj(_) => None,
         }
     }
 
@@ -216,39 +307,36 @@ impl LispFwd {
     /// the root -- and this is the one place that decides which variants are
     /// roots at all, rather than each registry deciding for itself.
     pub fn owned_value(&self) -> Option<Value> {
-        match self.ty {
+        match self.slot() {
             // `Bool` owns a native `bool`; `BufferObj`'s storage is the
             // buffer's slot array, traced with the buffer.
-            LispFwdType::Bool | LispFwdType::BufferObj => None,
-            LispFwdType::Int | LispFwdType::Obj | LispFwdType::KboardObj => self.load(),
+            ForwardSlot::Bool(_) | ForwardSlot::BufferObj(_) => None,
+            ForwardSlot::Int(int_fwd) => Some(int_fwd.get()),
+            ForwardSlot::Obj(obj_fwd) => Some(obj_fwd.get()),
+            ForwardSlot::KboardObj(kbd_fwd) => Some(kbd_fwd.get()),
         }
     }
 
-    /// [`Self::load`] for a leaked descriptor, for the `&Value`-returning
-    /// symbol accessors.
-    pub fn load_ref(&'static self) -> Option<&'static Value> {
-        match self.ty {
-            LispFwdType::Int => {
-                let int_fwd = unsafe { &*(self as *const Self as *const LispIntFwd) };
-                Some(int_fwd.get_ref())
-            }
-            LispFwdType::Bool => {
-                let bool_fwd = unsafe { &*(self as *const Self as *const LispBoolFwd) };
-                Some(if bool_fwd.get() {
-                    &Value::T
-                } else {
-                    &Value::NIL
-                })
-            }
-            LispFwdType::Obj => {
-                let obj_fwd = unsafe { &*(self as *const Self as *const LispObjFwd) };
-                Some(obj_fwd.get_ref())
-            }
-            LispFwdType::KboardObj => {
-                let kbd_fwd = unsafe { &*(self as *const Self as *const LispKboardObjFwd) };
-                Some(kbd_fwd.get_ref())
-            }
-            LispFwdType::BufferObj => None,
+    /// [`Self::load`] as a reference into the descriptor's slot, for the
+    /// `&Value`-returning symbol accessors (`Obarray::symbol_value_id`,
+    /// `default_value_id`).
+    ///
+    /// The slot is written in place, so a caller must copy the value before
+    /// anything can store to the variable; a reference held across a store
+    /// is undefined behaviour. That is why this is not public and its
+    /// callers are ratcheted (`value_ref_guard`): P7.4 replaces them with
+    /// copied values and removes it.
+    pub(super) fn load_ref(&'static self) -> Option<&'static Value> {
+        match self.slot() {
+            ForwardSlot::Int(int_fwd) => Some(int_fwd.get_ref()),
+            ForwardSlot::Bool(bool_fwd) => Some(if bool_fwd.get() {
+                &Value::T
+            } else {
+                &Value::NIL
+            }),
+            ForwardSlot::Obj(obj_fwd) => Some(obj_fwd.get_ref()),
+            ForwardSlot::KboardObj(kbd_fwd) => Some(kbd_fwd.get_ref()),
+            ForwardSlot::BufferObj(_) => None,
         }
     }
 
@@ -259,90 +347,97 @@ impl LispFwd {
     /// `BufferObj` holds only immutable registration metadata (offset,
     /// predicate, default) and is safe to share, which is why it answers
     /// `None`.
-    pub fn clone_stateful(&'static self) -> Option<&'static Self> {
-        match self.ty {
-            LispFwdType::Int => {
-                let int_fwd = unsafe { &*(self as *const Self as *const LispIntFwd) };
-                // Re-wrapping without re-checking is sound only here, inside
-                // the module that owns the invariant: the value being copied
-                // came out of a slot that `LispInteger::check` already passed.
-                let copy = alloc_intfwd(LispInteger(int_fwd.get()));
-                Some(unsafe { &*(copy as *const LispIntFwd as *const Self) })
-            }
-            LispFwdType::Bool => {
-                let bool_fwd = unsafe { &*(self as *const Self as *const LispBoolFwd) };
-                let copy = alloc_boolfwd(bool_fwd.get());
-                Some(unsafe { &*(copy as *const LispBoolFwd as *const Self) })
-            }
-            LispFwdType::Obj => {
-                let obj_fwd = unsafe { &*(self as *const Self as *const LispObjFwd) };
-                let copy = alloc_objfwd(obj_fwd.get());
-                Some(unsafe { &*(copy as *const LispObjFwd as *const Self) })
-            }
-            LispFwdType::KboardObj => {
-                let kbd_fwd = unsafe { &*(self as *const Self as *const LispKboardObjFwd) };
-                let copy = alloc_kboard_objfwd(kbd_fwd.get());
-                Some(unsafe { &*(copy as *const LispKboardObjFwd as *const Self) })
-            }
-            LispFwdType::BufferObj => None,
+    pub fn clone_stateful(&self) -> Option<&'static Self> {
+        match self.slot() {
+            // Re-wrapping without re-checking is sound only here, inside the
+            // module that owns the invariant: the value being copied came out
+            // of a slot that `LispInteger::check` already passed.
+            ForwardSlot::Int(int_fwd) => Some(alloc_intfwd(LispInteger(int_fwd.get())).header()),
+            ForwardSlot::Bool(bool_fwd) => Some(alloc_boolfwd(bool_fwd.get()).header()),
+            ForwardSlot::Obj(obj_fwd) => Some(alloc_objfwd(obj_fwd.get()).header()),
+            ForwardSlot::KboardObj(kbd_fwd) => Some(alloc_kboard_objfwd(kbd_fwd.get()).header()),
+            ForwardSlot::BufferObj(_) => None,
         }
     }
 
     /// The descriptor as an integer forwarder, if that is what it is.
-    pub fn as_int_fwd(&'static self) -> Option<&'static LispIntFwd> {
-        (self.ty == LispFwdType::Int)
-            .then(|| unsafe { &*(self as *const Self as *const LispIntFwd) })
+    pub fn as_int_fwd(&self) -> Option<&LispIntFwd> {
+        match self.slot() {
+            ForwardSlot::Int(int_fwd) => Some(int_fwd),
+            ForwardSlot::Bool(_)
+            | ForwardSlot::Obj(_)
+            | ForwardSlot::BufferObj(_)
+            | ForwardSlot::KboardObj(_) => None,
+        }
     }
 
     /// The descriptor as a Boolean forwarder, if that is what it is.
-    pub fn as_bool_fwd(&'static self) -> Option<&'static LispBoolFwd> {
-        (self.ty == LispFwdType::Bool)
-            .then(|| unsafe { &*(self as *const Self as *const LispBoolFwd) })
+    pub fn as_bool_fwd(&self) -> Option<&LispBoolFwd> {
+        match self.slot() {
+            ForwardSlot::Bool(bool_fwd) => Some(bool_fwd),
+            ForwardSlot::Int(_)
+            | ForwardSlot::Obj(_)
+            | ForwardSlot::BufferObj(_)
+            | ForwardSlot::KboardObj(_) => None,
+        }
     }
 
     /// The descriptor as a Lisp-object forwarder, if that is what it is.
-    pub fn as_obj_fwd(&'static self) -> Option<&'static LispObjFwd> {
-        (self.ty == LispFwdType::Obj)
-            .then(|| unsafe { &*(self as *const Self as *const LispObjFwd) })
+    pub fn as_obj_fwd(&self) -> Option<&LispObjFwd> {
+        match self.slot() {
+            ForwardSlot::Obj(obj_fwd) => Some(obj_fwd),
+            ForwardSlot::Int(_)
+            | ForwardSlot::Bool(_)
+            | ForwardSlot::BufferObj(_)
+            | ForwardSlot::KboardObj(_) => None,
+        }
+    }
+
+    /// The descriptor as a per-buffer slot forwarder, if that is what it is.
+    pub fn as_buffer_obj_fwd(&self) -> Option<&LispBufferObjFwd> {
+        match self.slot() {
+            ForwardSlot::BufferObj(buf_fwd) => Some(buf_fwd),
+            ForwardSlot::Int(_)
+            | ForwardSlot::Bool(_)
+            | ForwardSlot::Obj(_)
+            | ForwardSlot::KboardObj(_) => None,
+        }
     }
 
     /// The descriptor as a keyboard-object forwarder, if that is what it is.
-    pub fn as_kboard_obj_fwd(&'static self) -> Option<&'static LispKboardObjFwd> {
-        (self.ty == LispFwdType::KboardObj)
-            .then(|| unsafe { &*(self as *const Self as *const LispKboardObjFwd) })
+    pub fn as_kboard_obj_fwd(&self) -> Option<&LispKboardObjFwd> {
+        match self.slot() {
+            ForwardSlot::KboardObj(kbd_fwd) => Some(kbd_fwd),
+            ForwardSlot::Int(_)
+            | ForwardSlot::Bool(_)
+            | ForwardSlot::Obj(_)
+            | ForwardSlot::BufferObj(_) => None,
+        }
     }
 
     /// Perform the store for the variants whose storage is the descriptor.
     /// Returns the canonical value so callers that also mirror the write into
     /// buffer-local storage do not have to recompute it.
     pub fn commit(&self, store: ForwardStore) -> Value {
-        match store {
-            ForwardStore::Int(integer) => {
-                debug_assert_eq!(self.ty, LispFwdType::Int);
-                let int_fwd = unsafe { &*(self as *const Self as *const LispIntFwd) };
-                int_fwd.set(integer);
-            }
-            ForwardStore::Bool(flag) => {
-                debug_assert_eq!(self.ty, LispFwdType::Bool);
-                let bool_fwd = unsafe { &*(self as *const Self as *const LispBoolFwd) };
-                bool_fwd.set(flag);
-            }
-            ForwardStore::Object(value) => match self.ty {
-                LispFwdType::Obj => {
-                    let obj_fwd = unsafe { &*(self as *const Self as *const LispObjFwd) };
-                    obj_fwd.set(value);
-                }
-                LispFwdType::KboardObj => {
-                    let kbd_fwd = unsafe { &*(self as *const Self as *const LispKboardObjFwd) };
-                    kbd_fwd.set(value);
-                }
-                // A per-buffer slot's storage is the buffer's slot array; the
-                // caller writes it.
-                LispFwdType::BufferObj => {}
-                LispFwdType::Int | LispFwdType::Bool => {
-                    debug_assert!(false, "{:?} cannot store a Lisp object", self.ty)
-                }
-            },
+        match (store, self.slot()) {
+            (ForwardStore::Int(integer), ForwardSlot::Int(int_fwd)) => int_fwd.set(integer),
+            (ForwardStore::Bool(flag), ForwardSlot::Bool(bool_fwd)) => bool_fwd.set(flag),
+            (ForwardStore::Object(value), ForwardSlot::Obj(obj_fwd)) => obj_fwd.set(value),
+            (ForwardStore::Object(value), ForwardSlot::KboardObj(kbd_fwd)) => kbd_fwd.set(value),
+            // A per-buffer slot's storage is the buffer's slot array; the
+            // caller writes it.
+            (ForwardStore::Object(_), ForwardSlot::BufferObj(_)) => {}
+            // `store` built the value from this same header, so its variant
+            // always matches; anything else is a caller that paired one
+            // descriptor's store with another's commit.
+            (
+                ForwardStore::Int(_) | ForwardStore::Bool(_) | ForwardStore::Object(_),
+                ForwardSlot::Int(_)
+                | ForwardSlot::Bool(_)
+                | ForwardSlot::Obj(_)
+                | ForwardSlot::BufferObj(_)
+                | ForwardSlot::KboardObj(_),
+            ) => debug_assert!(false, "{store:?} cannot commit into a {:?} slot", self.ty),
         }
         store.canonical_value()
     }
@@ -433,7 +528,7 @@ impl LispInteger {
 /// is exactly as unable to hold a string as GNU's `intmax_t` is.
 #[repr(C)]
 pub struct LispIntFwd {
-    pub ty: LispFwdType,
+    ty: LispFwdType,
     /// Always an integer inside `intmax_t` range -- see [`LispInteger`].
     /// `UnsafeCell` because the descriptor is shared as `&'static` while the
     /// single Lisp thread writes through it, mirroring the `val.plain` symbol
@@ -448,7 +543,7 @@ pub(crate) const LISP_INT_FWD_VALUE_OFFSET: usize = std::mem::offset_of!(LispInt
 // Safety: a `LispIntFwd` is only ever mutated from the Lisp thread that owns
 // its `Obarray`, exactly like the symbol value cells beside it; the `Sync`
 // bound is needed solely so the descriptor can be a `&'static` shared with the
-// GC's root scan, which reads it with `load_value_atomic`.
+// GC's root scan, which reads it atomically (`load_slot`).
 unsafe impl Sync for LispIntFwd {}
 
 impl LispIntFwd {
@@ -456,7 +551,7 @@ impl LispIntFwd {
     /// which wraps the C slot back up with `make_int`.
     #[inline]
     pub fn get(&self) -> Value {
-        crate::tagged::header::load_value_atomic(unsafe { &*self.value.get() })
+        load_slot(&self.value)
     }
 
     /// The slot as GNU's C reads it: a plain `intmax_t`, no Lisp object.
@@ -479,10 +574,9 @@ impl LispIntFwd {
         }
     }
 
-    /// Borrow the stored integer. The descriptor is leaked at registration, so
-    /// the borrow is genuinely `'static`.
+    /// Borrow the stored integer, for [`LispFwd::load_ref`] only.
     #[inline]
-    pub fn get_ref(&'static self) -> &'static Value {
+    fn get_ref(&'static self) -> &'static Value {
         unsafe { &*self.value.get() }
     }
 
@@ -490,10 +584,7 @@ impl LispIntFwd {
     /// so there is no spelling of this call that stores a non-integer.
     #[inline]
     pub fn set(&self, value: LispInteger) {
-        let slot = unsafe { &mut *self.value.get() };
-        // SATB: a bignum slot value is a heap object about to be replaced.
-        crate::tagged::gc::note_root_overwrite(*slot);
-        crate::tagged::header::store_value_atomic(slot, value.value());
+        store_slot(&self.value, value.value());
     }
 }
 
@@ -504,7 +595,7 @@ impl LispIntFwd {
 /// between evaluators while retaining the same forwarded-value semantics.
 #[repr(C)]
 pub struct LispBoolFwd {
-    pub ty: LispFwdType,
+    ty: LispFwdType,
     value: AtomicBool,
 }
 
@@ -563,7 +654,7 @@ impl LispBoolFwd {
 /// way `staticpro` roots GNU's.
 #[repr(C)]
 pub struct LispObjFwd {
-    pub ty: LispFwdType,
+    ty: LispFwdType,
     /// `UnsafeCell` for the same reason as [`LispIntFwd`]'s slot: the
     /// descriptor is shared as `&'static` while the single Lisp thread writes
     /// through it, mirroring the `val.plain` symbol cell beside it.
@@ -576,30 +667,26 @@ pub(crate) const LISP_OBJ_FWD_VALUE_OFFSET: usize = std::mem::offset_of!(LispObj
 
 // Safety: identical to `LispIntFwd` -- mutated only from the Lisp thread that
 // owns its `Obarray`; `Sync` is needed solely so the descriptor can be the
-// `&'static` the GC root scan reads with `load_value_atomic`.
+// `&'static` the GC root scan reads atomically (`load_slot`).
 unsafe impl Sync for LispObjFwd {}
 
 impl LispObjFwd {
     /// GNU `do_symval_forwarding`'s `Lisp_Fwd_Obj` arm (`src/data.c:1343-1344`).
     #[inline]
     pub fn get(&self) -> Value {
-        crate::tagged::header::load_value_atomic(unsafe { &*self.value.get() })
+        load_slot(&self.value)
     }
 
-    /// Borrow the stored value.  The descriptor is leaked at registration, so
-    /// the borrow is genuinely `'static`.
+    /// Borrow the stored value, for [`LispFwd::load_ref`] only.
     #[inline]
-    pub fn get_ref(&'static self) -> &'static Value {
+    fn get_ref(&'static self) -> &'static Value {
         unsafe { &*self.value.get() }
     }
 
     /// The store half of GNU's `Lisp_Fwd_Obj` arm (`src/data.c:1489-1516`).
     #[inline]
     pub fn set(&self, value: Value) {
-        let slot = unsafe { &mut *self.value.get() };
-        // SATB: the slot holds a heap object about to be replaced.
-        crate::tagged::gc::note_root_overwrite(*slot);
-        crate::tagged::header::store_value_atomic(slot, value);
+        store_slot(&self.value, value);
     }
 }
 
@@ -610,7 +697,7 @@ impl LispObjFwd {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct LispBufferObjFwd {
-    pub ty: LispFwdType,
+    ty: LispFwdType,
     /// Index into `Buffer::slots`. Mirrors GNU `Lisp_Buffer_Objfwd::offset`.
     pub offset: u16,
     /// Index into `buffer_local_flags` for "is this buffer-local in the
@@ -691,7 +778,7 @@ impl LispBufferObjFwd {
 /// observable from Lisp until then.
 #[repr(C)]
 pub struct LispKboardObjFwd {
-    pub ty: LispFwdType,
+    ty: LispFwdType,
     /// See [`LispObjFwd`] for why this is an `UnsafeCell`.
     value: UnsafeCell<Value>,
 }
@@ -701,11 +788,100 @@ pub struct LispKboardObjFwd {
 pub(crate) const LISP_KBOARD_OBJ_FWD_VALUE_OFFSET: usize =
     std::mem::offset_of!(LispKboardObjFwd, value);
 
+/// Read a descriptor's `Value` slot with an atomic Acquire load, the
+/// counterpart of [`store_slot`] (and of the GC root scan's
+/// `load_value_atomic`).
+#[inline(always)]
+fn load_slot(slot: &UnsafeCell<Value>) -> Value {
+    // SAFETY: the slot is one machine word, as `AtomicUsize` is (asserted
+    // below), and every access to it is atomic.
+    Value::from_bits(unsafe { (*slot.get().cast::<AtomicUsize>()).load(Ordering::Acquire) })
+}
+
+/// Write a descriptor's `Value` slot: note the pre-image for the
+/// snapshot-at-the-beginning mark, then publish VALUE with a Release store.
+///
+/// The store goes through the cell's raw pointer and never forms a `&mut
+/// Value`: a `&Value` from [`LispFwd::load_ref`] may be live, and a `&mut`
+/// beside it would be undefined behaviour even if neither were read.
+#[inline(always)]
+fn store_slot(slot: &UnsafeCell<Value>, value: Value) {
+    crate::tagged::gc::note_root_overwrite(load_slot(slot));
+    // SAFETY: as in `load_slot`.
+    unsafe { (*slot.get().cast::<AtomicUsize>()).store(value.bits(), Ordering::Release) };
+}
+
 // A slot is one `Value` word the JIT reads and writes whole.
 const _: () = {
     assert!(std::mem::size_of::<UnsafeCell<Value>>() == std::mem::size_of::<usize>());
     assert!(std::mem::size_of::<AtomicBool>() == 1);
 };
+
+// The descriptor layouts compiled code bakes (`jit::compile::jit_layout`),
+// pinned to their numbers so a field change cannot move them silently. The
+// three value words sit at an aligned word offset, so each can become an
+// atomic word in place without moving: what the GC's concurrent root scan
+// needs once every access to them is atomic.
+const _: () = {
+    use std::mem::{align_of, size_of};
+    assert!(LISP_INT_FWD_VALUE_OFFSET == 8);
+    assert!(LISP_OBJ_FWD_VALUE_OFFSET == 8);
+    assert!(LISP_KBOARD_OBJ_FWD_VALUE_OFFSET == 8);
+    assert!(LISP_BOOL_FWD_VALUE_OFFSET == 1);
+    assert!(LISP_INT_FWD_VALUE_OFFSET % align_of::<AtomicUsize>() == 0);
+    assert!(LISP_OBJ_FWD_VALUE_OFFSET % align_of::<AtomicUsize>() == 0);
+    assert!(LISP_KBOARD_OBJ_FWD_VALUE_OFFSET % align_of::<AtomicUsize>() == 0);
+    assert!(size_of::<AtomicUsize>() == size_of::<UnsafeCell<Value>>());
+    assert!(align_of::<LispIntFwd>() >= align_of::<AtomicUsize>());
+    assert!(align_of::<LispObjFwd>() >= align_of::<AtomicUsize>());
+    assert!(align_of::<LispKboardObjFwd>() >= align_of::<AtomicUsize>());
+    assert!(size_of::<LispIntFwd>() == 16);
+    assert!(size_of::<LispObjFwd>() == 16);
+    assert!(size_of::<LispKboardObjFwd>() == 16);
+    assert!(size_of::<LispBoolFwd>() == 2);
+};
+
+impl std::fmt::Debug for LispIntFwd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LispIntFwd")
+            .field("value", &self.get())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for LispBoolFwd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LispBoolFwd")
+            .field("value", &self.get())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for LispObjFwd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LispObjFwd")
+            .field("value", &self.get())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for LispKboardObjFwd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LispKboardObjFwd")
+            .field("value", &self.get())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for LispBufferObjFwd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LispBufferObjFwd")
+            .field("offset", &self.offset)
+            .field("local_flags_idx", &self.local_flags_idx)
+            .field("default", &self.default)
+            .finish_non_exhaustive()
+    }
+}
 
 // Safety: see `LispObjFwd`.
 unsafe impl Sync for LispKboardObjFwd {}
@@ -715,12 +891,12 @@ impl LispKboardObjFwd {
     /// (`src/data.c:1352-1356`).
     #[inline]
     pub fn get(&self) -> Value {
-        crate::tagged::header::load_value_atomic(unsafe { &*self.value.get() })
+        load_slot(&self.value)
     }
 
-    /// Borrow the stored value; the descriptor is leaked at registration.
+    /// Borrow the stored value, for [`LispFwd::load_ref`] only.
     #[inline]
-    pub fn get_ref(&'static self) -> &'static Value {
+    fn get_ref(&'static self) -> &'static Value {
         unsafe { &*self.value.get() }
     }
 
@@ -728,9 +904,7 @@ impl LispKboardObjFwd {
     /// (`src/data.c:1529-1536`), which checks nothing.
     #[inline]
     pub fn set(&self, value: Value) {
-        let slot = unsafe { &mut *self.value.get() };
-        crate::tagged::gc::note_root_overwrite(*slot);
-        crate::tagged::header::store_value_atomic(slot, value);
+        store_slot(&self.value, value);
     }
 }
 
@@ -823,5 +997,5 @@ pub fn alloc_intfwd(initial: LispInteger) -> &'static LispIntFwd {
 mod tests;
 
 #[cfg(test)]
-#[path = "tests/mod.rs"]
+#[path = "tests/forward_module_test.rs"]
 mod gnu_parity_tests;

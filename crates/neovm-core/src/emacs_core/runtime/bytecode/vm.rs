@@ -6254,21 +6254,29 @@ impl<'a> Vm<'a> {
             return;
         }
 
-        let Some(first_arg) = call_args.first() else {
+        // Copy the argument out of the caller's buffer, as `replacement` is
+        // copied out of `result`. The walks below hand `from` to hash-table
+        // mutation closures, and the concurrent mutation path runs those out
+        // of line: a `from` pointing into `call_args` would make the
+        // interpreter's argument buffer escape at all six run_loop call sites
+        // of this function, which reloads it around each call and reshuffled
+        // the whole dispatch loop's register allocation (+2.5% VM tier).
+        let Some(&first_arg) = call_args.first() else {
             return;
         };
         if !first_arg.is_string() {
             return;
         }
 
-        if !result.is_string() || eq_value(first_arg, result) {
+        if !result.is_string() || eq_value(&first_arg, result) {
             return;
         }
         let replacement = *result;
 
-        if crate::emacs_core::value::equal_value(first_arg, &replacement, 0) {
+        if crate::emacs_core::value::equal_value(&first_arg, &replacement, 0) {
             return;
         }
+        let first_arg = &first_arg;
 
         let mut visited = HashSet::new();
         for value in self.ctx.bc_buf.iter_mut() {
@@ -6378,9 +6386,7 @@ impl<'a> Vm<'a> {
                 vec![Value::from_sym_id(name_id)],
             )
         })?;
-        if sym.redirect() == crate::emacs_core::symbol::SymbolRedirect::Plainval {
-            // SAFETY: redirect() already confirmed Plainval, so val.plain is active
-            let val = unsafe { sym.val.plain };
+        if let Some(val) = sym.plain_value() {
             if !val.is_unbound() {
                 // GNU installs `buffer-undo-list` as a DEFVAR_PER_BUFFER
                 // forwarder. Neomacs keeps its value in SharedUndoState so
@@ -6408,13 +6414,10 @@ impl<'a> Vm<'a> {
         // `None` for exactly the one variant that does need the context
         // (`BufferObj`), and the slow path's own non-`BufferObj` arm ends at
         // the same call, so the two cannot drift.
-        if sym.redirect() == crate::emacs_core::symbol::SymbolRedirect::Forwarded {
-            // SAFETY: redirect() confirmed Forwarded, so val.fwd is active and
-            // points at a descriptor `install_*fwd` leaked.
-            let fwd = unsafe { &*sym.val.fwd };
-            if let Some(value) = fwd.load() {
-                return Ok(value);
-            }
+        if let Some(fwd) = sym.forwarded_descriptor()
+            && let Some(value) = fwd.load()
+        {
+            return Ok(value);
         }
         self.lookup_var_id(name_id)
     }
@@ -6434,17 +6437,14 @@ impl<'a> Vm<'a> {
                     if crate::buffer::buffer::DedicatedBufferLocal::from_sym_id(name_id).is_none()
                         && crate::buffer::buffer::lookup_buffer_slot_by_sym_id(name_id).is_none()
                     {
-                        let target = sym.alias_target();
-                        if crate::buffer::buffer::DedicatedBufferLocal::from_sym_id(target)
-                            .is_none()
-                            && let Some(target_sym) = ob.get_by_id(target)
-                            && target_sym.redirect() == SymbolRedirect::Plainval
+                        if let Some(target) = sym.alias_target()
+                            && crate::buffer::buffer::DedicatedBufferLocal::from_sym_id(target)
+                                .is_none()
+                            && let Some(value) =
+                                ob.get_by_id(target).and_then(|target| target.plain_value())
+                            && !value.is_unbound()
                         {
-                            // SAFETY: the target's redirect selects its plain value cell.
-                            let value = unsafe { target_sym.val.plain };
-                            if !value.is_unbound() {
-                                return Ok(value);
-                            }
+                            return Ok(value);
                         }
                     }
                 }
@@ -6649,19 +6649,14 @@ impl<'a> Vm<'a> {
         if matches!(redirect, Some(SymbolRedirect::Forwarded))
             && let Some(buf_id) = self.ctx.buffers.current_buffer_id()
         {
-            use crate::emacs_core::forward::{LispBufferObjFwd, LispFwdType};
-            let fwd_ptr = self
+            let buf_fwd = self
                 .ctx
                 .obarray
                 .get_by_id(resolved)
-                .map(|s| unsafe { s.val.fwd });
-            if let Some(fwd) = fwd_ptr {
-                // Safety: install_buffer_objfwd leaks a 'static
-                // descriptor and the symbol's redirect tag is
-                // immutable once installed.
-                let header = unsafe { &*fwd };
-                if matches!(header.ty, LispFwdType::BufferObj) {
-                    let buf_fwd = unsafe { &*(fwd as *const LispBufferObjFwd) };
+                .and_then(|s| s.forwarded_descriptor())
+                .and_then(|fwd| fwd.as_buffer_obj_fwd());
+            {
+                if let Some(buf_fwd) = buf_fwd {
                     let Some(slot) = crate::buffer::buffer::BufferSlot::from_u16(buf_fwd.offset)
                     else {
                         return Err(signal(
@@ -8898,10 +8893,7 @@ impl<'a> Vm<'a> {
         let Some(sym) = ob.get_by_id(name_id) else {
             return (VR_SLOW_OTHER, false);
         };
-        if sym.redirect() == SymbolRedirect::Plainval {
-            // SAFETY: redirect() confirmed Plainval, so val.plain is active
-            // (same contract as fast_path_var_ref).
-            let val = unsafe { sym.val.plain };
+        if let Some(val) = sym.plain_value() {
             if !val.is_unbound() {
                 if !val.is_nil() {
                     return (VR_PLAIN, false);
@@ -9585,6 +9577,49 @@ impl<'a> crate::emacs_core::builtins::symbols::MacroexpandRuntime for Vm<'a> {
 }
 
 impl crate::emacs_core::builtins::higher_order::SortRuntime for Vm<'_> {
+    fn set_sort_slot(
+        &mut self,
+        slot: &crate::emacs_core::builtins::higher_order::SortRootSlot,
+        value: Value,
+    ) {
+        let crate::emacs_core::builtins::higher_order::SortRootSlot::Runtime(slot) = slot else {
+            unreachable!()
+        };
+        self.ctx.set_specpdl_root_slot(slot, value);
+    }
+
+    fn save_sort_roots(&self) -> crate::emacs_core::builtins::higher_order::SortRootScope {
+        crate::emacs_core::builtins::higher_order::SortRootScope::Runtime(
+            self.ctx.save_specpdl_roots(),
+        )
+    }
+
+    fn restore_sort_roots(
+        &mut self,
+        scope: crate::emacs_core::builtins::higher_order::SortRootScope,
+    ) {
+        let crate::emacs_core::builtins::higher_order::SortRootScope::Runtime(scope) = scope else {
+            unreachable!()
+        };
+        self.ctx.restore_specpdl_roots(scope);
+    }
+
+    fn root_sort_slot(
+        &mut self,
+        value: Value,
+    ) -> crate::emacs_core::builtins::higher_order::SortRootSlot {
+        crate::emacs_core::builtins::higher_order::SortRootSlot::Runtime(
+            self.ctx.push_specpdl_root_slot(value),
+        )
+    }
+
+    fn clear_sort_slot(&mut self, slot: &crate::emacs_core::builtins::higher_order::SortRootSlot) {
+        let crate::emacs_core::builtins::higher_order::SortRootSlot::Runtime(slot) = slot else {
+            unreachable!()
+        };
+        self.ctx.set_specpdl_root_slot(slot, Value::NIL);
+    }
+
     fn call_sort_function1(&mut self, function: Value, arg: Value) -> Result<Value, Flow> {
         self.with_vm_root_scope(|vm| {
             vm.push_dynamic_vm_root(arg);
@@ -9733,23 +9768,23 @@ pub(crate) mod resumed_chain_probe;
 pub(crate) use vm_leaf::render_vm_leaf_stats;
 
 #[cfg(test)]
-#[path = "tests/vm.rs"]
+#[path = "tests/vm_test.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "tests/builtin_result_return.rs"]
+#[path = "tests/builtin_result_return_test.rs"]
 mod builtin_result_return_tests;
 
 #[cfg(test)]
-#[path = "tests/arith_integer_fast_path.rs"]
+#[path = "tests/arith_integer_fast_path_test.rs"]
 mod arith_integer_fast_path_tests;
 
 #[cfg(test)]
-#[path = "tests/collection_capture.rs"]
+#[path = "tests/collection_capture_test.rs"]
 mod collection_capture_tests;
 
 #[cfg(test)]
-#[path = "tests/stack_pool.rs"]
+#[path = "tests/stack_pool_test.rs"]
 mod stack_pool_tests;
 
 impl ArithGenericKind {

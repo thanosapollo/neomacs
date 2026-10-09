@@ -1552,22 +1552,22 @@ pub(crate) fn eager_expansion_failure_policy() -> EagerExpansionFailure {
 /// Scope guard: [`EagerExpansionFailure::FallBackWhileBuildingImage`] for the
 /// duration of an image-constructing `loadup.el` load, restored on drop (and
 /// on unwind).
+#[must_use = "the thread-local extent ends when this guard drops"]
+#[derive(Debug)]
 pub(crate) struct ImageConstructionExpansionScope {
-    previous: EagerExpansionFailure,
+    _scope:
+        crate::tls_scope::TlsScope<EagerExpansionFailure, std::cell::Cell<EagerExpansionFailure>>,
 }
+static_assertions::assert_not_impl_any!(ImageConstructionExpansionScope: Send, Sync);
 
 impl ImageConstructionExpansionScope {
     pub(crate) fn enter() -> Self {
-        let previous = EAGER_EXPANSION_FAILURE
-            .with(|cell| cell.replace(EagerExpansionFailure::FallBackWhileBuildingImage));
-        Self { previous }
-    }
-}
-
-impl Drop for ImageConstructionExpansionScope {
-    fn drop(&mut self) {
-        let previous = self.previous;
-        EAGER_EXPANSION_FAILURE.with(|cell| cell.set(previous));
+        Self {
+            _scope: crate::tls_scope::TlsScope::new(
+                &EAGER_EXPANSION_FAILURE,
+                EagerExpansionFailure::FallBackWhileBuildingImage,
+            ),
+        }
     }
 }
 
@@ -2625,8 +2625,9 @@ static SHIPPED_EDITOR_PROCESS: std::sync::atomic::AtomicBool =
 /// bytecode the way GNU does instead of refusing to start.
 ///
 /// There is exactly one caller and there must only ever be one: `neomacs`'s
-/// `main`, as its first statement.  `crates/neomacs/src/bin/mock-display.rs` and
-/// `neomacsclient.rs` do not call it because neither builds an image; the
+/// `main`, as its first statement.  `crates/neomacs/src/bin/neomacsclient.rs`
+/// and the `crates/neomacs/examples/mock-display.rs` example do not call it
+/// because neither builds an image; the
 /// `bootstrap-neomacs` and `neomacs-temacs` role images are byte copies of the
 /// `neomacs` binary (`xtask` `copy_executable_role_images`), so they run this
 /// same `main` and are covered -- which they must be, since `fresh-build`
@@ -6798,8 +6799,8 @@ pub(crate) fn expand_tilde(path: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "tests/eager_failure.rs"]
+#[path = "tests/eager_failure_test.rs"]
 mod eager_failure_tests;
 #[cfg(test)]
-#[path = "tests/mod.rs"]
+#[path = "tests/load_test.rs"]
 mod tests;

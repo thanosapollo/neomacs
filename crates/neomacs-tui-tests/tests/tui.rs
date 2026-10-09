@@ -8,6 +8,17 @@
 
 mod support;
 
+mod coding_detection;
+mod coding_save;
+mod dual_width_fixed_pitch;
+#[path = "fontset_family_only_test.rs"]
+mod fontset_family_only;
+mod frame_bar_parameters;
+mod idle_timer_output;
+mod pixel_measurement;
+mod process_plist_isolation;
+mod process_send_encoding;
+
 #[cfg(test)]
 #[path = "mode_line_min_width_boundary_oracle.rs"]
 mod mode_line_min_width_boundary_oracle;
@@ -53,6 +64,8 @@ mod frame_visibility;
 mod help_describe;
 #[path = "ibuffer.rs"]
 mod ibuffer;
+#[path = "image_svg_animation.rs"]
+mod image_svg_animation;
 #[path = "input_methods.rs"]
 mod input_methods;
 #[path = "issue_140_hscroll.rs"]

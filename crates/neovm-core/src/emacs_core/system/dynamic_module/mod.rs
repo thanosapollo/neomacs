@@ -305,27 +305,20 @@ pub struct emacs_env_private {
 // Global module state
 // ============================================================================
 
+/// A loaded module's shared library, kept mapped until the process exits or
+/// the same path loads again.
+///
+/// Only the library outlives `module-load`. GNU's `Fmodule_load` keeps the
+/// runtime and its initialization environment on the C stack, valid only while
+/// the module's init function runs, so they are freed when loading returns,
+/// as on the failure paths. The environment holds evaluator-local values; it
+/// never belonged in this process-wide registry.
 pub struct LoadedModule {
     #[allow(dead_code)]
     library: Library,
-    #[allow(dead_code)]
-    runtime: Box<emacs_runtime>,
-    #[allow(dead_code)]
-    runtime_priv: Box<emacs_runtime_private>,
-    #[allow(dead_code)]
-    env: Box<emacs_env>,
-    #[allow(dead_code)]
-    env_priv: Box<emacs_env_private>,
 }
 
-// SAFETY: neomacs runs single-threaded. Module state is never accessed
-// from threads other than the main Lisp evaluation thread.
-unsafe impl Send for emacs_runtime {}
-unsafe impl Sync for emacs_runtime {}
-unsafe impl Send for emacs_runtime_private {}
-unsafe impl Sync for emacs_runtime_private {}
-unsafe impl Send for LoadedModule {}
-unsafe impl Sync for LoadedModule {}
+static_assertions::assert_impl_all!(LoadedModule: Send, Sync);
 
 static LOADED_MODULES: Mutex<Option<HashMap<String, LoadedModule>>> = Mutex::new(None);
 
@@ -552,32 +545,25 @@ pub(crate) fn collect_dynamic_module_gc_roots(roots: &mut Vec<Value>, heap_ident
     });
 }
 
+#[must_use = "the thread-local extent ends when this guard drops"]
+#[derive(Debug)]
 struct ActiveModuleEnv {
-    env_priv: *mut emacs_env_private,
+    _scope: crate::tls_scope::TlsStackScope<ActiveModuleEnvEntry>,
 }
+static_assertions::assert_not_impl_any!(ActiveModuleEnv: Send, Sync);
 
 impl ActiveModuleEnv {
     fn push(env_priv: *mut emacs_env_private) -> Self {
         let heap_identity = crate::tagged::gc::current_tagged_heap_identity().unwrap_or(0);
-        ACTIVE_ENVS.with(|envs| {
-            envs.borrow_mut().push(ActiveModuleEnvEntry {
-                env_priv,
-                heap_identity,
-            })
-        });
-        Self { env_priv }
-    }
-}
-
-impl Drop for ActiveModuleEnv {
-    fn drop(&mut self) {
-        ACTIVE_ENVS.with(|envs| {
-            let mut envs = envs.borrow_mut();
-            let last = envs
-                .pop()
-                .expect("active module environment stack underflow");
-            debug_assert_eq!(last.env_priv, self.env_priv);
-        });
+        Self {
+            _scope: crate::tls_scope::TlsStackScope::push(
+                &ACTIVE_ENVS,
+                ActiveModuleEnvEntry {
+                    env_priv,
+                    heap_identity,
+                },
+            ),
+        }
     }
 }
 
@@ -2092,21 +2078,18 @@ thread_local! {
 /// returns, the outer call's context must come back, or the outer module
 /// function's next `env->funcall` finds no evaluator context. `Drop` also
 /// keeps the teardown coherent once panics become catchable.
+#[must_use = "the thread-local extent ends when this guard drops"]
+#[derive(Debug)]
 struct ModuleContextGuard {
-    prev: *mut Context,
+    _scope: crate::tls_scope::TlsScope<*mut Context, std::cell::Cell<*mut Context>>,
 }
+static_assertions::assert_not_impl_any!(ModuleContextGuard: Send, Sync);
 
 impl ModuleContextGuard {
     fn install(ctx: *mut Context) -> Self {
         Self {
-            prev: MODULE_CTX.with(|c| c.replace(ctx)),
+            _scope: crate::tls_scope::TlsScope::new(&MODULE_CTX, ctx),
         }
-    }
-}
-
-impl Drop for ModuleContextGuard {
-    fn drop(&mut self) {
-        MODULE_CTX.with(|c| c.set(self.prev));
     }
 }
 
@@ -2248,17 +2231,14 @@ pub fn load_module(ctx: &mut Context, path: std::path::PathBuf) -> EvalResult {
     }
 
     unsafe { finalize_storage(&mut env_priv.storage) };
-    env_priv.non_local_exit_symbol = Value::NIL;
-    env_priv.non_local_exit_data = Value::NIL;
-    let rt_priv_reconstructed = unsafe { Box::from_raw(rt.private_members) };
+    // SAFETY: `private_members` came from `Box::into_raw` above and nothing
+    // else frees it. Init has returned, so no module code reads the runtime.
+    drop(unsafe { Box::from_raw(rt.private_members) });
+    drop(rt);
+    drop(env_box);
+    drop(env_priv);
 
-    let loaded = LoadedModule {
-        library: lib,
-        runtime: rt,
-        runtime_priv: rt_priv_reconstructed,
-        env: env_box,
-        env_priv,
-    };
+    let loaded = LoadedModule { library: lib };
 
     // Heal poison rather than unwrap: the registry is a plain map with no
     // invariant spanning the lock (an interrupted insert either happened or
@@ -2427,5 +2407,5 @@ pub fn apply_module_function(ctx: &mut Context, func: Value, args: Vec<Value>) -
 mod tests;
 
 #[cfg(test)]
-#[path = "tests/gc_tls_ownership.rs"]
+#[path = "tests/gc_tls_ownership_test.rs"]
 mod gc_tls_ownership_tests;

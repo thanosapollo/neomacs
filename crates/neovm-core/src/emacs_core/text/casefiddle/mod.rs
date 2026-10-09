@@ -1415,7 +1415,7 @@ pub(crate) fn builtin_char_resolve_modifiers(args: Vec<Value>) -> EvalResult {
 // Tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]
-#[path = "tests/mod.rs"]
+#[path = "tests/casefiddle_test.rs"]
 mod tests;
 
 #[cfg(test)]

@@ -2124,4 +2124,5 @@ impl WgpuRenderer {
 }
 
 #[cfg(test)]
+#[path = "glyphs/tests/glyphs_test.rs"]
 mod tests;

@@ -582,18 +582,18 @@ impl TaggedHeap {
     /// Take the ids of killed buffers whose buffer object the sweep freed
     /// since the last drain; the evaluator drops their killed records.
     pub fn take_pending_buffer_reclaims(&mut self) -> Vec<crate::buffer::BufferId> {
-        std::mem::take(&mut self.pending_buffer_reclaims)
+        std::mem::take(&mut self.process_registry.cold.pending_buffer_reclaims)
     }
 
     /// Hand a taken id back to be considered again after the next cycle.
     pub fn requeue_buffer_reclaim(&mut self, id: crate::buffer::BufferId) {
-        self.pending_buffer_reclaims.push(id);
+        self.process_registry.cold.pending_buffer_reclaims.push(id);
     }
 
     /// Take the ids of deleted processes whose process object the sweep
     /// freed since the last drain; the evaluator drops their records.
     pub fn take_pending_process_reclaims(&mut self) -> Vec<crate::emacs_core::process::ProcessId> {
-        std::mem::take(&mut self.pending_process_reclaims)
+        std::mem::take(&mut self.process_registry.cold.pending_process_reclaims)
     }
 
     /// Allocate an xwidget view object.
@@ -861,10 +861,20 @@ impl TaggedHeap {
             data,
         });
         let ptr = Box::into_raw(obj);
+        let value = unsafe { TaggedValue::from_veclike_ptr(ptr as *const VecLikeHeader) };
+        // GNU compare_overlays uses raw object identity, which need not follow
+        // allocation order. Initialize before linking/publishing the new
+        // object; explicit identities are retained for snapshot observers.
+        // This write is local to the owning mutator's fresh allocation.
+        unsafe {
+            if (*ptr).data.serial == 0 {
+                (*ptr).data.serial = value.bits() as u64;
+            }
+        }
         self.link_veclike(ptr as *mut VecLikeHeader);
         self.current_mutator_gc_mut().allocated_count += 1;
         self.note_allocation_bytes(size_of::<OverlayObj>());
-        unsafe { TaggedValue::from_veclike_ptr(ptr as *const VecLikeHeader) }
+        value
     }
 
     /// Allocate a marker.

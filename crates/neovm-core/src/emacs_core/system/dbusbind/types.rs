@@ -1,7 +1,6 @@
 //! GNU Lisp ↔ D-Bus type conversion (`xd_symbol_to_dbus_type`, `xd_append_arg`,
 //! `xd_retrieve_arg` in `src/dbusbind.c`).
 
-use dbus::arg::messageitem::{MessageItem, MessageItemArray, MessageItemDict};
 use dbus::arg::{ArgType, Iter, IterAppend};
 use dbus::strings::{Path as DbusPath, Signature};
 
@@ -122,169 +121,421 @@ pub(super) fn object_to_arg_type(object: Value) -> Result<ArgType, Flow> {
     Err(dbus_error("Unable to determine D-Bus type"))
 }
 
+/// Prepare the complete subtree before opening any native container. Native
+/// iterator callbacks cannot return Lisp errors, so they only emit owned,
+/// validated arguments and never inspect Lisp objects.
 pub(super) fn append_arg(
     iter: &mut IterAppend<'_>,
     arg_type: ArgType,
     object: Value,
 ) -> Result<(), Flow> {
-    // IterAppend callbacks cannot return Flow, and closing a partially written
-    // container can abort in libdbus. Validate and own the entire argument first.
-    // MessageItem derives recursive wire signatures, not the ArgType enum tag
-    // (notably 'r'/'e', which are not signature characters).
-    iter.append(prepare_arg(arg_type, object, 0)?);
+    PreparedArgument::prepare(arg_type, object, 0)?.append(iter);
     Ok(())
 }
 
+struct PreparedArgument {
+    signature: Signature<'static>,
+    body: PreparedBody,
+}
+
+enum PreparedBody {
+    Basic(PreparedBasic),
+    Array {
+        element_signature: Signature<'static>,
+        elements: Vec<PreparedArgument>,
+    },
+    Dictionary {
+        key_signature: Signature<'static>,
+        value_signature: Signature<'static>,
+        entries: Vec<PreparedEntry>,
+    },
+    Struct {
+        first: Box<PreparedArgument>,
+        rest: Vec<PreparedArgument>,
+    },
+    Variant(Box<PreparedArgument>),
+}
+
+struct PreparedEntry {
+    key: PreparedBasic,
+    value: PreparedArgument,
+}
+
+enum PreparedBasic {
+    Byte(u8),
+    Boolean(bool),
+    Int16(i16),
+    UInt16(u16),
+    Int32(i32),
+    UInt32(u32),
+    Int64(i64),
+    UInt64(u64),
+    Double(f64),
+    String(String),
+    ObjectPath(DbusPath<'static>),
+    Signature(Signature<'static>),
+    UnixFd(std::fs::File),
+}
+
+fn container_type_error(predicate: &str, value: Value) -> Flow {
+    signal(
+        LispCondition::WrongTypeArgument,
+        vec![Value::symbol(predicate), value],
+    )
+}
+
 fn checked_signature(signature: String) -> Result<Signature<'static>, Flow> {
+    if signature.contains('\0') {
+        return Err(dbus_error("D-Bus signature contains NUL"));
+    }
     Signature::new(signature).map_err(|err| dbus_error(&err))
 }
 
-fn prepare_arg(arg_type: ArgType, object: Value, depth: usize) -> Result<MessageItem, Flow> {
-    // Variants hide their contents in the outer signature. Bound traversal as
-    // well as validating signatures, including recursively self-containing Lisp.
-    if depth >= 64 {
-        return Err(dbus_error("D-Bus container nesting is too deep"));
+/// A signature may describe several values, but an array requires exactly one
+/// complete element type. Validate first, then find that type's end without
+/// entering libdbus's infallible container callback on malformed Lisp input.
+fn checked_array_signature(element: &str) -> Result<Signature<'static>, Flow> {
+    let signature = checked_signature(format!("a{element}"))?;
+    let bytes = element.as_bytes();
+    let mut end = 0;
+    while bytes.get(end) == Some(&b'a') {
+        end += 1;
     }
-    Ok(match arg_type {
-        ArgType::Boolean => {
-            if object == keyword_for(ArgType::Boolean) {
-                return Err(dbus_error("Missing D-Bus boolean value"));
-            }
-            MessageItem::Bool(object.is_truthy())
-        }
-        ArgType::Byte => MessageItem::Byte(unsigned(object, u8::MAX as u64)? as u8),
-        ArgType::Int16 => {
-            MessageItem::Int16(signed(object, i16::MIN as i64, i16::MAX as i64)? as i16)
-        }
-        ArgType::UInt16 => MessageItem::UInt16(unsigned(object, u16::MAX as u64)? as u16),
-        ArgType::Int32 => {
-            MessageItem::Int32(signed(object, i32::MIN as i64, i32::MAX as i64)? as i32)
-        }
-        ArgType::UInt32 | ArgType::UnixFd => {
-            MessageItem::UInt32(unsigned(object, u32::MAX as u64)? as u32)
-        }
-        ArgType::Int64 => MessageItem::Int64(signed(object, i64::MIN, i64::MAX)?),
-        ArgType::UInt64 => MessageItem::UInt64(unsigned(object, u64::MAX)?),
-        ArgType::Double => MessageItem::Double(object.as_float().ok_or_else(|| {
-            signal(
-                LispCondition::WrongTypeArgument,
-                vec![Value::symbol("numberp"), object],
-            )
-        })?),
-        ArgType::String => MessageItem::Str(string_arg(object)?),
-        ArgType::ObjectPath => MessageItem::ObjectPath(
-            DbusPath::new(string_arg(object)?).map_err(|err| dbus_error(&err))?,
-        ),
-        ArgType::Signature => MessageItem::Signature(checked_signature(string_arg(object)?)?),
-        ArgType::Array => prepare_array(container_elements(arg_type, object)?, depth + 1)?,
-        ArgType::Variant | ArgType::Struct => {
-            let elements = container_elements(arg_type, object)?;
-            let mut items = elements
-                .into_iter()
-                .map(|(kind, value)| prepare_arg(kind, value, depth + 1))
-                .collect::<Result<Vec<_>, _>>()?;
-            if arg_type == ArgType::Variant {
-                if items.len() != 1 {
-                    return Err(dbus_error("D-Bus variant must contain exactly one value"));
+    match bytes.get(end) {
+        Some(b'(' | b'{') => {
+            let mut depth = 0;
+            for byte in &bytes[end..] {
+                end += 1;
+                match byte {
+                    b'(' | b'{' => depth += 1,
+                    b')' | b'}' => depth -= 1,
+                    _ => {}
                 }
-                MessageItem::Variant(Box::new(items.remove(0)))
-            } else {
-                // MessageItem::signature uses an infallible constructor for
-                // structs; establish its nonempty/length/depth invariant here.
-                checked_signature(format!("({})", item_signatures(&items)))?;
-                MessageItem::Struct(items)
+                if depth == 0 {
+                    break;
+                }
             }
         }
-        ArgType::DictEntry => return Err(dbus_error("D-Bus dictionary entry outside an array")),
-        ArgType::Invalid => return Err(dbus_error("Invalid D-Bus type")),
-    })
+        Some(_) => end += 1,
+        None => return Err(dbus_error("Invalid D-Bus array signature")),
+    }
+    if end != bytes.len() {
+        return Err(dbus_error("Invalid D-Bus array signature"));
+    }
+    Ok(signature)
 }
 
-/// GNU's optional array marker and alternating TYPE VALUE element syntax.
-/// Other containers require their marker; dotted and cyclic lists are errors.
-fn container_elements(arg_type: ArgType, object: Value) -> Result<Vec<(ArgType, Value)>, Flow> {
+/// Normalize GNU's optional keyword/value pairs without accepting improper or
+/// cyclic lists, or a type keyword with no corresponding value.
+fn container_fields(object: Value) -> Result<Vec<(ArgType, Value)>, Flow> {
     let values = crate::emacs_core::value::list_to_vec(&object)
-        .ok_or_else(|| dbus_error("D-Bus container must be a proper, non-circular list"))?;
-    let has_marker = values.first().copied() == Some(keyword_for(arg_type));
-    if arg_type != ArgType::Array && !has_marker {
-        return Err(dbus_error("Missing D-Bus container type"));
-    }
-    let mut index = usize::from(has_marker);
-    let mut elements = Vec::new();
-    while index < values.len() {
-        let kind = object_to_arg_type(values[index])?;
-        if is_type_keyword(values[index]) {
-            index += 1;
+        .ok_or_else(|| dbus_error("D-Bus container must be a proper list"))?;
+    let mut fields = Vec::new();
+    let mut cursor = values.into_iter();
+    while let Some(value) = cursor.next() {
+        if let Some(dtype) = symbol_to_arg_type(value) {
+            let value = cursor
+                .next()
+                .ok_or_else(|| dbus_error("Missing D-Bus value"))?;
+            fields.push((dtype, value));
+        } else {
+            fields.push((object_to_arg_type(value)?, value));
         }
-        let value = values
-            .get(index)
-            .copied()
-            .ok_or_else(|| dbus_error("Missing D-Bus argument value"))?;
-        elements.push((kind, value));
-        index += 1;
     }
-    Ok(elements)
+    Ok(fields)
 }
 
-fn item_signatures(items: &[MessageItem]) -> String {
-    items
-        .iter()
-        .map(|item| item.signature().to_string())
-        .collect()
+impl PreparedArgument {
+    fn prepare(dtype: ArgType, object: Value, depth: usize) -> Result<Self, Flow> {
+        // D-Bus limits total container nesting to 64. Check before traversing
+        // Lisp data, including variants which do not grow their wire signature.
+        // A basic leaf after 64 containers adds no further container depth.
+        if depth > 64 || (depth == 64 && !is_basic(dtype)) {
+            return Err(dbus_error("D-Bus container nesting exceeds 64"));
+        }
+        if is_basic(dtype) {
+            let (signature, basic) = PreparedBasic::prepare(dtype, object)?;
+            return Ok(Self {
+                signature,
+                body: PreparedBody::Basic(basic),
+            });
+        }
+        let source = object;
+        if object.is_cons()
+            && symbol_to_arg_type(object.cons_car()).is_some_and(|kind| !is_basic(kind))
+            && object.cons_car() != keyword_for(dtype)
+        {
+            return Err(dbus_error("Mismatched D-Bus container type"));
+        }
+        if matches!(dtype, ArgType::Variant | ArgType::Struct)
+            && (!object.is_cons() || object.cons_car() != keyword_for(dtype))
+        {
+            return Err(dbus_error("Missing D-Bus container type"));
+        }
+        let object = if object.is_cons()
+            && symbol_to_arg_type(object.cons_car()).is_some_and(|kind| !is_basic(kind))
+        {
+            object.cons_cdr()
+        } else {
+            object
+        };
+        if dtype == ArgType::Array {
+            let raw = crate::emacs_core::value::list_to_vec(&object)
+                .ok_or_else(|| dbus_error("D-Bus array must be a proper list"))?;
+            if let [keyword, value] = raw.as_slice() {
+                if symbol_to_arg_type(*keyword) == Some(ArgType::Signature) {
+                    let element = string_arg(*value)?;
+                    // Validating the whole array permits a dictionary entry
+                    // only in its legal position as an array element.
+                    let signature = checked_array_signature(&element)?;
+                    let body = if element.starts_with('{') {
+                        PreparedBody::Dictionary {
+                            key_signature: checked_signature(element[1..2].to_owned())?,
+                            value_signature: checked_signature(
+                                element[2..element.len() - 1].to_owned(),
+                            )?,
+                            entries: Vec::new(),
+                        }
+                    } else {
+                        PreparedBody::Array {
+                            element_signature: checked_signature(element)?,
+                            elements: Vec::new(),
+                        }
+                    };
+                    return Ok(Self { signature, body });
+                }
+            }
+        }
+        let fields = container_fields(object)?;
+        match dtype {
+            ArgType::Array
+                if fields
+                    .first()
+                    .is_some_and(|(kind, _)| *kind == ArgType::DictEntry) =>
+            {
+                let mut entries = Vec::new();
+                let mut signatures: Option<(Signature<'static>, Signature<'static>)> = None;
+                for (kind, value) in fields {
+                    if kind != ArgType::DictEntry {
+                        return Err(container_type_error("D-Bus", value));
+                    }
+                    let entry_source = value;
+                    if !value.is_cons() || value.cons_car() != keyword_for(kind) {
+                        return Err(dbus_error("Missing D-Bus container type"));
+                    }
+                    let value =
+                        if value.is_cons() && symbol_to_arg_type(value.cons_car()) == Some(kind) {
+                            value.cons_cdr()
+                        } else {
+                            value
+                        };
+                    let fields = container_fields(value)?;
+                    let [(key_type, key), (value_type, value)] = fields.as_slice() else {
+                        return Err(match fields.get(2) {
+                            Some((_, value)) => container_type_error("D-Bus", *value),
+                            None => container_type_error("consp", Value::NIL),
+                        });
+                    };
+                    if !is_basic(*key_type) {
+                        return Err(container_type_error("D-Bus", *key));
+                    }
+                    let (key_signature, key) = PreparedBasic::prepare(*key_type, *key)?;
+                    let value = Self::prepare(*value_type, *value, depth + 2)?;
+                    if let Some((expected_key, expected_value)) = &signatures {
+                        if *expected_key != key_signature || *expected_value != value.signature {
+                            return Err(container_type_error("D-Bus", entry_source));
+                        }
+                    } else {
+                        signatures = Some((key_signature, value.signature.clone()));
+                    }
+                    entries.push(PreparedEntry { key, value });
+                }
+                let (key_signature, value_signature) =
+                    signatures.ok_or_else(|| dbus_error("Missing D-Bus dictionary signature"))?;
+                Ok(Self {
+                    signature: checked_signature(format!("a{{{key_signature}{value_signature}}}"))?,
+                    body: PreparedBody::Dictionary {
+                        key_signature,
+                        value_signature,
+                        entries,
+                    },
+                })
+            }
+            ArgType::Array => {
+                let mut elements = Vec::new();
+                for (kind, value) in fields {
+                    let element_source = value;
+                    let value = Self::prepare(kind, value, depth + 1)?;
+                    if elements
+                        .first()
+                        .is_some_and(|first: &Self| first.signature != value.signature)
+                    {
+                        return Err(container_type_error("D-Bus", element_source));
+                    }
+                    elements.push(value);
+                }
+                let element_signature = match elements.first() {
+                    Some(first) => first.signature.clone(),
+                    None => checked_signature("s".to_owned())?,
+                };
+                Ok(Self {
+                    signature: checked_signature(format!("a{element_signature}"))?,
+                    body: PreparedBody::Array {
+                        element_signature,
+                        elements,
+                    },
+                })
+            }
+            ArgType::Variant => {
+                let [(kind, value)] = fields.as_slice() else {
+                    return Err(match fields.get(1) {
+                        Some((_, value)) => container_type_error("D-Bus", *value),
+                        None => container_type_error("consp", object),
+                    });
+                };
+                Ok(Self {
+                    signature: checked_signature("v".to_owned())?,
+                    body: PreparedBody::Variant(Box::new(Self::prepare(*kind, *value, depth + 1)?)),
+                })
+            }
+            ArgType::Struct => {
+                let mut fields = fields.into_iter();
+                let (kind, value) = fields
+                    .next()
+                    .ok_or_else(|| container_type_error("consp", object))?;
+                let first = Box::new(Self::prepare(kind, value, depth + 1)?);
+                let rest: Vec<Self> = fields
+                    .map(|(kind, value)| Self::prepare(kind, value, depth + 1))
+                    .collect::<Result<_, _>>()?;
+                let mut signature = format!("({}", first.signature);
+                for field in &rest {
+                    signature.push_str(&field.signature);
+                }
+                signature.push(')');
+                Ok(Self {
+                    signature: checked_signature(signature)?,
+                    body: PreparedBody::Struct { first, rest },
+                })
+            }
+            ArgType::DictEntry => Err(container_type_error("D-Bus", source)),
+            _ => Err(dbus_error("Invalid D-Bus type")),
+        }
+    }
+
+    fn append(&self, iter: &mut IterAppend<'_>) {
+        match &self.body {
+            PreparedBody::Basic(value) => value.append(iter),
+            PreparedBody::Array {
+                element_signature,
+                elements,
+            } => iter.append_array(element_signature, |sub| {
+                for element in elements {
+                    element.append(sub);
+                }
+            }),
+            PreparedBody::Dictionary {
+                key_signature,
+                value_signature,
+                entries,
+            } => iter.append_dict(key_signature, value_signature, |sub| {
+                for entry in entries {
+                    sub.append_dict_entry(|sub| {
+                        entry.key.append(sub);
+                        entry.value.append(sub);
+                    });
+                }
+            }),
+            PreparedBody::Struct { first, rest } => iter.append_struct(|sub| {
+                first.append(sub);
+                for field in rest {
+                    field.append(sub);
+                }
+            }),
+            PreparedBody::Variant(value) => {
+                iter.append_variant(&value.signature, |sub| value.append(sub))
+            }
+        }
+    }
 }
 
-fn prepare_array(elements: Vec<(ArgType, Value)>, depth: usize) -> Result<MessageItem, Flow> {
-    // GNU (:array :signature "{sv}") denotes an EMPTY array, not an array
-    // containing a signature value. Validate in array context: {sv} alone
-    // cannot be constructed as a dbus::Signature.
-    if let [(ArgType::Signature, value)] = elements.as_slice() {
-        let signature = checked_signature(format!("a{}", string_arg(*value)?))?;
-        return MessageItemArray::new(Vec::new(), signature)
-            .map(MessageItem::Array)
-            .map_err(|_| dbus_error("Invalid D-Bus array signature"));
+impl PreparedBasic {
+    fn prepare(dtype: ArgType, object: Value) -> Result<(Signature<'static>, Self), Flow> {
+        let (signature, value) = match dtype {
+            ArgType::Byte => ("y", Self::Byte(unsigned(object, u8::MAX as u64)? as u8)),
+            ArgType::Boolean => {
+                if object == keyword_for(ArgType::Boolean) {
+                    return Err(dbus_error("Missing D-Bus boolean value"));
+                }
+                ("b", Self::Boolean(object.is_truthy()))
+            },
+            ArgType::Int16 => (
+                "n",
+                Self::Int16(signed(object, i16::MIN as i64, i16::MAX as i64)? as i16),
+            ),
+            ArgType::UInt16 => ("q", Self::UInt16(unsigned(object, u16::MAX as u64)? as u16)),
+            ArgType::Int32 => (
+                "i",
+                Self::Int32(signed(object, i32::MIN as i64, i32::MAX as i64)? as i32),
+            ),
+            ArgType::UInt32 => ("u", Self::UInt32(unsigned(object, u32::MAX as u64)? as u32)),
+            ArgType::Int64 => ("x", Self::Int64(signed(object, i64::MIN, i64::MAX)?)),
+            ArgType::UInt64 => ("t", Self::UInt64(unsigned(object, u64::MAX)?)),
+            ArgType::Double => (
+                "d",
+                Self::Double(object.as_float().ok_or_else(|| {
+                    signal(
+                        LispCondition::WrongTypeArgument,
+                        vec![Value::symbol("numberp"), object],
+                    )
+                })?),
+            ),
+            ArgType::String => ("s", Self::String(string_arg(object)?)),
+            ArgType::ObjectPath => (
+                "o",
+                Self::ObjectPath(
+                    DbusPath::new(string_arg(object)?).map_err(|err| dbus_error(&err))?,
+                ),
+            ),
+            ArgType::Signature => (
+                "g",
+                Self::Signature(checked_signature(string_arg(object)?)?),
+            ),
+            ArgType::UnixFd => {
+                use std::os::fd::FromRawFd;
+                let fd = unsigned(object, i32::MAX as u64)? as i32;
+                // A successful duplication establishes ownership without taking
+                // ownership of the Lisp caller's descriptor.
+                let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+                if duplicate < 0 {
+                    return Err(dbus_error("Invalid D-Bus file descriptor"));
+                }
+                (
+                    "h",
+                    Self::UnixFd(unsafe { std::fs::File::from_raw_fd(duplicate) }),
+                )
+            }
+            _ => return Err(dbus_error("D-Bus value is not basic")),
+        };
+        Ok((checked_signature(signature.to_owned())?, value))
     }
-    if elements
-        .first()
-        .is_some_and(|(kind, _)| *kind == ArgType::DictEntry)
-    {
-        let mut entries = Vec::new();
-        for (kind, value) in elements {
-            if kind != ArgType::DictEntry {
-                return Err(dbus_error("Inconsistent D-Bus array element types"));
-            }
-            let fields = container_elements(kind, value)?;
-            let [(key_type, key), (value_type, value)] = fields.as_slice() else {
-                return Err(dbus_error("D-Bus dictionary entry must contain two values"));
-            };
-            if !is_basic(*key_type) {
-                return Err(dbus_error("D-Bus dictionary key must be basic"));
-            }
-            entries.push((
-                prepare_arg(*key_type, *key, depth + 1)?,
-                prepare_arg(*value_type, *value, depth + 1)?,
-            ));
+
+    fn append(&self, iter: &mut IterAppend<'_>) {
+        match self {
+            Self::Byte(value) => iter.append(*value),
+            Self::Boolean(value) => iter.append(*value),
+            Self::Int16(value) => iter.append(*value),
+            Self::UInt16(value) => iter.append(*value),
+            Self::Int32(value) => iter.append(*value),
+            Self::UInt32(value) => iter.append(*value),
+            Self::Int64(value) => iter.append(*value),
+            Self::UInt64(value) => iter.append(*value),
+            Self::Double(value) => iter.append(*value),
+            Self::String(value) => iter.append(value.as_str()),
+            Self::ObjectPath(value) => iter.append(value),
+            Self::Signature(value) => iter.append(value),
+            Self::UnixFd(value) => iter.append(value),
         }
-        let (key, value) = &entries[0]; // nonempty by the first-element check
-        let key_signature = key.signature();
-        let value_signature = value.signature();
-        // MessageItemDict::new uses Signature::from internally.
-        checked_signature(format!("a{{{}{}}}", key_signature, value_signature))?;
-        return MessageItemDict::new(entries, key_signature, value_signature)
-            .map(MessageItem::Dict)
-            .map_err(|_| dbus_error("Inconsistent D-Bus dictionary element signatures"));
     }
-    let items = elements
-        .into_iter()
-        .map(|(kind, value)| prepare_arg(kind, value, depth))
-        .collect::<Result<Vec<_>, _>>()?;
-    let element_signature = items
-        .first()
-        .map(|item| item.signature().to_string())
-        .unwrap_or_else(|| "s".to_owned());
-    let signature = checked_signature(format!("a{element_signature}"))?;
-    MessageItemArray::new(items, signature)
-        .map(MessageItem::Array)
-        .map_err(|_| dbus_error("Inconsistent D-Bus array element signatures"))
 }
 
 pub(super) fn retrieve_arg(iter: &mut Iter<'_>) -> Result<Value, Flow> {
@@ -334,16 +585,16 @@ pub(super) fn retrieve_arg(iter: &mut Iter<'_>) -> Result<Value, Flow> {
 }
 
 fn string_arg(value: Value) -> Result<String, Flow> {
-    let text = value.as_utf8_str().ok_or_else(|| {
+    let string = value.as_utf8_str().map(str::to_owned).ok_or_else(|| {
         signal(
             LispCondition::WrongTypeArgument,
             vec![Value::symbol("stringp"), value],
         )
     })?;
-    if text.contains('\0') {
-        return Err(dbus_error("D-Bus strings cannot contain NUL"));
+    if string.contains('\0') {
+        return Err(dbus_error("D-Bus string contains NUL"));
     }
-    Ok(text.to_owned())
+    Ok(string)
 }
 
 fn signed(value: Value, min: i64, max: i64) -> Result<i64, Flow> {

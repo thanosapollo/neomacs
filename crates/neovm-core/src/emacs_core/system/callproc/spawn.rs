@@ -1133,5 +1133,5 @@ mod posix {
 }
 
 #[cfg(all(test, unix))]
-#[path = "tests/spawn.rs"]
+#[path = "tests/spawn_test.rs"]
 mod tests;

@@ -382,5 +382,5 @@ impl Drop for QuitRequestCell {
 }
 
 #[cfg(test)]
-#[path = "tests/quit_request.rs"]
+#[path = "tests/quit_request_test.rs"]
 mod quit_request_tests;

@@ -16,6 +16,9 @@
 //! signalled error's `error-conditions` list includes the handler's condition
 //! symbol.
 
+mod native_message;
+pub(crate) use native_message::CErrorMessage;
+
 use super::error::{
     EvalResult, Flow, FlowKind, signal, signal_suppressed, signal_with_data, signal_with_data_id,
 };
@@ -1414,5 +1417,5 @@ impl Default for ErrorRegistry {
 // Tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]
-#[path = "tests/mod.rs"]
+#[path = "tests/errors_test.rs"]
 mod tests;

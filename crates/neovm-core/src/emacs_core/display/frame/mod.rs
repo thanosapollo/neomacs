@@ -9,13 +9,13 @@ pub(crate) mod position;
 mod selection;
 pub(crate) use selection::{builtin_handle_switch_frame, builtin_select_frame};
 #[cfg(test)]
-#[path = "tests/selection.rs"]
+#[path = "tests/selection_test.rs"]
 mod selection_test;
 use position::{FrameCoordinateOrigin, FramePositionSpec, apply_frame_position};
 
 use super::error::Flow;
 use super::error::{EvalResult, LispCondition, signal};
-use super::intern::resolve_sym;
+use super::intern::{intern, resolve_sym};
 use super::value::{Value, ValueKind, VecLikeType};
 use super::window_cmds::{
     DeleteFrameMode, FRAME_TEXT_LINES_PARAM, FRAME_TOTAL_COLS_PARAM, FRAME_TOTAL_LINES_PARAM,
@@ -126,8 +126,7 @@ pub(crate) fn sync_gui_frame_alpha(eval: &mut super::eval::Context, frame: Frame
         .unwrap_or([-1.0; 2]);
     let limit = crate::window::frame_alpha::lower_limit(
         eval.obarray()
-            .symbol_value("frame-alpha-lower-limit")
-            .copied()
+            .symbol_value_id_copied(intern("frame-alpha-lower-limit"))
             .unwrap_or(Value::fixnum(20)),
     );
     if let Some(host) = eval.display_host.as_mut() {
@@ -1896,8 +1895,7 @@ pub(crate) fn builtin_modify_frame_parameters(
     }
     if let Some(frame) = eval.frames.get_mut(fid) {
         frame.sync_tab_bar_height_from_parameters();
-        frame.sync_menu_bar_height_from_parameters();
-        frame.sync_tool_bar_height_from_parameters();
+        frame.sync_bar_heights_from_parameters();
     }
 
     let requested_width = resolve_frame_size_parameter(&eval.frames, fid, requested_width, true);

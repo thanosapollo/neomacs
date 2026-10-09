@@ -112,6 +112,7 @@ fn named_to_color(named: NamedColor, default_fg: &Color, default_bg: &Color) -> 
 }
 
 #[cfg(test)]
+#[path = "colors/tests/colors_test.rs"]
 mod tests;
 
 #[cfg(test)]

@@ -223,7 +223,8 @@ use neovm_core::emacs_core::{
 use neovm_core::face::{FaceHeight, FontWeight, LFaceAttr};
 use neovm_core::heap_types::LispString;
 use neovm_core::window::{
-    FrameDisplayIdentity, FrameFullscreen, FrameId, FrameParam, FrameVisibility, Window,
+    FrameDisplayIdentity, FrameFullscreen, FrameId, FrameParam, FrameVisibility,
+    GuiBarPresentation, Window,
 };
 
 use image_catalog::{AsyncImageCatalog, RedisplayWaker};
@@ -986,39 +987,11 @@ fn startup_dimensions(
     noninteractive: bool,
 ) -> (u32, u32) {
     match frontend {
-        FrontendKind::Gui => {
-            // GNU gui_figure_window_size (frame.c) seeds the first GUI frame from
-            // an 80x36 text grid, then adds the scroll bar, fringes, menu bar and
-            // tool bar *outside* that text area. The window we request here is later
-            // divided into chrome + text, so we must reserve BOTH the side and top
-            // chrome up front — otherwise the scroll bar/fringes eat into the columns
-            // (frame 78 wide) and the menu/tool bars eat into the lines (frame 33).
-            //
-            // Observed GNU `(frame-height)` is one LESS than its nominal geometry
-            // rows — deterministic, not a WM trim: `-g 80x35`->34, `-g 80x36`->35,
-            // `-g 80x40`->39, and the default (== -g 80x36) nets 35. GNU's default
-            // GUI frame is therefore 80x35 of *counted* text; match that observable.
-            let cols = 80u32;
-            let text_rows = 35u32;
-            // Side chrome the layout reserves outside the text columns: a default
-            // vertical scroll bar (one char wide) plus the two 8px fringes.
-            const DEFAULT_FRINGE_PX: f32 = 8.0;
-            let side_chrome = frame_metrics.char_width + 2.0 * DEFAULT_FRINGE_PX;
-            // Top chrome reserved above the text lines for a default GUI frame: a
-            // one-line menu bar (char_height) plus the icon-height tool bar. Both
-            // default on under -Q; if a user disables either this slightly
-            // over-reserves — the same default-configuration assumption the side
-            // chrome makes for the scroll bar. The tool-bar height mirrors GNU's
-            // image + margin + relief model (window::default_gui_tool_bar_line_height).
-            let menu_bar = frame_metrics.char_height;
-            let tool_bar =
-                neovm_core::window::default_gui_tool_bar_line_height(frame_metrics.font_pixel_size)
-                    as f32;
-            let top_chrome = menu_bar + tool_bar;
-            let width = (cols as f32 * frame_metrics.char_width + side_chrome).round() as u32;
-            let height = (text_rows as f32 * frame_metrics.char_height + top_chrome).round() as u32;
-            (width.max(200), height.max(100))
-        }
+        FrontendKind::Gui => neovm_core::window::default_gui_frame_pixel_size(
+            frame_metrics.char_width,
+            frame_metrics.char_height,
+            frame_metrics.font_pixel_size,
+        ),
         FrontendKind::Tty => {
             if noninteractive {
                 // GNU `make_frame` seeds the initial non-window frame with
@@ -1179,6 +1152,8 @@ struct PrimaryWindowDisplayHost {
     font_sizing: FontSizing,
     primary_window_adopted: bool,
     primary_frame_id: Option<neovm_core::window::FrameId>,
+    // One cancellation bit per admitted live legacy frame, not a retry queue.
+    legacy_frame_leases: HashMap<FrameId, Arc<AtomicBool>>,
     last_window_titles: Mutex<HashMap<neovm_core::window::FrameId, LispString>>,
     font_metrics: Option<FontMetricsService>,
     primary_window_size: SharedPrimaryWindowSize,
@@ -1466,15 +1441,11 @@ impl PrimaryWindowDisplayHost {
             *defaults.visual.borrow_mut() = Some(config.clone());
             return Ok(());
         }
-        if self.deferred_frame.is_some() {
-            self.cmd_tx
-                .try_send(command)
-                .map_err(|err| format!("{error_context}: {err}"))?;
-        } else {
-            self.cmd_tx
-                .send(command)
-                .map_err(|err| format!("{error_context}: {err}"))?;
-        }
+        // Ordinary GPU startup can saturate staging too. Return admission
+        // failure to Lisp rather than blocking the evaluator behind the GPU.
+        self.cmd_tx
+            .try_send(command)
+            .map_err(|err| format!("{error_context}: {err}"))?;
         if let Some(waker) = &self.render_waker {
             waker.wake();
         }
@@ -1507,13 +1478,16 @@ fn render_fullscreen_mode(fullscreen: FrameFullscreen) -> WindowFullscreenMode {
 
 impl Drop for PrimaryWindowDisplayHost {
     fn drop(&mut self) {
+        for live in self.legacy_frame_leases.values() {
+            live.store(false, Ordering::Release);
+        }
         if let Some(defaults) = &self.deferred_frame {
             for live in defaults.leases.values() {
                 live.store(false, Ordering::Release);
             }
-            if let Some(waker) = &self.render_waker {
-                waker.wake();
-            }
+        }
+        if let Some(waker) = &self.render_waker {
+            waker.wake();
         }
     }
 }
@@ -1552,7 +1526,7 @@ impl PrimaryWindowDisplayHost {
                 fullscreen: request.fullscreen.map(render_fullscreen_mode),
                 visual,
                 adopt_primary,
-                reply,
+                reply: Some(reply),
                 live: live.clone(),
                 deadline,
             }),
@@ -1669,63 +1643,32 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         if self.deferred_frame.is_some() {
             return self.realize_deferred_gui_frame(request, title_string);
         }
-        if !self.primary_window_adopted {
-            let fullscreen_frame = FrameRef::Primary;
-            self.send_render_command(
-                RenderCommand::Window(WindowCommand::SetWindowTitle {
-                    title: title_string.clone(),
-                }),
-                "failed to update primary window title",
-            )?;
-            self.send_render_command(
-                RenderCommand::Window(WindowCommand::SetFrameGeometryHints {
-                    frame: FrameRef::Primary,
-                    geometry_hints: request.geometry_hints,
-                }),
-                "failed to update primary window geometry hints",
-            )?;
-            self.send_render_command(
-                RenderCommand::Window(WindowCommand::AdoptPrimaryFrame {
-                    frame: FrameRef::Frame(request.frame_id.0),
-                }),
-                "failed to adopt primary GUI frame",
-            )?;
-            // The opening GUI frame adopts the already-existing primary host
-            // window. Do not push stale Lisp bootstrap dimensions back into
-            // that window during adoption; host resize events remain the
-            // source of truth until the window is fully realized.
+        let adopt_primary = !self.primary_window_adopted;
+        let live = Arc::new(AtomicBool::new(true));
+        // Exactly one FIFO slot owns title, hints, identity and fullscreen.
+        // The legacy API acknowledges admission rather than native readiness.
+        // Its lease still cancels queued, staged or already-realized work.
+        self.send_render_command(
+            RenderCommand::Window(WindowCommand::RealizeFrame {
+                frame: FrameRef::Frame(request.frame_id.0),
+                width: request.width,
+                height: request.height,
+                title: title_string,
+                geometry_hints: request.geometry_hints,
+                fullscreen: request.fullscreen.map(render_fullscreen_mode),
+                visual: None,
+                adopt_primary,
+                reply: None,
+                live: live.clone(),
+                deadline: Instant::now() + std::time::Duration::from_secs(15),
+            }),
+            "failed to admit legacy native frame transaction",
+        )?;
+        self.legacy_frame_leases.insert(request.frame_id, live);
+        if adopt_primary {
+            // Adoption never applies stale Lisp dimensions to the host window.
             self.primary_window_adopted = true;
             self.primary_frame_id = Some(request.frame_id);
-            if let Some(fullscreen) = request.fullscreen {
-                self.send_render_command(
-                    RenderCommand::Window(WindowCommand::SetWindowFullscreen {
-                        frame: fullscreen_frame,
-                        mode: render_fullscreen_mode(fullscreen),
-                    }),
-                    "failed to set primary GUI frame fullscreen mode",
-                )?;
-            }
-        } else {
-            let fullscreen_frame = FrameRef::Frame(request.frame_id.0);
-            self.send_render_command(
-                RenderCommand::Window(WindowCommand::CreateWindow {
-                    frame: FrameRef::Frame(request.frame_id.0),
-                    width: request.width,
-                    height: request.height,
-                    title: title_string,
-                    geometry_hints: request.geometry_hints,
-                }),
-                "failed to create additional GUI window",
-            )?;
-            if let Some(fullscreen) = request.fullscreen {
-                self.send_render_command(
-                    RenderCommand::Window(WindowCommand::SetWindowFullscreen {
-                        frame: fullscreen_frame,
-                        mode: render_fullscreen_mode(fullscreen),
-                    }),
-                    "failed to set GUI frame fullscreen mode",
-                )?;
-            }
         }
         self.last_window_titles
             .lock()
@@ -1888,20 +1831,22 @@ impl DisplayHost for PrimaryWindowDisplayHost {
                 .remove(&frame_id);
             return Ok(());
         }
-        let frame = if self.primary_frame_id == Some(frame_id) {
+        // The exact admitted identity owns rollback authority even while its
+        // transaction is queued, and retirement needs no ordinary FIFO slot.
+        if let Some(live) = self.legacy_frame_leases.remove(&frame_id) {
+            live.store(false, Ordering::Release);
+            if let Some(waker) = &self.render_waker {
+                waker.wake();
+            }
+        }
+        if self.primary_frame_id == Some(frame_id) {
             self.primary_frame_id = None;
-            FrameRef::Primary
-        } else {
-            FrameRef::Frame(frame_id.0)
-        };
+        }
         self.last_window_titles
             .lock()
             .map_err(|err| format!("failed to forget GUI frame title: {err}"))?
             .remove(&frame_id);
-        self.send_render_command(
-            RenderCommand::Window(WindowCommand::DestroyWindow { frame }),
-            "failed to destroy GUI frame window",
-        )
+        Ok(())
     }
 
     fn show_popup_menu(&mut self, menu: PopupMenuRequest) -> Result<(), String> {
@@ -2130,9 +2075,8 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         {
             return Ok(());
         }
-        cached_titles.insert(frame_id, title.clone());
-        drop(cached_titles);
-
+        // Hold this cache guard through nonblocking admission: no failed send
+        // can suppress an identical redisplay retry.
         let title_string = title.as_utf8_str().unwrap_or("Neomacs").to_owned();
         let frame = if self.primary_frame_id == Some(frame_id) {
             FrameRef::Primary
@@ -2146,6 +2090,7 @@ impl DisplayHost for PrimaryWindowDisplayHost {
             }),
             "failed to update GUI frame title",
         )?;
+        cached_titles.insert(frame_id, title);
         Ok(())
     }
 
@@ -3269,6 +3214,13 @@ fn run_reused_gui_startup_frame_lisp(eval: &mut Context, frame_id: FrameId, body
 
 fn initialize_reused_gui_startup_frame(eval: &mut Context, frame_id: FrameId) {
     seed_gnu_default_gui_chrome_modes(eval);
+    // GNU gui_default_parameter seeds chrome at frame creation, before
+    // early-init/frame-initialize applies user settings. Redisplay must never
+    // replace those subsequent, authoritative frame-local requests.
+    if let Some(frame) = eval.frame_manager_mut().get_mut(frame_id) {
+        frame.set_known_parameter(FrameParam::MenuBarLines, Value::fixnum(1));
+        frame.set_known_parameter(FrameParam::ToolBarLines, Value::fixnum(1));
+    }
 
     // GNU startup calls `window-system-initialization`, then
     // `frame-initialize`; the opening GUI frame is created through
@@ -3344,18 +3296,20 @@ fn sync_selected_gui_chrome_state(eval: &mut Context) {
         return;
     }
 
-    let menu_enabled = !eval
-        .obarray()
-        .symbol_value("menu-bar-mode")
-        .copied()
-        .unwrap_or(Value::NIL)
-        .is_nil();
-    let tool_enabled = !eval
-        .obarray()
-        .symbol_value("tool-bar-mode")
-        .copied()
-        .unwrap_or(Value::NIL)
-        .is_nil();
+    let selected_gui_frame = eval
+        .frame_manager()
+        .selected_frame()
+        .filter(|frame| frame.effective_window_system().is_some());
+    let menu_enabled = selected_gui_frame.is_some_and(|frame| {
+        frame
+            .known_frame_parameter_int(FrameParam::MenuBarLines)
+            .is_some_and(|lines| lines > 0)
+    });
+    let tool_enabled = selected_gui_frame.is_some_and(|frame| {
+        frame
+            .known_frame_parameter_int(FrameParam::ToolBarLines)
+            .is_some_and(|lines| lines > 0)
+    });
     if tool_enabled {
         ensure_gnu_tool_bar_setup(eval);
     }
@@ -3400,28 +3354,14 @@ fn sync_selected_gui_chrome_state(eval: &mut Context) {
         // `sync_window_area_bounds`, so the reflow reserves the chrome rows.
         frame.displays_chrome = true;
         frame.set_parameter(
-            FrameParam::MenuBarLines.symbol(),
-            Value::fixnum(if menu_items.is_empty() || compact_bar_enabled {
-                0
-            } else {
-                1
-            }),
-        );
-        frame.set_parameter(
-            FrameParam::ToolBarLines.symbol(),
-            Value::fixnum(if tool_items.is_empty() || compact_bar_enabled {
-                0
-            } else {
-                1
-            }),
-        );
-        frame.set_parameter(
             Value::symbol("compact-bar-lines"),
             Value::fixnum(if compact_bar_enabled { 1 } else { 0 }),
         );
-        frame.sync_menu_bar_height_from_parameters();
-        frame.sync_tool_bar_height_from_parameters();
-        frame.sync_compact_bar_height_from_parameters();
+        frame.sync_gui_bar_heights_from_parameters(if compact_bar_enabled {
+            GuiBarPresentation::Compact
+        } else {
+            GuiBarPresentation::Separate
+        });
         geometry_hints = Some((frame.id, frame.gui_geometry_hints()));
     }
 
@@ -4007,6 +3947,7 @@ fn run_gui_evaluator_worker(
         font_sizing: bootstrap_display.font_sizing(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: HashMap::new(),
         last_window_titles: Mutex::new(HashMap::new()),
         font_metrics: None,
         primary_window_size: Arc::clone(&primary_window_size),
@@ -5054,17 +4995,6 @@ impl BootstrapFrameMetrics {
     };
 }
 
-fn font_weight_symbol(weight: FontWeight) -> &'static str {
-    weight.symbol_name()
-}
-
-fn startup_font_weight_symbol(weight: FontWeight) -> &'static str {
-    match weight {
-        FontWeight::Normal => "regular",
-        _ => font_weight_symbol(weight),
-    }
-}
-
 fn font_otf_capability_for_file(
     file: &str,
     face_index: u32,
@@ -5320,13 +5250,6 @@ fn bootstrap_buffers_with_font(
         startup_font::BootstrapFont::Tty => (Value::NIL, Value::string("fixed")),
         startup_font::BootstrapFont::Gui(font) => {
             let selected = (*font).into_selected();
-            let name = Value::string(format!(
-                "-*-{}-{}-{}-*-*-{}-*-*-*-*-*-*-*",
-                selected.resolved.family,
-                startup_font_weight_symbol(FontWeight::from_css_weight(selected.resolved.weight)),
-                selected.slant.symbol_name(),
-                selected.metrics.pixel_size,
-            ));
             let mut face = neovm_core::face::Face::new("default");
             face.height = Some(FaceHeight::Absolute(
                 display
@@ -5337,10 +5260,10 @@ fn bootstrap_buffers_with_font(
                 glyph_code: None,
                 font: core_opened_font_from_selection(selected, font_otf_capability_for_file),
             };
-            (
-                neovm_core::emacs_core::font::opened_font_from_resolved_match(&face, &matched),
-                name,
-            )
+            let opened =
+                neovm_core::emacs_core::font::opened_font_from_resolved_match(&face, &matched);
+            let name = neovm_core::emacs_core::font::public_frame_font_parameter_value(opened);
+            (opened, name)
         }
     };
     let bootstrap_font_snapshot = bootstrap_font

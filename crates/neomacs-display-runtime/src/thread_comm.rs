@@ -421,7 +421,8 @@ pub enum WindowCommand {
         fullscreen: Option<WindowFullscreenMode>,
         visual: Option<VisualConfig>,
         adopt_primary: bool,
-        reply: Sender<Result<(), String>>,
+        // Deferred realization owns readiness; legacy ownership is admission-only.
+        reply: Option<Sender<Result<(), String>>>,
         live: std::sync::Arc<std::sync::atomic::AtomicBool>,
         deadline: std::time::Instant,
     },
@@ -506,6 +507,10 @@ pub enum AssetCommand {
         /// Colors used by face-sensitive image formats and image-cache identity.
         colors: ImageColorContext,
         mask: ImageMaskPolicy,
+        /// Whether the renderer may materialize animation this source
+        /// computes itself (SVG SMIL). The disabled default is GNU's
+        /// behavior: one static frame.
+        animation: neomacs_display_protocol::ImageAnimationPolicy,
         frame: neomacs_display_protocol::ImageFrameIndex,
         sequence: neomacs_display_protocol::ImageSequenceId,
         /// The looking frame's resolved GNU `max-image-size`
@@ -530,6 +535,8 @@ pub enum AssetCommand {
         /// Colors used by face-sensitive image formats and image-cache identity.
         colors: ImageColorContext,
         mask: ImageMaskPolicy,
+        /// See [`AssetCommand::ImageLoadFile::animation`].
+        animation: neomacs_display_protocol::ImageAnimationPolicy,
         frame: neomacs_display_protocol::ImageFrameIndex,
         sequence: neomacs_display_protocol::ImageSequenceId,
         /// See [`AssetCommand::ImageLoadFile::limit`].
@@ -1370,6 +1377,7 @@ impl RenderComms {
 }
 
 #[cfg(test)]
+#[path = "thread_comm/tests/thread_comm_test.rs"]
 mod tests;
 
 #[cfg(test)]

@@ -132,4 +132,5 @@ impl RenderApp {
 }
 
 #[cfg(all(test, feature = "neo-term"))]
+#[path = "terminal_commands/tests/terminal_commands_test.rs"]
 mod tests;

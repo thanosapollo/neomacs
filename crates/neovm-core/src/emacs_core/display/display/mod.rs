@@ -3304,5 +3304,5 @@ fn make_monitor_alist(frames: Value) -> Value {
     ])
 }
 #[cfg(test)]
-#[path = "tests/mod.rs"]
+#[path = "tests/display_test.rs"]
 mod tests;

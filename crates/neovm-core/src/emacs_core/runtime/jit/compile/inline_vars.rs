@@ -69,7 +69,7 @@ use super::*;
 use crate::emacs_core::eval::SpecBinding;
 use crate::emacs_core::forward::{LispFwd, LispFwdType};
 use crate::emacs_core::symbol::{
-    SYMCELL_INLINE_WRITE_MASK, SymbolRedirect, symcell_inline_write_value,
+    SYMCELL_INLINE_WRITE_MASK, SymbolRedirect, ValueCell, symcell_inline_write_value,
 };
 use std::cell::{Cell, RefCell};
 
@@ -112,16 +112,17 @@ thread_local! {
 /// projection mask (the JIT cache's compile entries hold one while they
 /// compile). Without one, nothing is inlined.
 #[must_use = "the environment lasts as long as the scope"]
+#[derive(Debug)]
 pub(crate) struct CompileEnvScope {
-    prev: Option<CompileEnv>,
+    _scope: crate::tls_scope::TlsScope<Option<CompileEnv>, Cell<Option<CompileEnv>>>,
 }
+static_assertions::assert_not_impl_any!(CompileEnvScope: Send, Sync);
 
 impl CompileEnvScope {
     /// Enter CTX's environment (nothing when CTX is null or the knob is off).
     /// CTX must stay alive and its obarray and mask unmoved while the scope
     /// lives: the dormant seam-provided context of a compile.
     pub(crate) fn enter(ctx: *const Context) -> Self {
-        let prev = ENV.with(Cell::get);
         let env = (!ctx.is_null() && jit_inline_vars().any()).then(|| {
             // SAFETY: the caller's contract above.
             let ctx = unsafe { &*ctx };
@@ -130,14 +131,9 @@ impl CompileEnvScope {
                 projection: std::ptr::from_ref(ctx.runtime_projection_mask()),
             }
         });
-        ENV.with(|e| e.set(env));
-        Self { prev }
-    }
-}
-
-impl Drop for CompileEnvScope {
-    fn drop(&mut self) {
-        ENV.with(|e| e.set(self.prev));
+        Self {
+            _scope: crate::tls_scope::TlsScope::new(&ENV, env),
+        }
     }
 }
 
@@ -224,33 +220,30 @@ fn classify(sym: u32) -> Option<VarSite> {
         let id = SymId(sym);
         let cell = obarray.jit_symbol_cell_addr(id)?;
         let shape = match obarray.get_by_id(id) {
-            Some(symbol) => match symbol.redirect() {
-                SymbolRedirect::Localized => {
-                    // SAFETY: `Localized` selects the BLV arm, a record the
-                    // obarray owns for its life.
-                    let blv_ptr = unsafe { symbol.val.blv };
+            Some(symbol) => match symbol.value_cell() {
+                ValueCell::Localized(blv) => {
+                    let blv_ptr = blv.as_ptr();
+                    // SAFETY: a `Localized` cell names a record the obarray
+                    // owns for its life.
                     let blv = unsafe { &*blv_ptr };
                     match blv.fwd {
-                        Some(fwd) if FwdKind::of(fwd.ty).is_none() => VarShape::Plain,
+                        Some(fwd) if FwdKind::of(fwd.ty()).is_none() => VarShape::Plain,
                         fwd => VarShape::Localized {
                             blv: blv_ptr as usize,
                             fwd: fwd.map_or(0, |f| std::ptr::from_ref::<LispFwd>(f) as usize),
-                            rule: fwd.and_then(|f| FwdKind::of(f.ty)),
+                            rule: fwd.and_then(|f| FwdKind::of(f.ty())),
                             remembered_defcell: None,
                         },
                     }
                 }
-                SymbolRedirect::Forwarded => match symbol.forwarded_descriptor() {
-                    Some(fwd) => match FwdKind::of(fwd.ty) {
-                        Some(kind) => VarShape::Forwarded {
-                            desc: std::ptr::from_ref::<LispFwd>(fwd) as usize,
-                            kind,
-                        },
-                        None => VarShape::Plain,
+                ValueCell::Forwarded(fwd) => match FwdKind::of(fwd.ty()) {
+                    Some(kind) => VarShape::Forwarded {
+                        desc: std::ptr::from_ref::<LispFwd>(fwd) as usize,
+                        kind,
                     },
                     None => VarShape::Plain,
                 },
-                SymbolRedirect::Plainval | SymbolRedirect::Varalias => VarShape::Plain,
+                ValueCell::Plain(_) | ValueCell::Alias(_) => VarShape::Plain,
             },
             None => VarShape::Plain,
         };

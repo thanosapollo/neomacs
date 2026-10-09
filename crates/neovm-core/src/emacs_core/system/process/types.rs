@@ -790,6 +790,8 @@ pub struct Process {
     pub coding_state: ProcessCodingState,
     /// Current encoding coding-system.
     pub coding_encode: Value,
+    /// The coding and encoder continuation currently installed on the output fd.
+    pub(crate) encoding_state: ProcessEncodingState,
     /// True once Lisp explicitly changes this process's coding system.
     pub coding_explicitly_set: bool,
     /// True after explicit process coding has deferred one terminal status
@@ -1039,6 +1041,10 @@ impl WaitNotifier {
 }
 
 pub(super) struct ProcessWaitBackend {
+    /// A per-backend, one-shot scheduling gate for input-wakeup regressions.
+    /// Installation and consumption are synchronized; callbacks own no Lisp state.
+    #[cfg(test)]
+    before_next_wait: std::sync::Mutex<Option<Box<dyn FnOnce(Duration) + Send>>>,
     #[cfg(unix)]
     signal_fd: Option<std::os::fd::RawFd>,
     /// I/O multiplexer for process descriptors and cross-thread notifications.
@@ -1089,6 +1095,8 @@ impl ProcessWaitBackend {
         });
         Self {
             poller,
+            #[cfg(test)]
+            before_next_wait: std::sync::Mutex::new(None),
             #[cfg(unix)]
             signal_fd,
             notification_pending: Arc::new(AtomicBool::new(false)),
@@ -1141,6 +1149,14 @@ impl ProcessWaitBackend {
             } else {
                 timeout
             };
+
+            #[cfg(test)]
+            {
+                let before_wait = self.before_next_wait.lock().expect("wait gate lock").take();
+                if let Some(before_wait) = before_wait {
+                    before_wait(timeout);
+                }
+            }
 
             let deadline = Instant::now() + timeout;
             loop {
@@ -1517,6 +1533,7 @@ pub(super) fn process_coding_name_converts_nothing(name: &str) -> bool {
 /// (src/coding.c:7623-7625) resolves a VECTOR eol_type to `Qunix` before any
 /// encoder sees a character, so `raw-text`'s undecided end-of-line writes bare
 /// LF -- which is what "convert nothing" means on this side.
+#[cfg(test)]
 pub(super) fn process_encode_coding_converts_nothing(coding: Value) -> bool {
     coding.is_nil()
         || matches!(
@@ -2203,12 +2220,138 @@ impl ProcessCodingState {
     }
 }
 
+/// Whether GNU's installed output descriptor invokes an encoding engine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessEncodingEligibility {
+    Required,
+    Bypass,
+}
+
+/// A descriptor groups its coding identity, setup flags, and continuation.
+/// Fields stay private so changing identity cannot retain another codec's state.
+#[derive(Clone, Debug)]
+pub(crate) struct ProcessEncodingDescriptor {
+    coding: crate::encoding::RuntimeCodingSystem,
+    raw_coding: crate::encoding::RuntimeCodingSystem,
+    eligibility: ProcessEncodingEligibility,
+    encoder: crate::encoding::CodingEncoderState,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) enum ProcessEncodingState {
+    /// Manager-only records have no Context with which to perform GNU setup.
+    #[default]
+    Uninitialized,
+    Active(ProcessEncodingDescriptor),
+}
+
+impl ProcessEncodingState {
+    pub(crate) fn initialized(
+        coding: crate::encoding::RuntimeCodingSystem,
+        systems: &super::super::coding::CodingSystemManager,
+        eol_conversion: super::super::coding::EolConversion,
+    ) -> Result<Self, Flow> {
+        use super::super::coding::{EolConversion, EolType};
+        let metadata = coding.metadata(systems).ok_or_else(|| {
+            signal(
+                LispCondition::CodingSystemError,
+                vec![Value::symbol(coding.symbol())],
+            )
+        })?;
+        let info = metadata.info;
+        // setup_coding_system derives flags from effective EOL, hooks, and
+        // runtime codec type (GNU coding.c:5681-5696, 5719-5870).
+        let character_conversion = !matches!(
+            super::super::intern::resolve_sym(info.coding_type),
+            "raw-text" | "undecided"
+        );
+        let eol_conversion_required = eol_conversion == EolConversion::Enabled
+            && matches!(metadata.eol_type, EolType::Dos | EolType::Mac);
+        let eligibility = if character_conversion
+            || info.pre_write_conversion.is_some()
+            || eol_conversion_required
+        {
+            ProcessEncodingEligibility::Required
+        } else {
+            ProcessEncodingEligibility::Bypass
+        };
+        let raw = match metadata.eol_type {
+            EolType::Dos => "raw-text-dos",
+            EolType::Mac => "raw-text-mac",
+            EolType::Unix => "raw-text-unix",
+            EolType::Undecided => "raw-text",
+        };
+        Ok(Self::Active(ProcessEncodingDescriptor {
+            coding,
+            raw_coding: crate::encoding::RuntimeCodingSystem::from_symbol(
+                super::super::intern::intern(raw),
+            ),
+            eligibility,
+            encoder: crate::encoding::CodingEncoderState::default(),
+        }))
+    }
+
+    pub(crate) fn coding(&self) -> Option<crate::encoding::RuntimeCodingSystem> {
+        match self {
+            Self::Uninitialized => None,
+            Self::Active(descriptor) => Some(descriptor.coding),
+        }
+    }
+
+    pub(crate) fn requires_encoding(&self) -> bool {
+        matches!(
+            self,
+            Self::Active(ProcessEncodingDescriptor {
+                eligibility: ProcessEncodingEligibility::Required,
+                ..
+            })
+        )
+    }
+
+    /// Only send_process's input-mode transition selects another descriptor.
+    /// Codec continuation access after callbacks must never reselect it.
+    pub(crate) fn select_input(
+        &mut self,
+        systems: &super::super::coding::CodingSystemManager,
+        configured: crate::encoding::RuntimeCodingSystem,
+        multibyte: bool,
+        eol_conversion: super::super::coding::EolConversion,
+    ) -> Result<crate::encoding::RuntimeCodingSystem, Flow> {
+        let Self::Active(descriptor) = self else {
+            return Err(signal(
+                "error",
+                vec![Value::string("Process output coding is not initialized")],
+            ));
+        };
+        let reported = descriptor.coding;
+        if multibyte {
+            if descriptor.coding != configured {
+                *self = Self::initialized(configured, systems, eol_conversion)?;
+            }
+            Ok(configured)
+        } else {
+            if descriptor.eligibility == ProcessEncodingEligibility::Required {
+                *self = Self::initialized(descriptor.raw_coding, systems, eol_conversion)?;
+            }
+            Ok(reported)
+        }
+    }
+
+    pub(crate) fn encoder_mut(&mut self) -> Option<&mut crate::encoding::CodingEncoderState> {
+        match self {
+            Self::Uninitialized => None,
+            Self::Active(descriptor) => Some(&mut descriptor.encoder),
+        }
+    }
+}
+
 /// Encode the data passed to `process-send-string`/`process-send-region`
 /// through a process's ENCODE coding system, mirroring GNU `send_process`
 /// (src/process.c).  A `binary`/`raw-text`/`no-conversion`/nil encode coding
 /// (or an unset one) leaves the bytes untouched; every other coding goes through
 /// the shared string encoder, which performs character-code conversion and the
 /// EOL conversion the coding's eol_type requests.
+#[cfg(test)]
 pub(super) fn encode_process_send_input(
     processes: &ProcessManager,
     id: ProcessId,
@@ -3329,14 +3472,16 @@ pub(super) fn create_network_process_record(
     coding: ProcessCodingSystems,
 ) -> Result<ProcessId, Flow> {
     validate_resolved_process_coding_systems(Some(&eval.coding_systems), coding)?;
-    Ok(eval.processes.create_process_with_kind_lisp(
+    let id = eval.processes.create_process_with_kind_lisp(
         name,
         buffer,
         LispString::from_utf8("network"),
         Vec::new(),
         ProcessKindWithoutDevice::Network,
         coding,
-    ))
+    );
+    eval.setup_process_output_descriptor(id)?;
+    Ok(id)
 }
 
 /// GNU `set_network_socket_coding_system`'s resolver, src/process.c:3291-3367.
@@ -5704,6 +5849,7 @@ impl ProcessManager {
             coding_decode: coding.decode,
             coding_state: ProcessCodingState::default(),
             coding_encode: coding.encode,
+            encoding_state: ProcessEncodingState::default(),
             coding_explicitly_set: false,
             explicit_coding_status_deferred_once: false,
             inherit_coding_system_flag: false,
@@ -6562,6 +6708,20 @@ impl ProcessManager {
     /// publishing work. `None` if no poller could be created.
     pub(crate) fn wait_notifier(&self) -> Option<WaitNotifier> {
         self.wait_backend.notify_handle()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn before_next_backend_wait_for_test(
+        &mut self,
+        hook: impl FnOnce(Duration) + Send + 'static,
+    ) {
+        let slot = self
+            .wait_backend
+            .before_next_wait
+            .get_mut()
+            .expect("wait gate lock");
+        assert!(slot.is_none(), "wait gate already installed");
+        *slot = Some(Box::new(hook));
     }
 
     /// Block on the unified wait poller (cross-thread notification and/or process
@@ -8164,6 +8324,27 @@ impl AsyncCallbackKind {
 }
 
 impl super::super::eval::Context {
+    pub(super) fn setup_process_output_descriptor(&mut self, id: ProcessId) -> Result<(), Flow> {
+        let coding = self
+            .processes
+            .get_any(id)
+            .ok_or_else(|| signal("error", vec![Value::string("Process not found")]))?
+            .coding_encode
+            .as_symbol_id()
+            .filter(|&symbol| symbol != super::super::intern::intern("nil"))
+            .unwrap_or_else(|| super::super::intern::intern("undecided"));
+        let state = ProcessEncodingState::initialized(
+            crate::encoding::RuntimeCodingSystem::from_symbol(coding),
+            &self.coding_systems,
+            self.eol_conversion(),
+        )?;
+        self.processes
+            .get_any_mut(id)
+            .expect("setup does not invoke Lisp")
+            .encoding_state = state;
+        Ok(())
+    }
+
     pub(super) fn visible_process_read_config(&self) -> ProcessReadConfig {
         let readmax = self
             .visible_variable_value_or_nil("read-process-output-max")
@@ -8345,10 +8526,10 @@ impl super::super::eval::Context {
     /// loop and `send_process` hold the process in a C local (`proc`) while
     /// they decode output, run filters and sentinels, and wait on a
     /// connection or a full pipe; this side holds only an id there.  A
-    /// `:post-read-conversion`, filter, sentinel or timer that deletes one of
-    /// these processes and collects must not free the deleted record the
-    /// rest of the pass still reaches by id.  Ids without a record are left
-    /// alone, so no object is made for them.
+    /// `:pre-write-conversion`, `:post-read-conversion`, filter, sentinel or
+    /// timer that deletes one of these processes and collects must not free
+    /// the deleted record the rest of the pass still reaches by id. Ids without
+    /// a record are left alone, so no object is made for them.
     pub(super) fn with_processes_rooted<T>(
         &mut self,
         ids: &[ProcessId],
@@ -8717,8 +8898,16 @@ impl super::super::eval::Context {
         // "If a coding system for encoding is not yet decided, we set it as the
         // same as coding-system for decoding" (:6431-6433).
         let inherited = crate::encoding::coding_inherit_unix_eol_type(&self.coding_systems, used);
+        let coding = crate::encoding::RuntimeCodingSystem::from_symbol(
+            super::super::intern::intern(&inherited),
+        );
+        // Inheritance was derived from a registered decoder coding above.
+        let state =
+            ProcessEncodingState::initialized(coding, &self.coding_systems, self.eol_conversion())
+                .expect("inherited coding is registered");
         if let Some(proc) = self.processes.get_mut(id) {
             proc.coding_encode = Value::symbol(&inherited);
+            proc.encoding_state = state;
         }
     }
 
@@ -9070,6 +9259,7 @@ impl super::super::eval::Context {
                     outcome.record_serviced();
                 }
                 PendingNetworkConnectCompletion::Connected { sentinel } => {
+                    self.setup_process_output_descriptor(pid)?;
                     // GNU services :nowait completion inside the wait and
                     // keeps waiting (only read bytes complete the wait).
                     outcome.record_serviced();
@@ -9156,6 +9346,7 @@ impl super::super::eval::Context {
                         outcome.record_serviced();
                     }
                     PendingNetworkConnectCompletion::Connected { sentinel } => {
+                        self.setup_process_output_descriptor(pid)?;
                         outcome.record_serviced();
                         self.run_process_sentinel_callback(pid, sentinel, "open\n")?;
                     }
@@ -9281,6 +9472,9 @@ impl super::super::eval::Context {
             let accepted = self
                 .processes
                 .accept_network_server_connections(&mut self.buffers, pid)?;
+            for event in &accepted {
+                self.setup_process_output_descriptor(event.client_id)?;
+            }
             // The events' log/sentinel closures live only in this Rust Vec
             // while earlier callbacks run arbitrary Lisp; a log function
             // that set-process-sentinel's or delete-process's a connection

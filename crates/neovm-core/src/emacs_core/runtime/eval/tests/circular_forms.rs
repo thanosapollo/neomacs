@@ -6,8 +6,10 @@
 //! datum is the cons where the walk met its tortoise.
 //!
 //! Each case evaluates to `(CONDITION DATUM-IS-EXPECTED-CONS ...)`; the
-//! expected strings are GNU 32.0.50's output for the same forms.  The cases
-//! run on a worker thread so a regression fails here instead of hanging.
+//! expected strings are GNU's output for the same forms on the emacs-31.1
+//! `FOR_EACH_TAIL` Brent schedule (checked with GNU 30.2, whose lisp.h walk
+//! and `let`/`let*` are unchanged in 31.1).  The cases run on a worker
+//! thread so a regression fails here instead of hanging.
 
 use crate::emacs_core::eval::{TierIEvent, TierIMode};
 use crate::emacs_core::print::print_value;
@@ -236,7 +238,7 @@ fn circular_form_let_and_let_star_varlists_signal_circular_list() {
                (setcdr (cdr c) c) (setq fix15-n 0)
                (condition-case e (eval (list 'let* c 'a) t)
                  (error (list (car e) (eq (cadr e) c) fix15-n))))",
-            "(circular-list t 1)",
+            "(circular-list t 2)",
         ),
         (
             "(condition-case e (eval '(let ((a (error \"init\")) . 3) a) t) (error e))",
@@ -596,4 +598,94 @@ fn circular_form_let_star_keeps_its_varlist_alive_across_gc() {
         "(7 (circular-list t a)) live",
     ));
     assert_tier_i_cases(&cases);
+}
+
+/// By the third initializer both the cursor and Brent tortoise have left
+/// the original head. Detach that head from the function's live form before
+/// repeated GC, then require CHECK_LIST_END's original GNU datum. Save only
+/// its bits in Rust: rooting an expected Value would conceal the defect.
+#[test]
+fn improper_let_star_keeps_original_datum_after_moving_roots_advance() {
+    const MODES: [TierIMode; 3] = [TierIMode::Off, TierIMode::On, TierIMode::Verify];
+    crate::test_utils::init_test_tracing();
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::Builder::new()
+        .name("improper-let-star-datum".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let mut eval = crate::test_utils::runtime_startup_context();
+            eval.eval_str(PRELUDE).unwrap();
+            tx.send(String::new()).unwrap();
+            for mode in MODES {
+                for lex in ["nil", "t"] {
+                    eval.tier_i.set_mode(mode);
+                    eval.tier_i.set_threshold(1);
+                    eval.tier_i.clear_for_test();
+                    let setup = r#"(progn
+                      (setq fix15-gc nil fix15-n 0 fix15-datum nil)
+                      (setq fix15-c
+                        (list '(a 1) '(b 2)
+                          (list 'c '(progn
+                            (setq fix15-n (1+ fix15-n))
+                            (when fix15-gc
+                              (setcdr (nthcdr 2 fix15-c) 5)
+                              (setcar (cdr fix15-form) nil)
+                              (setq fix15-c nil fix15-form nil)
+                              (identity nil)
+                              (garbage-collect)
+                              (garbage-collect)
+                              (garbage-collect))
+                            3))))
+                      (setq fix15-form (list 'let* fix15-c 'c))
+                      (defalias 'fix15-original-datum
+                        (eval (list 'function (list 'lambda nil fix15-form)) LEX)))"#
+                        .replace("LEX", lex);
+                    eval.eval_str(&setup).unwrap();
+                    // Compile/run while proper; only the next invocation
+                    // detaches the head and changes its ending inside init 3.
+                    assert_eq!(
+                        print_value(&eval.eval_str("(fix15-original-datum)").unwrap()),
+                        "3"
+                    );
+                    let original_bits = eval.obarray.symbol_value("fix15-c").unwrap().bits();
+                    eval.eval_str("(setq fix15-gc t fix15-n 0)").unwrap();
+                    let runs_before = eval.tier_i.stats().count(TierIEvent::Run);
+                    let condition = eval
+                        .eval_str(
+                            "(condition-case e (fix15-original-datum)
+                               (error (setq fix15-datum (nth 2 e))
+                                      (list (car e) (cadr e))))",
+                        )
+                        .unwrap();
+                    assert_eq!(print_value(&condition), "(wrong-type-argument listp)");
+                    let datum = *eval.obarray.symbol_value("fix15-datum").unwrap();
+                    assert_eq!(datum.bits(), original_bits, "{mode:?}, lexical={lex}");
+                    // Check ownership before dereferencing/printing the cons.
+                    assert!(eval.tagged_heap.owns_heap_value_for_test(datum));
+                    if mode != TierIMode::Off {
+                        assert!(eval.tier_i.stats().count(TierIEvent::Run) > runs_before);
+                    }
+                    let result = eval
+                        .eval_str(
+                            "(list (caar fix15-datum) (car (nth 1 fix15-datum))
+                                   (car (nth 2 fix15-datum)) (nthcdr 3 fix15-datum)
+                                   fix15-n fix15-c fix15-form)",
+                        )
+                        .unwrap();
+                    tx.send(print_value(&result)).unwrap();
+                }
+            }
+        })
+        .expect("spawn improper-let-star-datum thread");
+    assert_eq!(rx.recv_timeout(STARTUP_TIMEOUT).expect("runtime startup"), "");
+    for mode in MODES {
+        for lex in ["nil", "t"] {
+            assert_eq!(
+                rx.recv_timeout(CASE_TIMEOUT)
+                    .expect("original-datum case must finish"),
+                "(a b c 5 1 nil nil)",
+                "{mode:?}, lexical={lex}"
+            );
+        }
+    }
 }
