@@ -2324,8 +2324,15 @@ fn prin1_to_lisp_string_value_in_state_with_overrides(
 
 pub(crate) fn builtin_princ(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     expect_min_args("princ", &args, 1)?;
-    ensure_continuous_print_number_table(eval);
     let target = resolve_print_target(eval, args.get(1));
+    let print_gensym = super::error::print_options_from_state(
+        &eval.obarray,
+        print_target_current_buffer(eval, target),
+    )
+    .print_gensym;
+    if super::print::is_print_circle_candidate(&args[0], print_gensym) {
+        ensure_continuous_print_number_table(eval);
+    }
     if print_target_is_direct(target) {
         return builtin_princ_impl(eval, args);
     }
@@ -2349,12 +2356,19 @@ pub(crate) fn builtin_princ_impl(
     args: Vec<Value>,
 ) -> EvalResult {
     expect_min_args("princ", &args, 1)?;
-    ensure_continuous_print_number_table(ctx);
     // Issue #131: emit canonical Emacs bytes directly. A real Private-Use glyph
     // is inserted as itself, while genuine eight-bit / non-Unicode content is
     // carried as its disjoint extended encoding — neither is ever mistaken for
     // the other, retiring the storage-string sink princ used to fall back to.
     let target = resolve_print_target_in_state(ctx, args.get(1));
+    let print_gensym = super::error::print_options_from_state(
+        &ctx.obarray,
+        print_target_current_buffer(ctx, target),
+    )
+    .print_gensym;
+    if super::print::is_print_circle_candidate(&args[0], print_gensym) {
+        ensure_continuous_print_number_table(ctx);
+    }
     let bytes =
         print_value_princ_bytes_in_buffer(ctx, &args[0], print_target_current_buffer(ctx, target))?;
     write_print_bytes_from_ctx(ctx, args.get(1), &bytes)?;
