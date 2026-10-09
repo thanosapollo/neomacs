@@ -1168,6 +1168,705 @@ fn hash_table_printer_omits_default_eql_test_like_gnu() {
 // whole lexical environment, trailing `t' included, as in a bare Context.
 // ---------------------------------------------------------------------------
 
+// Public `princ` must publish its initially nil continuous history before
+// rendering. These primitive-only forms need no bootstrap Lisp; GC runs
+// between prints and assertions inspect returned fields, not a formatter.
+fn assert_princ_history_fields(src: &str, strings: &[&str], fields: &[Value]) {
+    let mut ctx = crate::emacs_core::Context::new();
+    ctx.set_lexical_binding(true);
+    let mut result = ctx.eval_str(src).expect("primitive princ history fixture");
+    for (index, expected) in strings.iter().enumerate() {
+        assert!(result.is_cons(), "missing string field {index}");
+        assert_eq!(
+            result.cons_car().as_utf8_str(),
+            Some(*expected),
+            "string field {index}"
+        );
+        result = result.cons_cdr();
+    }
+    for (index, expected) in fields.iter().enumerate() {
+        assert!(result.is_cons(), "missing field {index}");
+        assert_eq!(result.cons_car(), *expected, "field {index}");
+        result = result.cons_cdr();
+    }
+    assert!(result.is_nil(), "unexpected trailing fields");
+}
+
+fn check_princ_continuous_history(buffer: bool, supplied: bool, continuous: bool) {
+    let src = r#"(progn
+  (let ((print-continuous-numbering nil)) (prin1-to-string nil))
+  (let* ((print-circle t) (print-continuous-numbering CONTINUOUS)
+         (caller TABLE) (print-number-table caller)
+         (x (list 1)) (pair (list x x)) (s "")
+         (sink SINK) first first-return second-return)
+    (setq first-return (eq pair (princ pair sink)))
+    (setq first SNAPSHOT s "")
+    CLEAR
+    (garbage-collect)
+    (setq second-return (eq pair (princ pair sink)))
+    (list first SNAPSHOT first-return second-return
+          (or (eq caller nil) (eq caller print-number-table))
+          (and print-continuous-numbering (hash-table-p print-number-table))
+          (and print-continuous-numbering (hash-table-p print-number-table)
+               (hash-table-count print-number-table)))))"#
+        .replace("CONTINUOUS", if continuous { "t" } else { "nil" })
+        .replace("TABLE", if supplied { "(make-hash-table :test 'eq)" } else { "nil" })
+        .replace("SINK", if buffer { "(progn (set-buffer (get-buffer-create \" princ-history\")) (erase-buffer) (current-buffer))" }
+                 else { "(lambda (ch) (setq s (concat s (string ch))))" })
+        .replace("SNAPSHOT", if buffer { "(progn (set-buffer sink) (buffer-string))" } else { "s" })
+        .replace("CLEAR", if buffer { "(erase-buffer)" } else { "nil" });
+    assert_princ_history_fields(
+        &src,
+        &[
+            "(#1=(1) #1#)",
+            if continuous {
+                "(#1# #1#)"
+            } else {
+                "(#1=(1) #1#)"
+            },
+        ],
+        &[
+            Value::T,
+            Value::T,
+            Value::T,
+            if continuous { Value::T } else { Value::NIL },
+            if continuous {
+                Value::fixnum(1)
+            } else {
+                Value::NIL
+            },
+        ],
+    );
+}
+
+#[test]
+fn princ_continuous_history_callable_nil_across_gc() {
+    check_princ_continuous_history(false, false, true);
+}
+
+#[test]
+fn princ_continuous_history_callable_supplied_across_gc() {
+    check_princ_continuous_history(false, true, true);
+}
+
+#[test]
+fn princ_continuous_history_callable_disabled_across_gc() {
+    check_princ_continuous_history(false, false, false);
+}
+
+#[test]
+fn princ_continuous_history_buffer_nil_across_gc() {
+    check_princ_continuous_history(true, false, true);
+}
+
+#[test]
+fn princ_continuous_history_buffer_supplied_across_gc() {
+    check_princ_continuous_history(true, true, true);
+}
+
+#[test]
+fn princ_continuous_history_buffer_disabled_across_gc() {
+    check_princ_continuous_history(true, false, false);
+}
+
+#[test]
+fn princ_continuous_history_scope_reset() {
+    assert_princ_history_fields(
+        r#"(let* ((print-circle t) (print-continuous-numbering t)
+       (caller (make-hash-table :test 'eq)) (print-number-table caller)
+       (x (list 1)) (pair (list x x)) (s "")
+       (sink (lambda (ch) (setq s (concat s (string ch))))) first second)
+  (let ((print-number-table nil)) (princ pair sink) (setq first s))
+  (setq s "")
+  (garbage-collect)
+  (let ((print-number-table nil)) (princ pair sink) (setq second s))
+  (list first second (eq caller print-number-table) (hash-table-count caller)))"#,
+        &["(#1=(1) #1#)", "(#1=(1) #1#)"],
+        &[Value::T, Value::fixnum(0)],
+    );
+}
+
+#[test]
+fn princ_continuous_history_nonlocal_recovery() {
+    assert_princ_history_fields(
+        r#"(let* ((print-circle t) (print-continuous-numbering t)
+       (print-number-table nil) (x (list 1)) (pair (list x x)) (s "")
+       (sink (lambda (ch) (setq s (concat s (string ch))))) table stopped returned)
+  (princ pair sink)
+  (setq table print-number-table s "")
+  (setq stopped (catch 'abort (princ pair (lambda (ch) (throw 'abort 'stopped)))))
+  (garbage-collect)
+  (setq returned (eq pair (princ pair sink)))
+  (list s (eq stopped 'stopped) returned (eq table print-number-table)
+        (and (hash-table-p print-number-table) (hash-table-count print-number-table))))"#,
+        &["(#1# #1#)"],
+        &[Value::T, Value::T, Value::T, Value::fixnum(1)],
+    );
+}
+
+#[test]
+fn princ_continuous_history_direct_impl_initializes_nil_table() {
+    use crate::emacs_core::builtins::misc_eval::builtin_princ_impl;
+    let mut ctx = crate::emacs_core::Context::new();
+    let pair = ctx
+        .eval_str(
+            r#"(progn
+        (setq print-circle t print-continuous-numbering t print-number-table nil)
+        (set-buffer (get-buffer-create " princ-history-direct"))
+        (setq princ-history-pair (let ((x (list 1))) (list x x))))"#,
+        )
+        .unwrap();
+    let sink = ctx.eval_str("(current-buffer)").unwrap();
+    assert_eq!(builtin_princ_impl(&mut ctx, vec![pair, sink]).unwrap(), pair);
+    assert_eq!(
+        ctx.eval_str("(buffer-string)").unwrap().as_utf8_str(),
+        Some("(#1=(1) #1#)")
+    );
+    assert_eq!(
+        ctx.eval_str("(hash-table-p print-number-table)").unwrap(),
+        Value::T
+    );
+    assert_eq!(
+        ctx.eval_str("(hash-table-count print-number-table)")
+            .unwrap(),
+        Value::fixnum(1)
+    );
+    ctx.eval_str("(progn (erase-buffer) (garbage-collect))")
+        .unwrap();
+    assert_eq!(builtin_princ_impl(&mut ctx, vec![pair, sink]).unwrap(), pair);
+    assert_eq!(
+        ctx.eval_str("(buffer-string)").unwrap().as_utf8_str(),
+        Some("(#1# #1#)")
+    );
+}
+
+// GNU only materializes nil history for a circle-preprocessing candidate.
+// Inspect the variable itself; neither output formatting nor a truthy
+// continuous-numbering flag is evidence that a history table was published.
+fn check_princ_candidate_history(
+    object: &str,
+    output: &str,
+    gensym: bool,
+    candidate: bool,
+    buffer: bool,
+) {
+    let src = r#"(let* ((print-circle t) (print-continuous-numbering t)
+       (print-gensym GENSYM) (caller nil) (print-number-table caller)
+       (x OBJECT) (s "") (sink SINK))
+  (let ((returned (princ x sink)))
+    (list SNAPSHOT (eq x returned) (hash-table-p print-number-table)
+          (eq print-number-table nil)
+          (or (eq caller nil) (eq caller print-number-table))
+          (if (hash-table-p print-number-table)
+              (hash-table-count print-number-table) nil))))"#
+        .replace("GENSYM", if gensym { "t" } else { "nil" })
+        .replace("OBJECT", object)
+        .replace("SINK", if buffer {
+            "(progn (set-buffer (get-buffer-create \" princ-candidate\")) (erase-buffer) (current-buffer))"
+        } else { "(lambda (ch) (setq s (concat s (string ch))))" })
+        .replace("SNAPSHOT", if buffer { "(buffer-string)" } else { "s" });
+    // Gensym spelling is independent of history eligibility. GNU includes
+    // `#:' here; the existing noescape renderer does not. Check the common
+    // history label, return identity, and table contents without changing
+    // that pre-existing renderer behavior in this regression.
+    let src = if candidate && gensym {
+        src.replace("(list (buffer-string)", "(list (substring (buffer-string) 0 3)")
+            .replace("(list s", "(list (substring s 0 3)")
+    } else {
+        src
+    };
+    assert_princ_history_fields(
+        &src,
+        &[output],
+        &[
+            Value::T,
+            if candidate { Value::T } else { Value::NIL },
+            if candidate { Value::NIL } else { Value::T },
+            Value::T,
+            if candidate {
+                Value::fixnum(if gensym { 1 } else { 0 })
+            } else {
+                Value::NIL
+            },
+        ],
+    );
+}
+
+#[test]
+fn princ_candidate_history_fixnum_stays_nil() {
+    for buffer in [false, true] {
+        check_princ_candidate_history("1", "1", false, false, buffer);
+    }
+}
+
+#[test]
+fn princ_candidate_history_nil_stays_nil() {
+    for buffer in [false, true] {
+        check_princ_candidate_history("nil", "nil", false, false, buffer);
+    }
+}
+
+#[test]
+fn princ_candidate_history_interned_symbol_stays_nil() {
+    for buffer in [false, true] {
+        check_princ_candidate_history("'princ-atom", "princ-atom", true, false, buffer);
+    }
+}
+
+#[test]
+fn princ_candidate_history_empty_string_stays_nil() {
+    for buffer in [false, true] {
+        check_princ_candidate_history("\"\"", "", false, false, buffer);
+    }
+}
+
+#[test]
+fn princ_candidate_history_empty_vector_stays_nil() {
+    for buffer in [false, true] {
+        check_princ_candidate_history("[]", "[]", false, false, buffer);
+    }
+}
+
+#[test]
+fn princ_candidate_history_gensym_disabled_stays_nil() {
+    for buffer in [false, true] {
+        check_princ_candidate_history(
+            "(make-symbol \"princ-atom\")",
+            "princ-atom",
+            false,
+            false,
+            buffer,
+        );
+    }
+}
+
+#[test]
+fn princ_candidate_history_public_buffer_atom_stays_nil() {
+    check_princ_candidate_history("1", "1", false, false, true);
+}
+
+#[test]
+fn princ_candidate_history_eligible_objects_publish_table() {
+    for buffer in [false, true] {
+        for (object, output, gensym) in [
+            ("\"abc\"", "abc", false),
+            ("[1]", "[1]", false),
+            ("(list 1)", "(1)", false),
+            ("(make-symbol \"princ-atom\")", "#1=", true),
+        ] {
+            check_princ_candidate_history(object, output, gensym, true, buffer);
+        }
+    }
+}
+
+#[test]
+fn princ_candidate_history_circle_disabled_and_supplied_atom_controls() {
+    assert_princ_history_fields(
+        r#"(let* ((print-circle nil) (print-continuous-numbering t)
+       (print-gensym nil) (caller nil) (print-number-table caller)
+       (x [1]) (s "") (sink (lambda (ch) (setq s (concat s (string ch))))))
+  (let ((returned (princ x sink)))
+    (list s (eq x returned) (hash-table-p print-number-table)
+          (eq print-number-table nil)
+          (or (eq caller nil) (eq caller print-number-table))
+          (if (hash-table-p print-number-table)
+              (hash-table-count print-number-table) nil))))"#,
+        &["[1]"],
+        &[Value::T, Value::NIL, Value::T, Value::T, Value::NIL],
+    );
+    assert_princ_history_fields(
+        r#"(let* ((print-circle t) (print-continuous-numbering t)
+       (print-gensym nil) (caller (make-hash-table :test 'eq)) (print-number-table caller)
+       (x 1) (s "") (sink (lambda (ch) (setq s (concat s (string ch))))))
+  (let ((returned (princ x sink)))
+    (list s (eq x returned) (hash-table-p print-number-table)
+          (eq print-number-table nil)
+          (or (eq caller nil) (eq caller print-number-table))
+          (if (hash-table-p print-number-table)
+              (hash-table-count print-number-table) nil))))"#,
+        &["1"],
+        &[Value::T, Value::T, Value::NIL, Value::T, Value::fixnum(0)],
+    );
+}
+
+#[test]
+fn princ_candidate_history_direct_impl_atom_stays_nil() {
+    use crate::emacs_core::builtins::misc_eval::builtin_princ_impl;
+    let mut ctx = crate::emacs_core::Context::new();
+    ctx.eval_str(
+        r#"(progn
+        (setq print-circle t print-continuous-numbering t print-gensym nil print-number-table nil)
+        (set-buffer (get-buffer-create " princ-candidate-direct")))"#,
+    )
+    .unwrap();
+    let sink = ctx.eval_str("(current-buffer)").unwrap();
+    let object = Value::fixnum(1);
+    assert_eq!(
+        builtin_princ_impl(&mut ctx, vec![object, sink]).unwrap(),
+        object
+    );
+    assert_eq!(
+        ctx.eval_str("(buffer-string)").unwrap().as_utf8_str(),
+        Some("1")
+    );
+    assert_eq!(ctx.eval_str("print-number-table").unwrap(), Value::NIL);
+    let caller = ctx
+        .eval_str("(setq print-number-table (make-hash-table :test 'eq))")
+        .unwrap();
+    assert_eq!(
+        builtin_princ_impl(&mut ctx, vec![object, sink]).unwrap(),
+        object
+    );
+    assert_eq!(ctx.eval_str("print-number-table").unwrap(), caller);
+    assert_eq!(
+        ctx.eval_str("(hash-table-count print-number-table)")
+            .unwrap(),
+        Value::fixnum(0)
+    );
+}
+
+// GNU primitive controls: effective current/destination bindings and history.
+fn assert_princ_scope_result(result: Value, output: &str, history: bool) {
+    let mut fields = result;
+    assert_eq!(
+        fields.cons_car().as_utf8_str(),
+        Some(output),
+        "scope output"
+    );
+    fields = fields.cons_cdr();
+    for expected in [
+        Value::T,
+        Value::T,
+        Value::T,
+        Value::T,
+        if history {
+            Value::fixnum(1)
+        } else {
+            Value::NIL
+        },
+        Value::T,
+    ] {
+        assert!(fields.is_cons(), "missing scope field");
+        assert_eq!(fields.cons_car(), expected, "scope field");
+        fields = fields.cons_cdr();
+    }
+    assert!(fields.is_nil());
+}
+
+fn check_princ_effective_scope(case: usize, route: &str) {
+    use crate::emacs_core::builtins::misc_eval::builtin_princ_impl;
+    let (setup, circle, history, other) = match case {
+        0 => (
+            r#"(progn
+  (setq print-circle t print-continuous-numbering t print-number-table nil)
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle nil)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  nil
+  (make-local-variable 'print-circle) (setq print-circle nil)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  nil
+  scope-x)"#,
+            false,
+            false,
+            false,
+        ),
+        1 => (
+            r#"(progn
+  (setq print-circle t print-continuous-numbering t print-number-table nil)
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering nil)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  nil
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering nil)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  nil
+  scope-x)"#,
+            true,
+            false,
+            false,
+        ),
+        2 => (
+            r#"(progn
+  (setq print-circle nil print-continuous-numbering nil print-number-table nil)
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  nil
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  nil
+  scope-x)"#,
+            true,
+            true,
+            false,
+        ),
+        3 => (
+            r#"(progn
+  (setq print-circle t print-continuous-numbering t print-number-table (make-hash-table :test 'eq))
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  nil
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  nil
+  scope-x)"#,
+            true,
+            true,
+            false,
+        ),
+        4 => (
+            r#"(progn
+  (setq print-circle t print-continuous-numbering t print-number-table nil)
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  nil
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table (make-hash-table :test 'eq))
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  nil
+  scope-x)"#,
+            true,
+            true,
+            false,
+        ),
+        5 => (
+            r#"(progn
+  (setq print-circle nil print-continuous-numbering nil print-number-table nil)
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle nil)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  (set-buffer (get-buffer-create " princ-scope-destination"))
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  scope-x)"#,
+            true,
+            true,
+            true,
+        ),
+        6 => (
+            r#"(progn
+  (setq print-circle t print-continuous-numbering t print-number-table nil)
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  (set-buffer (get-buffer-create " princ-scope-destination"))
+  (make-local-variable 'print-circle) (setq print-circle nil)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  scope-x)"#,
+            false,
+            false,
+            true,
+        ),
+        _ => unreachable!(),
+    };
+    let mut ctx = crate::emacs_core::Context::new();
+    ctx.set_lexical_binding(true);
+    let object = ctx.eval_str(setup).expect("primitive scope setup");
+    let sink = ctx.eval_str("scope-destination").unwrap();
+    let snapshot = if route == "callable" {
+        "scope-s"
+    } else {
+        "(buffer-string)"
+    };
+    // GNU publishes a transient table when circle=t/continuous=nil. That
+    // pre-existing renderer difference is not a continuous-history assertion.
+    let table_check = if history {
+        "(hash-table-p print-number-table)"
+    } else {
+        "(or (eq print-number-table nil) (eq print-continuous-numbering nil))"
+    };
+    let count = if history {
+        "(if (hash-table-p print-number-table) (hash-table-count print-number-table) nil)"
+    } else {
+        "nil"
+    };
+    let caller_check = if other {
+        r#"(progn (set-buffer (get-buffer-create " princ-scope-caller")) (eq scope-caller-table print-number-table))"#
+    } else {
+        "t"
+    };
+    let inspect = format!(
+        r#"(progn (set-buffer scope-destination)
+      (list {snapshot} (eq scope-x scope-returned) {table_check}
+        (or (eq scope-supplied-table nil) (eq scope-supplied-table print-number-table))
+        (eq scope-default-table (default-value 'print-number-table)) {count} {caller_check}))"#
+    );
+    let first = if circle { "(#1=(1) #1#)" } else { "((1) (1))" };
+    let second = if history { "(#1# #1#)" } else { first };
+    for output in [first, second] {
+        if route == "direct" {
+            assert_eq!(
+                builtin_princ_impl(&mut ctx, vec![object, sink]).unwrap(),
+                object
+            );
+            ctx.set_variable("scope-returned", object);
+        } else {
+            let stream = if route == "callable" {
+                "(lambda (ch) (setq scope-s (concat scope-s (string ch))))"
+            } else {
+                "scope-destination"
+            };
+            ctx.eval_str(&format!("(setq scope-returned (princ scope-x {stream}))"))
+                .unwrap();
+        }
+        let result = ctx.eval_str(&inspect).unwrap();
+        assert_princ_scope_result(result, output, history);
+        ctx.eval_str(r#"(progn (set-buffer scope-destination) (erase-buffer) (setq scope-s "") (garbage-collect))"#).unwrap();
+        if other {
+            ctx.eval_str(r#"(set-buffer (get-buffer-create " princ-scope-caller"))"#)
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn princ_effective_scope_local_circle_disabled_callable() {
+    check_princ_effective_scope(0, "callable");
+}
+
+#[test]
+fn princ_effective_scope_local_circle_disabled_buffer() {
+    check_princ_effective_scope(0, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_local_circle_disabled_direct() {
+    check_princ_effective_scope(0, "direct");
+}
+
+#[test]
+fn princ_effective_scope_local_continuous_disabled_callable() {
+    check_princ_effective_scope(1, "callable");
+}
+
+#[test]
+fn princ_effective_scope_local_continuous_disabled_buffer() {
+    check_princ_effective_scope(1, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_local_continuous_disabled_direct() {
+    check_princ_effective_scope(1, "direct");
+}
+
+#[test]
+fn princ_effective_scope_local_flags_enabled_callable() {
+    check_princ_effective_scope(2, "callable");
+}
+
+#[test]
+fn princ_effective_scope_local_flags_enabled_buffer() {
+    check_princ_effective_scope(2, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_local_flags_enabled_direct() {
+    check_princ_effective_scope(2, "direct");
+}
+
+#[test]
+fn princ_effective_scope_local_nil_table_default_supplied_callable() {
+    check_princ_effective_scope(3, "callable");
+}
+
+#[test]
+fn princ_effective_scope_local_nil_table_default_supplied_buffer() {
+    check_princ_effective_scope(3, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_local_nil_table_default_supplied_direct() {
+    check_princ_effective_scope(3, "direct");
+}
+
+#[test]
+fn princ_effective_scope_local_supplied_table_default_nil_callable() {
+    check_princ_effective_scope(4, "callable");
+}
+
+#[test]
+fn princ_effective_scope_local_supplied_table_default_nil_buffer() {
+    check_princ_effective_scope(4, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_local_supplied_table_default_nil_direct() {
+    check_princ_effective_scope(4, "direct");
+}
+
+#[test]
+fn princ_effective_scope_destination_enabled_caller_disabled_buffer() {
+    check_princ_effective_scope(5, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_destination_enabled_caller_disabled_direct() {
+    check_princ_effective_scope(5, "direct");
+}
+
+#[test]
+fn princ_effective_scope_destination_disabled_caller_enabled_buffer() {
+    check_princ_effective_scope(6, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_destination_disabled_caller_enabled_direct() {
+    check_princ_effective_scope(6, "direct");
+}
+
 fn princ_eval(src: &str) -> String {
     let mut ev = crate::emacs_core::Context::new();
     ev.set_lexical_binding(true);

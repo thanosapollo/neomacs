@@ -325,7 +325,7 @@ pub(crate) struct PrintState<'a> {
 
 /// Check if a value is a candidate for circle detection.
 /// Matches GNU Emacs's `print_circle_candidate_p`.
-fn is_print_circle_candidate(value: &Value, print_gensym: bool) -> bool {
+pub(crate) fn is_print_circle_candidate(value: &Value, print_gensym: bool) -> bool {
     match value.kind() {
         ValueKind::Cons => true,
         ValueKind::Veclike(VecLikeType::Vector) => {
