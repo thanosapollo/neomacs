@@ -338,21 +338,35 @@ fn assert_drained(ev: &mut Context, pid: ProcessId, expected: &[u8]) {
     assert_eq!(output(ev, "tls-output"), expected);
 }
 
-// A command wait yields after callbacks so the real reader can restart display
-// maintenance (keyboard.rs). Resume that same native wait, with one fixed
-// deadline, rather than treating its first Interrupted result as a final wait.
+// Bounded command reads service successive fair batches until their deadline.
+// Only unbounded reads yield to display maintenance after each callback batch.
 fn wait_for_idle_command_input(ev: &mut Context, deadline: Instant) -> CommandInputWaitOutcome {
     loop {
-        let before = output(ev, "tls-output").len();
         let outcome = ev.wait_for_command_input(Some(deadline)).unwrap();
-        assert!(
-            output(ev, "tls-output").len() <= before + 16,
-            "each native command-wait visit must retain the live read budget"
-        );
         if outcome != CommandInputWaitOutcome::Interrupted {
             return outcome;
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn tls_unbounded_command_input_wait_yields_between_bounded_output_batches() {
+    let (mut ev, pid, _peer, expected) = prepare();
+    other_stream(&mut ev);
+    while output(&mut ev, "tls-output").len() < expected.len() {
+        let before = output(&mut ev, "tls-output").len();
+        assert_eq!(
+            ev.wait_for_command_input(None).unwrap(),
+            CommandInputWaitOutcome::Interrupted
+        );
+        assert!(
+            output(&mut ev, "tls-output").len() <= before + 16,
+            "unbounded command reads yield after each bounded callback batch"
+        );
+    }
+    assert_eq!(output(&mut ev, "tls-other"), b"MARKER");
+    assert_drained(&mut ev, pid, &expected);
 }
 
 #[cfg(unix)]
