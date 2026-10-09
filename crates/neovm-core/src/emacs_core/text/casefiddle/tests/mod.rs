@@ -551,3 +551,131 @@ fn unibyte_buffer_capitalization_truncates_wide_mappings_like_gnu() {
     );
     assert_eq!(result, r#"OK ("BA Xa" "BA Xa" "BA Xa")"#);
 }
+
+/// GNU `buffer.h` downcase returns the character itself when the installed
+/// table has no mapping; it does not retry the Unicode lowercase mapping.
+#[test]
+fn missing_custom_downcase_entry_is_identity_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (with-temp-buffer
+          (let ((tbl (copy-case-table (standard-case-table))))
+            (aset tbl ?B nil)
+            (set-case-table tbl))
+          (list (aref (current-case-table) ?B)
+                (downcase ?B) (downcase ?A) (downcase ?C)
+                (downcase "ABC") (capitalize "ABC")
+                (upcase-initials "ABC") (char-equal ?B ?b)
+                (progn (insert "ABC ABC")
+                       (capitalize-region 1 4) (goto-char 5)
+                       (capitalize-word 1)
+                       (list (buffer-string) (point)))
+                (progn (erase-buffer) (insert "ABC ABC")
+                       (downcase-region 1 4) (goto-char 5)
+                       (downcase-word 1)
+                       (list (buffer-string) (point)))))
+        "#,
+    );
+    assert_eq!(
+        result,
+        r#"OK (nil 66 97 99 "aBc" "ABc" "ABC" nil ("ABc ABc" 8) ("aBc aBc" 8))"#
+    );
+}
+
+#[test]
+fn missing_custom_unicode_downcase_entry_is_identity_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (with-temp-buffer
+          (let ((tbl (copy-case-table (standard-case-table))))
+            (aset tbl ?É nil)
+            (set-case-table tbl))
+          (list (downcase ?É) (downcase ?Ä)
+                (downcase "ÉÄ") (capitalize "AÉÄ")
+                (char-equal ?É ?é)
+                (progn (insert "AÉÄ AÉÄ")
+                       (capitalize-region 1 4) (goto-char 5)
+                       (capitalize-word 1)
+                       (list (buffer-string) (point)))
+                (progn (erase-buffer) (insert "ÉÄ ÉÄ")
+                       (downcase-region 1 3) (goto-char 4)
+                       (downcase-word 1)
+                       (list (buffer-string) (point)))))
+        "#,
+    );
+    assert_eq!(
+        result,
+        r#"OK (201 228 "Éä" "AÉä" nil ("AÉä AÉä" 8) ("Éä Éä" 6))"#
+    );
+}
+
+/// An absent ASCII mapping is identity for unibyte strings and buffers too;
+/// raw high bytes remain raw. No out-of-byte case mapping is involved here.
+#[test]
+fn missing_custom_unibyte_downcase_entry_is_identity_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (let ((tbl (copy-case-table (standard-case-table))))
+            (aset tbl ?B nil)
+            (set-case-table tbl))
+          (let ((s (string-as-unibyte "ABC")))
+            (list (downcase s) (capitalize s)
+                  (multibyte-string-p (capitalize s))
+                  (string-to-list (downcase (unibyte-string 65 66 67 233)))
+                  (progn (insert "ABC ABC")
+                         (capitalize-region 1 4) (goto-char 5)
+                         (capitalize-word 1)
+                         (list (buffer-string) (point)))
+                  (progn (erase-buffer) (insert "ABC ABC")
+                         (downcase-region 1 4) (goto-char 5)
+                         (downcase-word 1)
+                         (list (buffer-string) (point))))))
+        "#,
+    );
+    assert_eq!(
+        result,
+        r#"OK ("aBc" "ABc" nil (97 66 99 233) ("ABc ABc" 8) ("aBc aBc" 8))"#
+    );
+}
+
+/// Resolve parent/default mappings before deciding a custom entry is absent;
+/// keep ordinary explicit mappings and the standard Unicode path unchanged.
+#[test]
+fn custom_downcase_resolves_entries_before_identity_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"
+        (list
+         (with-temp-buffer
+           (let ((tbl (copy-case-table (standard-case-table))))
+             (aset tbl ?B ?x)
+             (set-case-table tbl))
+           (list (downcase "ABC") (capitalize "ABC")))
+         (with-temp-buffer
+           (let ((tbl (make-char-table 'case-table nil))
+                 (parent (copy-case-table (standard-case-table))))
+             (aset parent ?B ?x)
+             (set-char-table-parent tbl parent)
+             (set-case-table tbl))
+           (list (downcase ?B) (downcase "ABC")))
+         (with-temp-buffer
+           (let ((tbl (copy-case-table (standard-case-table))))
+             (aset tbl ?B nil)
+             (set-char-table-range tbl nil ?x)
+             (set-case-table tbl))
+           (list (downcase ?B) (downcase "ABC")))
+         (with-temp-buffer
+           (list (downcase ?B) (downcase "ABC") (capitalize "ABC")
+                 (downcase "ÉÄ") (capitalize "AÉÄ"))))
+        "#,
+    );
+    assert_eq!(
+        result,
+        r#"OK (("axc" "Axc") (120 "axc") (120 "axc") (98 "abc" "Abc" "éä" "Aéä"))"#
+    );
+}

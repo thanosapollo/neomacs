@@ -1244,9 +1244,18 @@ fn write_value_stateful_inner(
     }
 }
 
+// Own only this helper's temporary roots; nested callers retain their prefix.
+struct BytecodeLiteralRootScope(usize);
+
+impl Drop for BytecodeLiteralRootScope {
+    fn drop(&mut self) {
+        crate::emacs_core::eval::restore_scratch_gc_roots(self.0);
+    }
+}
+
 fn with_bytecode_literal_slots<R>(value: &Value, f: impl FnOnce(&[Value]) -> R) -> Option<R> {
     let bc = value.get_bytecode_data()?.clone();
-    let saved_roots = crate::emacs_core::eval::save_scratch_gc_roots();
+    let _roots = BytecodeLiteralRootScope(crate::emacs_core::eval::save_scratch_gc_roots());
 
     let arglist = bc.arglist;
     crate::emacs_core::eval::push_scratch_gc_root(arglist);
@@ -1302,7 +1311,6 @@ fn with_bytecode_literal_slots<R>(value: &Value, f: impl FnOnce(&[Value]) -> R) 
         }
     }
     let result = f(&slots);
-    crate::emacs_core::eval::restore_scratch_gc_roots(saved_roots);
     Some(result)
 }
 
