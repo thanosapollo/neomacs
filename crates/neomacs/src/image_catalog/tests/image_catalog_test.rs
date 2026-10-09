@@ -641,3 +641,99 @@ fn a_refused_load_is_a_failed_lookup_carrying_gnus_diagnostic() {
         "the reserved slot survives the refusal, so the frame does not move"
     );
 }
+
+/// A failure arriving while a synchronous caller waits must be reported just
+/// like a failure already observed by ordinary lookup. Each explicit semantic
+/// query reports it once, independently of display-side negative caching.
+#[test]
+fn synchronous_wait_reports_a_new_decode_failure_and_each_cached_query() {
+    let (cmd_tx, _cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
+    let metadata = Arc::new(ImageRenderState::default());
+    let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::clone(&metadata), None);
+    let request = file_request("/nonexistent/neomacs/synchronous-failure.png");
+    let ImageLookup::Pending(pending) = lookup(&catalog, request.clone()) else {
+        panic!("new request must be pending");
+    };
+    let publisher = Arc::clone(&metadata);
+    let worker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        publisher.publish_terminal(
+            pending.load(),
+            ImageDecodeTerminal::Failed(ImageDiagnostic::InvalidSize),
+        );
+    });
+    let first = catalog.resolve_sync(request.clone(), ImageSizeLimit::UNLIMITED);
+    worker.join().expect("terminal publisher");
+    assert_eq!(first, Err(ImageDiagnostic::InvalidSize.message()));
+    assert_eq!(
+        catalog.take_pending_diagnostics(),
+        vec![ImageDiagnostic::InvalidSize.message()],
+        "failure arriving during the semantic wait must reach diagnostics"
+    );
+    assert_eq!(
+        catalog.resolve_sync(request, ImageSizeLimit::UNLIMITED),
+        Err(ImageDiagnostic::InvalidSize.message())
+    );
+    assert_eq!(
+        catalog.take_pending_diagnostics(),
+        vec![ImageDiagnostic::InvalidSize.message()],
+        "an explicit cached semantic query reports the same failure again"
+    );
+}
+
+/// Production-boundary measurement, not a GNU operation benchmark. Keeping
+/// the real command receiver alive without consuming commands models an owner
+/// that has stopped servicing work. Header geometry must not be mistaken for
+/// complete semantic metadata (mask/background/animation still need decoding).
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "explicit image metadata boundary profile; one-second stalls"]
+fn profile_synchronous_metadata_with_unserviced_render_owner() {
+    for repetition in 0..5 {
+        let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
+        let metadata = Arc::new(ImageRenderState::default());
+        let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::clone(&metadata), None);
+        let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+        let mut request = file_request(fixture.to_str().expect("utf8 fixture"));
+        request.size = ImageSizeSpec::new(AxisSize::AtMost(50), AxisSize::Native);
+        let ImageLookup::Pending(pending) = lookup(&catalog, request.clone()) else {
+            panic!("renderer has not serviced the load");
+        };
+        let header_deadline = Instant::now() + Duration::from_secs(10);
+        while lookup(&catalog, request.clone()).placement().dimensions() != (50, 100) {
+            assert!(
+                Instant::now() < header_deadline,
+                "header probe did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let sched_before = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap();
+        let start = Instant::now();
+        let result = catalog.resolve_sync(request, ImageSizeLimit::UNLIMITED);
+        let wall_ns = start.elapsed().as_nanos();
+        let sched_after = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap();
+        let parse = |text: &str| {
+            text.split_whitespace()
+                .take(2)
+                .map(|value| value.parse::<u64>().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = parse(&sched_before);
+        let after = parse(&sched_after);
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .starts_with("Timed out waiting for image decode")
+        );
+        assert!(metadata.terminal(pending.load()).is_none());
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(RenderCommand::Asset(AssetCommand::ImageLoadFile { load, .. })) if load == pending.load())
+        );
+        println!(
+            "R020_METADATA_PROFILE rep={repetition} wall_ns={wall_ns} cpu_ns={} runnable_ns={} header=50x100 terminal=absent result={result:?}",
+            after[0] - before[0],
+            after[1] - before[1]
+        );
+    }
+}
