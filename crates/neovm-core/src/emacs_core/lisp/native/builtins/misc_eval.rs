@@ -2325,14 +2325,7 @@ fn prin1_to_lisp_string_value_in_state_with_overrides(
 pub(crate) fn builtin_princ(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     expect_min_args("princ", &args, 1)?;
     let target = resolve_print_target(eval, args.get(1));
-    let print_gensym = super::error::print_options_from_state(
-        &eval.obarray,
-        print_target_current_buffer(eval, target),
-    )
-    .print_gensym;
-    if super::print::is_print_circle_candidate(&args[0], print_gensym) {
-        ensure_continuous_print_number_table(eval);
-    }
+    ensure_princ_continuous_print_number_table(eval, &args[0], target);
     if print_target_is_direct(target) {
         return builtin_princ_impl(eval, args);
     }
@@ -2361,18 +2354,47 @@ pub(crate) fn builtin_princ_impl(
     // carried as its disjoint extended encoding — neither is ever mistaken for
     // the other, retiring the storage-string sink princ used to fall back to.
     let target = resolve_print_target_in_state(ctx, args.get(1));
-    let print_gensym = super::error::print_options_from_state(
-        &ctx.obarray,
-        print_target_current_buffer(ctx, target),
-    )
-    .print_gensym;
-    if super::print::is_print_circle_candidate(&args[0], print_gensym) {
-        ensure_continuous_print_number_table(ctx);
-    }
+    ensure_princ_continuous_print_number_table(ctx, &args[0], target);
     let bytes =
         print_value_princ_bytes_in_buffer(ctx, &args[0], print_target_current_buffer(ctx, target))?;
     write_print_bytes_from_ctx(ctx, args.get(1), &bytes)?;
     Ok(args[0])
+}
+
+/// Initialize only the persistent history used by this `princ` renderer.
+/// Buffer/marker streams use the destination's bindings; callbacks use the
+/// caller's. Do not publish a default table for a disabled local flag or
+/// overwrite a supplied effective table. Other printers retain their helper.
+fn ensure_princ_continuous_print_number_table(
+    ctx: &mut crate::emacs_core::eval::Context,
+    value: &Value,
+    target: Value,
+) {
+    let buf = print_target_current_buffer(ctx, target);
+    let options = super::error::print_options_from_state(&ctx.obarray, buf);
+    if !options.print_circle
+        || !options.print_continuous_numbering
+        || options.print_number_table.is_some()
+        || !super::print::is_print_circle_candidate(value, options.print_gensym)
+    {
+        return;
+    }
+    let symbol = intern("print-number-table");
+    let local_cell = if ctx.obarray.is_localized(symbol) {
+        buf.and_then(|buf| buf.local_variable_binding_cell(symbol))
+    } else {
+        None
+    };
+    let table = Value::hash_table(crate::emacs_core::value::HashTableTest::Eq);
+    if let Some(cell) = local_cell {
+        // This is the same alist cell the option reader consults. Internal
+        // printer publication must not create a new local binding or switch
+        // the caller's current buffer (especially before a callback).
+        cell.set_cdr(table);
+    } else {
+        ctx.set_variable("print-number-table", table);
+    }
+    crate::emacs_core::print::reset_print_number_index();
 }
 
 /// GNU `print_object`/`print_preprocess` build `Vprint_number_table` (a real
