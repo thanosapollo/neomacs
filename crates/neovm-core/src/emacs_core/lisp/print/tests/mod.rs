@@ -1205,7 +1205,7 @@ fn check_princ_continuous_history(buffer: bool, supplied: bool, continuous: bool
     (garbage-collect)
     (setq second-return (eq pair (princ pair sink)))
     (list first SNAPSHOT first-return second-return
-          (or (not caller) (eq caller print-number-table))
+          (or (eq caller nil) (eq caller print-number-table))
           (and print-continuous-numbering (hash-table-p print-number-table))
           (and print-continuous-numbering (hash-table-count print-number-table)))))"#
         .replace("CONTINUOUS", if continuous { "t" } else { "nil" })
@@ -1297,7 +1297,7 @@ fn princ_continuous_history_nonlocal_recovery() {
   (garbage-collect)
   (setq returned (eq pair (princ pair sink)))
   (list s (eq stopped 'stopped) returned (eq table print-number-table)
-        (hash-table-count print-number-table)))"#,
+        (and (hash-table-p print-number-table) (hash-table-count print-number-table))))"#,
         &["(#1# #1#)"],
         &[Value::T, Value::T, Value::T, Value::fixnum(1)],
     );
@@ -1317,8 +1317,8 @@ fn princ_continuous_history_direct_impl_initializes_nil_table() {
         .unwrap();
     assert_eq!(builtin_princ_impl(&mut ctx, vec![pair]).unwrap(), pair);
     assert_eq!(
-        ctx.eval_str("(buffer-string)").unwrap(),
-        Value::string("(#1=(1) #1#)")
+        ctx.eval_str("(buffer-string)").unwrap().as_utf8_str(),
+        Some("(#1=(1) #1#)")
     );
     assert_eq!(
         ctx.eval_str("(hash-table-p print-number-table)").unwrap(),
@@ -1333,8 +1333,8 @@ fn princ_continuous_history_direct_impl_initializes_nil_table() {
         .unwrap();
     assert_eq!(builtin_princ_impl(&mut ctx, vec![pair]).unwrap(), pair);
     assert_eq!(
-        ctx.eval_str("(buffer-string)").unwrap(),
-        Value::string("(#1# #1#)")
+        ctx.eval_str("(buffer-string)").unwrap().as_utf8_str(),
+        Some("(#1# #1#)")
     );
 }
 
