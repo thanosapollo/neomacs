@@ -1458,3 +1458,152 @@ fn princ_shorthands_follow_gnu_print_quoted_rules() {
         assert_eq!(princ_eval(src), expected, "{src}");
     }
 }
+
+const DEEP_DATA_CHILD_FORM: &str = "NEOVM_DEEP_DATA_CHILD_FORM";
+
+/// Child half of the deep-data tests: eval the form and print the result.
+/// A native stack overflow kills only this process.
+#[test]
+#[ignore = "run in a child process by the deep-data tests"]
+fn deep_data_child() {
+    let Ok(src) = std::env::var(DEEP_DATA_CHILD_FORM) else {
+        return;
+    };
+    // An overflow here must not dump a core.
+    let no_core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: setrlimit and prctl only access their arguments; this process
+    // runs this test alone.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) }, 0);
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) }, 0);
+    println!("RESULT={}", princ_eval(&src));
+}
+
+/// Eval each form in a child process on an 8 MiB stack, the usual main
+/// thread's, and return the mismatches with GNU's result.
+fn deep_data_mismatches(cases: &[(&str, &str)]) -> Vec<String> {
+    crate::test_utils::init_test_tracing();
+    let child = format!(
+        "{}::deep_data_child",
+        module_path!().split_once("::").expect("crate path").1
+    );
+    let mut failures = Vec::new();
+    for (src, expected) in cases {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                child.as_str(),
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(DEEP_DATA_CHILD_FORM, src)
+            .env("RUST_MIN_STACK", (8 << 20).to_string())
+            .output()
+            .expect("spawn child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let tail = &stderr[stderr.len().saturating_sub(2000)..];
+            failures.push(format!("{src}: child {}\n{tail}", output.status));
+        } else if !stdout.contains(&format!("RESULT={expected}\n")) {
+            failures.push(format!("{src}: expected {expected}\n{stdout}"));
+        }
+    }
+    failures
+}
+
+/// GNU `read0` keeps unfinished lists, vectors and quotations on its own
+/// `read_stack`: data nested a million levels deep reads from a string or
+/// a buffer without overflowing the native stack.
+#[test]
+fn deeply_nested_data_reads_like_gnu() {
+    let failures = deep_data_mismatches(&[
+        (
+            r#"(let ((x (read (concat (make-string 1000000 ?\() (make-string 1000000 ?\)))))) (let ((d 0)) (while (consp x) (setq d (1+ d) x (car x))) d))"#,
+            r#"OK 999999"#,
+        ),
+        (
+            r#"(let ((x (read (concat (make-string 1000000 ?\[) (make-string 1000000 ?\]))))) (let ((d 0)) (while (and (vectorp x) (> (length x) 0)) (setq d (1+ d) x (aref x 0))) d))"#,
+            r#"OK 999999"#,
+        ),
+        (
+            r#"(let* ((r (read-from-string (concat (make-string 1000000 ?\() (make-string 1000000 ?\))))) (x (car r))) (list (let ((d 0)) (while (consp x) (setq d (1+ d) x (car x))) d) (cdr r)))"#,
+            r#"OK (999999 2000000)"#,
+        ),
+        (
+            r#"(save-current-buffer (set-buffer (get-buffer-create (generate-new-buffer-name "p"))) (insert (concat (make-string 1000000 ?\() (make-string 1000000 ?\)))) (goto-char 1) (let ((x (read (current-buffer)))) (list (let ((d 0)) (while (consp x) (setq d (1+ d) x (car x))) d) (point))))"#,
+            r#"OK (999999 2000001)"#,
+        ),
+        (
+            r#"(let ((x (read (concat (make-string 1000000 ?') "x"))) (d 0)) (while (consp x) (setq d (1+ d) x (car (cdr x)))) (list d x))"#,
+            r#"OK (1000000 x)"#,
+        ),
+        (
+            r#"(let ((x (read (concat (mapconcat #'identity (make-list 1000000 "(a . ") "") "nil" (make-string 1000000 ?\))))) (d 0)) (while (consp x) (setq d (1+ d) x (cdr x))) d)"#,
+            r#"OK 1000000"#,
+        ),
+        (
+            r#"(length (read (concat "(" (mapconcat #'identity (make-list 1000000 "1") " ") ")")))"#,
+            r#"OK 1000000"#,
+        ),
+    ]);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `#N=` labels, records, closures and strings with text properties nested
+/// fifty thousand levels deep read as in GNU, whose `read0` keeps them on its
+/// own `read_stack`; substituting a label's placeholder must not recurse
+/// once per level either.
+#[test]
+fn deeply_nested_labels_and_hash_syntax_read_like_gnu() {
+    let failures = deep_data_mismatches(&[
+        (
+            r##"(let ((x (read (concat "#1=" (make-string 50000 ?\[) "nil" (make-string 50000 ?\])))) (n 0)) (while (vectorp x) (setq n (1+ n) x (aref x 0))) n)"##,
+            r##"OK 50000"##,
+        ),
+        (
+            r##"(let* ((v (read (concat "#1=" (make-string 50000 ?\[) "#1#" (make-string 50000 ?\])))) (x (aref v 0)) (n 1)) (while (null (eq x v)) (setq n (1+ n) x (aref x 0))) n)"##,
+            r##"OK 50000"##,
+        ),
+        (
+            r##"(let ((x (read (concat "#1=" (make-string 50000 ?\() "nil" (make-string 50000 ?\))))) (n 0)) (while (consp x) (setq n (1+ n) x (car x))) n)"##,
+            r##"OK 50000"##,
+        ),
+        (
+            r##"(let* ((v (read (concat "#1=" (make-string 50000 ?\() "#1#" (make-string 50000 ?\))))) (x (car v)) (n 1)) (while (null (eq x v)) (setq n (1+ n) x (car x))) n)"##,
+            r##"OK 50000"##,
+        ),
+        (
+            r##"(let ((x (read (concat (make-string 50000 ?\[) "#1=[a]" (make-string 50000 ?\])))) (n 0)) (while (vectorp x) (setq n (1+ n) x (aref x 0))) (list n x))"##,
+            r##"OK (50001 a)"##,
+        ),
+        (
+            r##"(let ((x (read (concat (apply #'concat (make-list 50000 "#s(r ")) "nil" (make-string 50000 ?\))))) (n 0)) (while (recordp x) (setq n (1+ n) x (aref x 1))) n)"##,
+            r##"OK 50000"##,
+        ),
+        (
+            r##"(let ((x (read (concat "#1=" (apply #'concat (make-list 50000 "#s(r ")) "nil" (make-string 50000 ?\))))) (n 0)) (while (recordp x) (setq n (1+ n) x (aref x 1))) n)"##,
+            r##"OK 50000"##,
+        ),
+        (
+            r##"(let* ((v (read (concat "#1=" (apply #'concat (make-list 50000 "#s(r ")) "#1#" (make-string 50000 ?\))))) (x (aref v 1)) (n 1)) (while (null (eq x v)) (setq n (1+ n) x (aref x 1))) n)"##,
+            r##"OK 50000"##,
+        ),
+        (
+            r##"(let ((x (read (concat "#1=" (apply #'concat (make-list 50000 "#[nil (")) "nil" (apply #'concat (make-list 50000 ") nil]"))))) (n 0)) (while x (setq n (1+ n) x (car (aref x 1)))) n)"##,
+            r##"OK 50000"##,
+        ),
+        (
+            r##"(let ((x (read (concat (apply #'concat (make-list 50000 "#(\"x\" 0 1 (p ")) "nil" (make-string 100000 ?\))))) (n 0)) (while (stringp x) (setq n (1+ n) x (get-text-property 0 'p x))) n)"##,
+            r##"OK 50000"##,
+        ),
+        (
+            r##"(let ((x (read (concat "#1=" (make-string 50000 ?') "x"))) (n 0)) (while (consp x) (setq n (1+ n) x (car (cdr x)))) (list n x))"##,
+            r##"OK (50000 x)"##,
+        ),
+    ]);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
