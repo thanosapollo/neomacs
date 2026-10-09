@@ -648,6 +648,7 @@ pub(crate) fn capture_text_window_retry_checkpoint(
     let output_builder = output.builder();
     TextWindowOutputRetryCheckpoint {
         transition_hints_len: output_builder.transition_hints().len(),
+        face_fills_len: output_builder.face_fills_len(),
     }
 }
 
@@ -659,6 +660,7 @@ pub(crate) fn restore_text_window_retry_checkpoint(
         .builder()
         .install_window_metadata(OutputRetryCheckpointRestoreRequest::new(
             checkpoint.transition_hints_len,
+            checkpoint.face_fills_len,
         ));
 }
 
@@ -1032,6 +1034,7 @@ impl TextWindowEndPosition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TextWindowOutputRetryCheckpoint {
     pub(crate) transition_hints_len: usize,
+    pub(crate) face_fills_len: usize,
 }
 
 pub(crate) fn install_text_window_cursor_effects(

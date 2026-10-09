@@ -756,6 +756,10 @@ impl DisplayOutputBuilder {
         self.frame_state.transition_hints()
     }
 
+    pub(crate) fn face_fills_len(&self) -> usize {
+        self.frame_state.face_fills_len()
+    }
+
     pub(crate) fn output_face(&self, face_id: FaceId) -> Option<Face> {
         self.face_attempt.face(face_id)
     }
