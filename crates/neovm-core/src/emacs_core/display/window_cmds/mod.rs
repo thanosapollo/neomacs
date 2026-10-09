@@ -3292,8 +3292,8 @@ fn tty_batch_pixel_top(window: &Window, char_height: f32) -> i64 {
 }
 /// `(window-pixel-left &optional WINDOW)` -> integer.
 ///
-/// Graphical frames report the stored frame-relative pixel coordinate.  In
-/// batch-mode GNU Emacs, this helper reports character-cell units instead.
+/// Graphical frames report raw pixel coordinates excluding the frame internal
+/// border. In batch-mode GNU Emacs, this reports character-cell units instead.
 pub(crate) fn builtin_window_pixel_left(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
@@ -3308,8 +3308,9 @@ pub(crate) fn builtin_window_pixel_left(
     let graphical = frame.is_some_and(|frame| frame.effective_window_system().is_some());
     let cw = frame.map(|frame| frame.char_width).unwrap_or(8.0);
     let left = if graphical {
-        // GNU `Fwindow_pixel_left` returns `w->pixel_left` directly.
-        w.bounds().x as i64
+        // Stored bounds are physical frame coordinates; GNU's raw pixel edge
+        // excludes the border that `window-edges` adds back in Lisp.
+        w.bounds().x as i64 - frame.map_or(0, |frame| frame.internal_border_width())
     } else {
         tty_batch_pixel_left(w, cw)
     };
@@ -3317,8 +3318,8 @@ pub(crate) fn builtin_window_pixel_left(
 }
 /// `(window-pixel-top &optional WINDOW)` -> integer.
 ///
-/// Graphical frames report the stored frame-relative pixel coordinate.  In
-/// batch-mode GNU Emacs, this helper reports character-cell units instead.
+/// Graphical frames report raw pixel coordinates excluding the frame internal
+/// border. In batch-mode GNU Emacs, this reports character-cell units instead.
 pub(crate) fn builtin_window_pixel_top(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
@@ -3333,8 +3334,9 @@ pub(crate) fn builtin_window_pixel_top(
     let graphical = frame.is_some_and(|frame| frame.effective_window_system().is_some());
     let ch = frame.map(|frame| frame.char_height).unwrap_or(16.0);
     let top = if graphical {
-        // GNU `Fwindow_pixel_top` returns `w->pixel_top` directly.
-        w.bounds().y as i64
+        // Preserve the chrome offset while converting physical bounds to
+        // GNU's raw pixel edge, before Lisp adds the effective border.
+        w.bounds().y as i64 - frame.map_or(0, |frame| frame.internal_border_width())
     } else {
         tty_batch_pixel_top(w, ch)
     };
