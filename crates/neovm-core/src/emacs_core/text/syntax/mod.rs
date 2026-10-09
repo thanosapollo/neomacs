@@ -963,7 +963,7 @@ impl Default for SyntaxTable {
 /// A "word" is a maximal run of characters with syntax class `Word`.
 /// Between words, non-word characters are skipped.
 pub fn forward_word(buf: &Buffer, table: &SyntaxTable, count: i64) -> EmacsBytePos {
-    forward_word_with_options(buf, table, count, SyntaxProperties::Ignore).0
+    forward_word_with_options(buf, table, count, SyntaxProperties::Ignore, None).0
 }
 
 fn syntax_char_from_code(code: u32) -> char {
@@ -1262,11 +1262,24 @@ impl<'a> ParseBufferChars<'a> {
     }
 }
 
+fn word_scan_syntax_lookup(
+    buf: &Buffer,
+    table: &SyntaxTable,
+    boundary: Option<super::regex_emacs::WordBoundaryLookup>,
+) -> Option<super::regex_emacs::BufferSyntaxLookup> {
+    boundary.map(|word_boundary| super::regex_emacs::BufferSyntaxLookup {
+        syntax_table: *table,
+        category_table: super::category::active_category_table_for_buffer(Some(buf)).ok(),
+        word_boundary,
+    })
+}
+
 fn forward_word_with_options(
     buf: &Buffer,
     table: &SyntaxTable,
     count: i64,
     props: SyntaxProperties<'_>,
+    boundary: Option<super::regex_emacs::WordBoundaryLookup>,
 ) -> (EmacsBytePos, bool) {
     // Per-scan syntax-table property cache (GNU gl_state); one
     // interval lookup per property RUN instead of per character.
@@ -1274,7 +1287,7 @@ fn forward_word_with_options(
     let prop_cache = &prop_cache;
 
     if count < 0 {
-        return backward_word_with_options(buf, table, -count, props);
+        return backward_word_with_options(buf, table, -count, props, boundary);
     }
 
     let accessible_bytes = buf.accessible_emacs_byte_region();
@@ -1285,6 +1298,7 @@ fn forward_word_with_options(
     let mut idx = buffer_byte_to_char_pos(buf, accessible_bytes.clamp(buf.point_emacs_byte_pos()))
         .saturating_sub(accessible_char_start);
 
+    let lookup = word_scan_syntax_lookup(buf, table, boundary);
     for _ in 0..count {
         // Skip non-word characters
         while idx < accessible_len
@@ -1306,6 +1320,9 @@ fn forward_word_with_options(
             let abs_char = offset_char_pos(accessible_chars.start(), idx);
             return (buffer_char_to_emacs_byte_pos(buf, abs_char), false);
         }
+        // Scanner script/category boundaries select the endpoint; casing still
+        // uses syntax-only state across the entire selected span.
+        let word_start = idx;
         // Skip word characters
         while idx < accessible_len
             && matches!(
@@ -1320,6 +1337,15 @@ fn forward_word_with_options(
                 SyntaxClass::Word
             )
         {
+            if idx > word_start
+                && lookup.is_some_and(|lookup| {
+                    lookup.word_boundary.scan_boundary_between(
+                        chars.char_at(idx - 1), chars.char_at(idx), &lookup,
+                    )
+                })
+            {
+                break;
+            }
             idx += 1;
         }
     }
@@ -1331,7 +1357,7 @@ fn forward_word_with_options(
 
 /// Move backward over `count` words.  Returns the resulting Emacs byte position.
 pub fn backward_word(buf: &Buffer, table: &SyntaxTable, count: i64) -> EmacsBytePos {
-    backward_word_with_options(buf, table, count, SyntaxProperties::Ignore).0
+    backward_word_with_options(buf, table, count, SyntaxProperties::Ignore, None).0
 }
 
 /// Whether `find-word-boundary-function-table` has any binding (i.e. some mode
@@ -1492,7 +1518,13 @@ fn word_motion_with_table(
                 let props = SyntaxProperties::for_scan(honor, &eval.obarray, &eval.buffers);
                 let buf = eval.buffers.get(current_id).expect("buffer");
                 let table = SyntaxTable::for_buffer(buf);
-                forward_word_with_options(buf, &table, if forward { 1 } else { -1 }, props)
+                forward_word_with_options(
+                    buf,
+                    &table,
+                    if forward { 1 } else { -1 },
+                    props,
+                    Some(super::builtins::current_word_boundary_lookup(eval)),
+                )
             };
             let _ = eval.buffers.goto_buffer_emacs_byte_pos(current_id, byte);
             if !ok {
@@ -1536,7 +1568,10 @@ pub(crate) fn forward_word_destination(
         };
         let props = SyntaxProperties::for_scan(honor, &eval.obarray, &eval.buffers);
         let table = SyntaxTable::for_buffer(buf);
-        forward_word_with_options(buf, &table, count, props).0
+        forward_word_with_options(
+            buf, &table, count, props,
+            Some(super::builtins::current_word_boundary_lookup(eval)),
+        ).0
     }
 }
 
@@ -1545,6 +1580,7 @@ fn backward_word_with_options(
     table: &SyntaxTable,
     count: i64,
     props: SyntaxProperties<'_>,
+    boundary: Option<super::regex_emacs::WordBoundaryLookup>,
 ) -> (EmacsBytePos, bool) {
     // Per-scan syntax-table property cache (GNU gl_state); one
     // interval lookup per property RUN instead of per character.
@@ -1552,7 +1588,7 @@ fn backward_word_with_options(
     let prop_cache = &prop_cache;
 
     if count < 0 {
-        return forward_word_with_options(buf, table, -count, props);
+        return forward_word_with_options(buf, table, -count, props, boundary);
     }
 
     let accessible_bytes = buf.accessible_emacs_byte_region();
@@ -1562,6 +1598,7 @@ fn backward_word_with_options(
     let mut idx = buffer_byte_to_char_pos(buf, accessible_bytes.clamp(buf.point_emacs_byte_pos()))
         .saturating_sub(accessible_char_start);
 
+    let lookup = word_scan_syntax_lookup(buf, table, boundary);
     for _ in 0..count {
         // Skip non-word characters backward
         while idx > 0
@@ -1583,6 +1620,7 @@ fn backward_word_with_options(
             let abs_char = offset_char_pos(accessible_chars.start(), idx);
             return (buffer_char_to_emacs_byte_pos(buf, abs_char), false);
         }
+        let word_end = idx;
         // Skip word characters backward
         while idx > 0
             && matches!(
@@ -1597,6 +1635,15 @@ fn backward_word_with_options(
                 SyntaxClass::Word
             )
         {
+            if idx < word_end
+                && lookup.is_some_and(|lookup| {
+                    lookup.word_boundary.scan_boundary_between(
+                        chars.char_at(idx - 1), chars.char_at(idx), &lookup,
+                    )
+                })
+            {
+                break;
+            }
             idx -= 1;
         }
     }
@@ -5919,8 +5966,8 @@ pub(crate) fn builtin_forward_word(
         buf.point_emacs_byte_pos()
     };
     // When `find-word-boundary-function-table` is active (subword/superword),
-    // GNU's scan_words consults it per word; otherwise the plain syntax scan is
-    // used unchanged.
+    // GNU's scan_words consults it per word; otherwise syntax plus
+    // script/category boundaries select the endpoint.
     let wbtable = eval.visible_variable_value_or_nil("find-word-boundary-function-table");
     let (raw_byte, completed) = if word_boundary_table_active(&wbtable) {
         word_motion_with_table(eval, count, honor, wbtable)
@@ -5931,7 +5978,10 @@ pub(crate) fn builtin_forward_word(
             .current_buffer()
             .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
         let table = SyntaxTable::for_buffer(buf);
-        forward_word_with_options(buf, &table, count, props)
+        forward_word_with_options(
+            buf, &table, count, props,
+            Some(super::builtins::current_word_boundary_lookup(eval)),
+        )
     };
     let (orig_char, raw_char) = {
         let buf = eval

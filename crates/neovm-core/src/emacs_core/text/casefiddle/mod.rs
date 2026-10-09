@@ -279,6 +279,42 @@ fn push_multibyte_chars(out: &mut Vec<u8>, chars: impl IntoIterator<Item = char>
     }
 }
 
+/// GNU `do_casify_multibyte_region` first/last changed span, in byte offsets
+/// of the cased text. A character is changed when an admissible special
+/// string was used (even a byte-identical one) or its mapping differs.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CaseChangeSpan {
+    old_pos: usize,
+    first: Option<usize>,
+    old_end: usize,
+    new_end: usize,
+}
+
+impl CaseChangeSpan {
+    fn note(&mut self, code: u32, out: &[u8], out_start: usize, special: bool) {
+        let mut buf = [0u8; crate::emacs_core::emacs_char::MAX_MULTIBYTE_LENGTH];
+        let len = crate::emacs_core::emacs_char::char_string(code, &mut buf);
+        let old_start = self.old_pos;
+        self.old_pos += len;
+        if special || out[out_start..] != buf[..len] {
+            // Text before the first change is identical in both coordinates.
+            self.first.get_or_insert(old_start);
+            self.old_end = self.old_pos;
+            self.new_end = out.len();
+        }
+    }
+
+    /// Unibyte casing is per byte: changed exactly where bytes differ.
+    fn from_byte_diff(old: &[u8], new: &[u8]) -> Self {
+        if old.len() != new.len() {
+            return Self { old_pos: old.len(), first: Some(0), old_end: old.len(), new_end: new.len() };
+        }
+        let first = old.iter().zip(new).position(|(a, b)| a != b);
+        let last = old.iter().zip(new).rposition(|(a, b)| a != b).map_or(0, |i| i + 1);
+        Self { old_pos: old.len(), first, old_end: last, new_end: last }
+    }
+}
+
 /// Word-boundary predicate over the *standard* syntax table, for the pure/test
 /// casing forms that run without a current buffer. Mirrors GNU's `Sword` test
 /// against the standard syntax table.
@@ -319,47 +355,122 @@ pub(crate) fn casify_unibyte_string(
     LispString::from_unibyte(bytes)
 }
 
-fn downcase_lisp_string_emacs_compat(
+/// Prepare the existing GNU uniprop tables before copying current-buffer
+/// casing authority. Retain each result across later lazy-load callbacks;
+/// the input roots supplied by object callers and all tables unwind on Flow.
+pub(crate) fn with_text_downcase_table<T>(
+    eval: &mut super::eval::Context,
+    capitalize: bool,
+    body: impl FnOnce(&mut super::eval::Context, Value) -> Result<T, Flow>,
+) -> Result<T, Flow> {
+    let roots = eval.save_specpdl_roots();
+    let result = (|| {
+        if capitalize {
+            for property in ["titlecase", "special-uppercase"] {
+                let table = super::chartable::uniprop_table_in_state(eval, Value::symbol(property))?;
+                eval.push_specpdl_root(table);
+            }
+        }
+        let lower = super::chartable::uniprop_table_in_state(eval, Value::symbol("special-lowercase"))?;
+        eval.push_specpdl_root(lower);
+        if capitalize {
+            let table = super::chartable::uniprop_table_in_state(eval, Value::symbol("special-titlecase"))?;
+            eval.push_specpdl_root(table);
+        }
+        body(eval, lower)
+    })();
+    eval.restore_specpdl_roots(roots);
+    result
+}
+
+/// GNU text DOWN: special lowercase precedes the simple Down table; final
+/// sigma is postprocessed using original syntax, not the mapped character.
+/// Numeric character casing and unibyte casing do not use this expansion step.
+fn push_text_downcase(
+    out: &mut Vec<u8>,
+    code: u32,
+    casetab: &CaseTableOverride,
+    was_inword: bool,
+    next_word: bool,
+    special_lowercase: Option<Value>,
+) -> bool {
+    // None is only the no-Context pure helper. Runtime Some(nil) explicitly
+    // means unavailable support, never an unconditional Rust expansion.
+    if let Some(table) = special_lowercase {
+        if !table.is_nil() {
+            // The prepared loader already validates purpose, slots and decoder.
+            // GNU casing reads raw CHAR_TABLE_REF, not decoded public properties.
+            if let Ok(property) = super::chartable::ct_lookup(&table, code as i64) {
+                if let Some(string) = property.as_lisp_string() {
+                    if string.sbytes() <= 6 {
+                        if code == 0x03A3 && was_inword && !next_word {
+                            push_multibyte_char_code(out, 0x03C2);
+                        } else {
+                            out.extend_from_slice(string.as_bytes());
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+    } else if let Some(ch) = code_to_char(code as i64) {
+        let expansion = ch.to_lowercase();
+        if expansion.clone().nth(1).is_some() {
+            push_multibyte_chars(out, expansion);
+            return false;
+        }
+    }
+    // The standard simple mapping already preserves Kelvin and other GNU
+    // table exceptions. Explicit custom mappings (including nil identity)
+    // remain authoritative; no blanket Kelvin exception can precede them.
+    let mapped = casetab.map(CaseMap::Down, code as i64).unwrap_or_else(|| {
+        super::builtins::downcase_char_code_emacs_compat(code as i64)
+    }) as u32;
+    let mapped = if code == 0x03A3 && mapped != code && was_inword && !next_word {
+        0x03C2
+    } else {
+        mapped
+    };
+    push_multibyte_char_code(out, mapped);
+    false
+}
+
+pub(crate) fn downcase_lisp_string_emacs_compat(
     text: &LispString,
     is_word: impl Fn(u32) -> bool,
+    is_prefix: impl Fn(u32) -> bool,
     casetab: &CaseTableOverride,
+    target: CaseTarget,
+    special_lowercase: Option<Value>,
+) -> LispString {
+    downcase_lisp_string_tracked(text, is_word, is_prefix, casetab, target, special_lowercase, None)
+}
+
+fn downcase_lisp_string_tracked(
+    text: &LispString,
+    is_word: impl Fn(u32) -> bool,
+    is_prefix: impl Fn(u32) -> bool,
+    casetab: &CaseTableOverride,
+    target: CaseTarget,
+    special_lowercase: Option<Value>,
+    mut span: Option<&mut CaseChangeSpan>,
 ) -> LispString {
     if !text.is_multibyte() {
-        return casify_unibyte_string(text, CaseMap::Down, casetab, CaseTarget::Buffer);
+        return casify_unibyte_string(text, CaseMap::Down, casetab, target);
     }
-
-    // Greek capital sigma down-cases to its final form ς at the end of a word
-    // (GNU `casefiddle.c` `case_character`).
-    const GREEK_CAPITAL_SIGMA: u32 = 0x03A3;
-    const GREEK_SMALL_SIGMA: u32 = 0x03C3;
-    const GREEK_SMALL_FINAL_SIGMA: u32 = 0x03C2;
 
     let codes = super::builtins::lisp_string_char_codes(text);
     let mut out = Vec::with_capacity(text.sbytes());
     let mut prev_word = false;
     for (i, &code) in codes.iter().enumerate() {
-        let code_i64 = code as i64;
-        // GNU `downcase` consults the per-buffer case table first.
-        if let Some(mapped) = casetab.map(CaseMap::Down, code_i64) {
-            push_multibyte_char_code(&mut out, mapped as u32);
-        } else if code == GREEK_CAPITAL_SIGMA {
-            let next_word = codes.get(i + 1).is_some_and(|&next| is_word(next));
-            push_multibyte_char_code(
-                &mut out,
-                if prev_word && !next_word {
-                    GREEK_SMALL_FINAL_SIGMA
-                } else {
-                    GREEK_SMALL_SIGMA
-                },
-            );
-        } else if code == 0x212A || preserve_downcase_case_string_payload(code_i64) {
-            push_multibyte_char_code(&mut out, code);
-        } else if let Some(ch) = code_to_char(code_i64) {
-            push_multibyte_chars(&mut out, ch.to_lowercase());
-        } else {
-            push_multibyte_char_code(&mut out, code);
+        let next_word = codes.get(i + 1).is_some_and(|&next| is_word(next));
+        let start = out.len();
+        let special = push_text_downcase(&mut out, code, casetab, prev_word, next_word, special_lowercase);
+        if let Some(span) = span.as_deref_mut() {
+            span.note(code, &out, start, special);
         }
-        prev_word = is_word(code);
+        prev_word = is_word(code)
+            && (prev_word || target == CaseTarget::String || !is_prefix(code));
     }
     LispString::from_emacs_bytes(out)
 }
@@ -473,6 +584,21 @@ fn capitalize_like_gnu(
     casetab: &CaseTableOverride,
     rest: WordRest,
     target: CaseTarget,
+    special_lowercase: Option<Value>,
+) -> LispString {
+    capitalize_like_gnu_tracked(text, is_word, is_prefix, casetab, rest, target, special_lowercase, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capitalize_like_gnu_tracked(
+    text: &LispString,
+    is_word: impl Fn(u32) -> bool,
+    is_prefix: impl Fn(u32) -> bool,
+    casetab: &CaseTableOverride,
+    rest: WordRest,
+    target: CaseTarget,
+    special_lowercase: Option<Value>,
+    mut span: Option<&mut CaseChangeSpan>,
 ) -> LispString {
     let mut inword = false;
     let mut step = |code: u32| {
@@ -516,22 +642,22 @@ fn capitalize_like_gnu(
         return LispString::from_unibyte(out);
     }
 
+    let codes = super::builtins::lisp_string_char_codes(text);
     let mut out = Vec::with_capacity(text.sbytes());
-    for code in super::builtins::lisp_string_char_codes(text) {
+    for (i, &code) in codes.iter().enumerate() {
         let was_inword = step(code);
+        let start = out.len();
+        let mut special = false;
         if !was_inword {
             push_word_initial(&mut out, code, casetab);
         } else if rest == WordRest::Downcase {
-            if let Some(mapped) = casetab.map(CaseMap::Down, code as i64) {
-                push_multibyte_char_code(&mut out, mapped as u32);
-            } else {
-                match code_to_char(code as i64) {
-                    Some(c) => push_multibyte_chars(&mut out, c.to_lowercase()),
-                    None => push_multibyte_char_code(&mut out, code),
-                }
-            }
+            let next_word = codes.get(i + 1).is_some_and(|&next| is_word(next));
+            special = push_text_downcase(&mut out, code, casetab, was_inword, next_word, special_lowercase);
         } else {
             push_multibyte_char_code(&mut out, code);
+        }
+        if let Some(span) = span.as_deref_mut() {
+            span.note(code, &out, start, special);
         }
     }
     LispString::from_emacs_bytes(out)
@@ -553,6 +679,7 @@ fn capitalize_lisp_string(
     text: &LispString,
     is_word: impl Fn(u32) -> bool,
     casetab: &CaseTableOverride,
+    special_lowercase: Option<Value>,
 ) -> LispString {
     capitalize_like_gnu(
         text,
@@ -561,6 +688,7 @@ fn capitalize_lisp_string(
         casetab,
         WordRest::Downcase,
         CaseTarget::String,
+        special_lowercase,
     )
 }
 
@@ -577,22 +705,7 @@ pub(crate) fn upcase_initials_lisp_string(
         casetab,
         WordRest::Keep,
         CaseTarget::String,
-    )
-}
-
-fn preserve_downcase_case_string_payload(code: i64) -> bool {
-    matches!(
-        code,
-        7305
-            | 42955
-            | 42956
-            | 42958
-            | 42962
-            | 42964
-            | 42970
-            | 42972
-            | 68944..=68965
-            | 93856..=93880
+        None,
     )
 }
 
@@ -681,11 +794,11 @@ fn replace_current_buffer_region_in_buffers(
     Ok(Value::NIL)
 }
 
-fn casify_region_in_state(
+fn casify_region_without_preparation(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
     name: &str,
-    transform: impl Fn(&LispString) -> LispString + Copy,
+    transform: impl Fn(&mut super::eval::Context, &LispString) -> Result<LispString, Flow> + Copy,
 ) -> EvalResult {
     expect_min_max_args(name, &args, 2, 3)?;
 
@@ -743,7 +856,7 @@ fn casify_region_in_state(
         // GNU shape `((START . END) (ORIGINAL . START) POINT ...)`.  Route the
         // edit through the casify-specific replace so the undo recording and
         // marker handling match GNU instead of the generic replace path.
-        let replacement = transform(&text);
+        let replacement = transform(eval, &text)?;
         // GNU fires after-change-functions only when a character actually
         // changed (e.g. `downcase-region` over already-lowercase text signals
         // before- but not after-change); before-change and the undo record
@@ -790,11 +903,11 @@ fn casify_replace_current_buffer_region(
     Ok(Value::NIL)
 }
 
-fn casify_word_in_state(
+fn casify_word_without_preparation(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
     name: &str,
-    transform: impl FnOnce(&LispString) -> LispString,
+    transform: impl FnOnce(&mut super::eval::Context, &LispString) -> Result<LispString, Flow>,
 ) -> EvalResult {
     expect_args(name, &args, 1)?;
     let n = expect_int(&args[0])?;
@@ -819,7 +932,7 @@ fn casify_word_in_state(
         )
     };
 
-    let replacement = transform(&text);
+    let replacement = transform(eval, &text)?;
     if replacement.schars() != text.schars() {
         // A mapping that changes the character count (`ß` -> `SS`): the
         // casify path's same-byte-length overwrite does not yet move point
@@ -867,6 +980,143 @@ fn casify_word_in_state(
     Ok(Value::NIL)
 }
 
+fn casify_buffer_range(
+    eval: &mut super::eval::Context,
+    byte_range: EmacsByteRange,
+    prepare_downcase: Option<bool>,
+    transform: impl FnOnce(&mut super::eval::Context, &LispString, Option<Value>) -> Result<(LispString, Option<CaseChangeSpan>), Flow>,
+) -> Result<EmacsBytePos, Flow> {
+    let (buffer_id, start, end) = {
+        let buf = eval.buffers.current_buffer()
+            .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
+        if byte_range.is_empty() {
+            return Ok(byte_range.end());
+        }
+        if super::editfns::buffer_read_only_active_in_state(&eval.obarray, &[], buf) {
+            return Err(signal(LispCondition::BufferReadOnly, vec![buf.name_value()]));
+        }
+        (buf.id, buf.emacs_byte_pos_to_lisp_char_pos(byte_range.start()),
+            buf.emacs_byte_pos_to_lisp_char_pos(byte_range.end()))
+    };
+    // GNU freezes character endpoints, then modify_text, then casing preparation.
+    // Neither byte coordinates nor input text may survive either callback boundary.
+    eval.with_specpdl_roots(&[Value::make_buffer(buffer_id)], |eval| {
+        crate::emacs_core::textprop::verify_text_read_only_emacs_byte_range_in_state(
+            &eval.obarray, &eval.buffers, buffer_id, byte_range,
+        )?;
+        let change = super::editfns::text_change_for_unchanged_extent_in_manager(
+            &eval.buffers, buffer_id, byte_range,
+        )?;
+        super::editfns::signal_before_text_change(eval, change)?;
+        eval.set_current_buffer_unrecorded(buffer_id)?;
+        let apply = |eval: &mut super::eval::Context, lower: Option<Value>| {
+            // Modification hooks belong to the initiating buffer, but GNU casing
+            // follows the current buffer left by callback-capable preparation.
+            let buffer_id = eval.buffers.current_buffer_id()
+                .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
+            eval.with_specpdl_roots(&[Value::make_buffer(buffer_id)], |eval| {
+                let (range, text) = {
+                    let buf = eval.buffers.get(buffer_id)
+                        .ok_or_else(|| signal("error", vec![Value::string("Buffer was killed")]))?;
+                    let region = super::position::LispRegionArgs::from_values(
+                        &eval.buffers, Value::fixnum(start.as_i64()), Value::fixnum(end.as_i64()),
+                    )?;
+                    let range = region.accessible_byte_range(buf)?;
+                    (range, buf.buffer_substring_lisp_string_range(range))
+                };
+                let (replacement, span) = transform(eval, &text, lower)?;
+                // GNU signals after-change only over the first..last changed
+                // characters; a used special string counts even when identical.
+                let span = span.unwrap_or_else(|| {
+                    CaseChangeSpan::from_byte_diff(text.as_bytes(), replacement.as_bytes())
+                });
+                let change = span.first.map(|first| {
+                    let old = EmacsByteRange::new(
+                        EmacsBytePos::new(range.start().get() + first),
+                        EmacsBytePos::new(range.start().get() + span.old_end),
+                    );
+                    let new = crate::buffer::TextExtent::from_emacs_bytes(
+                        &replacement.as_bytes()[first..span.new_end], true,
+                    );
+                    super::editfns::text_change_for_replacement_in_manager(
+                        &eval.buffers, buffer_id, old, new,
+                    )
+                }).transpose()?;
+                eval.buffers.casify_replace_buffer_emacs_byte_range_lisp_string(
+                    buffer_id, range, &replacement,
+                ).ok_or_else(|| signal("error", vec![Value::string("Buffer was killed")]))?;
+                let new_end = EmacsBytePos::new((range.end().get() as i64
+                    + replacement.sbytes() as i64 - text.sbytes() as i64).max(0) as usize);
+                if let Some(change) = change {
+                    super::editfns::signal_after_text_change(eval, change)?;
+                }
+                Ok(new_end)
+            })
+        };
+        match prepare_downcase {
+            Some(capitalize) => with_text_downcase_table(eval, capitalize, |eval, lower| {
+                apply(eval, Some(lower))
+            }),
+            None => apply(eval, None),
+        }
+    })
+}
+
+fn casify_region_in_state(
+    eval: &mut super::eval::Context,
+    args: Vec<Value>,
+    name: &str,
+    prepare_downcase: Option<bool>,
+    transform: impl Fn(&mut super::eval::Context, &LispString, Option<Value>) -> Result<(LispString, Option<CaseChangeSpan>), Flow> + Copy,
+) -> EvalResult {
+    if prepare_downcase.is_none() {
+        return casify_region_without_preparation(eval, args, name, |eval, text| {
+            transform(eval, text, None).map(|(text, _)| text)
+        });
+    }
+    expect_min_max_args(name, &args, 2, 3)?;
+    let regions = if args.get(2).is_some_and(|value| !value.is_nil()) {
+        noncontiguous_case_regions(eval)?
+    } else {
+        vec![super::position::LispRegionArgs::from_values(&eval.buffers, args[0], args[1])?]
+    };
+    for region in regions {
+        let buf = eval.buffers.current_buffer()
+            .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
+        let range = region.accessible_byte_range(buf)?;
+        casify_buffer_range(eval, range, prepare_downcase, transform)?;
+    }
+    Ok(Value::NIL)
+}
+
+fn casify_word_in_state(
+    eval: &mut super::eval::Context,
+    args: Vec<Value>,
+    name: &str,
+    prepare_downcase: Option<bool>,
+    transform: impl FnOnce(&mut super::eval::Context, &LispString, Option<Value>) -> Result<(LispString, Option<CaseChangeSpan>), Flow>,
+) -> EvalResult {
+    if prepare_downcase.is_none() {
+        return casify_word_without_preparation(eval, args, name, |eval, text| {
+            transform(eval, text, None).map(|(text, _)| text)
+        });
+    }
+    expect_args(name, &args, 1)?;
+    let n = expect_int(&args[0])?;
+    let honor = crate::emacs_core::syntax::parse_sexp_lookup_properties_enabled(eval);
+    let target = crate::emacs_core::syntax::forward_word_destination(eval, n, honor);
+    let buf = eval.buffers.current_buffer()
+        .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
+    let range = EmacsByteRange::ordered(buf.point_emacs_byte_pos(), target);
+    let new_end = casify_buffer_range(eval, range, prepare_downcase, transform)?;
+    // Word scanning precedes preparation; do not rescan callback-mutated text.
+    // Like GNU SET_PT, settle point in the current buffer left by casing.
+    if let Some(buffer_id) = eval.buffers.current_buffer_id() {
+        let _ = eval.buffers.goto_buffer_emacs_byte_pos(buffer_id, new_end);
+    }
+    Ok(Value::NIL)
+}
+
 // ---------------------------------------------------------------------------
 // Pure builtins
 // ---------------------------------------------------------------------------
@@ -877,6 +1127,7 @@ fn capitalize_with_word_pred(
     args: Vec<Value>,
     is_word: impl Fn(u32) -> bool,
     casetab: &CaseTableOverride,
+    special_lowercase: Option<Value>,
 ) -> EvalResult {
     expect_args("capitalize", &args, 1)?;
     match args[0].kind() {
@@ -886,7 +1137,7 @@ fn capitalize_with_word_pred(
             let source_props = (!string.is_multibyte())
                 .then(|| get_string_text_properties_table_for_value(source))
                 .flatten();
-            let result = Value::heap_string(capitalize_lisp_string(string, is_word, casetab));
+            let result = Value::heap_string(capitalize_lisp_string(string, is_word, casetab, special_lowercase));
             if let Some(table) = source_props {
                 set_string_text_properties_table_for_value(result, table);
             }
@@ -906,7 +1157,7 @@ fn capitalize_with_word_pred(
 /// Pure form (used by tests); word boundaries follow the standard syntax table.
 #[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn builtin_capitalize(args: Vec<Value>) -> EvalResult {
-    capitalize_with_word_pred(args, standard_word_predicate, &CaseTableOverride::none())
+    capitalize_with_word_pred(args, standard_word_predicate, &CaseTableOverride::none(), None)
 }
 
 /// Dispatched form: word boundaries follow the current buffer's syntax table
@@ -916,14 +1167,19 @@ pub(crate) fn builtin_capitalize_in_state(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
+    expect_args("capitalize", &args, 1)?;
     if args.len() == 1 {
         if let ValueKind::Fixnum(code) = args[0].kind() {
             return titlecase_character_in_state(eval, code);
         }
     }
-    let is_word = crate::emacs_core::syntax::casing_word_predicate(eval);
-    let casetab = CaseTableOverride::for_current_buffer(eval)?;
-    capitalize_with_word_pred(args, is_word, &casetab)
+    eval.with_specpdl_roots(&args.clone(), |eval| {
+        with_text_downcase_table(eval, true, |eval, lower| {
+            let is_word = crate::emacs_core::syntax::casing_word_predicate(eval);
+            let casetab = CaseTableOverride::for_current_buffer(eval)?;
+            capitalize_with_word_pred(args, is_word, &casetab, Some(lower))
+        })
+    })
 }
 
 /// `(upcase-initials OBJ)` -- uppercase the first letter of each word in
@@ -1191,6 +1447,7 @@ pub(crate) fn apply_replace_match_case_lisp_cased(
             casetab,
             WordRest::Keep,
             target,
+            None,
         ),
     }
 }
@@ -1295,14 +1552,38 @@ fn default_is_word_char(ch: char) -> bool {
     matches!(ch, '$' | '%')
 }
 
+fn downcase_buffer_text(
+    ctx: &mut super::eval::Context,
+    text: &LispString,
+    capitalize: bool,
+    lower: Value,
+) -> Result<(LispString, Option<CaseChangeSpan>), Flow> {
+    if text.schars() == 0 {
+        return Ok((text.clone(), None));
+    }
+        let is_word = crate::emacs_core::syntax::casing_word_predicate(ctx);
+        let is_prefix = crate::emacs_core::syntax::casing_prefix_predicate(ctx);
+        let casetab = CaseTableOverride::for_current_buffer(ctx)?;
+        let mut span = CaseChangeSpan::default();
+        let cased = if capitalize {
+            capitalize_like_gnu_tracked(text, is_word, is_prefix, &casetab,
+                WordRest::Downcase, CaseTarget::Buffer, Some(lower), Some(&mut span))
+        } else {
+            downcase_lisp_string_tracked(text, is_word, is_prefix,
+                &casetab, CaseTarget::Buffer, Some(lower), Some(&mut span))
+        };
+        // Unibyte casing records no per-character span; diff its bytes.
+        Ok((cased, text.is_multibyte().then_some(span)))
+}
+
 pub(crate) fn builtin_downcase_region(
     ctx: &mut super::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
-    let is_word = crate::emacs_core::builtins::casing_word_predicate(ctx);
-    let casetab = CaseTableOverride::for_current_buffer(ctx)?;
-    casify_region_in_state(ctx, args, "downcase-region", move |s| {
-        downcase_lisp_string_emacs_compat(s, is_word, &casetab)
+    ctx.with_specpdl_roots(&args.clone(), |ctx| {
+        casify_region_in_state(ctx, args, "downcase-region", Some(false), |ctx, s, lower| {
+            downcase_buffer_text(ctx, s, false, lower.expect("prepared lower"))
+        })
     })
 }
 
@@ -1311,8 +1592,8 @@ pub(crate) fn builtin_upcase_region(
     args: Vec<Value>,
 ) -> EvalResult {
     let casetab = CaseTableOverride::for_current_buffer(ctx)?;
-    casify_region_in_state(ctx, args, "upcase-region", move |s| {
-        upcase_lisp_string_emacs_compat(s, &casetab, CaseTarget::Buffer)
+    casify_region_in_state(ctx, args, "upcase-region", None, move |_, s, _| {
+        Ok((upcase_lisp_string_emacs_compat(s, &casetab, CaseTarget::Buffer), None))
     })
 }
 
@@ -1320,18 +1601,10 @@ pub(crate) fn builtin_capitalize_region(
     ctx: &mut super::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
-    let is_word = crate::emacs_core::syntax::casing_word_predicate(ctx);
-    let is_prefix = crate::emacs_core::syntax::casing_prefix_predicate(ctx);
-    let casetab = CaseTableOverride::for_current_buffer(ctx)?;
-    casify_region_in_state(ctx, args, "capitalize-region", move |s| {
-        capitalize_like_gnu(
-            s,
-            is_word,
-            is_prefix,
-            &casetab,
-            WordRest::Downcase,
-            CaseTarget::Buffer,
-        )
+    ctx.with_specpdl_roots(&args.clone(), |ctx| {
+        casify_region_in_state(ctx, args, "capitalize-region", Some(true), |ctx, s, lower| {
+            downcase_buffer_text(ctx, s, true, lower.expect("prepared lower"))
+        })
     })
 }
 
@@ -1342,15 +1615,16 @@ pub(crate) fn builtin_upcase_initials_region(
     let is_word = crate::emacs_core::syntax::casing_word_predicate(ctx);
     let is_prefix = crate::emacs_core::syntax::casing_prefix_predicate(ctx);
     let casetab = CaseTableOverride::for_current_buffer(ctx)?;
-    casify_region_in_state(ctx, args, "upcase-initials-region", move |s| {
-        capitalize_like_gnu(
+    casify_region_in_state(ctx, args, "upcase-initials-region", None, move |_, s, _| {
+        Ok((capitalize_like_gnu(
             s,
             is_word,
             is_prefix,
             &casetab,
             WordRest::Keep,
             CaseTarget::Buffer,
-        )
+            None,
+        ), None))
     })
 }
 
@@ -1358,17 +1632,17 @@ pub(crate) fn builtin_downcase_word(
     ctx: &mut super::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
-    let is_word = crate::emacs_core::builtins::casing_word_predicate(ctx);
-    let casetab = CaseTableOverride::for_current_buffer(ctx)?;
-    casify_word_in_state(ctx, args, "downcase-word", move |s| {
-        downcase_lisp_string_emacs_compat(s, is_word, &casetab)
+    ctx.with_specpdl_roots(&args.clone(), |ctx| {
+        casify_word_in_state(ctx, args, "downcase-word", Some(false), |ctx, s, lower| {
+            downcase_buffer_text(ctx, s, false, lower.expect("prepared lower"))
+        })
     })
 }
 
 pub(crate) fn builtin_upcase_word(ctx: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     let casetab = CaseTableOverride::for_current_buffer(ctx)?;
-    casify_word_in_state(ctx, args, "upcase-word", move |s| {
-        upcase_lisp_string_emacs_compat(s, &casetab, CaseTarget::Buffer)
+    casify_word_in_state(ctx, args, "upcase-word", None, move |_, s, _| {
+        Ok((upcase_lisp_string_emacs_compat(s, &casetab, CaseTarget::Buffer), None))
     })
 }
 
@@ -1376,18 +1650,10 @@ pub(crate) fn builtin_capitalize_word(
     ctx: &mut super::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
-    let is_word = crate::emacs_core::syntax::casing_word_predicate(ctx);
-    let is_prefix = crate::emacs_core::syntax::casing_prefix_predicate(ctx);
-    let casetab = CaseTableOverride::for_current_buffer(ctx)?;
-    casify_word_in_state(ctx, args, "capitalize-word", move |s| {
-        capitalize_like_gnu(
-            s,
-            is_word,
-            is_prefix,
-            &casetab,
-            WordRest::Downcase,
-            CaseTarget::Buffer,
-        )
+    ctx.with_specpdl_roots(&args.clone(), |ctx| {
+        casify_word_in_state(ctx, args, "capitalize-word", Some(true), |ctx, s, lower| {
+            downcase_buffer_text(ctx, s, true, lower.expect("prepared lower"))
+        })
     })
 }
 

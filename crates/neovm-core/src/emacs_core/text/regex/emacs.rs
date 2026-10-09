@@ -4031,6 +4031,25 @@ impl WordBoundaryLookup {
             return false;
         }
 
+        self.category_boundary_between(c1, c2, syntax)
+    }
+
+    /// GNU `scan_words` calls `word_boundary_p` directly, without the
+    /// regexp macro's ASCII/Latin-1 shortcut. Keep one category/script policy
+    /// while preserving those distinct caller boundaries.
+    pub(crate) fn scan_boundary_between(
+        &self,
+        c1: char,
+        c2: char,
+        syntax: &dyn SyntaxLookup,
+    ) -> bool {
+        if !syntax.char_has_category_set(c1) || !syntax.char_has_category_set(c2) {
+            return self.script_at(c1) != self.script_at(c2);
+        }
+        self.category_boundary_between(c1, c2, syntax)
+    }
+
+    fn category_boundary_between(&self, c1: char, c2: char, syntax: &dyn SyntaxLookup) -> bool {
         let same_script = self.script_at(c1) == self.script_at(c2);
         let mut categories = if same_script {
             self.word_separating_categories
@@ -4065,6 +4084,12 @@ pub(crate) trait SyntaxLookup {
 
     /// Return true if character `c` belongs to category `cat`.
     fn char_has_category(&self, c: char, cat: u8) -> bool;
+
+    /// Scanner policy distinguishes a nil resolved set from an empty set.
+    /// Synthetic standard lookups have valid category sets by default.
+    fn char_has_category_set(&self, _c: char) -> bool {
+        true
+    }
 
     /// Return true when two adjacent word constituents have a GNU word
     /// boundary between them because of their scripts/categories.
@@ -4166,6 +4191,13 @@ impl SyntaxLookup for DefaultSyntaxLookup {
 }
 
 impl SyntaxLookup for BufferSyntaxLookup {
+    fn char_has_category_set(&self, c: char) -> bool {
+        self.category_table.is_none_or(|table| {
+            crate::emacs_core::chartable::ct_lookup(&table, c as i64)
+                .is_ok_and(|set| !set.is_nil())
+        })
+    }
+
     fn char_syntax(&self, c: char) -> SyntaxClass {
         self.syntax_table.char_syntax(c)
     }
