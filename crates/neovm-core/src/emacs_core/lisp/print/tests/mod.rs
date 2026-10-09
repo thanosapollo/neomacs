@@ -1207,7 +1207,8 @@ fn check_princ_continuous_history(buffer: bool, supplied: bool, continuous: bool
     (list first SNAPSHOT first-return second-return
           (or (eq caller nil) (eq caller print-number-table))
           (and print-continuous-numbering (hash-table-p print-number-table))
-          (and print-continuous-numbering (hash-table-count print-number-table)))))"#
+          (and print-continuous-numbering (hash-table-p print-number-table)
+               (hash-table-count print-number-table)))))"#
         .replace("CONTINUOUS", if continuous { "t" } else { "nil" })
         .replace("TABLE", if supplied { "(make-hash-table :test 'eq)" } else { "nil" })
         .replace("SINK", if buffer { "(progn (set-buffer (get-buffer-create \" princ-history\")) (erase-buffer) (current-buffer))" }
@@ -1315,7 +1316,8 @@ fn princ_continuous_history_direct_impl_initializes_nil_table() {
         (setq princ-history-pair (let ((x (list 1))) (list x x))))"#,
         )
         .unwrap();
-    assert_eq!(builtin_princ_impl(&mut ctx, vec![pair]).unwrap(), pair);
+    let sink = ctx.eval_str("(current-buffer)").unwrap();
+    assert_eq!(builtin_princ_impl(&mut ctx, vec![pair, sink]).unwrap(), pair);
     assert_eq!(
         ctx.eval_str("(buffer-string)").unwrap().as_utf8_str(),
         Some("(#1=(1) #1#)")
@@ -1331,7 +1333,7 @@ fn princ_continuous_history_direct_impl_initializes_nil_table() {
     );
     ctx.eval_str("(progn (erase-buffer) (garbage-collect))")
         .unwrap();
-    assert_eq!(builtin_princ_impl(&mut ctx, vec![pair]).unwrap(), pair);
+    assert_eq!(builtin_princ_impl(&mut ctx, vec![pair, sink]).unwrap(), pair);
     assert_eq!(
         ctx.eval_str("(buffer-string)").unwrap().as_utf8_str(),
         Some("(#1# #1#)")
