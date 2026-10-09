@@ -830,7 +830,7 @@ pub(crate) fn builtin_number_to_string(
 }
 
 /// Dispatched form: honors the current buffer's case table (`set-case-table`).
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn builtin_upcase_in_state(
     eval: &mut crate::emacs_core::eval::Context,
     args: Vec<Value>,
@@ -955,6 +955,15 @@ fn transform_string_case(
     casetab: &super::super::casetab::CaseTableOverride,
 ) -> crate::heap_types::LispString {
     use super::super::casetab::CaseMap;
+    if !s.is_multibyte() {
+        let which = if upcase { CaseMap::Up } else { CaseMap::Down };
+        return crate::emacs_core::casefiddle::casify_unibyte_string(
+            s,
+            which,
+            casetab,
+            crate::emacs_core::casefiddle::CaseTarget::String,
+        );
+    }
     // Greek capital sigma down-cases to the final form ς at the end of a word
     // (GNU `casefiddle.c` `case_character`): when the preceding character is a
     // word constituent and the following one is not.
@@ -983,11 +992,18 @@ fn transform_string_case(
             (bytes[pos] as u32, 1)
         };
         pos += len;
-        // GNU `case_character_impl` resolves each character through the
-        // per-buffer up/down case table (`buffer.h` `downcase`/`upcase`) before
-        // the Unicode special-casing. When a custom table is installed and has
-        // an explicit entry for this character, use it and skip the hardwired
-        // path; otherwise fall through unchanged (byte-identical default).
+        // GNU `case_character_impl` checks special-uppercase before the
+        // one-to-one Up table. Character and unibyte conversion do not expand.
+        if upcase {
+            if let Some(expansion) = crate::emacs_core::casefiddle::special_upcase_expansion(code) {
+                for upper in expansion {
+                    push(&mut out, upper as u32);
+                }
+                continue;
+            }
+        }
+        // Keep the ordinary custom up/down mappings unchanged. Lowercase
+        // special-casing precedence is a separate Tracker #68 item.
         if casetab.is_custom() {
             let which = if upcase { CaseMap::Up } else { CaseMap::Down };
             if let Some(mapped) = casetab.map(which, code as i64) {
@@ -1199,7 +1215,7 @@ pub(crate) fn builtin_downcase(args: Vec<Value>) -> EvalResult {
 
 /// Dispatched form: applies the Greek final-sigma rule via the buffer syntax
 /// table (honoring `case-symbols-as-words`) and the current case table.
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn builtin_downcase_in_state(
     eval: &mut crate::emacs_core::eval::Context,
     args: Vec<Value>,

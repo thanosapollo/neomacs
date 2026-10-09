@@ -621,7 +621,7 @@ fn dispatch_builtin_stateless_placeholder(
     Some(Ok(value))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn dispatch_builtin_without_eval_state(
     name: &str,
     args: Vec<Value>,

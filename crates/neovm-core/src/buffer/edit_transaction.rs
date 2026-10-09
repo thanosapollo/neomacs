@@ -410,8 +410,10 @@ impl Buffer {
         }
 
         let replacement = plan.replacement();
-        if replacement.old_byte_len() == replacement.new_byte_len() {
-            // Same byte length: GNU `casify_region` overwrites the bytes in
+        if replacement.old_byte_len() == replacement.new_byte_len()
+            && replacement.old_char_len() == replacement.new_char_len()
+        {
+            // Same byte and character length: GNU `casify_region` overwrites the bytes in
             // place (`memcpy`) without moving point, markers, or overlays.  Use
             // the same-length mutation path so interior markers are preserved.
             self.text

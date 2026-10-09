@@ -2168,13 +2168,21 @@ impl Obarray {
         // O(n^2) deep-`equal` over every loaded form -- the dominant cost of
         // startup.  Track visited heap objects by their tagged-pointer bits.
         let mut seen = rustc_hash::FxHashSet::default();
-        self.materialize_read_symbols_1(value, &mut seen);
+        // Walk with an explicit stack, in the order of a recursive walk: read
+        // data can nest without bound, and a long list is a deep cdr chain.
+        let mut pending = vec![value];
+        while let Some(value) = pending.pop() {
+            let children = pending.len();
+            self.materialize_read_symbols_1(value, &mut seen, &mut pending);
+            pending[children..].reverse();
+        }
     }
 
     fn materialize_read_symbols_1(
         &mut self,
         value: Value,
         seen: &mut rustc_hash::FxHashSet<usize>,
+        pending: &mut Vec<Value>,
     ) {
         match value.kind() {
             ValueKind::Symbol(id) => self.ensure_interned_global_id(id),
@@ -2182,8 +2190,8 @@ impl Obarray {
                 if !seen.insert(value.bits()) {
                     return;
                 }
-                self.materialize_read_symbols_1(value.cons_car(), seen);
-                self.materialize_read_symbols_1(value.cons_cdr(), seen);
+                pending.push(value.cons_car());
+                pending.push(value.cons_cdr());
             }
             ValueKind::Veclike(
                 VecLikeType::Vector
@@ -2200,7 +2208,7 @@ impl Obarray {
                     .or_else(|| value.closure_slots())
                 {
                     for slot in slots.iter().copied() {
-                        self.materialize_read_symbols_1(slot, seen);
+                        pending.push(slot);
                     }
                 }
             }
@@ -2210,7 +2218,7 @@ impl Obarray {
                 }
                 if let Some(slots) = value.char_table_external_slots() {
                     for slot in slots {
-                        self.materialize_read_symbols_1(slot, seen);
+                        pending.push(slot);
                     }
                 }
             }
@@ -2220,7 +2228,7 @@ impl Obarray {
                 }
                 if let Some(table) = value.as_sub_char_table_obj() {
                     for slot in table.contents.iter().copied() {
-                        self.materialize_read_symbols_1(slot, seen);
+                        pending.push(slot);
                     }
                 }
             }
@@ -2230,10 +2238,10 @@ impl Obarray {
                 }
                 if let Some(table) = value.as_hash_table() {
                     for key_value in table.key_snapshots().copied() {
-                        self.materialize_read_symbols_1(key_value, seen);
+                        pending.push(key_value);
                     }
                     for value in table.data.values().copied() {
-                        self.materialize_read_symbols_1(value, seen);
+                        pending.push(value);
                     }
                 }
             }
@@ -2242,27 +2250,27 @@ impl Obarray {
                     return;
                 }
                 if let Some(bytecode) = value.get_bytecode_data() {
-                    self.materialize_read_symbols_1(bytecode.arglist, seen);
+                    pending.push(bytecode.arglist);
                     for constant in bytecode.constants.iter().copied() {
-                        self.materialize_read_symbols_1(constant, seen);
+                        pending.push(constant);
                     }
                     if let Some(env) = bytecode.env {
-                        self.materialize_read_symbols_1(env, seen);
+                        pending.push(env);
                     }
                     if let Some(doc_form) = bytecode.doc_form {
-                        self.materialize_read_symbols_1(doc_form, seen);
+                        pending.push(doc_form);
                     }
                     if let Some(interactive) = bytecode.interactive {
-                        self.materialize_read_symbols_1(interactive, seen);
+                        pending.push(interactive);
                     }
                     for slot in bytecode.extra_slots.iter().copied() {
-                        self.materialize_read_symbols_1(slot, seen);
+                        pending.push(slot);
                     }
                 }
             }
             ValueKind::Veclike(VecLikeType::SymbolWithPos) => {
                 if let Some(symbol) = value.as_symbol_with_pos_sym() {
-                    self.materialize_read_symbols_1(symbol, seen);
+                    pending.push(symbol);
                 }
             }
             _ => {}
