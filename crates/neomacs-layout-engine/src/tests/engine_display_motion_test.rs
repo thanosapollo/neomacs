@@ -2502,6 +2502,120 @@ fn absolute_row_queries_survive_viewport_placement_but_not_source_changes() {
     assert!(probe::max_depth() > 0);
 }
 
+// #89 discriminator only: a tiny no-font-metrics fixture, not Org cost or
+// GNU performance evidence. Probe depth detects entry, not produced-row count
+// or the total number of producer invocations within a query.
+#[test]
+fn page_query_repetition_discriminator_records_real_row_producer_entries() {
+    use crate::engine::viewport_retry_depth_probe as probe;
+    use neovm_core::window::{WindowLayoutAttemptFreshness, WindowLayoutQueryScope};
+    use std::{cell::{Cell, RefCell}, rc::Rc};
+
+    #[derive(Debug)]
+    struct Entry {
+        command: &'static str,
+        control: bool,
+        frame: neovm_core::window::FrameId,
+        window: neovm_core::window::WindowId,
+        scope: WindowLayoutQueryScope,
+        point: i64,
+        fontification_non_nil: bool,
+        before: WindowLayoutAttemptFreshness,
+        freshness_unchanged: bool,
+        same_request_seen: bool,
+        same_input_seen: bool,
+        rows: usize,
+        points: usize,
+        end: i64,
+        depth: usize,
+    }
+
+    let (mut eval, frame, window) =
+        position_query_fixture(&"ordinary row\n".repeat(100), 400, 160);
+    eval.eval_str("(setq fontification-functions nil)").unwrap();
+    let ledger = Rc::new(RefCell::new(Vec::<Entry>::new()));
+    let observed = ledger.clone();
+    let command = Rc::new(Cell::new("scroll-up"));
+    let active_command = command.clone();
+    let mut engine = WindowLayoutQueryEngine::new_without_font_metrics();
+    eval.install_window_layout_query(move |eval, frame, window, scope| {
+        // Keep the original callback's synchronous answer. The second call is
+        // an explicitly labelled same-request control, NOT a paging request.
+        let mut answer = None;
+        for control in [false, true] {
+            let point = eval.eval_str("(point)").unwrap().as_fixnum().unwrap();
+            let fontification_non_nil = !eval.eval_str("fontification-functions").unwrap().is_nil();
+            let before = eval.window_layout_attempt_freshness(frame, window, eval.buffer_manager().current_buffer().unwrap().id()).unwrap();
+            probe::reset();
+            let result = engine.query_window_layout(eval, frame, window, scope);
+            let depth = probe::max_depth();
+            let query = match result {
+                Ok(query) => query,
+                Err(error) => {
+                    eprintln!("QUERY89 command={} control={control} frame={frame:?} window={window:?} scope={scope:?} outcome=Failed({error:?}) depth={depth}", active_command.get());
+                    return WindowLayoutQueryOutcome::Failed(error);
+                }
+            };
+            let after = eval.window_layout_attempt_freshness(frame, window, eval.buffer_manager().current_buffer().unwrap().id()).unwrap();
+            let geometry = query.geometry().expect("synchronous geometry");
+            let mut entries = observed.borrow_mut();
+            let same_request_seen = entries.iter().any(|entry| {
+                entry.frame == frame && entry.window == window && entry.scope == scope
+            });
+            let same_input_seen = entries.iter().any(|entry| {
+                entry.frame == frame && entry.window == window && entry.scope == scope
+                    && entry.point == point && entry.fontification_non_nil == fontification_non_nil
+                    && entry.before == before
+            });
+            let entry = Entry {
+                command: active_command.get(), control, frame, window, scope, point,
+                fontification_non_nil, freshness_unchanged: before == after, before,
+                same_request_seen, same_input_seen, rows: geometry.rows.len(),
+                points: geometry.iter_points().count(), end: query.end().as_i64(), depth,
+            };
+            println!("QUERY89 command={} control={} frame={:?} window={:?} scope={:?} point={} fontification_non_nil={} freshness_unchanged={} same_request_seen={} same_input_seen={} rows={} points={} end={} producer_entered={} max_depth={} outcome=Ready",
+                entry.command, entry.control, entry.frame, entry.window, entry.scope, entry.point,
+                entry.fontification_non_nil, entry.freshness_unchanged, entry.same_request_seen,
+                entry.same_input_seen, entry.rows, entry.points, entry.end, entry.depth > 0, entry.depth);
+            entries.push(entry);
+            if let Some(original) = answer.as_ref() {
+                let original: &neovm_core::window::WindowLayoutQuery = original;
+                assert_eq!(query.end(), original.end(), "duplicate synchronous end");
+                assert_eq!(query.geometry(), original.geometry(), "duplicate synchronous geometry");
+                assert_eq!(depth, 0, "unchanged exact-request control reentered producer");
+            } else {
+                answer = Some(query);
+            }
+        }
+        WindowLayoutQueryOutcome::Ready(answer.unwrap())
+    });
+
+    eval.eval_str("(let ((noninteractive nil)) (scroll-up))").unwrap();
+    let forward = eval.eval_str("(window-start)").unwrap().as_fixnum().unwrap();
+    assert!(forward > 1, "synchronous forward page must commit");
+    let forward_callbacks = ledger.borrow().iter().filter(|entry| !entry.control).count();
+    command.set("scroll-down");
+    eval.eval_str("(let ((noninteractive nil)) (scroll-down))").unwrap();
+    let backward = eval.eval_str("(window-start)").unwrap().as_fixnum().unwrap();
+    assert!(backward < forward, "synchronous backward page must commit");
+    assert_eq!(eval.frame_manager().get(frame).unwrap().selected_window, window);
+    let entries = ledger.borrow();
+    let page: Vec<_> = entries.iter().filter(|entry| !entry.control).collect();
+    assert!(forward_callbacks >= 2 && page.len() > forward_callbacks);
+    assert!(page.iter().all(|entry| matches!(entry.scope, WindowLayoutQueryScope::Pixels { .. })));
+    assert!(page.windows(2).any(|pair| pair[0].scope != pair[1].scope),
+        "destination/coverage requests must be distinguished from duplicates");
+    assert!(page.iter().any(|entry| entry.depth > 0), "real producer positive control");
+    assert!(entries.iter().filter(|entry| entry.control).all(|entry|
+        entry.same_request_seen && entry.depth == 0 && entry.rows > 0 && entry.points > 0));
+    println!("QUERY89 SUMMARY page_callbacks={} page_producer_entered_queries={} page_repeated_requests={} page_repeated_full_inputs={} duplicate_controls={} duplicate_producer_entered_queries={} forward_start={forward} backward_start={backward} fixture=small-no-font-metrics NOT_REAL_ORG_COST NOT_GNU_GAIN",
+        page.len(), page.iter().filter(|entry| entry.depth > 0).count(),
+        page.iter().filter(|entry| entry.same_request_seen).count(),
+        page.iter().filter(|entry| entry.same_input_seen).count(),
+        entries.iter().filter(|entry| entry.control).count(),
+        entries.iter().filter(|entry| entry.control && entry.depth > 0).count());
+}
+
 #[test]
 fn page_viewports_measure_their_pixel_extent_in_one_walk() {
     use std::{cell::Cell, rc::Rc};
