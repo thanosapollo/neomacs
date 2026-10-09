@@ -1607,3 +1607,37 @@ fn deeply_nested_labels_and_hash_syntax_read_like_gnu() {
     ]);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// A string's property runs are snapshots: read-label replacements must be
+/// written back after walking the plists, including direct keys and values.
+#[test]
+fn read_labels_in_string_properties_preserve_identity() {
+    for (src, expected) in [
+        (
+            r##"(let ((s (read "#1=#(\"x\" 0 1 (p #1#))"))) (eq (get-text-property 0 'p s) s))"##,
+            "OK t",
+        ),
+        (
+            r##"(let* ((v (read "#1=[#(\"x\" 0 1 (p #1#))]")) (s (aref v 0))) (eq (get-text-property 0 'p s) v))"##,
+            "OK t",
+        ),
+        (
+            r##"(let ((s (read "#1=#(\"x\" 0 1 (#1# value))"))) (list (eq (car (text-properties-at 0 s)) s) (get-text-property 0 s s)))"##,
+            "OK (t value)",
+        ),
+        (
+            r##"(let* ((v (read "#1=[#(\"xy\" 0 1 (p #1# q 7) 1 2 (p #1# q 8))]")) (s (aref v 0))) (list (eq (get-text-property 0 'p s) v) (eq (get-text-property 1 'p s) v) (get-text-property 0 'q s) (get-text-property 1 'q s)))"##,
+            "OK (t t 7 8)",
+        ),
+        (
+            r##"(let* ((s (read "#1=#(\"x\" 0 1 (p #(\"y\" 0 1 (p #1#))))")) (child (get-text-property 0 'p s))) (eq (get-text-property 0 'p child) s))"##,
+            "OK t",
+        ),
+        (
+            r##"(let ((s (read "#1=#(\"x\" 0 1 (p (#1#)))"))) (eq (car (get-text-property 0 'p s)) s))"##,
+            "OK t",
+        ),
+    ] {
+        assert_eq!(princ_eval(src), expected, "{src}");
+    }
+}
