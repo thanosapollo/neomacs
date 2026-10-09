@@ -1340,6 +1340,181 @@ fn princ_continuous_history_direct_impl_initializes_nil_table() {
     );
 }
 
+// GNU only materializes nil history for a circle-preprocessing candidate.
+// Inspect the variable itself; neither output formatting nor a truthy
+// continuous-numbering flag is evidence that a history table was published.
+fn check_princ_candidate_history(
+    object: &str,
+    output: &str,
+    gensym: bool,
+    candidate: bool,
+    buffer: bool,
+) {
+    let src = r#"(let* ((print-circle t) (print-continuous-numbering t)
+       (print-gensym GENSYM) (caller nil) (print-number-table caller)
+       (x OBJECT) (s "") (sink SINK))
+  (let ((returned (princ x sink)))
+    (list SNAPSHOT (eq x returned) (hash-table-p print-number-table)
+          (eq print-number-table nil)
+          (or (eq caller nil) (eq caller print-number-table))
+          (if (hash-table-p print-number-table)
+              (hash-table-count print-number-table) nil))))"#
+        .replace("GENSYM", if gensym { "t" } else { "nil" })
+        .replace("OBJECT", object)
+        .replace("SINK", if buffer {
+            "(progn (set-buffer (get-buffer-create \" princ-candidate\")) (erase-buffer) (current-buffer))"
+        } else { "(lambda (ch) (setq s (concat s (string ch))))" })
+        .replace("SNAPSHOT", if buffer { "(buffer-string)" } else { "s" });
+    assert_princ_history_fields(
+        &src,
+        &[output],
+        &[
+            Value::T,
+            if candidate { Value::T } else { Value::NIL },
+            if candidate { Value::NIL } else { Value::T },
+            Value::T,
+            if candidate {
+                Value::fixnum(if gensym { 1 } else { 0 })
+            } else {
+                Value::NIL
+            },
+        ],
+    );
+}
+
+#[test]
+fn princ_candidate_history_fixnum_stays_nil() {
+    for buffer in [false, true] {
+        check_princ_candidate_history("1", "1", false, false, buffer);
+    }
+}
+
+#[test]
+fn princ_candidate_history_nil_stays_nil() {
+    for buffer in [false, true] {
+        check_princ_candidate_history("nil", "nil", false, false, buffer);
+    }
+}
+
+#[test]
+fn princ_candidate_history_interned_symbol_stays_nil() {
+    for buffer in [false, true] {
+        check_princ_candidate_history("'princ-atom", "princ-atom", true, false, buffer);
+    }
+}
+
+#[test]
+fn princ_candidate_history_empty_string_stays_nil() {
+    for buffer in [false, true] {
+        check_princ_candidate_history("\"\"", "", false, false, buffer);
+    }
+}
+
+#[test]
+fn princ_candidate_history_empty_vector_stays_nil() {
+    for buffer in [false, true] {
+        check_princ_candidate_history("[]", "[]", false, false, buffer);
+    }
+}
+
+#[test]
+fn princ_candidate_history_gensym_disabled_stays_nil() {
+    for buffer in [false, true] {
+        check_princ_candidate_history(
+            "(make-symbol \"princ-atom\")",
+            "princ-atom",
+            false,
+            false,
+            buffer,
+        );
+    }
+}
+
+#[test]
+fn princ_candidate_history_public_buffer_atom_stays_nil() {
+    check_princ_candidate_history("1", "1", false, false, true);
+}
+
+#[test]
+fn princ_candidate_history_eligible_objects_publish_table() {
+    for buffer in [false, true] {
+        for (object, output, gensym) in [
+            ("\"abc\"", "abc", false),
+            ("[1]", "[1]", false),
+            ("(list 1)", "(1)", false),
+            ("(make-symbol \"princ-atom\")", "#1=#:princ-atom", true),
+        ] {
+            check_princ_candidate_history(object, output, gensym, true, buffer);
+        }
+    }
+}
+
+#[test]
+fn princ_candidate_history_circle_disabled_and_supplied_atom_controls() {
+    assert_princ_history_fields(
+        r#"(let* ((print-circle nil) (print-continuous-numbering t)
+       (print-gensym nil) (caller nil) (print-number-table caller)
+       (x [1]) (s "") (sink (lambda (ch) (setq s (concat s (string ch))))))
+  (let ((returned (princ x sink)))
+    (list s (eq x returned) (hash-table-p print-number-table)
+          (eq print-number-table nil)
+          (or (eq caller nil) (eq caller print-number-table))
+          (if (hash-table-p print-number-table)
+              (hash-table-count print-number-table) nil))))"#,
+        &["[1]"],
+        &[Value::T, Value::NIL, Value::T, Value::T, Value::NIL],
+    );
+    assert_princ_history_fields(
+        r#"(let* ((print-circle t) (print-continuous-numbering t)
+       (print-gensym nil) (caller (make-hash-table :test 'eq)) (print-number-table caller)
+       (x 1) (s "") (sink (lambda (ch) (setq s (concat s (string ch))))))
+  (let ((returned (princ x sink)))
+    (list s (eq x returned) (hash-table-p print-number-table)
+          (eq print-number-table nil)
+          (or (eq caller nil) (eq caller print-number-table))
+          (if (hash-table-p print-number-table)
+              (hash-table-count print-number-table) nil))))"#,
+        &["1"],
+        &[Value::T, Value::T, Value::NIL, Value::T, Value::fixnum(0)],
+    );
+}
+
+#[test]
+fn princ_candidate_history_direct_impl_atom_stays_nil() {
+    use crate::emacs_core::builtins::misc_eval::builtin_princ_impl;
+    let mut ctx = crate::emacs_core::Context::new();
+    ctx.eval_str(
+        r#"(progn
+        (setq print-circle t print-continuous-numbering t print-gensym nil print-number-table nil)
+        (set-buffer (get-buffer-create " princ-candidate-direct")))"#,
+    )
+    .unwrap();
+    let sink = ctx.eval_str("(current-buffer)").unwrap();
+    let object = Value::fixnum(1);
+    assert_eq!(
+        builtin_princ_impl(&mut ctx, vec![object, sink]).unwrap(),
+        object
+    );
+    assert_eq!(
+        ctx.eval_str("(buffer-string)").unwrap().as_utf8_str(),
+        Some("1")
+    );
+    assert_eq!(ctx.eval_str("print-number-table").unwrap(), Value::NIL);
+    let caller = ctx
+        .eval_str("(setq print-number-table (make-hash-table :test 'eq))")
+        .unwrap();
+    assert_eq!(
+        builtin_princ_impl(&mut ctx, vec![object, sink]).unwrap(),
+        object
+    );
+    assert_eq!(ctx.eval_str("print-number-table").unwrap(), caller);
+    assert_eq!(
+        ctx.eval_str("(hash-table-count print-number-table)")
+            .unwrap(),
+        Value::fixnum(0)
+    );
+}
+
 fn princ_eval(src: &str) -> String {
     let mut ev = crate::emacs_core::Context::new();
     ev.set_lexical_binding(true);
