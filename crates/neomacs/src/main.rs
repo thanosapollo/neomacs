@@ -119,6 +119,7 @@ mod input_bridge;
 mod secondary_tty;
 mod startup_font;
 mod startup_frame;
+mod startup_ptrace;
 mod startup_resources;
 mod termcap_input;
 pub(crate) mod terminal_capabilities;
@@ -4525,6 +4526,13 @@ pub fn run(mode: RuntimeMode) {
     // original invocation exits only when Lisp calls daemon-initialized.
     let daemon_notifier = daemon::prepare(startup.daemon.as_ref()).unwrap_or_else(|error| {
         eprintln!("neomacs: {error}");
+        std::process::exit(1);
+    });
+
+    // Yama exceptions are process-specific, not inherited by forked daemons.
+    // Apply in the final editor before logging, evaluator or worker startup.
+    startup_ptrace::configure().unwrap_or_else(|error| {
+        eprintln!("neomacs: NEOMACS_ALLOW_PTRACE=1: cannot allow ptrace: {error}");
         std::process::exit(1);
     });
 

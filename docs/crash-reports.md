@@ -78,6 +78,59 @@ capture SIGKILL/OOM kills, SIGSEGV, explicit aborts, or failures before logging
 initialization. It does not recover buffers. On non-Unix hosts this private
 file mechanism is unavailable and the existing Rust panic hook is unchanged.
 
+## Opt-in debugger attachment on Linux
+
+Linux systems with Yama `ptrace_scope=1` normally deny a debugger that is not
+an ancestor of the editor. To permit otherwise-authorized debuggers to attach
+to a **new** Neomacs process, launch it with:
+
+```sh
+NEOMACS_ALLOW_PTRACE=1 neomacs
+```
+
+The default is off. Only the exact value `1` enables it; unset, empty, `0`,
+`true`, and other values leave the existing process policy untouched. On Linux,
+Neomacs calls `prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)` in the final editor
+process after daemon forking, before logging, evaluator initialization and
+worker startup. If that explicitly requested call fails, startup exits with
+status 1 and a stderr diagnostic rather than silently running without it.
+Help/version-only invocations return before this policy is applied. On other
+operating systems the variable has no effect.
+
+This removes only Yama's ancestor restriction for this process. Normal kernel
+UID/credential, dumpability, capability and other security-module checks still
+apply; it does not grant root privileges, set dumpability or change the host
+sysctl. Yama modes 2 and 3 are not bypassed. **Any otherwise-authorized process**
+may attach, not just one named debugger. A same-user compromised application
+could read editor memory, including buffer text and credentials, or modify its
+execution. Enable only when that tradeoff is acceptable. The option does not
+relax perf's separate kernel policy or guarantee symbol availability.
+
+Changing the environment does not modify an already-running editor. Disable
+for the next launch by omitting the variable; do not restart an editor with
+unsaved work merely to change this setting. The kernel exception is associated
+with this process, survives an ordinary same-process nonprivileged `execve`,
+and is not inherited by a newly forked child. A child that itself starts
+Neomacs with this environment variable will explicitly opt itself in again.
+See the [kernel Yama documentation](https://docs.kernel.org/admin-guide/LSM/Yama.html)
+and its [`yama_lsm.c` implementation](https://github.com/torvalds/linux/blob/v6.18/security/yama/yama_lsm.c)
+(`yama_task_prctl`, `ptracer_exception_found`, `yama_task_free`). Privileged
+exec transitions have additional credential/dumpability rules; no exception to
+those rules is promised.
+
+A lightweight regression fixture in
+`crates/neomacs/tests/fixtures/startup_ptrace.rs` imports the exact production
+module. Compile it with `rustc --edition=2024` and the current build's libc rlib
+(`--extern libc=PATH -L dependency=TARGET/debug/deps -o INFERIOR`), then run
+`python3 scripts/test-startup-ptrace.py INFERIOR` inside a private PID/process
+sandbox as a non-root user with Yama mode 1. The runner drops user-namespace
+capabilities before creating sibling inferior/tracer processes. It checks
+non-ancestor attach and detach when enabled, denial by default/invalid values,
+ordinary exec retention without reapplying the option, and nondumpable denial.
+A `rustc --test` build of the same fixture checks exact-value gating and error
+propagation. These standalone tests do not launch the full editor or certify
+its complete startup path.
+
 ## Focused tests
 
 From the repository root:
