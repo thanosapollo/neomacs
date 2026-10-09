@@ -485,11 +485,19 @@ fn concurrent_termination_classifies_deferred_kinds() {
         "no float may remain parked on a bare page-only heap (f={})",
         kinds.float,
     );
-    assert!(
-        kinds.hash_table >= N_HT,
-        "hash tables parked (ht={})",
-        kinds.hash_table,
-    );
+    if heap.concurrent_claims() {
+        assert!(heap.last_concurrent_claim_counts().1 >= N_HT);
+        assert_eq!(
+            kinds.hash_table, 0,
+            "eligible hashes leave the parked buffer"
+        );
+    } else {
+        assert!(
+            kinds.hash_table >= N_HT,
+            "hash tables parked with U3.5 off (ht={})",
+            kinds.hash_table,
+        );
+    }
     // Task 01: owned page vectors' headers are claimed on the GC thread
     // (their backings already traced concurrently via Tier B), so the
     // vector bucket collapses and the claim counter carries the count.
@@ -504,13 +512,16 @@ fn concurrent_termination_classifies_deferred_kinds() {
         "no vector may remain parked on a bare page-only heap (vec={})",
         kinds.vector,
     );
-    // Page bignums are not claimed on the GC thread (P0.11 §3.6: childless,
-    // and too few deferrals to pay for a snapshot); they park in `other`.
-    assert!(
-        kinds.other >= N_BIG,
-        "arena bignums stay parked in the other bucket (other={})",
-        kinds.other,
-    );
+    if heap.concurrent_claims() {
+        assert!(heap.last_concurrent_claim_counts().0 >= N_BIG);
+        assert_eq!(kinds.other, 0, "page leaves leave the parked buffer");
+    } else {
+        assert!(
+            kinds.other >= N_BIG,
+            "arena bignums stay parked with U3.5 off (other={})",
+            kinds.other,
+        );
+    }
     assert_eq!(
         kinds.total(),
         stats.last_termination_deferred,
@@ -1775,7 +1786,9 @@ fn concurrent_claim_reaches_obarray_symbol_value_strings() {
     ev.obarray.set_symbol_value("neovm--str-claim-probe", s);
 
     // Stage the obarray snapshot exactly like the start handshake does.
-    let snap = ev.obarray.scan_snapshot();
+    // SAFETY: this test captures on the sole owner before starting the marker.
+    let world = unsafe { scan_contract::SingleMutatorWorld::from_heap(&mut ev.tagged_heap) };
+    let snap = ev.obarray.scan_snapshot(&world);
     ev.tagged_heap.set_pending_obarray_scan(snap);
     ev.tagged_heap.concurrent_begin();
     ev.tagged_heap.launch_concurrent_mark();
@@ -2215,13 +2228,10 @@ fn parity_idle_born_object_is_traced_on_the_next_cycle() {
     }
 }
 
-/// Gap 3 drop safety: dropping a heap while the GC thread is still
-/// concurrently marking it must stop + join the GC thread before any
-/// storage it can read is freed (dump-less heaps now reach this state at
-/// every safe-point collection after bootstrap, e.g. a test Context
-/// dropped mid-mark).
+/// Drop requests marker stop and retains readable storage. Completion is an
+/// explicit operation outside Drop; heap abandonment never frees its pages.
 #[test]
-fn dropping_heap_mid_concurrent_mark_joins_gc_thread() {
+fn dropping_heap_mid_concurrent_mark_retains_gc_storage() {
     crate::test_utils::init_test_tracing();
     let mut heap = TaggedHeap::new();
     set_tagged_heap(&mut heap);
@@ -2236,10 +2246,17 @@ fn dropping_heap_mid_concurrent_mark_joins_gc_thread() {
     heap.seed_root(list);
     heap.launch_concurrent_mark();
     assert!(heap.concurrent_mark_running());
-    // Drop with the mark in flight; under TSAN/ASAN a missing join is a
-    // use-after-free the sanitizer catches, and the join panics if the GC
-    // thread is gone.
+    let completion = heap.gc_exited.take().unwrap();
     drop(heap);
+    completion
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("abandoned marker must finish without owner storage");
+    // SAFETY: abandonment retained this owned cons block, and the explicit
+    // completion wait proves no marker still reads it.
+    assert_eq!(
+        unsafe { (*list.xcons_ptr()).load_car() }.as_fixnum(),
+        Some(N - 1)
+    );
 }
 
 /// Run `scenario` on a fresh thread and fail unless it finishes within
@@ -2569,8 +2586,11 @@ fn vector_registry_matches_full_filter_across_cycles() {
         // Safety: `addr` is a live owned Vector's `GcHeader` address (both
         // callers iterate live-object sets under a stopped world).
         let obj = unsafe { &*(addr as *const VectorObj) };
-        let entry = obj.data.scan_entry();
-        (entry.base as usize, entry.len, entry.is_mapped)
+        (
+            obj.data.as_slice().as_ptr() as usize,
+            obj.data.len(),
+            !obj.data.is_owned(),
+        )
     }
     // Ground-truth snapshot contents, stage-3 form: allocated VECTOR
     // ARENA PAGE SLOTS (walked allocated-bit-first) ∪ any residual
@@ -3289,7 +3309,7 @@ fn a_plain_variable_store_logs_its_pre_image_only_while_marking() {
         .lock()
         .unwrap()
         .iter()
-        .map(|v| v.bits())
+        .map(|word| word.value().bits())
         .collect();
     heap.set_concurrent_active_for_test(false);
 
@@ -3332,7 +3352,7 @@ fn a_specbind_swap_logs_its_pre_image_only_while_marking() {
         .lock()
         .unwrap()
         .iter()
-        .map(|v| v.bits())
+        .map(|word| word.value().bits())
         .collect();
     heap.set_concurrent_active_for_test(false);
 

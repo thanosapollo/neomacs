@@ -238,7 +238,10 @@ fn parity_two_cycle_bignum_survival_and_reclaim_verified() {
 /// by `mark_value` through `owns_veclike_object`'s bignum arm.
 fn deferred_bignum_resolves_at_termination_body(verify: bool) {
     crate::test_utils::init_test_tracing();
+    // Preserve the legacy deferral regression under knob-on suite runs.
+    knobs::set_concurrent_claims_for_test(Some(false));
     let mut heap = TaggedHeap::new();
+    knobs::set_concurrent_claims_for_test(None);
     set_tagged_heap(&mut heap);
     if verify {
         arm_partition(&mut heap, true);
@@ -581,6 +584,8 @@ fn bignum_payload_pages_freed_at_heap_drop_body(mid_mark: bool) {
             heap.seed_root(root);
             heap.launch_concurrent_mark();
             assert!(heap.concurrent_mark_running());
+            heap.finish_concurrent_mark()
+                .expect("finish marker before orderly teardown");
         }
         drop(heap);
     }

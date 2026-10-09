@@ -217,6 +217,12 @@ thread_local! {
     /// bool whenever a heap is (re)installed on a thread — that resync, not a
     /// guard, is the panic-recovery point.
     static TAGGED_HEAP_CONCURRENT_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// The installed mutator's Tier-H activation, independently of the general
+    /// SATB window: claims-OFF cycles still mark concurrently. Derived from
+    /// running + claims + snapshot presence at launch and heap installation;
+    /// cleared at join/uninstall, before retained snapshot storage is freed.
+    /// Like the general window, this is protocol state, never scope-restored.
+    static TAGGED_HEAP_CONCURRENT_HASH_ACTIVE: Cell<bool> = const { Cell::new(false) };
     /// Mirrors `TaggedHeap::{dump_addr_lo, dump_addr_hi}` so the write
     /// barrier's partition-only path can span-test a cons owner without
     /// dereferencing the heap. `(usize::MAX, 0)` = empty span.
@@ -279,12 +285,6 @@ fn barrier_cache_slot(bits: usize) -> usize {
 
 fn clear_barrier_cache(cache: &'static std::thread::LocalKey<[Cell<usize>; BARRIER_CACHE_SLOTS]>) {
     cache.with(|slots| slots.iter().for_each(|slot| slot.set(0)));
-}
-
-static NEXT_TAGGED_HEAP_ID: AtomicUsize = AtomicUsize::new(1);
-
-fn next_tagged_heap_identity() -> usize {
-    NEXT_TAGGED_HEAP_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +389,7 @@ pub struct TaggedHeap {
     /// Lisp values.  It deliberately does not use this heap's address: boxed
     /// heaps are routinely dropped and recreated by snapshot-based tests, and
     /// the allocator may reuse an address for a different heap lifetime.
-    identity: usize,
+    identity: HeapIdentity,
 
     /// The O(1) page directory (`chunk_map.rs`) when `NEOVM_GC_CHUNK_MAP`
     /// is on (read once, at construction): every cons block and arena page
@@ -764,7 +764,7 @@ pub struct TaggedHeap {
     concurrent_mark_running: bool,
     /// Mutator->GC channel (Phase 5): the SATB barrier appends the overwritten
     /// children here (locked); the GC thread drains them into its gray worklist.
-    satb_shared: std::sync::Arc<std::sync::Mutex<Vec<TaggedValue>>>,
+    satb_shared: SharedMarkQueue,
     /// Per-cycle dedup for the COARSE (bulk) SATB barrier. A bulk mutator
     /// (`with_hash_table_mut`, `with_vector_data_mut`, char-table, …) hands a
     /// `&mut` to an arbitrary closure, so the barrier — which runs BEFORE the
@@ -794,7 +794,7 @@ pub struct TaggedHeap {
     /// can be reallocated by the mutator, so reading it concurrently would be a
     /// UAF). They are marked black and parked here, then traced at the
     /// termination handshake while the mutator is stopped.
-    deferred_veclikes: std::sync::Arc<std::sync::Mutex<Vec<TaggedValue>>>,
+    deferred_veclikes: SharedMarkQueue,
     /// GC thread sets this (Release) when gray + SATB are drained; the mutator
     /// polls it (Acquire) at safe points to decide when to terminate.
     gc_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -957,9 +957,9 @@ pub struct TaggedHeap {
     /// read once, here at construction): the Tier-B snapshot (the default),
     /// or, for the F-G measurement only, deferral to the termination.
     vec_scan: knobs::VecScanMode,
-    /// The generation census (`census.rs`), present only under
-    /// `NEOVM_GC_CENSUS` / `NEOVM_GC_CENSUS_REMSET` (read once, here at
-    /// construction). Trace-only: it never changes what is marked or freed.
+    /// The original census pointer also carries optional U35 cold state.
+    /// A claims-only carrier has disabled measurement; the two facilities
+    /// retain independent history, snapshot and per-mutator log lifetimes.
     census: Option<Box<GenCensus>>,
 }
 
@@ -999,18 +999,20 @@ pub(crate) fn set_verify_marked_objects_for_test(on: bool) {
     VERIFY_MARKED_OBJECTS.with(|flag| flag.set(on));
 }
 
+static_assertions::assert_not_impl_any!(TaggedHeap: Send, Sync);
+
 impl TaggedHeap {
     pub fn new() -> Self {
         super::collection_reads::initialize();
         let chunk_map = knobs::chunk_map_on().then(|| std::sync::Arc::new(ChunkMap::new()));
-        let heap = Self {
+        let mut heap = Self {
             generational: generational::GenState::new(
                 std::env::var("NEOVM_GC_GENERATIONAL").as_deref() == Ok("1"),
             ),
             jit: JitHeapState::new(),
             region_book: RegionBook::new(),
             region_stats: RegionStats::default(),
-            identity: next_tagged_heap_identity(),
+            identity: HeapIdentity::issue(),
             chunk_map: chunk_map.clone().map(HeapChunkMap::new),
             cons_blocks: Vec::new(),
             cons_block_index_by_base: FxHashMap::default(),
@@ -1174,6 +1176,9 @@ impl TaggedHeap {
             vec_scan: knobs::vec_scan_mode(),
             census: GenCensus::from_knob(),
         };
+        if knobs::concurrent_claims_on() {
+            heap.install_concurrent_claims();
+        }
         // The census's remembered-set probe widens the window compiled code
         // tests from the start (the thread-local mirror follows when the heap
         // is installed, `set_tagged_heap`).
@@ -1182,6 +1187,12 @@ impl TaggedHeap {
     }
 
     pub(crate) fn identity(&self) -> usize {
+        self.identity.get()
+    }
+
+    /// This heap lifetime's typed identity.
+    #[inline]
+    pub fn heap_identity(&self) -> HeapIdentity {
         self.identity
     }
 
@@ -2616,15 +2627,17 @@ impl TaggedHeap {
 
 impl Drop for TaggedHeap {
     fn drop(&mut self) {
-        // A live concurrent mark holds start-of-cycle snapshots into this
-        // heap (cons blocks + their mark bitmaps, vector backings, the
-        // Context obarray) on the GC thread. Reclaim exclusive ownership
-        // BEFORE freeing anything it can still read. `tagged_heap` is the
-        // first `Context` field, so this join also runs before the obarray
-        // drops. No-op when no mark is in flight.
+        // Explicit finish is the only blocking completion handoff. Drop
+        // cannot establish exclusive ownership while a marker is active, so
+        // its fallback retains every marker-readable allocation and returns.
         if self.concurrent_mark_running {
-            self.join_concurrent_mark();
+            self.abandon_concurrent_mark();
+            crate::tagged::gc::clear_tagged_heap_if_installed(self);
+            return;
         }
+        // No marker is active, so Tier-H's snapshot and retired originals are
+        // freed with the claims state when the census carrier drops below;
+        // Drop takes none of its locks.
         // Leave no dangling thread-local pointer behind: a heap installed with
         // `set_tagged_heap` and dropped by anything but a `Context` (a failed
         // pdump load drops the half-built one on its error path) used to stay
@@ -2634,33 +2647,10 @@ impl Drop for TaggedHeap {
         // which is also why the frees below run with no heap installed either
         // way.
         crate::tagged::gc::clear_tagged_heap_if_installed(self);
-        // Free all non-cons objects via every intrusive list: young, tenured,
-        // and any objects detached for an in-flight deferred sweep.
-        for mut current in [
-            self.all_objects,
-            self.tenured_objects,
-            self.sweep_noncons_pending,
-        ] {
-            while !current.is_null() {
-                unsafe {
-                    let next = (*current).next;
-                    self.free_gc_object(current);
-                    current = next;
-                }
-            }
-        }
-        for mut old in [
-            self.generational.old_objects,
-            self.generational.old_sweep_pending,
-        ] {
-            while !old.is_null() {
-                unsafe {
-                    let next = (*old).gc_link();
-                    self.free_gc_object(old);
-                    old = next;
-                }
-            }
-        }
+        // Automatic destruction cannot invoke module finalizers or SQLite
+        // teardown. Explicit shutdown reclaims those resources beforehand;
+        // the fallback retains native payloads and frees inert Rust storage.
+        self.reclaim_intrusive_objects(ReclamationMode::DropFallback);
         // ConsBlocks are dropped automatically (they implement Drop).
         // Object arena pages likewise: page floats/strings/vectors/bytecode/
         // lambdas/macros/records/symbols-with-pos are on NONE of the lists
@@ -2673,9 +2663,8 @@ impl Drop for TaggedHeap {
         // lambdas/macros/records their slot `Vec` + cached params; floats and
         // symbols-with-pos are POD and the walk compiles out) before releasing
         // the page storage —
-        // retired pages included. The concurrent-mark join at the top of this
-        // body has already reclaimed exclusive ownership, so the GC thread
-        // cannot still be reading a page.
+        // retired pages included. This path only runs without an active mark,
+        // so the GC thread cannot still be reading a page.
     }
 }
 
@@ -2802,8 +2791,21 @@ mod old_sweep;
 mod pacing;
 
 mod concurrent;
+pub use concurrent::MarkFinishError;
+mod heap_identity;
+pub use heap_identity::HeapIdentity;
+mod mark_word;
+use mark_word::{MarkStack, MarkWord, SharedMarkQueue};
+pub(crate) mod scan_contract;
+#[cfg(test)]
+#[path = "gc/tests/shutdown_tests.rs"]
+mod shutdown_tests;
+pub(crate) use concurrent::{concurrent_hash_snapshot, prepare_concurrent_hash_write};
+pub(crate) mod concurrent_hash;
 
 mod incremental;
+mod reclamation;
+use reclamation::ReclamationMode;
 
 mod cons_block_trailer;
 use cons_block_trailer::*;
@@ -2854,6 +2856,7 @@ mod chunk_map;
 use chunk_map::{CHUNK_CLASS_COUNT, ChunkClass, ChunkEntry, ChunkMap, HeapChunkMap, PageSnapshot};
 
 mod census;
+mod cold_gc;
 #[cfg(test)]
 use census::CensusRecord;
 use census::{CensusCycleKind, GenCensus, census_remset_probe_on};

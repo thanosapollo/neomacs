@@ -6535,17 +6535,24 @@ impl crate::emacs_core::eval::Context {
             return Ok(help);
         }
 
-        let inhibit = crate::emacs_core::textprop::builtin_get_text_property_in_state(
-            &self.obarray,
-            &self.buffers,
-            &[
-                Value::fixnum(1),
-                Value::symbol("help-echo-inhibit-substitution"),
-                help,
-            ],
-        )?;
-        if inhibit.is_truthy() {
-            return Ok(help);
+        // GNU keyboard.c:2221-2226 inspects only the first character,
+        // and skips the property lookup for an empty help string.
+        if help
+            .as_lisp_string()
+            .is_some_and(|string| string.schars() > 0)
+        {
+            let inhibit = crate::emacs_core::textprop::builtin_get_text_property_in_state(
+                &self.obarray,
+                &self.buffers,
+                &[
+                    Value::fixnum(0),
+                    Value::symbol("help-echo-inhibit-substitution"),
+                    help,
+                ],
+            )?;
+            if inhibit.is_truthy() {
+                return Ok(help);
+            }
         }
 
         match self.obarray.symbol_function("substitute-command-keys") {
@@ -7502,7 +7509,8 @@ impl crate::emacs_core::eval::Context {
             y: (y - coordinate_origin.y().get()).round() as i64,
             metrics,
         });
-        let Some(posn_string) = Self::presented_string_position_value(frame, window_id, hit) else {
+        let Some(posn_string) = Self::presented_string_position_value(eval, frame, window_id, hit)
+        else {
             return Some(position);
         };
         let Some(mut parts) = crate::emacs_core::value::list_to_vec(&position) else {
@@ -7513,6 +7521,7 @@ impl crate::emacs_core::eval::Context {
     }
 
     fn presented_string_position_value(
+        eval: &Self,
         frame: &crate::window::Frame,
         window: crate::window::WindowId,
         hit: neomacs_display_protocol::PresentedHit,
@@ -7524,8 +7533,9 @@ impl crate::emacs_core::eval::Context {
             .chrome_strings
             .iter()
             .find(|source| source.area() == area && source.string_id() == position.string())?;
+        let object = eval.materialize(source.object()).ok()?.value();
         Some(Value::cons(
-            source.value(),
+            object,
             Value::fixnum(position.char_index().min(i64::MAX as u64) as i64),
         ))
     }

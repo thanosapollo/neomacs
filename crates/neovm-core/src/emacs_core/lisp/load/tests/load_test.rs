@@ -4716,6 +4716,49 @@ fn bootstrap_runtime_file_directories_are_unibyte_and_vc_mode_matches_gnu() {
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
+    // Source archives and remote correctness lanes omit checkout metadata.
+    // Give the real VC path a committed HELLO file in this test's own repo.
+    let fixture = tempdir().expect("HELLO Git fixture");
+    fs::copy(
+        crate::test_utils::workspace_root().join("etc/HELLO"),
+        fixture.path().join("HELLO"),
+    )
+    .expect("copy HELLO fixture");
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(fixture.path())
+            .args([
+                "-c",
+                "core.hooksPath=.git/no-fixture-hooks",
+                "-c",
+                "commit.gpgSign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("Git fixture command");
+        assert!(
+            output.status.success(),
+            "Git fixture {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--quiet"]);
+    git(&["add", "--", "HELLO"]);
+    git(&[
+        "-c",
+        "user.name=NeoVM fixture",
+        "-c",
+        "user.email=fixture@neomacs.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "HELLO fixture",
+    ]);
+    eval.set_variable(
+        "data-directory",
+        Value::unibyte_string(format!("{}/", fixture.path().display())),
+    );
+
     let rendered = eval_rendered(
         &mut eval,
         r#"(progn
@@ -10022,27 +10065,21 @@ fn load_file_exact_gc_roots_load_history_and_after_load_filename() {
 fn ensure_startup_compat_variables_backfills_xfaces_bootstrap_state() {
     crate::test_utils::init_test_tracing();
     let mut eval = super::super::eval::Context::new();
-    for name in [
-        "face-filters-always-match",
-        "face--new-frame-defaults",
-        "face-default-stipple",
-        "scalable-fonts-allowed",
-        "face-ignored-fonts",
-        "face-remapping-alist",
-        "face-font-rescale-alist",
-        "face-near-same-color-threshold",
-        "face-font-lax-matched-attributes",
-        "data-directory",
-        "doc-directory",
-        "system-configuration",
-        "system-configuration-options",
-        "system-configuration-features",
-        "system-uses-terminfo",
-        "operating-system-release",
-        "delayed-warnings-list",
-    ] {
-        eval.obarray_mut().makunbound(name);
-    }
+    // GNU data.c:1799-1808 refuses unbinding forwarded built-ins, including
+    // the face table (xfaces.c:7618-7622). A normal nil assignment represents
+    // incomplete face state and exercises the table repair branch instead.
+    eval.set_variable("face--new-frame-defaults", Value::NIL);
+    assert_eq!(
+        eval.obarray()
+            .symbol_value("face--new-frame-defaults")
+            .copied(),
+        Some(Value::NIL)
+    );
+    assert_eq!(
+        eval.obarray().symbol_value("doc-directory").copied(),
+        Some(Value::NIL),
+        "the bare constructor's forwarded doc-directory is bound"
+    );
 
     let project_root = crate::test_utils::workspace_root();
     ensure_startup_compat_variables(&mut eval, &project_root);
@@ -10077,13 +10114,9 @@ fn ensure_startup_compat_variables_backfills_xfaces_bootstrap_state() {
         Some("x86_64-pc-linux-gnu")
     );
     assert_eq!(
-        eval.obarray()
-            .symbol_value("doc-directory")
-            .and_then(|value| value.as_utf8_str()),
-        eval.obarray()
-            .symbol_value("data-directory")
-            .and_then(|value| value.as_utf8_str()),
-        "GNU initializes doc-directory from PATH_DOC, matching data-directory in this tree"
+        eval.obarray().symbol_value("doc-directory").copied(),
+        Some(Value::NIL),
+        "backfilling missing variables must preserve a bound nil doc-directory"
     );
     assert!(
         eval.obarray()
@@ -10133,6 +10166,29 @@ fn ensure_startup_compat_variables_backfills_xfaces_bootstrap_state() {
     assert!(
         has_seeded_faces,
         "face--new-frame-defaults should be preseeded with GNU face entries"
+    );
+
+    // GNU init_callproc_1 sets PATH_DOC during real startup (callproc.c:
+    // 1952-1956). Test that path after dropping the partial-bootstrap context,
+    // rather than trying to void the constructor's protected forwarder.
+    drop(eval);
+    let eval = crate::test_utils::runtime_startup_context();
+    let expected_directory = lisp_directory_name_from_host_path(&project_root.join("etc"));
+    assert_eq!(
+        eval.obarray()
+            .symbol_value("doc-directory")
+            .and_then(|value| value.as_utf8_str()),
+        Some(expected_directory.as_str()),
+        "real startup must initialize doc-directory from PATH_DOC"
+    );
+    assert_eq!(
+        eval.obarray()
+            .symbol_value("doc-directory")
+            .and_then(|value| value.as_utf8_str()),
+        eval.obarray()
+            .symbol_value("data-directory")
+            .and_then(|value| value.as_utf8_str()),
+        "PATH_DOC and PATH_DATA both refer to this tree's etc directory"
     );
 }
 

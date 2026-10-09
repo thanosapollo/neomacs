@@ -2119,6 +2119,7 @@ pub(crate) fn builtin_set_buffer_multibyte(
         overlay: Value,
         start_old_emacs_byte: EmacsBytePos,
         end_old_emacs_byte: EmacsBytePos,
+        old_begin: CharPos0,
     }
 
     struct BufferSnapshot {
@@ -2150,6 +2151,9 @@ pub(crate) fn builtin_set_buffer_multibyte(
                         overlay,
                         start_old_emacs_byte: EmacsBytePos::new(start).min(total_end),
                         end_old_emacs_byte: EmacsBytePos::new(end).min(total_end),
+                        old_begin: buffer.emacs_byte_pos_to_char_pos_clamped(
+                            EmacsBytePos::new(start).min(total_end),
+                        ),
                     })
                 })
                 .collect();
@@ -2296,15 +2300,45 @@ pub(crate) fn builtin_set_buffer_multibyte(
             )
             .ok_or_else(|| signal("error", vec![Value::string("Missing shared buffer")]))?;
 
-        for overlay in snapshot.overlays {
-            let start_byte = map_boundary(overlay.start_old_emacs_byte.get());
-            let end_byte = map_boundary(overlay.end_old_emacs_byte.get());
+        // GNU buffer.c:1044 visits an ascending snapshot, then itree.c:750
+        // compares numeric begins while nodes change coordinate spaces. Build
+        // the complete remap before publication, rather than moving by bytes.
+        let remap_buffer = eval
+            .buffers
+            .get(snapshot.id)
+            .ok_or_else(|| signal("error", vec![Value::string("Missing shared buffer")]))?;
+        let remaps: Vec<_> = snapshot
+            .overlays
+            .into_iter()
+            .map(|overlay| {
+                let start_byte = map_boundary(overlay.start_old_emacs_byte.get());
+                let end_byte = map_boundary(overlay.end_old_emacs_byte.get());
+                crate::buffer::overlay::OverlayPositionRemap {
+                    overlay: overlay.overlay,
+                    old_range: EmacsByteRange::new(
+                        overlay.start_old_emacs_byte,
+                        overlay.end_old_emacs_byte,
+                    ),
+                    range: EmacsByteRange::new(
+                        EmacsBytePos::new(start_byte),
+                        EmacsBytePos::new(end_byte),
+                    ),
+                    old_begin: overlay.old_begin,
+                    // Replaced buffer text owns indexed byte/character lookup;
+                    // rescanning a Lisp string prefix per overlay is quadratic.
+                    new_begin: remap_buffer
+                        .emacs_byte_pos_to_char_pos_clamped(EmacsBytePos::new(start_byte)),
+                }
+            })
+            .collect();
+        eval.buffers
+            .get_mut(snapshot.id)
+            .ok_or_else(|| signal("error", vec![Value::string("Missing shared buffer")]))?
+            .overlays
+            .remap_overlay_positions(&remaps);
+        for _ in &remaps {
             eval.buffers
-                .move_buffer_overlay_to_emacs_byte_range(
-                    snapshot.id,
-                    overlay.overlay,
-                    EmacsByteRange::new(EmacsBytePos::new(start_byte), EmacsBytePos::new(end_byte)),
-                )
+                .note_overlay_modification(snapshot.id)
                 .ok_or_else(|| signal("error", vec![Value::string("Missing shared buffer")]))?;
         }
 
@@ -3169,16 +3203,15 @@ fn lisp_string_advance_byte_to_boundary(
         return clamped;
     }
 
+    // These are valid Emacs internal multibyte bytes, including C0/C1 raw
+    // bytes and five-byte characters. GNU buffer.c:1057-1064 advances only
+    // across the current character's continuation bytes, never a prefix scan.
     let bytes = string.as_bytes();
-    let mut pos = 0usize;
-    while pos < clamped && pos < bytes.len() {
-        let (_, len) = crate::emacs_core::emacs_char::string_char(&bytes[pos..]);
-        if pos + len >= clamped {
-            return pos + len;
-        }
-        pos += len;
+    let mut pos = clamped;
+    while pos < bytes.len() && !crate::emacs_core::emacs_char::char_head_p(bytes[pos]) {
+        pos += 1;
     }
-    clamped
+    pos
 }
 
 fn remap_text_property_table(
@@ -5498,13 +5531,7 @@ pub(crate) fn builtin_overlayp_pure(args: Vec<Value>) -> EvalResult {
 
 /// (overlays-at POS &optional SORTED)
 pub(crate) fn builtin_overlays_at(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
-    builtin_overlays_at_in_buffers(&eval.buffers, args)
-}
-
-pub(crate) fn builtin_overlays_at_in_buffers(
-    buffers: &BufferManager,
-    args: Vec<Value>,
-) -> EvalResult {
+    let buffers = &eval.buffers;
     expect_min_args("overlays-at", &args, 1)?;
     expect_max_args("overlays-at", &args, 2)?;
     let pos = expect_integer_or_marker_in_buffers(buffers, &args[0])?;
@@ -5523,14 +5550,24 @@ pub(crate) fn builtin_overlays_at_in_buffers(
         // whose `window` property is a window distinct from W are dropped.
         if let Some(target_window_id) = sorted.as_window_id() {
             let window_sym = Value::symbol("window");
-            ids.retain(|ov| match buf.overlays.overlay_get_named(*ov, window_sym) {
-                Some(prop) => prop
+            ids.retain(|ov| {
+                super::textprop::lookup_overlay_property(&eval.obarray, buffers, *ov, window_sym)
                     .as_window_id()
-                    .is_none_or(|wid| wid == target_window_id),
-                None => true,
+                    .is_none_or(|wid| wid == target_window_id)
             });
         }
-        buf.overlays.sort_overlay_ids_by_priority_desc(&mut ids);
+        // GNU buffer.c:3292 resolves priority with Foverlay_get, including
+        // the category symbol and char-property aliases.
+        let priority = Value::symbol("priority");
+        buf.overlays
+            .sort_overlay_ids_by_priority_desc_with(&mut ids, &|overlay| {
+                Some(super::textprop::lookup_overlay_property(
+                    &eval.obarray,
+                    buffers,
+                    overlay,
+                    priority,
+                ))
+            });
     }
     Ok(Value::list(ids))
 }
@@ -5595,7 +5632,8 @@ pub(crate) fn builtin_overlay_lists_in_buffers(
     let buf = buffers
         .get(buf_id)
         .ok_or_else(|| signal("error", vec![Value::string("Buffer does not exist")]))?;
-    let before = Value::list(buf.overlays.overlays_in_gnu_lists_order());
+    let full = EmacsByteRange::new(EmacsBytePos::new(0), buf.total_emacs_byte_end_pos());
+    let before = Value::list(buf.overlays.overlays_in_gnu_full_region(full));
     Ok(Value::cons(before, Value::NIL))
 }
 

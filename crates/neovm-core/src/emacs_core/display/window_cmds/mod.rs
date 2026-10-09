@@ -7096,7 +7096,7 @@ pub(crate) fn builtin_x_create_frame(
                     && explicit.minibuffer != Some(Value::symbol("only"))
                     && eval
                         .obarray()
-                        .symbol_value(mode)
+                        .symbol_value_id_copied(intern(mode))
                         .is_some_and(|value| value.is_truthy());
                 Value::fixnum(i64::from(enabled))
             });

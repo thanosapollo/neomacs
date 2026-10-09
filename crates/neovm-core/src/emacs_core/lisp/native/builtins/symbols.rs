@@ -240,8 +240,6 @@ pub(crate) fn would_create_variable_alias_cycle_in_obarray(
     new_symbol: SymId,
     old_symbol: SymId,
 ) -> bool {
-    use crate::emacs_core::symbol::SymbolRedirect;
-
     // Phase 3: walk via the new redirect tag instead of the legacy
     // SymbolValue enum. Mirrors GNU `Fdefvaralias`'s base-chain walk
     // (`src/eval.c:631-726`).
@@ -250,11 +248,12 @@ pub(crate) fn would_create_variable_alias_cycle_in_obarray(
         if current == new_symbol {
             return true;
         }
-        match obarray.get_by_id(current) {
-            Some(sym) if sym.flags.redirect() == SymbolRedirect::Varalias => {
-                current = unsafe { sym.val.alias };
-            }
-            _ => return false,
+        match obarray
+            .get_by_id(current)
+            .and_then(|sym| sym.alias_target())
+        {
+            Some(target) => current = target,
+            None => return false,
         }
     }
 }
@@ -507,8 +506,12 @@ pub(crate) fn install_defvaralias_state(
     state_change: &DefvaraliasStateChange,
 ) {
     ctx.obarray.make_special_id(state_change.alias_id);
-    ctx.obarray
+    // `defvaralias` refused forwarded and buffer-local NEW-ALIAS cells
+    // before this state change was built.
+    let installed = ctx
+        .obarray
         .make_alias(state_change.alias_id, state_change.base_id);
+    debug_assert!(installed.is_ok(), "defvaralias checked the redirect");
     ctx.obarray.make_special_id(state_change.base_id);
     ctx.mark_user_test_gc_settings_volatile_if_gc_symbol(state_change.alias_id);
     ctx.refresh_gc_runtime_settings_after_change_by_id(state_change.alias_id);
@@ -809,14 +812,30 @@ pub(crate) fn would_create_function_alias_cycle_in_obarray(
 pub(crate) fn builtin_makunbound(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     expect_args("makunbound", &args, 1)?;
     let symbol = SymId::from_value(eval, args[0])?;
+    // GNU `Fmakunbound` (`src/data.c:776-789`). An alias inherits its
+    // target's `trapped_write` (`Fdefvaralias`), so an alias of a constant
+    // is a constant too.
     let resolved = resolve_variable_alias_id(eval, symbol)?;
     if eval.obarray().is_constant_id(resolved) {
         return Err(signal(LispCondition::SettingConstant, vec![args[0]]));
     }
-    crate::emacs_core::eval::check_forwarded_unbind(eval.obarray(), resolved, args[0])?;
     eval.note_macro_expansion_mutation();
+    if eval.obarray().is_alias_id(symbol) {
+        // `redirect = SYMBOL_PLAINVAL; SET_SYMBOL_VAL (sym, Qunbound)`: the
+        // alias becomes a void plain cell, its target keeps its value, and no
+        // watcher hears of it.
+        eval.obarray_mut().delete_variable_alias_id(symbol);
+        eval.makunbound_runtime_binding_by_id(symbol);
+        return Ok(args[0]);
+    }
+    // `Fset (symbol, Qunbound)`: the watchers first, then `set_internal`'s
+    // store on the arm they left, which refuses to void a built-in.
     eval.run_variable_watchers_by_id(resolved, &Value::NIL, &Value::NIL, "makunbound")?;
-    eval.makunbound_runtime_binding_by_id(resolved);
+    eval.set_internal_after_watchers(
+        symbol,
+        Value::UNBOUND,
+        crate::emacs_core::symbol::SetInternalBind::Set,
+    )?;
     Ok(args[0])
 }
 
@@ -3869,10 +3888,10 @@ pub(crate) fn builtin_variable_binding_locus(
     let symbol = SymId::from_value(ctx, args[0])?;
     let resolved = resolve_variable_alias_id_in_obarray(&ctx.obarray, symbol)?;
 
-    use crate::emacs_core::symbol::SymbolRedirect;
+    use crate::emacs_core::symbol::ValueCell;
     if let Some(sym) = ctx.obarray.get_by_id(resolved) {
-        match sym.redirect() {
-            SymbolRedirect::Localized => {
+        match sym.value_cell() {
+            ValueCell::Localized(_) => {
                 if let Some(buf) = ctx.buffers.current_buffer() {
                     let target_buf = Value::make_buffer(buf.id);
                     if buf.has_buffer_local_by_sym_id(resolved) {
@@ -3886,7 +3905,7 @@ pub(crate) fn builtin_variable_binding_locus(
                     return Ok(blv.where_buf);
                 }
             }
-            SymbolRedirect::Forwarded => {
+            ValueCell::Forwarded(fwd) => {
                 // GNU answers the TERMINAL, not a buffer, for a keyboard
                 // variable: `Fmake_local_variable`'s SYMBOL_FORWARDED arm
                 // returns `Fframe_terminal (selected_frame)`
@@ -3894,8 +3913,7 @@ pub(crate) fn builtin_variable_binding_locus(
                 // buffer, so it is checked before the per-buffer question.
                 {
                     use crate::emacs_core::forward::LispFwdType;
-                    let fwd = unsafe { &*sym.val.fwd };
-                    if matches!(fwd.ty, LispFwdType::KboardObj) {
+                    if matches!(fwd.ty(), LispFwdType::KboardObj) {
                         return crate::emacs_core::terminal::pure::builtin_frame_terminal(
                             ctx,
                             vec![],
@@ -3904,10 +3922,7 @@ pub(crate) fn builtin_variable_binding_locus(
                 }
                 if let Some(buf) = ctx.buffers.current_buffer() {
                     let is_local = {
-                        use crate::emacs_core::forward::{LispBufferObjFwd, LispFwdType};
-                        let fwd = unsafe { &*sym.val.fwd };
-                        if matches!(fwd.ty, LispFwdType::BufferObj) {
-                            let buf_fwd = unsafe { &*(fwd as *const _ as *const LispBufferObjFwd) };
+                        if let Some(buf_fwd) = fwd.as_buffer_obj_fwd() {
                             let Some(slot) =
                                 crate::buffer::buffer::BufferSlot::from_u16(buf_fwd.offset)
                             else {
@@ -3924,7 +3939,7 @@ pub(crate) fn builtin_variable_binding_locus(
                     }
                 }
             }
-            SymbolRedirect::Plainval | SymbolRedirect::Varalias => {}
+            ValueCell::Plain(_) | ValueCell::Alias(_) => {}
         }
     }
 
@@ -4371,11 +4386,9 @@ pub(crate) fn builtin_local_variable_if_set_p(
             // symbols because setting them auto-localizes the per-buffer slot
             // (`data.c:2458-2460`). Other forwarder kinds are not
             // buffer-local variables.
-            let is_buffer_objfwd = {
-                use crate::emacs_core::forward::LispFwdType;
-                let fwd = unsafe { &*sym.val.fwd };
-                matches!(fwd.ty, LispFwdType::BufferObj)
-            };
+            let is_buffer_objfwd = sym
+                .forwarded_descriptor()
+                .is_some_and(|fwd| fwd.ty() == crate::emacs_core::forward::LispFwdType::BufferObj);
             Ok(Value::bool_val(is_buffer_objfwd))
         }
         _ => Ok(Value::NIL),

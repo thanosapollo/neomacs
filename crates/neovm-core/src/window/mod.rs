@@ -1040,6 +1040,16 @@ pub struct WindowLayoutQuery {
 pub enum WindowLayoutQueryScope {
     #[default]
     Viewport,
+    /// Inert pixel measurement of a source buffer, including an offscreen one.
+    /// Width is absolute logical pixels; None means unbounded. The source
+    /// projection never changes the live window or publishes a presentation.
+    TextExtent {
+        buffer: BufferId,
+        start: LispCharPos1,
+        end: LispCharPos1,
+        width: Option<usize>,
+        height: Option<std::num::NonZeroUsize>,
+    },
     /// A prefix of the live viewport through the complete target row. If the
     /// target is not reached, walk the viewport. Placement and clipping retain
     /// the live start and vscroll; the returned end describes this prefix or
@@ -2699,40 +2709,149 @@ pub use neomacs_display_protocol::PresentedWindowChromeArea;
 /// Evaluator-owned half of GNU's `(glyph->object, glyph->charpos)` pair.
 ///
 /// The renderer-safe presentation carries the string identity and character
-/// index.  This rooted value remains in the window snapshot so input can join
-/// the two halves without re-evaluating a mode/tab/header-line format.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// index. The string object stays in the window snapshot so input can join the
+/// two halves without re-evaluating a mode/tab/header-line format. Snapshots
+/// are shared with render and input threads and retained by the layout engine
+/// across frames, so the object travels as a [`SharedRoot`]: its own lease
+/// keeps it alive in every copy, and only the evaluator materializes it.
+///
+/// [`SharedRoot`]: crate::tagged::transport::SharedRoot
+#[derive(Clone, Debug)]
 pub struct PresentedWindowChromeString {
     area: PresentedWindowChromeArea,
     string_id: neomacs_display_protocol::glyph_matrix::GlyphStringId,
-    value: Value,
+    object: crate::tagged::transport::SharedRoot,
 }
 
+static_assertions::assert_impl_all!(PresentedWindowChromeString: Send, Sync, Clone, std::fmt::Debug);
+
 impl PresentedWindowChromeString {
-    pub const fn new(
+    pub fn new(
         area: PresentedWindowChromeArea,
         string_id: neomacs_display_protocol::glyph_matrix::GlyphStringId,
-        value: Value,
+        object: crate::tagged::transport::SharedRoot,
     ) -> Self {
         Self {
             area,
             string_id,
-            value,
+            object,
         }
     }
 
-    pub const fn area(self) -> PresentedWindowChromeArea {
+    pub const fn area(&self) -> PresentedWindowChromeArea {
         self.area
     }
 
-    pub const fn string_id(self) -> neomacs_display_protocol::glyph_matrix::GlyphStringId {
+    pub const fn string_id(&self) -> neomacs_display_protocol::glyph_matrix::GlyphStringId {
         self.string_id
     }
 
-    pub const fn value(self) -> Value {
-        self.value
+    /// The rooted string object; the evaluator materializes it.
+    pub fn object(&self) -> &crate::tagged::transport::SharedRoot {
+        &self.object
+    }
+
+    /// Share one private vector lease across all areas of a window snapshot.
+    /// Existing handles keep every child alive during allocation, and are
+    /// replaced only after successful admission. An already shared lease is
+    /// reused, including whole-window chrome reused from a previous frame.
+    ///
+    /// # Errors
+    /// A missing installed heap, or a source belonging to another evaluator.
+    pub fn coalesce_roots(
+        sources: &mut [Self],
+        evaluator: &crate::emacs_core::Context,
+    ) -> Result<(), crate::tagged::transport::SharedRootError> {
+        for source in sources.iter() {
+            let _local = evaluator.materialize(&source.object)?;
+        }
+        let roots: Vec<_> = sources.iter().map(|source| &source.object).collect();
+        let replacement =
+            crate::tagged::transport::SharedRoot::coalesce_on_current_mutator(&roots)?;
+        if let Some(replacement) = replacement {
+            for (source, root) in sources.iter_mut().zip(replacement) {
+                source.object = root;
+            }
+        }
+        Ok(())
     }
 }
+
+/// Snapshot equality keeps GNU `equal` on the string objects, as when the
+/// field held the raw value: an evaluator comparing two snapshots treats a
+/// re-formatted, equal mode line as unchanged. Off the evaluator only object
+/// identity is observable.
+impl PartialEq for PresentedWindowChromeString {
+    fn eq(&self, other: &Self) -> bool {
+        self.area == other.area
+            && self.string_id == other.string_id
+            && (self.object.is_same_object(&other.object)
+                || self
+                    .object
+                    .value_on_current_mutator()
+                    .zip(other.object.value_on_current_mutator())
+                    .is_some_and(|(left, right)| left == right))
+    }
+}
+
+impl Eq for PresentedWindowChromeString {}
+
+/// Immutable rooted chrome sources shared across redisplay snapshots.
+///
+/// Cloning shares one allocation and its existing heap-identified root leases.
+/// The empty collection has no allocation, and no mutable slice is exposed.
+/// Formatting builds an owned vector; publication freezes it after root
+/// coalescing, while unchanged windows retain this collection directly.
+#[repr(transparent)]
+#[derive(Clone, Debug, Default)]
+pub struct PresentedWindowChromeStrings(Option<Arc<[PresentedWindowChromeString]>>);
+
+static_assertions::assert_impl_all!(PresentedWindowChromeStrings: Send, Sync, Clone, std::fmt::Debug, Eq);
+static_assertions::assert_not_impl_any!(PresentedWindowChromeStrings: Copy);
+
+impl PresentedWindowChromeStrings {
+    /// Borrow the immutable sources without copying their rooted handles.
+    #[inline]
+    pub fn as_slice(&self) -> &[PresentedWindowChromeString] {
+        self.0.as_deref().unwrap_or(&[])
+    }
+}
+
+impl From<Vec<PresentedWindowChromeString>> for PresentedWindowChromeStrings {
+    fn from(sources: Vec<PresentedWindowChromeString>) -> Self {
+        if sources.is_empty() {
+            Self::default()
+        } else {
+            Self(Some(sources.into()))
+        }
+    }
+}
+
+impl AsRef<[PresentedWindowChromeString]> for PresentedWindowChromeStrings {
+    fn as_ref(&self) -> &[PresentedWindowChromeString] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::Deref for PresentedWindowChromeStrings {
+    type Target = [PresentedWindowChromeString];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl PartialEq for PresentedWindowChromeStrings {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right) || left == right,
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+}
+
+impl Eq for PresentedWindowChromeStrings {}
 
 /// Last authoritative redisplay geometry for a live leaf window.
 #[derive(Clone, Debug)]
@@ -2757,7 +2876,7 @@ pub struct WindowDisplaySnapshot {
     /// Last redisplay tab-line height in pixels.
     pub tab_line_height: i64,
     /// Rooted displayed string objects used by window-chrome glyph rows.
-    pub chrome_strings: Vec<PresentedWindowChromeString>,
+    pub chrome_strings: PresentedWindowChromeStrings,
     /// Intended cursor position in the redisplay result, even when no physical
     /// cursor was emitted.
     pub logical_cursor: Option<WindowCursorPos>,
@@ -2801,6 +2920,9 @@ pub struct WindowDisplaySnapshot {
     /// Exact end record produced by the same row walk as this snapshot.
     pub window_end_record: Option<WindowEndRecord>,
 }
+
+static_assertions::assert_impl_all!(WindowDisplaySnapshot: Send, Sync, Clone, std::fmt::Debug);
+static_assertions::assert_not_impl_any!(WindowDisplaySnapshot: Copy);
 
 /// Which window bodies an explicit `force-window-update` invalidated.
 ///
@@ -3539,7 +3661,7 @@ impl Default for WindowDisplaySnapshot {
             mode_line_height: 0,
             header_line_height: 0,
             tab_line_height: 0,
-            chrome_strings: Vec::new(),
+            chrome_strings: PresentedWindowChromeStrings::default(),
             logical_cursor: None,
             phys_cursor: None,
             points: Vec::new(),
@@ -8779,21 +8901,8 @@ impl GcTrace for FrameManager {
                 roots.push(*v);
             }
             roots.push(frame.face_hash_table);
-            for snapshot in frame.redisplay_cache.values() {
-                roots.extend(snapshot.chrome_strings.iter().map(|source| source.value()));
-            }
-            for prepared in frame.presentation_state.prepared.values() {
-                for publication in &prepared.publications {
-                    let snapshot = publication.display_snapshot();
-                    roots.extend(snapshot.chrome_strings.iter().map(|source| source.value()));
-                }
-            }
-            if let Some(active) = &frame.presentation_state.active {
-                for publication in &active.publications {
-                    let snapshot = publication.display_snapshot();
-                    roots.extend(snapshot.chrome_strings.iter().map(|source| source.value()));
-                }
-            }
+            // Chrome string objects in published snapshots are rooted by
+            // their own `SharedRoot` leases.
             frame.tree().trace_roots(roots);
             if let Some(mb) = &frame.minibuffer_leaf {
                 mb.trace_roots(roots);

@@ -8,10 +8,14 @@
 
 mod support;
 
+mod coding_detection;
+mod coding_save;
+mod dual_width_fixed_pitch;
 #[path = "fontset_family_only_test.rs"]
 mod fontset_family_only;
 mod frame_bar_parameters;
 mod idle_timer_output;
+mod pixel_measurement;
 mod process_plist_isolation;
 mod process_send_encoding;
 

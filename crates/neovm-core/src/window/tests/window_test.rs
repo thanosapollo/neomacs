@@ -1774,11 +1774,23 @@ fn frame_manager_gc_traces_name_icon_name_and_title_values() {
 }
 
 #[test]
-fn frame_manager_gc_traces_prepared_and_active_chrome_strings() {
+fn prepared_and_active_chrome_strings_are_rooted_by_their_shared_roots() {
+    let mut heap = crate::tagged::gc::TaggedHeap::new();
+    let displayed = heap.alloc_string(crate::heap_types::LispString::from_utf8(
+        "displayed tab line",
+    ));
+    let collect = |heap: &mut crate::tagged::gc::TaggedHeap| {
+        let mut roots = Vec::new();
+        crate::tagged::transport::collect_shared_root_gc_roots(heap.heap_identity(), &mut roots);
+        heap.collect_exact(roots.into_iter());
+    };
+    // SAFETY: `displayed` was just allocated by this heap. All collections
+    // below seed the shared-root table, and the heap outlives materialization
+    // and use of its prepared and active snapshots.
+    let displayed_root = unsafe { crate::tagged::transport::SharedRoot::new(&heap, displayed) };
     let mut mgr = FrameManager::new();
     let frame_id = mgr.create_frame("chrome-roots", 800, 600, BufferId(1));
     let window_id = mgr.get(frame_id).unwrap().selected_window;
-    let displayed = Value::string("displayed tab line");
     mgr.get_mut(frame_id)
         .unwrap()
         .prepare_live_window_presentation(
@@ -1789,24 +1801,85 @@ fn frame_manager_gc_traces_prepared_and_active_chrome_strings() {
                 chrome_strings: vec![PresentedWindowChromeString::new(
                     PresentedWindowChromeArea::TabLine,
                     neomacs_display_protocol::GlyphStringId::new(1),
-                    displayed,
-                )],
+                    displayed_root,
+                )]
+                .into(),
                 ..Default::default()
             }],
         )
         .unwrap();
 
+    // The frame manager no longer traces chrome strings itself: each copy of
+    // a snapshot, including render-thread copies, roots its own object.
     let mut roots = Vec::new();
     mgr.trace_roots(&mut roots);
-    assert!(roots.contains(&displayed));
+    assert!(!roots.iter().any(|root| root.bits() == displayed.bits()));
+    collect(&mut heap);
+    assert!(heap.owns_heap_value_for_test(displayed));
 
     mgr.get_mut(frame_id)
         .unwrap()
         .activate_display_presentation(geometry::PresentationId::new(9))
         .unwrap();
-    roots.clear();
-    mgr.trace_roots(&mut roots);
-    assert!(roots.contains(&displayed));
+    collect(&mut heap);
+    assert!(heap.owns_heap_value_for_test(displayed));
+
+    drop(mgr);
+    collect(&mut heap);
+    assert!(!heap.owns_heap_value_for_test(displayed));
+}
+
+#[test]
+fn frozen_chrome_clone_keeps_shared_root_alive_until_last_collection_drop() {
+    let mut heap = crate::tagged::gc::TaggedHeap::new();
+    let displayed = heap.alloc_string(crate::heap_types::LispString::from_utf8(
+        "shared immutable chrome",
+    ));
+    // SAFETY: this freshly allocated string belongs to `heap`. Every
+    // collection below seeds its shared-root table, and the heap outlives
+    // both immutable collection holders and their final root retirement.
+    let root = unsafe { crate::tagged::transport::SharedRoot::new(&heap, displayed) };
+    let sources: PresentedWindowChromeStrings = vec![PresentedWindowChromeString::new(
+        PresentedWindowChromeArea::ModeLine,
+        neomacs_display_protocol::GlyphStringId::new(1),
+        root,
+    )]
+    .into();
+    let retained = sources.clone();
+    assert_eq!(sources.as_slice().as_ptr(), retained.as_slice().as_ptr());
+    drop(sources);
+
+    let collect = |heap: &mut crate::tagged::gc::TaggedHeap| {
+        let mut roots = Vec::new();
+        crate::tagged::transport::collect_shared_root_gc_roots(heap.heap_identity(), &mut roots);
+        heap.collect_exact(roots.into_iter());
+    };
+    collect(&mut heap);
+    assert!(heap.owns_heap_value_for_test(displayed));
+    // A reader transfers only the immutable rooted collection, never a raw
+    // Value or a Context, and returns the same last collection holder.
+    let retained = std::thread::spawn(move || {
+        assert_eq!(retained.len(), 1);
+        retained
+    })
+    .join()
+    .unwrap();
+    collect(&mut heap);
+    assert!(heap.owns_heap_value_for_test(displayed));
+
+    drop(retained);
+    collect(&mut heap);
+    assert!(!heap.owns_heap_value_for_test(displayed));
+}
+
+#[test]
+fn frozen_chrome_empty_collection_has_no_shared_allocation() {
+    let default = PresentedWindowChromeStrings::default();
+    let from_empty: PresentedWindowChromeStrings = Vec::new().into();
+    assert!(default.0.is_none());
+    assert!(from_empty.0.is_none());
+    assert_eq!(default, from_empty);
+    assert!(from_empty.as_slice().is_empty());
 }
 
 #[test]

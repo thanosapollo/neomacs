@@ -117,7 +117,7 @@ fn file_restore_preserves_configuration_hook_default_and_local_lists() {
             .obarray()
             .blv(symbol)
             .and_then(|value| value.fwd)
-            .map(|value| value.ty),
+            .map(|value| value.ty()),
         Some(LispFwdType::Obj),
         "existing activation must attach the normal GNU localized forwarder"
     );
@@ -150,7 +150,9 @@ fn file_restore_preserves_an_explicit_unbound_configuration_hook_cell() {
         // can be explicitly made unbound and has no separate provenance bit.
         eval.obarray_mut().get_or_intern(HOOK);
         assert_eq!(
-            eval.obarray().get_by_id(symbol).map(|value| value.plain()),
+            eval.obarray()
+                .get_by_id(symbol)
+                .and_then(|value| value.plain_value()),
             Some(Value::UNBOUND)
         );
         assert!(!eval.obarray().is_special_id(symbol));

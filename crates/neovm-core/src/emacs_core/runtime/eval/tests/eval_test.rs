@@ -1,6 +1,10 @@
 use super::*;
 
 #[cfg(test)]
+#[path = "input_wait.rs"]
+mod input_wait;
+
+#[cfg(test)]
 #[path = "gc_generational_test.rs"]
 mod gc_generational;
 
@@ -4453,7 +4457,7 @@ fn read_char_mouse_press_uses_clicked_window_geometry() {
             mode_line_height: 0,
             header_line_height: 0,
             tab_line_height: 0,
-            chrome_strings: Vec::new(),
+            chrome_strings: Default::default(),
             logical_cursor: None,
             phys_cursor: None,
             buffer_modiff: None,
@@ -4581,7 +4585,7 @@ fn read_key_sequence_uses_clicked_window_local_map_for_mouse_event() {
             mode_line_height: 0,
             header_line_height: 0,
             tab_line_height: 0,
-            chrome_strings: Vec::new(),
+            chrome_strings: Default::default(),
             logical_cursor: None,
             phys_cursor: None,
             buffer_modiff: None,
@@ -4694,7 +4698,7 @@ fn read_key_sequence_drops_unbound_down_mouse_before_bound_click() {
             mode_line_height: 0,
             header_line_height: 0,
             tab_line_height: 0,
-            chrome_strings: Vec::new(),
+            chrome_strings: Default::default(),
             logical_cursor: None,
             phys_cursor: None,
             buffer_modiff: None,
@@ -5278,7 +5282,7 @@ fn read_key_sequence_uses_clicked_window_buffer_local_minor_mode_maps() {
             mode_line_height: 0,
             header_line_height: 0,
             tab_line_height: 0,
-            chrome_strings: Vec::new(),
+            chrome_strings: Default::default(),
             logical_cursor: None,
             phys_cursor: None,
             buffer_modiff: None,
@@ -5388,7 +5392,7 @@ fn read_key_sequence_prefixes_mode_line_mouse_click_for_lookup() {
             mode_line_height: 18,
             header_line_height: 0,
             tab_line_height: 0,
-            chrome_strings: Vec::new(),
+            chrome_strings: Default::default(),
             logical_cursor: None,
             phys_cursor: None,
             buffer_modiff: None,
@@ -5764,13 +5768,12 @@ fn read_char_fires_bootstrapped_gnu_run_with_timer_while_waiting_for_input() {
     )
     .expect("schedule GNU Lisp timer");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = input_wait::InputPublisher::install(&mut ev);
     // Keep one sender alive: dropping the last tx disconnects the channel,
     // which the input machinery treats as terminal-gone -> quit (timing flake;
     // see the sit-for soak fix).
     let _tx_keepalive = tx.clone();
-    thread::spawn(move || {
+    let sender = thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100));
         tx.send(crate::keyboard::InputEvent::key_press(
             crate::keyboard::KeyEvent::char('a'),
@@ -5781,6 +5784,7 @@ fn read_char_fires_bootstrapped_gnu_run_with_timer_while_waiting_for_input() {
     let event = ev
         .read_char()
         .expect("read_char should return queued keypress");
+    sender.join().expect("input publisher thread");
     assert_eq!(event, Value::fixnum('a' as i64));
     assert_eq!(
         ev.eval_symbol("vm-timer-fired")
@@ -5792,11 +5796,8 @@ fn read_char_fires_bootstrapped_gnu_run_with_timer_while_waiting_for_input() {
 #[test]
 fn read_char_fires_bootstrapped_gnu_run_with_idle_timer_while_waiting_for_input() {
     crate::test_utils::init_test_tracing();
-    eprintln!("idle test: bootstrap");
     let mut ev = runtime_startup_context();
 
-    eprintln!("idle test: parse forms");
-    eprintln!("idle test: eval schedule");
     ev.eval_str(
         r#"(progn
            (setq vm-idle-fired nil)
@@ -5809,14 +5810,12 @@ fn read_char_fires_bootstrapped_gnu_run_with_idle_timer_while_waiting_for_input(
     )
     .expect("schedule GNU Lisp idle timer");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = input_wait::InputPublisher::install(&mut ev);
     // Keep one sender alive: dropping the last tx disconnects the channel,
     // which the input machinery treats as terminal-gone -> quit (timing flake;
     // see the sit-for soak fix).
     let _tx_keepalive = tx.clone();
-    eprintln!("idle test: spawn sender");
-    thread::spawn(move || {
+    let sender = thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100));
         tx.send(crate::keyboard::InputEvent::key_press(
             crate::keyboard::KeyEvent::char('a'),
@@ -5824,11 +5823,10 @@ fn read_char_fires_bootstrapped_gnu_run_with_idle_timer_while_waiting_for_input(
         .expect("send keypress");
     });
 
-    eprintln!("idle test: read_char");
     let event = ev
         .read_char()
         .expect("read_char should return queued keypress");
-    eprintln!("idle test: read_char returned {:?}", event);
+    sender.join().expect("input publisher thread");
     assert_eq!(event, Value::fixnum('a' as i64));
     assert_eq!(
         ev.eval_symbol("vm-idle-fired")
@@ -5875,10 +5873,9 @@ fn repeating_idle_timer_rearms_after_user_input_starts_new_idle_epoch() {
     )
     .expect("schedule repeating GNU Lisp idle timer");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = input_wait::InputPublisher::install(&mut ev);
     let _tx_keepalive = tx.clone();
-    thread::spawn(move || {
+    let sender = thread::spawn(move || {
         thread::sleep(Duration::from_millis(80));
         tx.send(crate::keyboard::InputEvent::key_press(
             crate::keyboard::KeyEvent::char('a'),
@@ -5899,6 +5896,7 @@ fn repeating_idle_timer_rearms_after_user_input_starts_new_idle_epoch() {
         ev.read_char().expect("read second keypress"),
         Value::fixnum('b' as i64)
     );
+    sender.join().expect("input publisher thread");
     assert_eq!(
         ev.eval_symbol("vm-repeating-idle-count")
             .expect("idle timer count should be bound"),
@@ -5959,10 +5957,9 @@ fn read_key_sequence_clears_stale_this_command_keys_at_entry_for_idle_probe() {
     .expect("arm idle snapshot timer");
 
     // Deliver the real key only after a delay so the idle timer fires first.
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = input_wait::InputPublisher::install(&mut ev);
     let _tx_keepalive = tx.clone();
-    thread::spawn(move || {
+    let sender = thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(120));
         tx.send(crate::keyboard::InputEvent::key_press(
             crate::keyboard::KeyEvent::char('a'),
@@ -5979,6 +5976,7 @@ fn read_key_sequence_clears_stale_this_command_keys_at_entry_for_idle_probe() {
         ))
         .expect("nested read should return the freshly delivered key");
 
+    sender.join().expect("input publisher thread");
     assert_eq!(
         keys,
         vec![Value::fixnum('a' as i64)],
@@ -26071,14 +26069,14 @@ fn context_cached_symbols_are_marked_runtime_projected() {
             .get_by_id(intern(name))
             .unwrap_or_else(|| panic!("{name} should have a slot"));
         assert!(
-            sym.flags.runtime_projected(),
+            sym.flags().runtime_projected(),
             "{name} is mirrored by the Context and must refuse the bind/unbind fast tier"
         );
     }
     assert!(
         ev.obarray
             .get_by_id(intern("most-positive-fixnum"))
-            .is_some_and(|s| !s.flags.runtime_projected()),
+            .is_some_and(|s| !s.flags().runtime_projected()),
         "an ordinary variable must stay on the fast tier"
     );
 }

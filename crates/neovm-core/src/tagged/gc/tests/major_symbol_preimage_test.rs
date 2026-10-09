@@ -114,7 +114,12 @@ impl Drop for MarkPhase {
 }
 
 fn satb(heap: &TaggedHeap) -> Vec<TaggedValue> {
-    heap.satb_shared.lock().unwrap().clone()
+    heap.satb_shared
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|word| word.value())
+        .collect()
 }
 
 fn special_immediates() -> [TaggedValue; 4] {
@@ -339,7 +344,8 @@ fn major_symbol_raw_interval_choke_points_retain_plists_once_and_ignore_nil_gaps
         assert!(heap.current_mutator_gc().major_symbol_preimages.is_empty());
         phase.stop_synthetic(&mut heap);
         let retained = std::mem::take(&mut *heap.satb_shared.lock().unwrap());
-        heap.gray_queue.extend(retained);
+        heap.gray_queue
+            .extend(retained.into_iter().map(MarkWord::value));
         heap.incremental_drain_all();
         assert!(heap.marked_symbols.contains(id(key)));
         assert!(heap.current_mutator_gc().major_symbol_preimages.is_empty());
@@ -350,6 +356,9 @@ fn major_symbol_raw_interval_choke_points_retain_plists_once_and_ignore_nil_gaps
 fn major_symbol_join_merges_worker_and_mutator_results_after_publication_stops() {
     for enabled in [false, true] {
         let mut heap = heap(enabled);
+        // U3.5 full cycles preserve worker-discovered Symbols independently
+        // of the still-major-only mutator preimage producers below.
+        let worker_preserves_symbols = enabled || heap.concurrent_claims();
         set_tagged_heap(&mut heap);
         let roots = ScratchRoots::new();
         let worker = symbol("major-preimage-worker-snapshot");
@@ -363,7 +372,12 @@ fn major_symbol_join_merges_worker_and_mutator_results_after_publication_stops()
             roots.keep(heap.alloc_symbol_with_pos(positioned_key, TaggedValue::fixnum(4)));
         let mut obarray = Obarray::new();
         obarray.set_symbol_value("major-preimage-worker-owner", worker);
-        heap.set_pending_obarray_scan(obarray.scan_snapshot());
+        let snapshot = {
+            // SAFETY: capture occurs on this test's sole heap/obarray writer.
+            let world = unsafe { scan_contract::SingleMutatorWorld::from_heap(&mut heap) };
+            obarray.scan_snapshot(&world)
+        };
+        heap.set_pending_obarray_scan(snapshot);
         let _phase = MarkPhase::worker(&mut heap, &[], false);
         note_root_overwrite(root);
         assert!(crate::tagged::mutate::set_cons_car(
@@ -390,7 +404,7 @@ fn major_symbol_join_merges_worker_and_mutator_results_after_publication_stops()
         );
         assert_eq!(
             heap.marked_symbols.contains(id(worker)),
-            enabled,
+            worker_preserves_symbols,
             "start scans finish even if join requests an immediate stop"
         );
         assert_eq!(heap.marked_symbols.contains(id(root)), enabled);

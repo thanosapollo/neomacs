@@ -5,10 +5,9 @@
 //! keyed by the function's stable [`super::Runtime::compiled_id`]:
 //!
 //! - A [`CompiledLeaf`] owns executable memory and a raw code pointer, so it is
-//!   `!Send + !Sync`. Keeping it thread-local means it is never shared across
-//!   threads — sound by construction, and a fine fit for elisp's overwhelmingly
-//!   single-threaded execution. (Each thread that runs a function hot enough
-//!   compiles its own copy; in practice that is just the main thread.)
+//!   `!Send + !Sync`. Each mutator owns its compiled cache and activation state.
+//!   The legacy shared source leaf slot also carries an address into this cache;
+//!   it still requires an owner-local replacement before parallel activation.
 //! - The id is monotonic and never reused, so a function that is GC'd (freeing
 //!   the memory its compiled code baked constant pointers into) can never have
 //!   its stale cache entry looked up again — even after the non-moving GC reuses
@@ -390,6 +389,8 @@ pub(crate) fn leaf_report_rows() -> (Vec<LeafRow>, LeafTotals) {
 /// compiled entry leaves a cache (retire or clear), so a slot armed earlier
 /// reads as empty and re-resolves through the cache. Starts at 1 so a fresh
 /// slot (epoch 0) never matches.
+/// This invalidation counter is not a cache-owner or lifetime capability. A
+/// leaf slot can be dereferenced only by the mutator owning the live TLS entry.
 static LEAF_SLOT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[inline]
@@ -525,22 +526,26 @@ pub(crate) fn native_depth() -> u32 {
 
 /// RAII marker for one native leaf execution (see `NATIVE_DEPTH`). Zero-sized
 /// and a no-op in release builds; unwind-safe (the decrement is in `Drop`).
-pub(crate) struct NativeDepthGuard(());
+#[must_use = "the thread-local extent ends when this guard drops"]
+#[derive(Debug)]
+pub(crate) struct NativeDepthGuard {
+    #[cfg(debug_assertions)]
+    _scope: crate::tls_scope::TlsScope<u32, std::cell::Cell<u32>>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+static_assertions::assert_not_impl_any!(NativeDepthGuard: Send, Sync);
 
 impl NativeDepthGuard {
     #[inline]
     pub(crate) fn enter() -> Self {
-        #[cfg(debug_assertions)]
-        NATIVE_DEPTH.with(|d| d.set(d.get() + 1));
-        Self(())
-    }
-}
-
-impl Drop for NativeDepthGuard {
-    #[inline]
-    fn drop(&mut self) {
-        #[cfg(debug_assertions)]
-        NATIVE_DEPTH.with(|d| d.set(d.get() - 1));
+        Self {
+            #[cfg(debug_assertions)]
+            _scope: crate::tls_scope::TlsScope::restore(
+                &NATIVE_DEPTH,
+                NATIVE_DEPTH.with(|depth| depth.replace(depth.get().saturating_add(1))),
+            ),
+            _thread: std::marker::PhantomData,
+        }
     }
 }
 

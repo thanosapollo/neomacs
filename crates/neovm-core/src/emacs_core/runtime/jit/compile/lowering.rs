@@ -3077,17 +3077,19 @@ pub(crate) fn active_regalloc_choice() -> RegallocChoice {
 
 /// RAII scope: every ISA built inside it uses `choice`; the previous choice
 /// is restored on drop (a nested compile restores its parent's).
-pub(crate) struct RegallocScope(RegallocChoice);
+#[must_use = "the thread-local extent ends when this guard drops"]
+#[derive(Debug)]
+pub(crate) struct RegallocScope {
+    _scope: crate::tls_scope::TlsScope<RegallocChoice, std::cell::Cell<RegallocChoice>>,
+}
+
+static_assertions::assert_not_impl_any!(RegallocScope: Send, Sync);
 
 impl RegallocScope {
     pub(crate) fn enter(choice: RegallocChoice) -> Self {
-        Self(ACTIVE_REGALLOC.with(|c| c.replace(choice)))
-    }
-}
-
-impl Drop for RegallocScope {
-    fn drop(&mut self) {
-        ACTIVE_REGALLOC.with(|c| c.set(self.0));
+        Self {
+            _scope: crate::tls_scope::TlsScope::new(&ACTIVE_REGALLOC, choice),
+        }
     }
 }
 
@@ -4877,8 +4879,9 @@ fn lower_bcall_leaf_site(
 /// [`STATUS_DEOPT_AT`]: the failing op's bytecode index, the live operand
 /// stack depth (the values themselves go to the spill buffer), and the number
 /// of condition frames this frame had registered at that point. `Cell` makes
-/// the native interior writes legal; the mutator is single-threaded and the
-/// values are consumed immediately after the native call returns.
+/// the native interior writes legal. The enclosing !Send/!Sync CompiledLeaf
+/// confines its scratch to one mutator, which consumes these values immediately
+/// after the native call returns.
 ///
 /// Two trailing cells carry what a cold block knows beyond the framestate
 /// (P2.0 §3.4; the offsets of the first three never move, so the AOT
@@ -4904,6 +4907,11 @@ pub(crate) struct DeoptCells {
     pub(crate) reason: core::cell::Cell<i64>,
     pub(crate) chain: core::cell::Cell<i64>,
 }
+
+// The unshared allocation may move before publication. Once published to a
+// leaf, generated code writes these cells only on that leaf's owning mutator.
+static_assertions::assert_impl_all!(DeoptCells: Send);
+static_assertions::assert_not_impl_any!(DeoptCells: Sync);
 
 impl DeoptCells {
     /// `reason`'s unset value: the hook classifies the deopt from its op.
@@ -5021,6 +5029,11 @@ thread_local! {
 /// Enter (or leave) an inlined region for the ops lowered next.
 pub(crate) fn set_active_region(region: Option<RegionDeopt>) {
     ACTIVE_REGION.with(|r| *r.borrow_mut() = region);
+}
+
+/// Teardown may run while TLS is borrowed or already being destroyed.
+pub(crate) fn clear_active_region_on_scope_drop() {
+    drop(crate::tls_scope::TlsScope::restore(&ACTIVE_REGION, None));
 }
 
 /// The call site of the region the lowering is inside, if any.

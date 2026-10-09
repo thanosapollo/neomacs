@@ -1041,6 +1041,10 @@ impl WaitNotifier {
 }
 
 pub(super) struct ProcessWaitBackend {
+    /// A per-backend, one-shot scheduling gate for input-wakeup regressions.
+    /// Installation and consumption are synchronized; callbacks own no Lisp state.
+    #[cfg(test)]
+    before_next_wait: std::sync::Mutex<Option<Box<dyn FnOnce(Duration) + Send>>>,
     #[cfg(unix)]
     signal_fd: Option<std::os::fd::RawFd>,
     /// I/O multiplexer for process descriptors and cross-thread notifications.
@@ -1091,6 +1095,8 @@ impl ProcessWaitBackend {
         });
         Self {
             poller,
+            #[cfg(test)]
+            before_next_wait: std::sync::Mutex::new(None),
             #[cfg(unix)]
             signal_fd,
             notification_pending: Arc::new(AtomicBool::new(false)),
@@ -1143,6 +1149,14 @@ impl ProcessWaitBackend {
             } else {
                 timeout
             };
+
+            #[cfg(test)]
+            {
+                let before_wait = self.before_next_wait.lock().expect("wait gate lock").take();
+                if let Some(before_wait) = before_wait {
+                    before_wait(timeout);
+                }
+            }
 
             let deadline = Instant::now() + timeout;
             loop {
@@ -6694,6 +6708,20 @@ impl ProcessManager {
     /// publishing work. `None` if no poller could be created.
     pub(crate) fn wait_notifier(&self) -> Option<WaitNotifier> {
         self.wait_backend.notify_handle()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn before_next_backend_wait_for_test(
+        &mut self,
+        hook: impl FnOnce(Duration) + Send + 'static,
+    ) {
+        let slot = self
+            .wait_backend
+            .before_next_wait
+            .get_mut()
+            .expect("wait gate lock");
+        assert!(slot.is_none(), "wait gate already installed");
+        *slot = Some(Box::new(hook));
     }
 
     /// Block on the unified wait poller (cross-thread notification and/or process

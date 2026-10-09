@@ -374,7 +374,7 @@ impl EchoAreaMessageText {
             )
         };
         if message.has_intervals() {
-            *converted.intervals_mut() = message.intervals().clone();
+            *converted.intervals_mut() = message.intervals().to_owned_table();
         }
         converted
     }
@@ -2814,19 +2814,6 @@ pub struct PopupMenuRequest {
     pub selected: usize,
 }
 
-/// The Elisp evaluator.
-///
-/// # Safety: Send
-/// Evaluator is inherently single-threaded (uses thread-local heap and caches).
-/// # Safety: Send
-/// Context is inherently single-threaded (uses thread-local heap and caches).
-/// `neovm-worker` moves the Context to a worker thread inside
-/// `Arc<Mutex<..>>`, which ensures exclusive access.
-// SAFETY: Rc is !Send only because it uses non-atomic refcounting.
-// Since Context is always used single-threaded (guarded by Mutex when
-// transferred between threads), this is safe.
-unsafe impl Send for Context {}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OverlayModificationHook {
     pub(crate) hook_list: Value,
@@ -3046,6 +3033,10 @@ pub(crate) struct DaemonState {
 pub type GuiDisplayInitializer =
     Box<dyn FnMut(&mut Context, Option<&str>) -> Result<(), EvalError>>;
 
+/// The evaluator state owned by the mutator thread that constructs it.
+///
+/// Host hooks, Rc leases and active TLS registry views remain on that thread.
+/// Parallel Lisp creates a Context on each mutator over the shared World.
 pub struct Context {
     /// Arithmetic policy ownership, reconstructed rather than dumped.
     pub(crate) integer_width_context: super::builtins::IntegerWidthContext,
@@ -3316,7 +3307,9 @@ pub struct Context {
     pub(crate) command_loop: crate::keyboard::CommandLoop,
     /// Input event receiver from the display/render thread.
     /// `None` in batch mode (tests, non-interactive evaluation).
-    /// When `Some`, `read_char()` blocks on this channel for interactive input.
+    /// When `Some`, `read_char()` drains this queue but normally blocks on the
+    /// unified process/input poller. Producers must enqueue first, then call
+    /// [`Context::wait_notifier`]'s notifier so input cannot miss that wait.
     pub input_rx: Option<crossbeam_channel::Receiver<crate::keyboard::InputEvent>>,
     /// Tasks queued from other threads (e.g. the diagnostics server) to run on
     /// the Lisp thread at a safe point. Drained in the `read_char` loop.
@@ -3673,6 +3666,9 @@ pub struct Context {
     pub(crate) in_flight_registry: super::error::InFlightRegistryHandle,
     pub(crate) cached_standard_case_table: Option<Value>,
 }
+
+// A mutex does not make the host hooks, Rc leases or TLS views transferable.
+static_assertions::assert_not_impl_any!(Context: Send, Sync);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShutdownRequest {
@@ -4341,12 +4337,42 @@ fn lisp_frame_manager() -> FrameManager {
 impl Drop for Context {
     fn drop(&mut self) {
         super::dynamic_module::retire_dynamic_module_registry(&self.dynamic_module_registry);
+        // Context is !Send, pinned by thread contracts, so Drop stays on its
+        // owner thread. Retain upstream policy retirement as defence in depth.
         self.integer_width_context.retire();
         crate::tagged::gc::clear_tagged_heap_if_installed(&self.tagged_heap);
     }
 }
 
 impl Context {
+    /// Finish the marker and reclaim native resources on this Context's owner
+    /// thread before consuming its stationary allocation.
+    ///
+    /// Module finalizers and SQLite teardown may block or fail. Automatic Drop
+    /// skips those operations; callers use this explicit lifecycle boundary.
+    ///
+    /// # Errors
+    /// Returns an error if marker completion cannot be established. Drop then
+    /// retains marker-readable storage and skips native callbacks.
+    pub fn shutdown(mut self: Box<Self>) -> Result<(), crate::tagged::gc::MarkFinishError> {
+        // SAFETY: this consumes the boxed Context without moving its contents.
+        // The heap remains at its owner-thread address through reclamation,
+        // and this method neither reads Values nor executes Lisp afterward.
+        unsafe { self.tagged_heap.shutdown_owned_resources() }
+    }
+
+    /// Stop and finish this owner's concurrent marker before orderly teardown.
+    ///
+    /// This may wait for the marker. Drop instead retains reader-visible
+    /// storage when no explicit completion has been established.
+    ///
+    /// # Errors
+    /// Returns an error if the worker completion is missing/disconnected or
+    /// collector queues are poisoned. The heap then refuses reclamation.
+    pub fn finish_concurrent_mark(&mut self) -> Result<(), crate::tagged::gc::MarkFinishError> {
+        self.tagged_heap.finish_concurrent_mark()
+    }
+
     pub(crate) fn module_boundary_snapshot(&self) -> ModuleBoundarySnapshot {
         ModuleBoundarySnapshot {
             spec_depth: self.specpdl.len(),
@@ -5905,28 +5931,21 @@ impl Context {
         // update the visible per-buffer slot rather than just the
         // obarray symbol value (which a FORWARDED symbol no longer
         // consults at read time).
-        use super::symbol::SymbolRedirect;
-        if let Some(sym) = self.obarray.get_by_id(sym_id)
-            && sym.flags.redirect() == SymbolRedirect::Forwarded
+        if let Some(buf_fwd) = self
+            .obarray
+            .get_by_id(sym_id)
+            .and_then(|sym| sym.forwarded_descriptor())
+            .and_then(|fwd| fwd.as_buffer_obj_fwd())
             && let Some(buf_id) = self.buffers.current_buffer_id()
         {
-            use super::forward::{LispBufferObjFwd, LispFwdType};
-            // Safety: install_buffer_objfwd leaks a 'static
-            // descriptor; the symbol's redirect tag and val.fwd
-            // pointer are immutable once installed.
-            let fwd_ptr = unsafe { sym.val.fwd };
-            let header = unsafe { &*fwd_ptr };
-            if matches!(header.ty, LispFwdType::BufferObj) {
-                let buf_fwd = unsafe { &*(fwd_ptr as *const LispBufferObjFwd) };
-                let offset = buf_fwd.offset as usize;
-                if let Some(buf) = self.buffers.get_mut(buf_id)
-                    && offset < buf.slots.len()
-                {
-                    buf.slots[offset] = value;
-                    self.refresh_gc_runtime_settings_after_change_by_id(sym_id);
-                    self.mark_redisplay_dirty_if_display_var(sym_id);
-                    return;
-                }
+            let offset = buf_fwd.offset as usize;
+            if let Some(buf) = self.buffers.get_mut(buf_id)
+                && offset < buf.slots.len()
+            {
+                buf.slots[offset] = value;
+                self.refresh_gc_runtime_settings_after_change_by_id(sym_id);
+                self.mark_redisplay_dirty_if_display_var(sym_id);
+                return;
             }
         }
         self.obarray.set_symbol_value(name, value);
@@ -5978,12 +5997,12 @@ impl Context {
         &self,
         sym: &crate::emacs_core::symbol::LispSymbol,
     ) -> Option<Value> {
-        use crate::emacs_core::forward::LispFwdType;
+        use crate::emacs_core::forward::ForwardSlot;
 
-        let fwd = unsafe { &*sym.val.fwd };
-        match fwd.ty {
-            LispFwdType::Int | LispFwdType::Bool | LispFwdType::Obj => fwd.load(),
-            LispFwdType::BufferObj | LispFwdType::KboardObj => None,
+        let fwd = sym.forwarded_descriptor()?;
+        match fwd.slot() {
+            ForwardSlot::Int(_) | ForwardSlot::Bool(_) | ForwardSlot::Obj(_) => fwd.load(),
+            ForwardSlot::BufferObj(_) | ForwardSlot::KboardObj(_) => None,
         }
     }
 
@@ -5992,14 +6011,7 @@ impl Context {
         &self,
         sym: &crate::emacs_core::symbol::LispSymbol,
     ) -> Option<Value> {
-        use crate::emacs_core::forward::{LispBufferObjFwd, LispFwdType};
-
-        let fwd = unsafe { &*sym.val.fwd };
-        if !matches!(fwd.ty, LispFwdType::BufferObj) {
-            return None;
-        }
-
-        let buf_fwd = unsafe { &*(fwd as *const _ as *const LispBufferObjFwd) };
+        let buf_fwd = sym.forwarded_descriptor()?.as_buffer_obj_fwd()?;
         let slot = crate::buffer::buffer::BufferSlot::from_u16(buf_fwd.offset)?;
         let off = slot.index();
         if let Some(buf) = self.buffers.current_buffer() {
@@ -6114,9 +6126,8 @@ impl Context {
         if sym_id != buffer_undo_list_symbol()
             && let Some(sym) = self.obarray.get_by_id(sym_id)
         {
-            match sym.redirect() {
-                crate::emacs_core::symbol::SymbolRedirect::Plainval => {
-                    let value = unsafe { sym.val.plain };
+            match sym.value_cell() {
+                crate::emacs_core::symbol::ValueCell::Plain(value) => {
                     if !value.is_unbound() {
                         return Ok(SymbolValueLookup::Bound(value));
                     }
@@ -6127,7 +6138,7 @@ impl Context {
                 // `find_symbol_value` dispatches on the redirect tag
                 // directly). `read_localized`'s same-buffer epoch check makes
                 // the common read one compare + one cdr.
-                crate::emacs_core::symbol::SymbolRedirect::Localized => {
+                crate::emacs_core::symbol::ValueCell::Localized(_) => {
                     if let Some(buf) = self.buffers.current_buffer()
                         && let Some(value) = self.obarray.read_localized_symbol_for_buffer(
                             sym_id,
@@ -6142,7 +6153,7 @@ impl Context {
                         return Ok(SymbolValueLookup::Bound(value));
                     }
                 }
-                crate::emacs_core::symbol::SymbolRedirect::Forwarded => {
+                crate::emacs_core::symbol::ValueCell::Forwarded(_) => {
                     if let Some(value) = self.forwarded_buffer_obj_value(sym) {
                         return Ok(SymbolValueLookup::Bound(value));
                     }
@@ -6156,7 +6167,7 @@ impl Context {
                         return Ok(SymbolValueLookup::Bound(value));
                     }
                 }
-                crate::emacs_core::symbol::SymbolRedirect::Varalias => {}
+                crate::emacs_core::symbol::ValueCell::Alias(_) => {}
             }
         }
 
@@ -7047,7 +7058,7 @@ pub(crate) fn check_forwarded_store_at(
     let Some(fwd) = assignment_forwarder(obarray, sym_id) else {
         return Ok(ForwardChecked(value));
     };
-    if fwd.ty == LispFwdType::BufferObj {
+    if fwd.ty() == LispFwdType::BufferObj {
         if site == ForwardStoreSite::SetDefault {
             return Ok(ForwardChecked(value));
         }
@@ -7132,48 +7143,6 @@ pub(crate) fn check_forwarded_unbind(
             crate::emacs_core::intern::resolve_sym(reported.as_symbol_id().unwrap_or(sym_id))
         ))],
     ))
-}
-
-pub(crate) fn makunbound_runtime_binding_in_state(
-    obarray: &mut Obarray,
-    buffers: &mut BufferManager,
-    _custom: &CustomManager,
-    _specpdl: &[SpecBinding],
-    sym_id: SymId,
-) {
-    let symbol_is_canonical = super::builtins::is_canonical_symbol_id(sym_id);
-
-    // specbind writes directly to obarray, so no dynamic frame lookup needed.
-
-    // Non-localized globals are never in any `local_var_alist`; skip the scan.
-    let sym_is_localized = obarray.is_localized(sym_id);
-    if symbol_is_canonical
-        && let Some(current_id) = buffers.current_buffer_id()
-        && let Some(buf) = buffers.get(current_id)
-        && buf.has_buffer_local_by_sym_id_gated(sym_id, sym_is_localized)
-    {
-        let _ = buffers.set_buffer_local_void_property_by_sym_id(current_id, sym_id);
-        return;
-    }
-
-    // Mirrors GNU `set_internal` SYMBOL_LOCALIZED arm with
-    // `unbinding_p = true` (`src/data.c:1687-1762`). The BLV's
-    // `local_if_set` flag determines whether to create a per-buffer
-    // void binding; LOCALIZED symbols carry a BLV so this fires only
-    // for them.
-    let local_if_set = obarray
-        .blv(sym_id)
-        .map(|blv| blv.local_if_set)
-        .unwrap_or(false);
-    if symbol_is_canonical
-        && local_if_set
-        && let Some(current_id) = buffers.current_buffer_id()
-    {
-        let _ = buffers.set_buffer_local_void_property_by_sym_id(current_id, sym_id);
-        return;
-    }
-
-    obarray.makunbound_id(sym_id);
 }
 
 impl Context {
@@ -7377,14 +7346,13 @@ impl Context {
         Ok(locus)
     }
 
+    /// Void the plain cell SYM_ID names, without watchers: what GNU
+    /// `Fmakunbound`'s alias arm (`src/data.c:779-783`) and
+    /// `internal-delete-indirect-variable` leave once the alias is undone.
+    /// Any other arm is voided by `set_internal`'s store,
+    /// [`Self::set_internal_after_watchers`].
     pub(crate) fn makunbound_runtime_binding_by_id(&mut self, sym_id: SymId) {
-        makunbound_runtime_binding_in_state(
-            &mut self.obarray,
-            &mut self.buffers,
-            &self.custom,
-            &[],
-            sym_id,
-        );
+        self.obarray.makunbound_id(sym_id);
         self.sync_cached_runtime_binding_by_id(sym_id, Value::NIL);
         self.sync_keyboard_runtime_binding_by_id(sym_id, Value::NIL);
         self.refresh_gc_runtime_settings_after_change_by_id(sym_id);
@@ -7616,7 +7584,7 @@ impl Context {
     }
 
     pub(crate) fn variable_watcher_where_for_set_by_id(&self, sym_id: SymId) -> Value {
-        use crate::emacs_core::forward::{LispBufferObjFwd, LispFwdType};
+        use crate::emacs_core::forward::LispFwdType;
         use crate::emacs_core::symbol::SymbolRedirect;
 
         let Some(current_id) = self.buffers.current_buffer_id() else {
@@ -7642,9 +7610,10 @@ impl Context {
                 }
             }
             SymbolRedirect::Forwarded => {
-                let fwd = unsafe { &*sym.val.fwd };
-                if matches!(fwd.ty, LispFwdType::BufferObj) {
-                    let _buf_fwd = unsafe { &*(fwd as *const _ as *const LispBufferObjFwd) };
+                if sym
+                    .forwarded_descriptor()
+                    .is_some_and(|fwd| fwd.ty() == LispFwdType::BufferObj)
+                {
                     return Value::make_buffer(current_id);
                 }
                 Value::NIL
@@ -7760,6 +7729,10 @@ use form_head_cache::{FormHead, HeadClass};
 #[path = "tests/eval_test.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "tests/gc_context_shutdown.rs"]
+mod gc_context_shutdown_tests;
+
 // task3-jitcrash-diag: diagnostic repros for the pre-existing JIT
 // heap-corruption crash (no fix here).
 #[cfg(test)]
@@ -7803,6 +7776,9 @@ mod var_fast_tests;
 #[cfg(test)]
 #[path = "tests/circular_forms.rs"]
 mod circular_forms_tests;
+#[cfg(test)]
+#[path = "tests/watcher_redispatch_test.rs"]
+mod watcher_redispatch_tests;
 
 #[cfg(test)]
 #[path = "tests/builtin_vars_test.rs"]

@@ -297,6 +297,10 @@ fn presented_tab_line_hit_joins_renderer_string_index_with_rooted_lisp_value() {
     let protocol_presentation = PresentationId::new(7);
     let string_id = GlyphStringId::new(1);
     let text = Value::string("first second");
+    // SAFETY: `text` was just allocated through this evaluator's installed
+    // heap, with no intervening collection. The evaluator stays alive while
+    // the snapshot is used and its collector traces shared roots.
+    let shared_text = unsafe { eval.share_value(text) };
     let tab_bounds = FrameRect::new(0.0, 0.0, 200.0, 16.0).unwrap();
     let char_bounds = FrameRect::new(40.0, 0.0, 8.0, 16.0).unwrap();
     let hit_index = PresentedHitIndex::from_parts_with_strings(
@@ -346,8 +350,9 @@ fn presented_tab_line_hit_joins_renderer_string_index_with_rooted_lisp_value() {
                     chrome_strings: vec![PresentedWindowChromeString::new(
                         PresentedWindowChromeArea::TabLine,
                         string_id,
-                        text,
-                    )],
+                        shared_text.clone(),
+                    )]
+                    .into(),
                     ..Default::default()
                 }],
             )
@@ -2573,3 +2578,10 @@ fn timed_read_preserves_idle_epoch_during_preliminary_redisplay_service() {
     );
     assert_eq!(eval.command_loop.idle_start_time, epoch);
 }
+#[cfg(test)]
+#[path = "help_echo_substitution.rs"]
+mod help_echo_substitution;
+
+#[cfg(test)]
+#[path = "gnu_help_echo_direct_oracle.rs"]
+mod gnu_help_echo_direct_oracle;

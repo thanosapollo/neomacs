@@ -237,3 +237,9 @@ fn reverse_endpoint_stream_is_the_exact_inverse_across_tree_levels() {
 
     assert_eq!(reverse, forward.into_iter().rev().collect::<Vec<_>>());
 }
+
+#[cfg(test)]
+mod deletion_single_restore;
+
+#[cfg(test)]
+mod property_mask_republish;

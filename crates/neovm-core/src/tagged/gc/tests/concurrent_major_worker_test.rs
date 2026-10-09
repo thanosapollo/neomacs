@@ -128,8 +128,8 @@ fn claim_job(heap: &TaggedHeap, major: bool) -> ConcurrentClaimJob {
 struct WorkerHarness {
     job: ConcurrentMarkJob,
     result: std::sync::mpsc::Receiver<ConcurrentMarkResult>,
-    deferred: Arc<Mutex<Vec<TaggedValue>>>,
-    satb: Arc<Mutex<Vec<TaggedValue>>>,
+    deferred: SharedMarkQueue,
+    satb: SharedMarkQueue,
 }
 impl WorkerHarness {
     fn new(heap: &TaggedHeap, major: bool) -> Self {
@@ -138,7 +138,7 @@ impl WorkerHarness {
         let satb = Arc::new(Mutex::new(Vec::new()));
         Self {
             job: ConcurrentMarkJob {
-                gray: Vec::new(),
+                gray: MarkStack::default(),
                 claims: claim_job(heap, major),
                 satb: satb.clone(),
                 deferred: deferred.clone(),
@@ -166,14 +166,22 @@ impl WorkerHarness {
             "worker must send only once"
         );
         let deferred = std::mem::take(&mut *self.deferred.lock().unwrap());
-        (result, deferred)
+        (result, deferred.into_iter().map(MarkWord::value).collect())
     }
 }
 
-fn snapshot(vector: TaggedValue) -> crate::tagged::header::VectorScanSnapshot {
+fn snapshot(
+    heap: &mut TaggedHeap,
+    vector: TaggedValue,
+) -> crate::tagged::header::VectorScanSnapshot {
+    // SAFETY: the test owns the live vector and admits its only heap writer.
     let object = unsafe { &*(vector.as_veclike_ptr().unwrap() as *const VectorObj) };
-    let mut snapshot = crate::tagged::header::VectorScanSnapshot::with_capacity(1);
-    snapshot.push(object.data.scan_entry());
+    // SAFETY: capture occurs before the test starts its marker job.
+    let world = unsafe { scan_contract::SingleMutatorWorld::from_heap(heap) };
+    let mut snapshot = crate::tagged::header::VectorScanSnapshot::with_capacity(1, &world);
+    // SAFETY: the test owns this vector in the admitted heap until its
+    // worker finishes; no backing mutation or replacement occurs.
+    unsafe { snapshot.push(object.data.scan_entry()) };
     snapshot
 }
 
@@ -201,7 +209,7 @@ fn generational_worker_major_claims_promote_only_young_headers() {
             set_age(value, age);
             let job = claim_job(&heap, true);
             let before = unsafe { (*header(value)).raw_mark() };
-            let mut gray = Vec::new();
+            let mut gray = MarkStack::default();
             let mut logs = WorkerMarkLogs::default();
             assert!(concurrent_try_mark_owned_logged::<true>(
                 value, &job, &mut gray, &mut logs
@@ -223,7 +231,7 @@ fn generational_worker_major_claims_promote_only_young_headers() {
                 assert!(unsafe { (*header(value)).is_marked_at(job.parity) });
             }
             logs.result.symbols.clear();
-            gray.clear();
+            gray = MarkStack::default();
             assert!(concurrent_try_mark_owned_logged::<true>(
                 value, &job, &mut gray, &mut logs
             ));
@@ -250,7 +258,7 @@ fn generational_worker_legacy_claim_parity_and_tenured_rules_are_unchanged() {
             set_age(value, age);
             let job = claim_job(&heap, false);
             let before = unsafe { (*header(value)).raw_mark() };
-            let mut gray = Vec::new();
+            let mut gray = MarkStack::default();
             let mut logs = WorkerMarkLogs::default();
             assert!(concurrent_try_mark_owned_logged::<false>(
                 value, &job, &mut gray, &mut logs
@@ -278,7 +286,7 @@ fn generational_worker_born_black_claims_have_no_promo_or_child_handoff() {
         heap.close_alloc_regions();
         let job = claim_job(&heap, true);
         unsafe { (*header(value)).set_marked(job.parity) };
-        let mut gray = Vec::new();
+        let mut gray = MarkStack::default();
         let mut logs = WorkerMarkLogs::default();
         assert!(concurrent_try_mark_owned_logged::<true>(
             value, &job, &mut gray, &mut logs
@@ -305,7 +313,7 @@ fn generational_worker_born_black_bytecode_does_not_read_its_value_children() {
     let job = claim_job(&heap, true);
     unsafe { (*header(value)).set_marked(job.parity) };
     let mut logs = WorkerMarkLogs::default();
-    let mut gray = Vec::new();
+    let mut gray = MarkStack::default();
     assert!(concurrent_try_mark_owned_logged::<true>(
         value, &job, &mut gray, &mut logs
     ));
@@ -329,7 +337,7 @@ fn generational_worker_refuses_interval_strings_and_snapshot_misses_before_claim
     if let PageSnapshot::BaseSets { vector, .. } = &mut job.pages {
         vector.clear();
     }
-    let mut gray = Vec::new();
+    let mut gray = MarkStack::default();
     let mut logs = WorkerMarkLogs::default();
     for value in [string, vector, boxed] {
         let before = unsafe { (*header(value)).raw_mark() };
@@ -363,7 +371,7 @@ fn generational_worker_snapshot_misses_never_claim_or_promote_any_header_class()
         vector: FxHashSet::default(),
         bytecode: FxHashSet::default(),
     };
-    let mut gray = Vec::new();
+    let mut gray = MarkStack::default();
     let mut logs = WorkerMarkLogs::default();
     for value in values {
         let before = unsafe { (*header(value)).raw_mark() };
@@ -400,7 +408,7 @@ fn generational_worker_bytecode_routes_each_symbol_field_and_keeps_legacy_heap_f
         let value = roots.keep(heap.alloc_bytecode(function));
         heap.close_alloc_regions();
         let job = claim_job(&heap, major);
-        let mut gray = Vec::new();
+        let mut gray = MarkStack::default();
         let mut logs = WorkerMarkLogs::default();
         let handled = if major {
             concurrent_try_mark_owned_logged::<true>(value, &job, &mut gray, &mut logs)
@@ -408,7 +416,7 @@ fn generational_worker_bytecode_routes_each_symbol_field_and_keeps_legacy_heap_f
             concurrent_try_mark_owned_logged::<false>(value, &job, &mut gray, &mut logs)
         };
         assert!(handled);
-        assert_eq!(gray, [child]);
+        assert_eq!(gray.into_values(), [child]);
         if major {
             assert_eq!(logs.result.promo, [header(value) as usize]);
             for symbol in &symbols {
@@ -442,8 +450,10 @@ fn generational_worker_vector_and_obarray_snapshots_deduplicate_bare_symbols() {
         obarray.set_symbol_plist_id(owner, symbols[2]);
         heap.close_alloc_regions();
         let mut harness = WorkerHarness::new(&heap, major);
-        harness.job.vectors = Some(snapshot(vector));
-        harness.job.obarray = Some(obarray.scan_snapshot());
+        harness.job.vectors = Some(snapshot(&mut heap, vector));
+        // SAFETY: the test owns the matching obarray and captures before launch.
+        let world = unsafe { scan_contract::SingleMutatorWorld::from_heap(&mut heap) };
+        harness.job.obarray = Some(obarray.scan_snapshot(&world));
         let (result, deferred) = harness.run();
         assert!(deferred.is_empty());
         if major {
@@ -466,7 +476,11 @@ fn generational_worker_gray_and_satb_symbols_reach_major_result_only() {
         let second = symbol("u34-worker-satb");
         let mut harness = WorkerHarness::new(&heap, major);
         harness.job.gray.push(first);
-        harness.satb.lock().unwrap().extend([first, second]);
+        harness
+            .satb
+            .lock()
+            .unwrap()
+            .extend([first, second].map(MarkWord::of));
         let (result, deferred) = harness.run();
         assert!(deferred.is_empty());
         assert!(result.promo.is_empty());
@@ -527,7 +541,7 @@ fn generational_worker_early_cdr_stop_retains_initial_claims_symbols_and_tail() 
     heap.close_alloc_regions();
     let mut harness = WorkerHarness::new(&heap, true);
     harness.job.gray.push(spine);
-    harness.job.vectors = Some(snapshot(vector));
+    harness.job.vectors = Some(snapshot(&mut heap, vector));
     let parity = harness.job.claims.parity;
     let (result, deferred) = harness.run();
     assert_eq!(result.promo, [header(float) as usize]);
@@ -561,7 +575,9 @@ fn generational_worker_outer_stop_preserves_unprocessed_gray_and_owned_logs() {
     let key = symbol("u34-worker-outer-stop");
     heap.close_alloc_regions();
     let mut harness = WorkerHarness::new(&heap, true);
-    harness.job.gray.extend(std::iter::repeat_n(value, 2048));
+    for _ in 0..2048 {
+        harness.job.gray.push(value);
+    }
     // Both are visited before the quantum reaches the repeated float tail.
     harness.job.gray.push(key);
     let (result, deferred) = harness.run();
@@ -569,4 +585,135 @@ fn generational_worker_outer_stop_preserves_unprocessed_gray_and_owned_logs() {
     assert_symbol_once(&result, key);
     assert!(!deferred.is_empty());
     assert!(deferred.iter().all(|&item| item == value));
+}
+
+/// These are the ordinary, non-cfg(test)-extended worker payloads. The enabled
+/// request's box must not widen the per-heap channel's legacy payload.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+fn concurrent_worker_legacy_payload_sizes_match_base() {
+    // b40 base: ts7's VectorScanSnapshot carries its heap identity.
+    assert_eq!(size_of::<PageSnapshot>(), 160);
+    assert_eq!(size_of::<ConcurrentClaimJob>(), 224);
+    assert_eq!(size_of::<ConcurrentMarkJob>(), 424);
+    assert_eq!(size_of::<GcRequest>(), 424);
+    assert_eq!(size_of::<WorkerMarkLogs>(), 80);
+}
+
+#[test]
+fn concurrent_worker_channel_dispatch_preserves_legacy_and_enabled_symbol_policies() {
+    for enabled in [false, true] {
+        for major in [false, true] {
+            for chunk_map in [false, true] {
+                knobs::set_concurrent_claims_for_test(Some(enabled));
+                knobs::set_chunk_map_for_test(Some(chunk_map));
+                let mut heap = Box::new(TaggedHeap::new());
+                knobs::set_concurrent_claims_for_test(None);
+                knobs::set_chunk_map_for_test(None);
+                heap.generational.enabled = major;
+                let direct = symbol("u35-channel-direct");
+                let nested = symbol("nil");
+                let positioned = symbol("t");
+                let root_cons = heap.alloc_cons(direct, TaggedValue::NIL);
+                let nested_cons = heap.alloc_cons(nested, TaggedValue::NIL);
+                let position = heap.alloc_symbol_with_pos(positioned, TaggedValue::fixnum(17));
+                let mut table = LispHashTable::new(HashTableTest::Eq);
+                let key = TaggedValue::fixnum(1);
+                table.insert(key.to_hash_key(&HashTableTest::Eq), key, nested_cons);
+                let owner = heap.alloc_hash_table(table);
+                heap.close_alloc_regions();
+                for block in &mut heap.cons_blocks {
+                    block.clear_marks();
+                }
+                let parity = heap.mark_parity.flip();
+                // Exclusively owned fixtures, before channel publication.
+                unsafe {
+                    (*header(position)).set_marked(parity.flip());
+                    (*header(owner)).set_marked(parity.flip());
+                }
+                let mut pages = heap.page_snapshot_for_mark();
+                let extension = enabled.then(|| {
+                    let leaves = heap.leaf_page_snapshot_for_mark(&mut pages);
+                    let mut snapshot = concurrent_hash::HashTableScanSnapshot::new();
+                    // SAFETY: the authoritative owner remains alive until the
+                    // real worker's exit handshake; its backing is unmodified.
+                    assert!(unsafe {
+                        snapshot.capture_owned(
+                            header(owner) as usize,
+                            if major {
+                                CollectionScope::Full
+                            } else {
+                                CollectionScope::Young
+                            },
+                        )
+                    });
+                    EnabledClaims {
+                        leaves,
+                        leaf_claimed: Some(Arc::new(AtomicUsize::new(0))),
+                        hashes: Some(Arc::new(snapshot)),
+                        hash_claimed: Some(Arc::new(AtomicUsize::new(0))),
+                    }
+                });
+                let counters = extension.as_ref().map(|claims| {
+                    (
+                        claims.leaf_claimed.as_ref().unwrap().clone(),
+                        claims.hash_claimed.as_ref().unwrap().clone(),
+                    )
+                });
+                let mut harness = WorkerHarness::new(&heap, major);
+                harness.job.claims.pages = pages;
+                harness.job.gray = MarkStack::from_values(vec![root_cons, owner, position]);
+                let done = harness.job.done.clone();
+                let request = if let Some(claims) = extension {
+                    GcRequest::ConcurrentMarkEnabled(Box::new(EnabledConcurrentMarkJob {
+                        job: harness.job,
+                        claims,
+                    }))
+                } else {
+                    GcRequest::ConcurrentMark(harness.job)
+                };
+                // Exercise the actual per-heap channel match, not a direct loop
+                // call or a model of its enabled/legacy election.
+                heap.gc_worker.send(request);
+                let result = harness
+                    .result
+                    // Keep the heap alive until the actual exit handoff. A
+                    // scheduler timeout must not free raw snapshot pointers.
+                    // Nextest supervises a worker that fails to make progress.
+                    .recv()
+                    .expect("GC worker failed to hand off its result");
+                assert!(done.load(Ordering::Acquire));
+                assert!(harness.result.try_recv().is_err());
+                let ids: Vec<_> = [direct, nested, positioned]
+                    .map(TaggedValue::xsymbol_id)
+                    .into();
+                assert_eq!(
+                    result.symbols.iter().filter(|&&id| id == ids[0]).count(),
+                    usize::from(major || enabled)
+                );
+                for id in &ids[1..] {
+                    assert_eq!(
+                        result.symbols.iter().filter(|&&seen| seen == *id).count(),
+                        usize::from(enabled)
+                    );
+                }
+                let deferred = harness.deferred.lock().unwrap();
+                if enabled {
+                    assert!(deferred.is_empty());
+                    assert!(unsafe { (*header(owner)).is_marked_at(parity) });
+                    assert!(unsafe { (*header(position)).is_marked_at(parity) });
+                    let (leaf, hash) = counters.unwrap();
+                    assert_eq!(leaf.load(Ordering::Relaxed), 1);
+                    assert_eq!(hash.load(Ordering::Relaxed), 1);
+                } else {
+                    assert!(deferred.contains(&MarkWord::of(owner)));
+                    assert!(deferred.contains(&MarkWord::of(position)));
+                    assert!(!unsafe { (*header(owner)).is_marked_at(parity) });
+                    assert!(!unsafe { (*header(position)).is_marked_at(parity) });
+                }
+                // No snapshot/heap reads follow the result handoff. The heap
+                // can now drop and join its own worker.
+            }
+        }
+    }
 }

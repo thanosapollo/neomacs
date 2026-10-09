@@ -1446,3 +1446,24 @@ fn file_attributes_resolves_names_only_for_the_string_id_format_like_gnu() {
 #[cfg(test)]
 #[path = "compare_case_table_test.rs"]
 mod compare_case_table;
+
+#[cfg(all(test, unix))]
+mod count_nil;
+
+#[cfg(all(test, unix))]
+mod count_zero_open;
+
+#[cfg(all(test, unix))]
+mod directory_error_data;
+
+#[cfg(all(test, unix))]
+mod streaming_quit;
+
+#[cfg(all(test, unix))]
+mod attribute_failures;
+
+#[cfg(all(test, unix))]
+mod attribute_failure_seams;
+
+#[cfg(all(test, unix))]
+mod readdir_order;
