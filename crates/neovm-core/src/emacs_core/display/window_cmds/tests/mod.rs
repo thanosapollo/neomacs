@@ -23,6 +23,7 @@ mod core_hook_restore;
 mod body_geometry_test;
 mod frame_position_test;
 mod frame_resize_test;
+mod raw_origin_test;
 
 #[test]
 fn alpha_lower_limit_variable_projects_without_replaying_alpha_policy() {
