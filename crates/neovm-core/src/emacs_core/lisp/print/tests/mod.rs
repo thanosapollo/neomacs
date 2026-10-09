@@ -8,6 +8,244 @@ use crate::emacs_core::value::{
     set_string_text_properties_for_value,
 };
 
+// Independent of the production scope: even a RED assertion must not leak TLS
+// roots into another test, and cleanup runs before the Context drops its heap.
+struct BytecodeTestRootCleanup(usize);
+
+impl BytecodeTestRootCleanup {
+    fn new() -> Self {
+        Self(crate::emacs_core::eval::save_scratch_gc_roots())
+    }
+}
+
+impl Drop for BytecodeTestRootCleanup {
+    fn drop(&mut self) {
+        crate::emacs_core::eval::restore_scratch_gc_roots(self.0);
+    }
+}
+
+fn bytecode_root_fixture() -> Value {
+    let mut function =
+        crate::emacs_core::bytecode::ByteCodeFunction::new(LambdaParams::simple(vec![]));
+    function.gnu_bytecode_bytes = Some(vec![b'A', b'B'].into());
+    function.constants.ensure_owned().push(Value::fixnum(73));
+    function.docstring = Some(crate::heap_types::LispString::from_utf8(
+        "r028 documentation",
+    ));
+    Value::make_bytecode(function)
+}
+
+fn bytecode_temporary_slots(slots: &[Value]) -> [Value; 3] {
+    [slots[1], slots[2], slots[4]]
+}
+
+fn bytecode_slot_ownership(ctx: &crate::emacs_core::Context, values: [Value; 3]) -> [bool; 3] {
+    values.map(|value| ctx.tagged_heap.owns_heap_value_for_test(value))
+}
+
+#[test]
+fn bytecode_literal_slots_restore_caller_roots_after_gc_and_panic() {
+    use crate::emacs_core::eval::{
+        push_scratch_gc_root, push_scratch_gc_root_slot, save_scratch_gc_roots, set_scratch_gc_root,
+    };
+    crate::test_utils::init_test_tracing();
+    let mut ctx = crate::emacs_core::Context::new();
+    ctx.gc_stress = false;
+    let cleanup = BytecodeTestRootCleanup::new();
+    let owner = bytecode_root_fixture();
+    push_scratch_gc_root(owner);
+    let sentinel = Value::cons(Value::fixnum(19), Value::fixnum(23));
+    let sentinel_slot = push_scratch_gc_root_slot(sentinel);
+    let caller_depth = save_scratch_gc_roots();
+    let mut temporary = [Value::NIL; 3];
+    let mut during = [false; 3];
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_bytecode_literal_slots_public(&owner, |slots| {
+            temporary = bytecode_temporary_slots(slots);
+            // Establish ownership before reading payloads, including after GC.
+            assert_eq!(bytecode_slot_ownership(&ctx, temporary), [true; 3]);
+            assert_eq!(print_value(&slots[1]), "\"AB\"");
+            assert_eq!(print_value(&slots[2]), "[73]");
+            assert_eq!(print_value(&slots[4]), "\"r028 documentation\"");
+            ctx.gc_collect_exact();
+            during = bytecode_slot_ownership(&ctx, temporary);
+            assert_eq!(during, [true; 3]);
+            assert!(ctx.tagged_heap.owns_heap_value_for_test(owner));
+            assert!(ctx.tagged_heap.owns_heap_value_for_test(sentinel));
+            std::panic::panic_any("r028 bytecode literal callback panic");
+        });
+    }));
+    let payload = panic
+        .as_ref()
+        .err()
+        .and_then(|p| p.downcast_ref::<&str>())
+        .copied();
+    let depth_after = save_scratch_gc_roots();
+    ctx.gc_collect_exact();
+    let after = bytecode_slot_ownership(&ctx, temporary);
+    let caller_owned = [owner, sentinel].map(|v| ctx.tagged_heap.owns_heap_value_for_test(v));
+    // The caller-owned slot must remain addressable, not merely have a similar depth.
+    if depth_after >= caller_depth {
+        set_scratch_gc_root(sentinel_slot, sentinel);
+    }
+    eprintln!(
+        "r028 panic: payload={payload:?} caller_depth={caller_depth} depth_after={depth_after} during={during:?} after={after:?} caller_owned={caller_owned:?}"
+    );
+    drop(cleanup);
+    assert_eq!(payload, Some("r028 bytecode literal callback panic"));
+    assert_eq!(during, [true; 3]);
+    assert_eq!(caller_owned, [true; 2]);
+    // One aggregate assertion records both balance AND reclaimability on RED.
+    assert_eq!((depth_after, after), (caller_depth, [false; 3]));
+}
+
+#[test]
+fn bytecode_literal_slots_nested_panic_preserves_outer_prefix_and_recovers() {
+    use crate::emacs_core::eval::{push_scratch_gc_root, save_scratch_gc_roots};
+    crate::test_utils::init_test_tracing();
+    let mut ctx = crate::emacs_core::Context::new();
+    ctx.gc_stress = false;
+    let cleanup = BytecodeTestRootCleanup::new();
+    let outer = bytecode_root_fixture();
+    push_scratch_gc_root(outer);
+    let inner = bytecode_root_fixture();
+    push_scratch_gc_root(inner);
+    let sentinel = Value::cons(Value::fixnum(31), Value::NIL);
+    push_scratch_gc_root(sentinel);
+    let caller_depth = save_scratch_gc_roots();
+    let mut outer_temporary = [Value::NIL; 3];
+    let mut inner_temporary = [Value::NIL; 3];
+    let mut inner_during = [false; 3];
+    let mut inner_after = [true; 3];
+    let mut outer_after_inner = [false; 3];
+    let mut inner_depth_after = 0;
+    let mut payload_ok = false;
+    let returned = with_bytecode_literal_slots_public(&outer, |outer_slots| {
+        outer_temporary = bytecode_temporary_slots(outer_slots);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_bytecode_literal_slots_public(&inner, |inner_slots| {
+                inner_temporary = bytecode_temporary_slots(inner_slots);
+                ctx.gc_collect_exact();
+                inner_during = bytecode_slot_ownership(&ctx, inner_temporary);
+                assert_eq!(inner_during, [true; 3]);
+                assert_eq!(bytecode_slot_ownership(&ctx, outer_temporary), [true; 3]);
+                std::panic::panic_any("r028 nested bytecode panic");
+            });
+        }));
+        payload_ok = panic.as_ref().err().and_then(|p| p.downcast_ref::<&str>())
+            == Some(&"r028 nested bytecode panic");
+        inner_depth_after = save_scratch_gc_roots();
+        ctx.gc_collect_exact();
+        inner_after = bytecode_slot_ownership(&ctx, inner_temporary);
+        outer_after_inner = bytecode_slot_ownership(&ctx, outer_temporary);
+        // Continue through a fresh normal extent after the locally caught panic.
+        with_bytecode_literal_slots_public(&inner, |slots| {
+            ctx.gc_collect_exact();
+            assert_eq!(
+                bytecode_slot_ownership(&ctx, bytecode_temporary_slots(slots)),
+                [true; 3]
+            );
+        });
+        101
+    });
+    let depth_after = save_scratch_gc_roots();
+    ctx.gc_collect_exact();
+    let outer_after = bytecode_slot_ownership(&ctx, outer_temporary);
+    let caller_owned =
+        [outer, inner, sentinel].map(|v| ctx.tagged_heap.owns_heap_value_for_test(v));
+    eprintln!(
+        "r028 nested: payload_ok={payload_ok} caller_depth={caller_depth} inner_depth_after={inner_depth_after} final_depth={depth_after} inner_during={inner_during:?} inner_after={inner_after:?} outer_after_inner={outer_after_inner:?} outer_after={outer_after:?} caller_owned={caller_owned:?}"
+    );
+    drop(cleanup);
+    assert!(payload_ok);
+    assert_eq!(returned, Some(101));
+    assert_eq!(inner_during, [true; 3]);
+    assert_eq!(outer_after_inner, [true; 3]);
+    assert_eq!(caller_owned, [true; 3]);
+    assert_eq!((depth_after, outer_after), (caller_depth, [false; 3]));
+    assert_eq!(
+        (inner_depth_after, inner_after),
+        (caller_depth + 5, [false; 3])
+    );
+}
+
+#[test]
+fn bytecode_literal_slots_normal_and_nonlocal_flow_returns_restore_prefix() {
+    use crate::emacs_core::error::{Flow, FlowRef};
+    use crate::emacs_core::eval::{push_scratch_gc_root, save_scratch_gc_roots};
+    crate::test_utils::init_test_tracing();
+    let mut ctx = crate::emacs_core::Context::new();
+    ctx.gc_stress = false;
+    let cleanup = BytecodeTestRootCleanup::new();
+    let owner = bytecode_root_fixture();
+    push_scratch_gc_root(owner);
+    let sentinel = Value::cons(Value::fixnum(47), Value::NIL);
+    push_scratch_gc_root(sentinel);
+    let caller_depth = save_scratch_gc_roots();
+    let mut temporary = [Value::NIL; 3];
+    let normal = with_bytecode_literal_slots_public(&owner, |slots| {
+        temporary = bytecode_temporary_slots(slots);
+        ctx.gc_collect_exact();
+        assert_eq!(bytecode_slot_ownership(&ctx, temporary), [true; 3]);
+        211
+    });
+    let normal_depth = save_scratch_gc_roots();
+    ctx.gc_collect_exact();
+    let normal_after = bytecode_slot_ownership(&ctx, temporary);
+    let flow: Option<Result<(), Flow>> = with_bytecode_literal_slots_public(&owner, |slots| {
+        temporary = bytecode_temporary_slots(slots);
+        ctx.gc_collect_exact();
+        assert_eq!(bytecode_slot_ownership(&ctx, temporary), [true; 3]);
+        Err(Flow::throw(Value::symbol("r028-tag"), Value::fixnum(307)))
+    });
+    let flow_depth = save_scratch_gc_roots();
+    let flow_ok = matches!(flow.as_ref(), Some(Err(f)) if matches!(f.kind(), FlowRef::Throw(data)
+        if data.tag == Value::symbol("r028-tag") && data.value == Value::fixnum(307)));
+    ctx.gc_collect_exact();
+    let flow_after = bytecode_slot_ownership(&ctx, temporary);
+    let caller_owned = [owner, sentinel].map(|v| ctx.tagged_heap.owns_heap_value_for_test(v));
+    eprintln!(
+        "r028 returns: normal={normal:?} flow_ok={flow_ok} caller_depth={caller_depth} normal_depth={normal_depth} flow_depth={flow_depth} normal_after={normal_after:?} flow_after={flow_after:?} caller_owned={caller_owned:?}"
+    );
+    drop(cleanup);
+    assert_eq!(normal, Some(211));
+    assert!(flow_ok);
+    assert_eq!((normal_depth, normal_after), (caller_depth, [false; 3]));
+    assert_eq!((flow_depth, flow_after), (caller_depth, [false; 3]));
+    assert_eq!(caller_owned, [true; 2]);
+}
+
+#[test]
+fn bytecode_literal_slots_nonbytecode_does_not_call_or_change_roots() {
+    use crate::emacs_core::eval::{push_scratch_gc_root, save_scratch_gc_roots};
+    crate::test_utils::init_test_tracing();
+    let mut ctx = crate::emacs_core::Context::new();
+    let cleanup = BytecodeTestRootCleanup::new();
+    let sentinel = Value::cons(Value::fixnum(59), Value::NIL);
+    push_scratch_gc_root(sentinel);
+    let caller_depth = save_scratch_gc_roots();
+    let mut called = false;
+    for input in [Value::NIL, Value::fixnum(17), sentinel] {
+        assert_eq!(
+            with_bytecode_literal_slots_public(&input, |_| {
+                called = true;
+                1
+            }),
+            None
+        );
+    }
+    ctx.gc_collect_exact();
+    let depth_after = save_scratch_gc_roots();
+    let sentinel_owned = ctx.tagged_heap.owns_heap_value_for_test(sentinel);
+    eprintln!(
+        "r028 nonbytecode: called={called} caller_depth={caller_depth} depth_after={depth_after} sentinel_owned={sentinel_owned}"
+    );
+    drop(cleanup);
+    assert!(!called);
+    assert_eq!(depth_after, caller_depth);
+    assert!(sentinel_owned);
+}
+
 #[test]
 fn print_basic_values() {
     crate::test_utils::init_test_tracing();
