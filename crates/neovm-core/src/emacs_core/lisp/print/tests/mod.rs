@@ -27,7 +27,7 @@ impl Drop for BytecodeTestRootCleanup {
 fn bytecode_root_fixture() -> Value {
     let mut function =
         crate::emacs_core::bytecode::ByteCodeFunction::new(LambdaParams::simple(vec![]));
-    function.gnu_bytecode_bytes = Some(vec![b'A', b'B'].into());
+    function.gnu_bytecode_bytes = Some(crate::tagged::header::LispByteVec::owned(vec![b'A', b'B']));
     function.constants.ensure_owned().push(Value::fixnum(73));
     function.docstring = Some(crate::heap_types::LispString::from_utf8(
         "r028 documentation",
