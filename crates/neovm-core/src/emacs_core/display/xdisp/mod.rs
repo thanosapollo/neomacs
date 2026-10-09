@@ -1471,7 +1471,7 @@ fn display_element_run(
         let v = super::textprop::builtin_get_text_property_in_state(
             &eval.obarray,
             &eval.buffers,
-            &[Value::fixnum(charpos1), *display_sym],
+            &[Value::fixnum(charpos1), *display_sym, Value::make_buffer(buf.id)],
         )
         .ok()?;
         if v.is_nil() { None } else { Some((v, None)) }
@@ -1507,7 +1507,7 @@ fn display_element_run(
         let run_end_char1 = super::textprop::builtin_next_single_property_change_in_state(
             &eval.obarray,
             &eval.buffers,
-            &[Value::fixnum(charpos1), *display_sym],
+            &[Value::fixnum(charpos1), *display_sym, Value::make_buffer(buf.id)],
         )
         .ok()
         .and_then(|v| match v.kind() {
