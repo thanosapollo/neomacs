@@ -411,7 +411,7 @@ fn major_symbol_join_merges_worker_and_mutator_results_after_publication_stops()
 }
 
 #[test]
-fn major_symbol_first_partition_join_keeps_symbols_and_discards_worker_promo() {
+fn major_symbol_first_partition_join_keeps_symbols_and_worker_promo() {
     let mut heap = heap(true);
     // Registering the image below activates the partition and its real span;
     // do not publish a partition window before a mapped object exists.
@@ -426,8 +426,10 @@ fn major_symbol_first_partition_join_keeps_symbols_and_discards_worker_promo() {
     heap.join_concurrent_mark();
     assert!(heap.marked_symbols.contains(id(key)));
     assert!(
-        heap.generational.promo.is_empty(),
-        "the permanent splice owns first promotion"
+        heap.generational
+            .promo
+            .contains(&(TaggedHeap::value_heap_addr(float).unwrap() as *mut GcHeader)),
+        "the worker claim must join ordinary P-all at the first partition"
     );
     assert!(!heap.value_is_old_for_test(float));
     assert!(
@@ -438,6 +440,30 @@ fn major_symbol_first_partition_join_keeps_symbols_and_discards_worker_promo() {
     assert!(heap.first_cycle_concurrent);
     assert!(heap.current_mutator_gc().major_symbol_preimages.is_empty());
     assert!(!concurrent_mark_active());
+    heap.reseed_runtime_and_remembered_roots();
+    heap.seed_root(float);
+    heap.incremental_drain_all();
+    heap.incremental_finish(heap.live_bytes(), std::time::Instant::now());
+    heap.finish_incremental_sweep_now();
+    heap.finish_first_partition_cycle();
+    assert!(heap.owns_heap_value_for_test(float));
+    assert!(heap.value_is_old_for_test(float));
+    assert!(!unsafe {
+        (*(TaggedHeap::value_heap_addr(float).unwrap() as *const GcHeader))
+            .generation
+            .permanent()
+    });
+    heap.begin_minor_collection();
+    assert!(heap.is_minor_collection());
+    heap.seed_root(float);
+    heap.complete_minor_collection();
+    heap.finish_incremental_sweep_now();
+    assert!(heap.owns_heap_value_for_test(float));
+    assert_eq!(float.as_float(), Some(2.25));
+    restore_scratch_gc_roots(roots.0);
+    heap.collect_exact(std::iter::empty());
+    assert!(!heap.owns_heap_value_for_test(float));
+    assert!(heap.mapped_image_owns_for_test(mapped));
 }
 
 #[test]

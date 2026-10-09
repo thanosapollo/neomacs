@@ -492,6 +492,7 @@ fn bignum_survivors_tenure_and_full_pages_retire_body(verify: bool) {
     assert_eq!(heap.bignum_arena.pages[0].allocated, BIGNUM_PAGE_SLOTS);
 
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(heap.dump_blackened);
     for b in &bigs {
         assert!(unsafe { (*b.as_veclike_ptr().unwrap()).gc.tenured });

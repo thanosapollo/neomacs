@@ -12,6 +12,86 @@ use crate::emacs_core::eval::Context;
 use crate::emacs_core::format_eval_result;
 use crate::emacs_core::value::Value;
 
+/// A registered image must not change the lifetime of session allocations.
+/// The mapped vector fixture activates the real first-partition path without
+/// constructing a pdump. Its one contiguous allocation cannot swallow
+/// unrelated heap objects into the mapped address span.
+fn first_partition_killed_buffer_lifetime(mut ev: Context) {
+    let measured_collect = |ev: &mut Context, stage: &str| {
+        let start = std::time::Instant::now();
+        ev.eval_str("(garbage-collect)").unwrap();
+        ev.eval_str("(garbage-collect)").unwrap();
+        let wall = start.elapsed().as_secs_f64();
+        let rss = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find(|line| line.starts_with("VmRSS:"))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|kib| kib.parse::<u64>().ok())
+            });
+        let weak = eval_ok(ev, "(hash-table-count lifetime-weak)");
+        println!(
+            "LIFETIME stage={stage} weak={weak} rss_kib={rss:?} gc_wall_seconds={wall:.9} explicit_gc_count=2"
+        );
+    };
+    ev.eval_str("(setq gc-cons-threshold most-positive-fixnum)")
+        .unwrap();
+    let image = crate::tagged::gc::fake_image::FakeImage::leak(false);
+    image.register_vector(&mut ev.tagged_heap);
+    assert!(ev.tagged_heap.is_partition_first_cycle());
+    ev.eval_str(
+        "(progn
+        (setq lifetime-weak (make-hash-table :weakness 'key))
+        (setq lifetime-holder (vector (get-buffer-create \"partition-held\")))
+        (puthash (aref lifetime-holder 0) t lifetime-weak)
+        (kill-buffer (aref lifetime-holder 0)))",
+    )
+    .unwrap();
+    let id = ev
+        .eval_str("(aref lifetime-holder 0)")
+        .unwrap()
+        .as_buffer_id()
+        .unwrap();
+    measured_collect(&mut ev, "strong-holder");
+    assert!(!ev.tagged_heap.is_partition_first_cycle());
+    assert_eq!(
+        eval_ok(
+            &mut ev,
+            "(list (bufferp (aref lifetime-holder 0))
+               (buffer-live-p (aref lifetime-holder 0))
+               (buffer-last-name (aref lifetime-holder 0))
+               (hash-table-count lifetime-weak))"
+        ),
+        "OK (t nil \"partition-held\" 1)"
+    );
+    assert!(
+        ev.buffers.get_dead(id).is_some(),
+        "a strong holder must retain the dead buffer"
+    );
+    ev.eval_str("(setq lifetime-holder nil)").unwrap();
+    measured_collect(&mut ev, "released-holder");
+    assert_eq!(
+        eval_ok(&mut ev, "(hash-table-count lifetime-weak)"),
+        "OK 0",
+        "the first partition must not turn the holder or buffer permanent"
+    );
+    assert!(
+        ev.buffers.get_dead(id).is_none(),
+        "the unreachable killed record must be reclaimed"
+    );
+}
+
+#[test]
+fn first_partition_releases_killed_buffer_after_holder_root_is_cleared() {
+    first_partition_killed_buffer_lifetime(Context::new());
+}
+
+#[test]
+fn first_partition_releases_killed_buffer_under_generational_collection() {
+    first_partition_killed_buffer_lifetime(generational_context());
+}
+
 /// Make and kill COUNT temporary buffers the way `with-temp-buffer` does,
 /// keeping no reference to any of them.
 fn churn_temp_buffers(ev: &mut Context, count: usize) {

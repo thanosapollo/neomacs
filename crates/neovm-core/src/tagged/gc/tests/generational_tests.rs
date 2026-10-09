@@ -130,6 +130,7 @@ fn generational_mapped_and_permanent_logs_are_per_cycle() {
     let permanent = heap.alloc_vector(vec![TaggedValue::NIL]);
     roots.keep(permanent);
     heap.collect_exact(std::iter::once(permanent));
+    heap.make_survivors_permanent_for_test();
     assert!(header(permanent).generation.permanent());
     let child = heap.alloc_cons(TaggedValue::T, TaggedValue::NIL);
     for _ in 0..2 {
@@ -168,6 +169,7 @@ fn generational_disabled_never_logs_r() {
     let permanent = heap.alloc_vector(vec![TaggedValue::NIL]);
     roots.keep(permanent);
     heap.collect_exact(std::iter::once(permanent));
+    heap.make_survivors_permanent_for_test();
     let child = heap.alloc_cons(TaggedValue::T, TaggedValue::NIL);
     crate::tagged::mutate::set_vector_slot(mapped, 0, child);
     crate::tagged::mutate::set_vector_slot(permanent, 0, child);
@@ -259,6 +261,7 @@ fn minor_mapped_and_permanent_edges_are_seeded_by_r() {
     let permanent = heap.alloc_vector(vec![TaggedValue::NIL]);
     roots.keep(permanent);
     heap.collect_exact(std::iter::once(permanent));
+    heap.make_survivors_permanent_for_test();
     let child = heap.alloc_cons(TaggedValue::fixnum(29), TaggedValue::NIL);
     crate::tagged::mutate::set_vector_slot(mapped, 0, child);
     crate::tagged::mutate::set_vector_slot(permanent, 0, child);
@@ -433,6 +436,7 @@ fn major_before_first_minor_preserves_permanent_edge() {
     let owner = heap.alloc_vector(vec![TaggedValue::NIL]);
     roots.keep(owner);
     heap.collect_exact(std::iter::once(owner));
+    heap.make_survivors_permanent_for_test();
     assert!(header(owner).generation.permanent());
     let child = heap.alloc_cons(TaggedValue::fixnum(97), TaggedValue::NIL);
     crate::tagged::mutate::set_vector_slot(owner, 0, child);
@@ -631,6 +635,7 @@ fn minor_lazy_hydration_keys_survive_from_old_and_permanent_owners() {
             let image = fake_image::FakeImage::leak(false);
             roots.keep(image.register_vector(&mut heap));
             heap.collect_exact(std::iter::once(owner));
+            heap.make_survivors_permanent_for_test();
         } else {
             minor(&mut heap, &[owner]);
         }

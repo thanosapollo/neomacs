@@ -2071,8 +2071,9 @@ fn parity_tenured_objects_stay_frozen_across_cycles_under_verifier() {
     let t = heap.alloc_record(vec![y]);
     let root = heap.alloc_cons(t, TaggedValue::fixnum(0));
 
-    // First partition cycle: STW full trace + sweep, then promotion.
+    // First partition STW trace/sweep, then explicit fixture promotion.
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(heap.dump_blackened);
     let t_header = t.as_veclike_ptr().unwrap();
     assert!(
@@ -3182,8 +3183,9 @@ fn write_barrier_caches_skip_only_writes_with_nothing_to_record() {
     for &owner in &owners {
         root = heap.alloc_cons(owner, root);
     }
-    // The first partition cycle tenures every survivor.
+    // Explicit fixture promotion constructs permanent barrier owners.
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(owners.iter().all(|&owner| heap.value_is_tenured(owner)));
     let calls = || RECORD_HEAP_WRITE_CALLS.with(|c| c.get());
 

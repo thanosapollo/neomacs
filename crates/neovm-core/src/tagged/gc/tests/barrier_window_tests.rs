@@ -126,8 +126,9 @@ fn partitioned_heap_owners(heap: &mut TaggedHeap) -> Owners {
     let remembered_vector = heap.alloc_vector(vec![TaggedValue::NIL; 2]);
     let root = heap.alloc_cons(tenured_vector, TaggedValue::NIL);
     let root = heap.alloc_cons(remembered_vector, root);
-    // The first partition cycle tenures every survivor.
+    // Explicit fixture promotion constructs permanent barrier owners.
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(heap.value_is_tenured(tenured_vector));
     assert!(heap.value_is_tenured(remembered_vector));
     // One write remembers this owner.
@@ -362,6 +363,7 @@ fn the_remembered_bit_is_set_exactly_when_the_owner_is_remembered() {
         assert!(!header_remembered(owner), "{owner:?} starts unremembered");
     }
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
 
     // Promotion: the scan remembers the tenured owner holding a young cons.
     assert!(heap.value_is_tenured(parent));
