@@ -18,6 +18,7 @@ mod idle_timer_output;
 mod pixel_measurement;
 mod process_plist_isolation;
 mod process_send_encoding;
+mod stalled_tls;
 
 #[cfg(test)]
 #[path = "mode_line_min_width_boundary_oracle.rs"]
@@ -164,3 +165,5 @@ mod gnu_redisplay_mutation_oracle;
 #[cfg(test)]
 #[path = "redisplay_mini_source_start_oracle.rs"]
 mod redisplay_mini_source_start_oracle;
+
+mod font_coverage;

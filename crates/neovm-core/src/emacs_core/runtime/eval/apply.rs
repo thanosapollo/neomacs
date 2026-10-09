@@ -542,7 +542,7 @@ impl Context {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(super) fn release_backtrace_args(&mut self, args: &BacktraceArgs) {
         let Some(index) = args.owned_index() else {
             return;
@@ -1210,6 +1210,7 @@ impl Context {
         self.eval_call_roots.extend(values.iter().copied());
     }
 
+    #[inline(never)]
     pub(crate) fn record_save_excursion(&mut self) -> Option<usize> {
         let buffer_id = self.buffers.current_buffer_id()?;
         let (marker, marker_id) =
@@ -1285,6 +1286,7 @@ impl Context {
     /// For a builtin that fills a known number of results in place (GNU
     /// `Fmapcar`'s `SAFE_ALLOCA` array): each result is a slot write, rooted
     /// across every callback, with no push per element.
+    #[inline(never)]
     pub(crate) fn reserve_vm_frame_root_slots(&mut self, count: usize) -> usize {
         let roots = &mut self
             .vm_root_frames
@@ -1298,6 +1300,7 @@ impl Context {
 
     /// The root slots `base..base + count` reserved by
     /// [`Self::reserve_vm_frame_root_slots`].
+    #[inline(always)]
     pub(crate) fn vm_frame_root_slots(&self, base: usize, count: usize) -> &[Value] {
         &self
             .vm_root_frames
@@ -1665,6 +1668,7 @@ impl Context {
     /// Each failed cleanup has already popped its own entry. Keep unwinding so
     /// lower bindings cannot leak; if another cleanup exits nonlocally, that
     /// later/lower flow supersedes the earlier one just as it does in GNU.
+    #[inline(never)]
     pub(super) fn drain_unwind_to(&mut self, count: usize, result: EvalResult) -> EvalResult {
         // GNU eval.c `unbind_to(count, value)` carries VALUE through cleanup.
         // In Rust the value is not on the C stack/register root set, so keep
@@ -1960,6 +1964,7 @@ impl Context {
         count
     }
 
+    #[inline(never)]
     pub(super) fn apply_internal(
         &mut self,
         function: Value,
@@ -2143,6 +2148,7 @@ impl Context {
     /// The `match` over the dispatch plan is intentionally exhaustive: once
     /// a compiled tier exists it MUST be handled here, enforced by the
     /// compiler. Behind the `jit` feature; the default build is unchanged.
+    #[inline(never)]
     pub(crate) fn execute_bytecode_call(
         &mut self,
         bc_data: &super::super::bytecode::ByteCodeFunction,
@@ -2303,7 +2309,7 @@ impl Context {
     /// `record_backtrace`: quit, depth, backtrace frame, GC safe point,
     /// debug-on-next-call, stack growth, then the call, signal dispatch and
     /// the unwind to the frame.
-    #[inline]
+    #[inline(never)]
     pub(crate) fn apply1(&mut self, function: Value, arg0: Value) -> EvalResult {
         #[cfg(feature = "jit")]
         if function.veclike_type() == Some(VecLikeType::ByteCode) {
@@ -2320,6 +2326,7 @@ impl Context {
     /// for. `None` for everything else, which keeps the generic funcall path
     /// (autoloads, special forms, evaluator callables, lambdas, bytecode,
     /// compiler overrides).
+    #[inline(never)]
     pub(crate) fn resolve_mapped_subr_callee(&mut self, function: Value) -> Option<(Value, u64)> {
         let sym_id = function.as_symbol_id()?;
         if self.compiler_function_overrides_active()
@@ -2438,7 +2445,7 @@ impl Context {
     /// capture. Private synchronous scopes restore that state after every
     /// prologue hook and callback; other mutators keep their own observations.
     #[cfg(feature = "jit")]
-    #[inline]
+    #[inline(always)]
     pub(crate) fn apply1_bytecode_unobserved(
         &mut self,
         function: Value,
@@ -2779,6 +2786,7 @@ impl Context {
     /// This is the typed seam used by the bytecode interpreter's iterative
     /// `Bcall` transition.  `Interpret` means the caller must install a Tier-0
     /// frame; `Complete` means native code either returned or raised a flow.
+    #[inline(never)]
     pub(crate) fn dispatch_bytecode_call_from_stack(
         &mut self,
         bc_data: &super::super::bytecode::ByteCodeFunction,
@@ -3405,7 +3413,7 @@ impl Context {
         }
     }
 
-    #[inline]
+    #[inline(never)]
     pub(super) fn apply_subr_object(
         &mut self,
         function: Value,
@@ -3448,7 +3456,7 @@ impl Context {
     }
 
     /// Apply a dynamic module function.
-    #[inline]
+    #[inline(never)]
     pub(super) fn apply_module_function(
         &mut self,
         function: Value,
@@ -3813,6 +3821,7 @@ impl Context {
         walk_lambda_formals(fun, arglist, args, |sym, arg| self.try_specbind(sym, arg))
     }
 
+    #[inline(never)]
     pub(super) fn apply_lambda(&mut self, func_value: Value, args: LispArgVec) -> EvalResult {
         let raw_cons_lambda = func_value.is_cons();
         let (arglist, body, env) = if raw_cons_lambda {

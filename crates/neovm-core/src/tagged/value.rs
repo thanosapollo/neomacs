@@ -320,7 +320,7 @@ impl TaggedValue {
     // -- Fixnum --
 
     /// Create a fixnum (62-bit signed integer, no heap allocation).
-    #[inline]
+    #[inline(always)]
     pub fn fixnum(n: i64) -> Self {
         // Encode: (n << 2) | 2. The low 2 bits are `10`, matching GNU's
         // fixnum tags 010 and 110.
@@ -349,7 +349,7 @@ impl TaggedValue {
     ///
     /// # Safety
     /// `cell` must be a valid, 8-byte-aligned pointer to a live `ConsCell`.
-    #[inline]
+    #[inline(always)]
     pub unsafe fn from_cons_ptr(cell: *const ConsCell) -> Self {
         debug_assert!(!cell.is_null());
         debug_assert!(cell as usize & TAG_MASK == 0, "ConsCell not aligned");
@@ -575,7 +575,7 @@ impl TaggedValue {
     }
 
     /// Bignums are PVEC_BIGNUM veclike heap objects (mirrors GNU `BIGNUMP`).
-    #[inline]
+    #[inline(always)]
     pub fn is_bignum(self) -> bool {
         self.veclike_type() == Some(super::header::VecLikeType::Bignum)
     }
@@ -693,7 +693,7 @@ impl TaggedValue {
     }
 
     /// Extract fixnum value without tag check. Caller must ensure `is_fixnum()`.
-    #[inline]
+    #[inline(always)]
     pub fn xfixnum(self) -> i64 {
         debug_assert!(self.is_fixnum());
         (self.0 as i64) >> FIXNUM_SHIFT
@@ -966,7 +966,7 @@ impl TaggedValue {
     // -- Compat predicates --
 
     /// True if this value is "truthy" (not nil).
-    #[inline]
+    #[inline(always)]
     pub fn is_truthy(self) -> bool {
         !self.is_nil()
     }
@@ -974,7 +974,7 @@ impl TaggedValue {
     /// True for integers — both fixnums and bignums (matches GNU `INTEGERP`).
     /// Characters are also integers in GNU Emacs, and since chars are encoded
     /// as fixnums, they fall through the fixnum branch.
-    #[inline]
+    #[inline(always)]
     pub fn is_integer(self) -> bool {
         self.is_fixnum() || self.is_bignum()
     }

@@ -211,6 +211,7 @@ fn prepare() -> (Context, ProcessId, TcpStream, Vec<u8>) {
     proc.coding_decode = Value::symbol("utf-8-unix");
     proc.coding_encode = Value::symbol("utf-8-unix");
     proc.live_io.tls_stream = Some(tls);
+    proc.gnutls_initstage = GnutlsInitStage::Ready;
     ev.processes.set_process_output_read_interest(pid, true);
     let ready = ev
         .processes
@@ -404,6 +405,61 @@ fn tls_buffered_response_resumes_inside_other_target_wait_without_target_activit
     );
     assert_eq!(output(&mut ev, "tls-other"), b"MARKER");
     assert_drained(&mut ev, pid, &expected);
+}
+
+#[test]
+fn tls_buffered_readiness_waits_for_completed_unsuspended_handshake() {
+    let (mut ev, pid, _peer, expected) = prepare();
+    ev.processes.get_mut(pid).unwrap().gnutls_initstage = GnutlsInitStage::Ready;
+    // Real plaintext is buffered and the TCP descriptor has no ciphertext.
+    // A pending handshake cannot consume it, even if the rustls client has
+    // finished reading peer records but still owes its final outbound bytes.
+    ev.processes.get_mut(pid).unwrap().gnutls_initstage = GnutlsInitStage::HandshakeTried;
+    for suspended in [false, true] {
+        if suspended {
+            assert!(ev.processes.suspend_tls_handshake_polling(pid));
+        }
+        let events = ev
+            .processes
+            .wait_for_backend_events_for_service(
+                Duration::ZERO,
+                ProcessWaitBackendInterest::ProcessesOnly,
+                ProcessOutputServiceRequest::any(None),
+            )
+            .unwrap();
+        assert!(
+            !events.has_ready_process(pid),
+            "incomplete handshake plaintext must not bypass readiness suspension"
+        );
+    }
+    // Completion alone must not override a nested wait's suspension owner.
+    ev.processes.get_mut(pid).unwrap().gnutls_initstage = GnutlsInitStage::Ready;
+    let events = ev
+        .processes
+        .wait_for_backend_events_for_service(
+            Duration::ZERO,
+            ProcessWaitBackendInterest::ProcessesOnly,
+            ProcessOutputServiceRequest::any(None),
+        )
+        .unwrap();
+    assert!(!events.has_ready_process(pid));
+    ev.processes.resume_tls_handshake_polling(pid);
+    let events = ev
+        .processes
+        .wait_for_backend_events_for_service(
+            Duration::ZERO,
+            ProcessWaitBackendInterest::ProcessesOnly,
+            ProcessOutputServiceRequest::any(None),
+        )
+        .unwrap();
+    assert!(events.has_ready_process(pid));
+    assert_eq!(output(&mut ev, "tls-output"), expected[..16]);
+    ev.poll_ready_process_output_for_service_request(
+        events,
+        &ProcessOutputServiceRequest::target_only(pid),
+    )
+    .unwrap();
+    assert_eq!(output(&mut ev, "tls-output"), expected[..32]);
 }
 
 #[test]

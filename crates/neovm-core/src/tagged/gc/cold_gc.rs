@@ -251,9 +251,12 @@ impl TaggedHeap {
 }
 
 // The normal x86-64 shipping type has no cfg(test) mapped_veclike_traces word.
-// Main 2e4c571469's compiled DWARF supplies this baseline. These assertions
-// reject silent hot-layout drift during ordinary compilation, independently
-// of the runtime knob. The complete staged DWARF table remains the final gate.
+// Main 2e4c571469's compiled DWARF supplies the original baseline. The indexed
+// ProcessRegistry has the same inline size/alignment as the original map, but
+// its Vec niche changes repr(Rust) field ordering: non_cons_object_addrs moves
+// by 32 bytes. Heap size and every JIT offset remain pinned to the baseline.
+// These assertions reject silent hot-layout drift during ordinary compilation,
+// independently of the runtime knob.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64", not(test)))]
 const _: () = {
     use std::mem::{align_of, offset_of, size_of};
@@ -266,7 +269,7 @@ const _: () = {
     assert!(offset_of!(TaggedHeap, float_arena) == 1264);
     assert!(offset_of!(TaggedHeap, string_arena) == 1368);
     assert!(offset_of!(TaggedHeap, vector_arena) == 1472);
-    assert!(offset_of!(TaggedHeap, non_cons_object_addrs) == 3048);
+    assert!(offset_of!(TaggedHeap, non_cons_object_addrs) == 3080);
     assert!(offset_of!(TaggedHeap, satb_shared) == 3432);
     assert!(offset_of!(TaggedHeap, jit) == 3608);
     assert!(jit_state::HEAP_JIT_CONS_CUR == 3608);

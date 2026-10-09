@@ -4387,7 +4387,7 @@ impl Obarray {
     /// Acquire the function-binding publication clock before reading a stamp
     /// or binding. A refresh must retain this snapshot, so a redefinition
     /// following its proof leaves the refreshed entry below the new clock.
-    #[inline]
+    #[inline(always)]
     pub fn function_epoch(&self) -> u64 {
         self.function_epoch.load(Ordering::Acquire)
     }
