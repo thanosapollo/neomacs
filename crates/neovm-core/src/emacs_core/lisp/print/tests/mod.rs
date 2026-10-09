@@ -1317,7 +1317,10 @@ fn princ_continuous_history_direct_impl_initializes_nil_table() {
         )
         .unwrap();
     let sink = ctx.eval_str("(current-buffer)").unwrap();
-    assert_eq!(builtin_princ_impl(&mut ctx, vec![pair, sink]).unwrap(), pair);
+    assert_eq!(
+        builtin_princ_impl(&mut ctx, vec![pair, sink]).unwrap(),
+        pair
+    );
     assert_eq!(
         ctx.eval_str("(buffer-string)").unwrap().as_utf8_str(),
         Some("(#1=(1) #1#)")
@@ -1333,7 +1336,10 @@ fn princ_continuous_history_direct_impl_initializes_nil_table() {
     );
     ctx.eval_str("(progn (erase-buffer) (garbage-collect))")
         .unwrap();
-    assert_eq!(builtin_princ_impl(&mut ctx, vec![pair, sink]).unwrap(), pair);
+    assert_eq!(
+        builtin_princ_impl(&mut ctx, vec![pair, sink]).unwrap(),
+        pair
+    );
     assert_eq!(
         ctx.eval_str("(buffer-string)").unwrap().as_utf8_str(),
         Some("(#1# #1#)")
@@ -1370,8 +1376,11 @@ fn check_princ_candidate_history(
     // history label, return identity, and table contents without changing
     // that pre-existing renderer behavior in this regression.
     let src = if candidate && gensym {
-        src.replace("(list (buffer-string)", "(list (substring (buffer-string) 0 3)")
-            .replace("(list s", "(list (substring s 0 3)")
+        src.replace(
+            "(list (buffer-string)",
+            "(list (substring (buffer-string) 0 3)",
+        )
+        .replace("(list s", "(list (substring s 0 3)")
     } else {
         src
     };
@@ -1523,6 +1532,348 @@ fn princ_candidate_history_direct_impl_atom_stays_nil() {
             .unwrap(),
         Value::fixnum(0)
     );
+}
+
+// GNU primitive controls: effective current/destination bindings and history.
+fn assert_princ_scope_result(result: Value, output: &str, history: bool) {
+    let mut fields = result;
+    assert_eq!(
+        fields.cons_car().as_utf8_str(),
+        Some(output),
+        "scope output"
+    );
+    fields = fields.cons_cdr();
+    for expected in [
+        Value::T,
+        Value::T,
+        Value::T,
+        Value::T,
+        if history {
+            Value::fixnum(1)
+        } else {
+            Value::NIL
+        },
+        Value::T,
+    ] {
+        assert!(fields.is_cons(), "missing scope field");
+        assert_eq!(fields.cons_car(), expected, "scope field");
+        fields = fields.cons_cdr();
+    }
+    assert!(fields.is_nil());
+}
+
+fn check_princ_effective_scope(case: usize, route: &str) {
+    use crate::emacs_core::builtins::misc_eval::builtin_princ_impl;
+    let (setup, circle, history, other) = match case {
+        0 => (
+            r#"(progn
+  (setq print-circle t print-continuous-numbering t print-number-table nil)
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle nil)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  nil
+  (make-local-variable 'print-circle) (setq print-circle nil)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  nil
+  scope-x)"#,
+            false,
+            false,
+            false,
+        ),
+        1 => (
+            r#"(progn
+  (setq print-circle t print-continuous-numbering t print-number-table nil)
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering nil)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  nil
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering nil)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  nil
+  scope-x)"#,
+            true,
+            false,
+            false,
+        ),
+        2 => (
+            r#"(progn
+  (setq print-circle nil print-continuous-numbering nil print-number-table nil)
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  nil
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  nil
+  scope-x)"#,
+            true,
+            true,
+            false,
+        ),
+        3 => (
+            r#"(progn
+  (setq print-circle t print-continuous-numbering t print-number-table (make-hash-table :test 'eq))
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  nil
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  nil
+  scope-x)"#,
+            true,
+            true,
+            false,
+        ),
+        4 => (
+            r#"(progn
+  (setq print-circle t print-continuous-numbering t print-number-table nil)
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  nil
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table (make-hash-table :test 'eq))
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  nil
+  scope-x)"#,
+            true,
+            true,
+            false,
+        ),
+        5 => (
+            r#"(progn
+  (setq print-circle nil print-continuous-numbering nil print-number-table nil)
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle nil)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  (set-buffer (get-buffer-create " princ-scope-destination"))
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  scope-x)"#,
+            true,
+            true,
+            true,
+        ),
+        6 => (
+            r#"(progn
+  (setq print-circle t print-continuous-numbering t print-number-table nil)
+  (setq scope-default-table (default-value 'print-number-table))
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  (make-local-variable 'print-circle) (setq print-circle t)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-caller-table print-number-table)
+  (set-buffer (get-buffer-create " princ-scope-destination"))
+  (make-local-variable 'print-circle) (setq print-circle nil)
+  (make-local-variable 'print-continuous-numbering) (setq print-continuous-numbering t)
+  (make-local-variable 'print-number-table) (setq print-number-table nil)
+  (setq scope-supplied-table print-number-table scope-destination (current-buffer))
+  (setq scope-x (let ((x (list 1))) (list x x)) scope-s "")
+  (erase-buffer)
+  (set-buffer (get-buffer-create " princ-scope-caller"))
+  scope-x)"#,
+            false,
+            false,
+            true,
+        ),
+        _ => unreachable!(),
+    };
+    let mut ctx = crate::emacs_core::Context::new();
+    ctx.set_lexical_binding(true);
+    let object = ctx.eval_str(setup).expect("primitive scope setup");
+    let sink = ctx.eval_str("scope-destination").unwrap();
+    let snapshot = if route == "callable" {
+        "scope-s"
+    } else {
+        "(buffer-string)"
+    };
+    // GNU publishes a transient table when circle=t/continuous=nil. That
+    // pre-existing renderer difference is not a continuous-history assertion.
+    let table_check = if history {
+        "(hash-table-p print-number-table)"
+    } else {
+        "(or (eq print-number-table nil) (eq print-continuous-numbering nil))"
+    };
+    let count = if history {
+        "(hash-table-count print-number-table)"
+    } else {
+        "nil"
+    };
+    let caller_check = if other {
+        r#"(progn (set-buffer (get-buffer-create " princ-scope-caller")) (eq scope-caller-table print-number-table))"#
+    } else {
+        "t"
+    };
+    let inspect = format!(
+        r#"(progn (set-buffer scope-destination)
+      (list {snapshot} (eq scope-x scope-returned) {table_check}
+        (or (eq scope-supplied-table nil) (eq scope-supplied-table print-number-table))
+        (eq scope-default-table (default-value 'print-number-table)) {count} {caller_check}))"#
+    );
+    let first = if circle { "(#1=(1) #1#)" } else { "((1) (1))" };
+    let second = if history { "(#1# #1#)" } else { first };
+    for output in [first, second] {
+        if route == "direct" {
+            assert_eq!(
+                builtin_princ_impl(&mut ctx, vec![object, sink]).unwrap(),
+                object
+            );
+            ctx.set_variable("scope-returned", object);
+        } else {
+            let stream = if route == "callable" {
+                "(lambda (ch) (setq scope-s (concat scope-s (string ch))))"
+            } else {
+                "scope-destination"
+            };
+            ctx.eval_str(&format!("(setq scope-returned (princ scope-x {stream}))"))
+                .unwrap();
+        }
+        let result = ctx.eval_str(&inspect).unwrap();
+        assert_princ_scope_result(result, output, history);
+        ctx.eval_str(r#"(progn (set-buffer scope-destination) (erase-buffer) (setq scope-s "") (garbage-collect))"#).unwrap();
+        if other {
+            ctx.eval_str(r#"(set-buffer (get-buffer-create " princ-scope-caller"))"#)
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn princ_effective_scope_local_circle_disabled_callable() {
+    check_princ_effective_scope(0, "callable");
+}
+
+#[test]
+fn princ_effective_scope_local_circle_disabled_buffer() {
+    check_princ_effective_scope(0, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_local_circle_disabled_direct() {
+    check_princ_effective_scope(0, "direct");
+}
+
+#[test]
+fn princ_effective_scope_local_continuous_disabled_callable() {
+    check_princ_effective_scope(1, "callable");
+}
+
+#[test]
+fn princ_effective_scope_local_continuous_disabled_buffer() {
+    check_princ_effective_scope(1, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_local_continuous_disabled_direct() {
+    check_princ_effective_scope(1, "direct");
+}
+
+#[test]
+fn princ_effective_scope_local_flags_enabled_callable() {
+    check_princ_effective_scope(2, "callable");
+}
+
+#[test]
+fn princ_effective_scope_local_flags_enabled_buffer() {
+    check_princ_effective_scope(2, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_local_flags_enabled_direct() {
+    check_princ_effective_scope(2, "direct");
+}
+
+#[test]
+fn princ_effective_scope_local_nil_table_default_supplied_callable() {
+    check_princ_effective_scope(3, "callable");
+}
+
+#[test]
+fn princ_effective_scope_local_nil_table_default_supplied_buffer() {
+    check_princ_effective_scope(3, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_local_nil_table_default_supplied_direct() {
+    check_princ_effective_scope(3, "direct");
+}
+
+#[test]
+fn princ_effective_scope_local_supplied_table_default_nil_callable() {
+    check_princ_effective_scope(4, "callable");
+}
+
+#[test]
+fn princ_effective_scope_local_supplied_table_default_nil_buffer() {
+    check_princ_effective_scope(4, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_local_supplied_table_default_nil_direct() {
+    check_princ_effective_scope(4, "direct");
+}
+
+#[test]
+fn princ_effective_scope_destination_enabled_caller_disabled_buffer() {
+    check_princ_effective_scope(5, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_destination_enabled_caller_disabled_direct() {
+    check_princ_effective_scope(5, "direct");
+}
+
+#[test]
+fn princ_effective_scope_destination_disabled_caller_enabled_buffer() {
+    check_princ_effective_scope(6, "buffer");
+}
+
+#[test]
+fn princ_effective_scope_destination_disabled_caller_enabled_direct() {
+    check_princ_effective_scope(6, "direct");
 }
 
 fn princ_eval(src: &str) -> String {
