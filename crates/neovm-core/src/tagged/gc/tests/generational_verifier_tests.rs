@@ -201,6 +201,7 @@ fn generational_verifier_accepts_mapped_and_permanent_owners() {
     let permanent = heap.alloc_vector(vec![TaggedValue::NIL; 2]);
     roots.keep(permanent);
     heap.collect_exact([mapped, permanent].into_iter());
+    heap.make_survivors_permanent_for_test();
     let header = TaggedHeap::value_heap_addr(permanent).unwrap() as *const GcHeader;
     assert!(unsafe { (*header).generation.permanent() });
     assert!(heap.dump_blackened);

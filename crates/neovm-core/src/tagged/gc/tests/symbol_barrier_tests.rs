@@ -38,6 +38,9 @@ fn weak_symbol_key_survives_full_collections(mapped: bool, with_position: bool) 
     };
     roots.keep(owner);
     heap.collect_exact(std::iter::once(owner));
+    if !mapped {
+        heap.make_survivors_permanent_for_test();
+    }
     assert!(heap.dump_blackened);
     assert!(!heap.mapped_remembered.contains(&owner.bits()));
 

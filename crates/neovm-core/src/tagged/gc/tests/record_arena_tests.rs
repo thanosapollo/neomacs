@@ -462,6 +462,7 @@ fn record_survivors_tenure_and_full_pages_retire_body(verify: bool) {
     assert_eq!(heap.record_arena.pages[0].allocated, RECORD_PAGE_SLOTS);
 
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(heap.dump_blackened);
     for b in &records {
         assert!(unsafe { (*b.as_veclike_ptr().unwrap()).gc.tenured });
@@ -520,6 +521,7 @@ fn record_mixed_page_tenured_survive_alternating_parities_body(verify: bool) {
         }
     }
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(heap.dump_blackened);
     assert!(!heap.record_arena.pages[0].retired);
 
@@ -567,6 +569,7 @@ fn record_payload_pages_freed_at_heap_drop_body(mid_mark: bool) {
         assert!(LIVE_RECORD_PAGES.load(Ordering::Relaxed) > before);
 
         heap.collect_exact(std::iter::once(root));
+        heap.make_survivors_permanent_for_test();
         assert!(heap.dump_blackened);
         heap.assert_object_arenas_coherent();
 
@@ -607,6 +610,7 @@ fn tenured_page_record_keeps_young_cons_child_alive_body(verify: bool) {
     let root = heap.alloc_cons(b, TaggedValue::fixnum(0));
 
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(heap.dump_blackened);
     assert!(unsafe { (*b.as_veclike_ptr().unwrap()).gc.tenured });
 

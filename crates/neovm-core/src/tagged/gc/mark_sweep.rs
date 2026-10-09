@@ -244,84 +244,15 @@ impl TaggedHeap {
         }
     }
 
-    /// Run once at the END of the first partition cycle (after a full
-    /// trace+sweep): promote every survivor to the tenured old generation,
-    /// blacken the mapped dump image, and build the initial remembered set.
-    /// Thereafter both regions are permanently black and skipped each cycle.
+    /// Blacken only the mapped image after the first full trace and sweep.
+    ///
+    /// Surviving heap objects may be session allocations, not dump objects.
+    /// Making them permanent here pins killed buffers and their holders after
+    /// the last Lisp reference disappears. Keep heap objects collectible and
+    /// preserve image edges through the existing remembered-set scan below.
+    /// The historical method name is retained for internal test callers.
     pub(super) fn promote_and_blacken(&mut self) {
-        // An open region's reserved slots would be tenured (and its full
-        // pages retired) as survivors.
         self.close_alloc_regions();
-        self.join_old_boxes_for_partition_world_stopped();
-        // 1. Promote every surviving heap object to tenured (old generation).
-        //    The first partition cycle ran a full trace+sweep, so everything
-        //    still in `all_objects` is alive = a permanent (the preloaded world
-        //    plus whatever the session has retained). They are already marked;
-        //    setting `tenured` FREEZES that bit — no later parity flip may be
-        //    interpreted against it (every tenured reader short-circuits on
-        //    the flag), so these objects are permanently black without ever
-        //    being re-touched.
-        //    Move the whole young list onto the tenured list and flag each
-        //    node so the nursery (`all_objects`) starts empty; from now on only
-        //    post-loadup allocations land there and get cleared/swept.
-        let mut tail: *mut GcHeader = std::ptr::null_mut();
-        let mut obj = self.all_objects;
-        while !obj.is_null() {
-            unsafe {
-                (*obj).make_permanent();
-                // A weak hash table being tenured becomes permanent-black and the
-                // main mark will never re-touch it; record it so the weak sweep
-                // keeps re-evaluating its entries every GC (GNU sweeps every weak
-                // table every GC). See `permanent_weak_hash_tables`.
-                if (*obj).kind == HeapObjectKind::VecLike {
-                    let vptr = obj as *mut VecLikeHeader;
-                    if (*vptr).type_tag == VecLikeType::HashTable {
-                        let ht_ptr = vptr as *mut HashTableObj;
-                        if (*ht_ptr).table.weakness.is_some()
-                            && !self.permanent_weak_hash_tables_set.contains(&ht_ptr)
-                        {
-                            self.permanent_weak_hash_tables_set.insert(ht_ptr);
-                            self.permanent_weak_hash_tables.push(ht_ptr);
-                        }
-                    }
-                }
-                tail = obj;
-                obj = (*obj).next;
-            }
-        }
-        if !tail.is_null() {
-            // Splice: [all_objects .. tail] -> front of tenured_objects.
-            unsafe {
-                (*tail).next = self.tenured_objects;
-            }
-            self.tenured_objects = self.all_objects;
-            self.all_objects = std::ptr::null_mut();
-        }
-        // 1b. PROMOTION PAGE WALK (stage 3): page objects are on no intrusive
-        //     list, so the splice above cannot tenure them — without this
-        //     walk the (loadup-sized) paged survivor set would stay young and
-        //     be re-seeded + re-traced + re-swept every cycle, defeating
-        //     tenuring. Flip `header.tenured` on every ALLOCATED slot (the
-        //     sweep has already run, so allocated ≡ survivor); the per-object
-        //     header REMAINS the sole mark-path authority — no page-level
-        //     flag is consulted by any mark path. No weak-table registration
-        //     is needed here (the paged classes are Float/String/Vector;
-        //     hash tables stay Box and ride the splice above). Then RETIRE
-        //     full pages: a page whose every slot is allocated (hence, after
-        //     this walk, tenured) can never free a slot again — the sweep
-        //     skips it whole, the allocator never touches it, and it is
-        //     freed only at heap teardown, while STAYING in the page-base
-        //     registry so the ownership oracle keeps answering "owned"
-        //     (`value_is_tenured` gates on ownership — see C1 on the arena
-        //     doc). The criterion is deliberately occupancy==SLOTS, NOT "all
-        //     allocated slots tenured": right after this walk EVERY page
-        //     trivially satisfies the latter, which would retire
-        //     nearly-empty pages and strand their free slots forever.
-        //     Partial pages stay in rotation as MIXED pages — every later
-        //     sweep re-skips their tenured slots, a perpetual per-slot
-        //     branch bounded by the one-time loadup survivor set (the only
-        //     population this one-shot promotion ever tenures).
-        self.promote_arena_pages_and_retire_full();
         // 2. Blacken the mapped image.
         self.mark_mapped_image_side_tables();
         // Mapped (pdump) weak hash tables become permanent-black here too (the
@@ -351,12 +282,12 @@ impl TaggedHeap {
                 self.permanent_weak_hash_tables.push(ht_ptr);
             }
         }
-        // 3. Remember permanents (mapped or tenured) that point at a YOUNG
-        //    heap object so its children stay live. After promotion (list
-        //    splice + page walk) the only young heap objects are heap CONSES
-        //    (header-less, cannot be tenured), so this scan retains exactly
-        //    the permanent→cons edges. It covers page-tenured owners too —
-        //    see the page walk inside `scan_permanents_for_young_children`.
+        // Remember every current image edge to a collectible heap child.
+        // The child remains live while that edge exists, but must be eligible
+        // for collection when the image slot or its transitive holder changes.
+        // Ordinary generational-old objects stay in their normal major sweep;
+        // no heap list is spliced into the permanent region and no runtime
+        // arena page is retired merely because it was full in this cycle.
         self.scan_permanents_for_young_children();
         self.clear_black_births_world_stopped();
     }
@@ -1899,9 +1830,9 @@ impl TaggedHeap {
         self.pace_mark_start = None;
         self.forced_termination_pending = false;
 
-        // End of the first partition cycle: every survivor is a permanent.
-        // Promote them to the tenured old generation and blacken the dump so
-        // all later cycles skip both regions.
+        // End of the first partition: only the image becomes permanent-black.
+        // Heap survivors retain ordinary generational ownership and remain
+        // reclaimable by later full cycles.
         if self.partition_dump && !self.dump_blackened {
             self.promote_and_blacken();
             self.dump_blackened = true;

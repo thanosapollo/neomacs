@@ -450,6 +450,7 @@ fn concurrent_tenured_float_dropped_not_claimed() {
     let f = heap.alloc_float(3.25);
     let root = heap.alloc_cons(f, TaggedValue::fixnum(0));
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     let f_ptr = f.as_float_ptr().unwrap();
     assert!(
         unsafe { (*f_ptr).header.tenured },
@@ -797,8 +798,9 @@ fn tenured_owner_keeps_young_page_float_alive_body(verify: bool) {
     let t = heap.alloc_record(vec![f]);
     let root = heap.alloc_cons(t, TaggedValue::fixnum(0));
 
-    // First partition cycle: T promotes to tenured.
+    // First partition trace/sweep, then explicit permanent fixture setup.
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(heap.dump_blackened);
     let t_header = t.as_veclike_ptr().unwrap();
     assert!(

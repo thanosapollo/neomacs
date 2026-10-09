@@ -249,7 +249,6 @@ impl TaggedHeap {
             // before any sweep can reclaim the missed young child.
             self.verify_dump_partition();
         }
-        let partition_first = self.partition_dump && !self.dump_blackened;
         let mut headers = std::mem::take(&mut self.generational.promo);
         for mutator in self.mutators() {
             headers.extend(mutator.black_born.iter().copied());
@@ -258,18 +257,18 @@ impl TaggedHeap {
             }
         }
         let mut newly_promoted_header_bytes = 0usize;
-        // The first partition's existing permanent splice owns non-cons
-        // promotion, including survivors of a late-loaded image.
-        if !partition_first {
-            for ptr in headers {
-                let header = unsafe { &mut *ptr };
-                if !header.tenured {
-                    debug_assert!(header.is_marked_at(self.mark_parity));
-                    header.tenured = true;
-                    let bytes = Self::object_bytes_from_header(ptr);
-                    self.generational.old_bytes = self.generational.old_bytes.saturating_add(bytes);
-                    newly_promoted_header_bytes = newly_promoted_header_bytes.saturating_add(bytes);
-                }
+        // First-partition heap survivors are ordinary old, not permanent.
+        // Promote the complete header cohort alongside its cons owners:
+        // a following minor skips old conses and cannot discover a child
+        // left young here without an intervening remembered owner store.
+        for ptr in headers {
+            let header = unsafe { &mut *ptr };
+            if !header.tenured {
+                debug_assert!(header.is_marked_at(self.mark_parity));
+                header.tenured = true;
+                let bytes = Self::object_bytes_from_header(ptr);
+                self.generational.old_bytes = self.generational.old_bytes.saturating_add(bytes);
+                newly_promoted_header_bytes = newly_promoted_header_bytes.saturating_add(bytes);
             }
         }
         let major = self.generational.major_in_progress;
@@ -297,13 +296,10 @@ impl TaggedHeap {
             self,
             newly_promoted_header_bytes.saturating_add(newly_promoted_cons_bytes),
         );
-        if !partition_first {
-            self.clear_black_births_world_stopped();
-        }
+        self.clear_black_births_world_stopped();
     }
 
-    /// Clear only after ordinary P-all or the first permanent splice. GEN-4
-    /// prevents a new collection until deferred first-partition promotion ends.
+    /// Clear after ordinary P-all consumes all traced headers and black births.
     #[cold]
     #[inline(never)]
     pub(super) fn clear_black_births_world_stopped(&mut self) {

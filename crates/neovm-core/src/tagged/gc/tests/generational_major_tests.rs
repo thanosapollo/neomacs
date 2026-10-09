@@ -157,6 +157,7 @@ fn major_keeps_permanent_payload_and_its_ordinary_old_child() {
     let bytes = retained_bytes(code);
     crate::tagged::mutate::set_vector_slot(mapped, 0, code);
     major(&mut heap, &[]);
+    heap.make_survivors_permanent_for_test();
     assert!(unsafe { (*header_ptr(code)).generation.permanent() });
     roots.clear(child_root);
     roots.clear(code_root);
@@ -379,9 +380,19 @@ fn late_dump_partition_visits_old_objects_and_consumes_stale_r_safely() {
     assert!(heap.owns_heap_value_for_test(live));
     assert!(heap.owns_heap_value_for_test(vector));
     assert!(heap.owns_heap_value_for_test(live_child));
-    assert!(unsafe { (*header_ptr(live)).generation.permanent() });
-    assert!(unsafe { (*header_ptr(vector)).generation.permanent() });
-    assert!(heap.generational.old_objects.is_null());
+    assert_ordinary_old(&heap, live);
+    assert_ordinary_old(&heap, vector);
+    assert_eq!(
+        heap.generational.old_objects,
+        header_ptr(live) as *mut GcHeader
+    );
+    assert!(unsafe { (*header_ptr(live)).gc_link().is_null() });
+    assert!(heap.tenured_objects.is_null());
+    let expected_old_bytes = size_of::<ConsCell>()
+        + TaggedHeap::object_bytes_from_header(header_ptr(live))
+        + TaggedHeap::object_bytes_from_header(header_ptr(vector));
+    assert_eq!(heap.generational.old_cons_count, 1);
+    assert_eq!(heap.generational.old_bytes, expected_old_bytes);
     assert!(
         !heap
             .current_mutator_gc()
@@ -403,7 +414,15 @@ fn late_dump_partition_visits_old_objects_and_consumes_stale_r_safely() {
     assert_eq!(live_child.cons_car(), TaggedValue::fixnum(131));
     assert!(heap.owns_heap_value_for_test(live));
     assert_eq!(heap.generational.old_cons_count, 1);
-    assert_eq!(heap.generational.old_bytes, size_of::<ConsCell>());
+    assert_ordinary_old(&heap, live);
+    assert_ordinary_old(&heap, vector);
+    assert_eq!(
+        heap.generational.old_objects,
+        header_ptr(live) as *mut GcHeader
+    );
+    assert!(unsafe { (*header_ptr(live)).gc_link().is_null() });
+    assert!(heap.tenured_objects.is_null());
+    assert_eq!(heap.generational.old_bytes, expected_old_bytes);
 }
 
 #[test]
@@ -645,19 +664,22 @@ fn major_explicit_first_partition_disarm_drops_completed_black_birth_logs() {
     assert!(!heap.dump_blackened);
     assert!(!heap.concurrent_mark_running());
     assert!(!heap.sweep_in_progress());
-    assert!(
-        heap.current_mutator_gc()
-            .black_born
-            .contains(&(header_ptr(record) as *mut GcHeader))
-    );
-    assert!(!heap.current_mutator_gc().black_born_regions.is_empty());
+    // First-partition termination now consumes ordinary P-all before sweep,
+    // rather than preserving these logs for a later permanent splice.
+    assert!(heap.current_mutator_gc().black_born.is_empty());
+    assert!(heap.current_mutator_gc().black_born_regions.is_empty());
     for value in [record, float, cons] {
         assert!(heap.owns_heap_value_for_test(value));
+        assert!(heap.value_is_old_for_test(value));
+    }
+    for value in [record, float] {
+        assert!(!unsafe { (*header_ptr(value)).generation.permanent() });
     }
 
     // Exactly the explicit-entry ordering: finish the prior sweep, then
-    // disarm and run a fresh STW first partition. Calling the permanent
-    // splice here instead would pin these unreachable births forever.
+    // disarm and run a fresh STW first partition. Ordinary-old births must
+    // still die here; neither black-birth logs nor a permanent splice may pin
+    // them after their final roots have gone.
     heap.begin_stw_collection();
     assert!(!heap.first_cycle_concurrent);
     assert!(heap.current_mutator_gc().black_born.is_empty());

@@ -51,11 +51,11 @@ fn black_by_generation_per_scope() {
     assert_eq!(heap.collection_scope(), CollectionScope::Young);
 }
 
-/// The first partition cycle promotes every survivor — boxed objects and
-/// page slots of every class — to tenured AND permanent, and nothing else;
+/// Explicit fixture promotion makes every survivor — boxed objects and
+/// page slots of every class — tenured AND permanent, and nothing else;
 /// the permanents then stay black across later cycles of both parities.
 #[test]
-fn the_first_partition_cycle_makes_survivors_permanent() {
+fn explicit_permanent_survivors_stay_black_across_partition_cycles() {
     let mut heap = TaggedHeap::new();
     set_tagged_heap(&mut heap);
     heap.extend_dump_span(4096, 16);
@@ -73,6 +73,7 @@ fn the_first_partition_cycle_makes_survivors_permanent() {
         root = heap.alloc_cons(value, root);
     }
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     for &value in &kept {
         let header = unsafe { &*header_of(value) };
         assert!(header.tenured, "{value:?}");
@@ -94,6 +95,282 @@ fn the_first_partition_cycle_makes_survivors_permanent() {
         }
     }
     assert!(heap.is_value_marked(young));
+}
+
+/// An ordinary session survivor is not a permanent merely because an image
+/// was registered before its first collection. It remains collectible when
+/// its last root disappears, in both legacy and generational modes.
+#[test]
+fn ordinary_first_partition_survivors_remain_collectible() {
+    for generational in [false, true] {
+        let mut heap = TaggedHeap::new();
+        heap.generational.enabled = generational;
+        set_tagged_heap(&mut heap);
+        heap.extend_dump_span(4096, 16);
+        let table = heap.alloc_hash_table(crate::emacs_core::value::LispHashTable::new(
+            crate::emacs_core::value::HashTableTest::Eq,
+        ));
+        let vector = heap.alloc_vector(vec![TaggedValue::NIL; 2]);
+        let string = heap.alloc_string(crate::heap_types::LispString::from_utf8("session"));
+        let float = heap.alloc_float(1.5);
+        let record = heap.alloc_record(vec![TaggedValue::T]);
+        let lambda = heap.alloc_lambda(vec![TaggedValue::NIL]);
+        let kept = [table, vector, string, float, record, lambda];
+        let mut root = TaggedValue::NIL;
+        for &value in &kept {
+            root = heap.alloc_cons(value, root);
+        }
+        assert!(heap.is_partition_first_cycle());
+        heap.collect_exact(std::iter::once(root));
+        assert!(heap.dump_blackened);
+        assert!(!heap.is_partition_first_cycle());
+        assert!(heap.tenured_objects.is_null());
+        for &value in &kept {
+            assert!(heap.owns_heap_value_for_test(value));
+            assert!(!unsafe { (*header_of(value)).generation.permanent() });
+            assert!(!unsafe { (*header_of(value)).black_by_generation(CollectionScope::Full) });
+        }
+        for _ in 0..2 {
+            heap.collect_exact(std::iter::once(root));
+            for &value in &kept {
+                assert!(heap.owns_heap_value_for_test(value));
+                assert!(!unsafe { (*header_of(value)).generation.permanent() });
+            }
+        }
+        // No allocation or stale header/payload access after reclamation.
+        heap.collect_exact(std::iter::empty());
+        assert!(!heap.owns_heap_value_for_test(root));
+        for &value in &kept {
+            assert!(!heap.owns_heap_value_for_test(value));
+        }
+        assert!(heap.all_objects.is_null());
+        assert!(heap.tenured_objects.is_null());
+        assert!(heap.generational.old_objects.is_null());
+        assert_eq!(heap.generational.old_cons_count, 0);
+        assert_eq!(heap.generational.old_bytes, 0);
+    }
+}
+
+/// A mapped object's current edge retains its heap child, but neither that
+/// child nor an unrelated session root is permanently owned by the image.
+#[test]
+fn first_partition_keeps_session_and_image_children_collectible() {
+    for generational in [false, true] {
+        for concurrent in [false, true] {
+            let mut heap = TaggedHeap::new();
+            heap.generational.enabled = generational;
+            set_tagged_heap(&mut heap);
+            let image = fake_image::FakeImage::leak(false);
+            let mapped = image.register_cons(&mut heap);
+            let image_child = heap.alloc_vector(vec![TaggedValue::fixnum(11)]);
+            let session = heap.alloc_hash_table(crate::emacs_core::value::LispHashTable::new(
+                crate::emacs_core::value::HashTableTest::Eq,
+            ));
+            let image_addr = TaggedHeap::value_heap_addr(image_child).unwrap();
+            let session_addr = TaggedHeap::value_heap_addr(session).unwrap();
+            assert!(crate::tagged::mutate::set_cons_car(mapped, image_child));
+            assert!(heap.is_partition_first_cycle());
+            if concurrent {
+                heap.arm_first_cycle_concurrent();
+                heap.concurrent_begin();
+                heap.seed_root(session);
+                heap.launch_concurrent_mark();
+                while !heap.concurrent_mark_done() {
+                    std::thread::yield_now();
+                }
+                heap.join_concurrent_mark();
+                heap.reseed_runtime_and_remembered_roots();
+                heap.seed_root(session);
+                let before = heap.live_bytes();
+                heap.incremental_drain_all();
+                heap.incremental_finish(before, std::time::Instant::now());
+                heap.finish_incremental_sweep_now();
+                heap.finish_first_partition_cycle();
+            } else {
+                heap.collect_exact(std::iter::once(session));
+            }
+            assert!(heap.dump_blackened);
+            for address in [image_addr, session_addr] {
+                assert!(heap.owns_non_cons_object(address as *const u8));
+                assert!(
+                    !unsafe { (*(address as *const GcHeader)).generation.permanent() },
+                    "heap survivor became permanent (generational={generational}, concurrent={concurrent})"
+                );
+            }
+            heap.collect_exact(std::iter::empty());
+            assert!(
+                heap.owns_non_cons_object(image_addr as *const u8),
+                "image edge keeps child"
+            );
+            assert!(
+                !heap.owns_non_cons_object(session_addr as *const u8),
+                "released session dies"
+            );
+            assert!(crate::tagged::mutate::set_cons_car(
+                mapped,
+                TaggedValue::NIL
+            ));
+            heap.collect_exact(std::iter::empty());
+            assert!(
+                !heap.owns_non_cons_object(image_addr as *const u8),
+                "detached image child dies"
+            );
+        }
+    }
+}
+
+#[test]
+fn full_session_page_is_not_retired_by_first_partition() {
+    let mut heap = TaggedHeap::new();
+    set_tagged_heap(&mut heap);
+    heap.extend_dump_span(4096, 16);
+    let mut root = TaggedValue::NIL;
+    for i in 0..FLOAT_PAGE_SLOTS {
+        let value = heap.alloc_float(i as f64);
+        root = heap.alloc_cons(value, root);
+    }
+    heap.collect_exact(std::iter::once(root));
+    assert!(heap.dump_blackened);
+    assert_eq!(heap.float_arena.pages.len(), 1);
+    assert!(
+        !heap.float_arena.pages[0].retired,
+        "runtime page must stay collectible"
+    );
+    heap.collect_exact(std::iter::empty());
+    assert!(
+        heap.float_arena.pages.iter().all(|p| p.allocated == 0),
+        "released runtime slots reclaimed"
+    );
+}
+
+// These controls use actual young-scope cycles, not collect_exact (a major).
+// The cons is the sole explicit root; no owner store occurs after partition.
+fn first_partition_then_true_minors(concurrent: bool, black_births: bool) {
+    let mut heap = TaggedHeap::new();
+    heap.generational.enabled = true;
+    set_tagged_heap(&mut heap);
+    let image = fake_image::FakeImage::leak(false);
+    image.register_cons(&mut heap);
+    let vector = heap.alloc_vector(vec![TaggedValue::fixnum(71)]);
+    let string = heap.alloc_string(crate::heap_types::LispString::from_utf8("minor-child"));
+    let string_owner = heap.alloc_cons(string, TaggedValue::NIL);
+    let root = heap.alloc_cons(vector, string_owner);
+    let mut born = Vec::new();
+    assert!(heap.is_partition_first_cycle());
+    if concurrent {
+        heap.arm_first_cycle_concurrent();
+        heap.concurrent_begin();
+        heap.seed_root(root);
+        heap.launch_concurrent_mark();
+        if black_births {
+            // Allocate during a real launched major, covering both explicit
+            // header logs and used-prefix cons/float region logs.
+            let v = heap.alloc_vector(vec![TaggedValue::fixnum(83)]);
+            let f = heap.alloc_float(4.25);
+            let tail = heap.alloc_cons(f, TaggedValue::NIL);
+            let owner = heap.alloc_cons(v, tail);
+            born.extend([owner, tail, v, f]);
+            assert!(!heap.current_mutator_gc().black_born.is_empty());
+        }
+        while !heap.concurrent_mark_done() {
+            std::thread::yield_now();
+        }
+        heap.join_concurrent_mark();
+        assert!(
+            heap.sweep_stats().last_concurrent_str_claimed >= 1,
+            "the worker, not just termination, must claim the string"
+        );
+        if black_births {
+            assert!(!heap.current_mutator_gc().black_born_regions.is_empty());
+        }
+        heap.reseed_runtime_and_remembered_roots();
+        heap.seed_root(root);
+        // Deliberately do not seed black births: P-all must consume their
+        // constructor/log closure even if no fresh header claim occurs.
+        let before = heap.live_bytes();
+        heap.incremental_drain_all();
+        heap.incremental_finish(before, std::time::Instant::now());
+        heap.finish_incremental_sweep_now();
+        heap.finish_first_partition_cycle();
+    } else {
+        heap.collect_exact(std::iter::once(root));
+    }
+    assert!(heap.dump_blackened);
+    assert!(heap.value_is_old_for_test(root));
+    for cycle in 0..3 {
+        heap.begin_minor_collection();
+        assert!(heap.is_minor_collection(), "must exercise the minor skip");
+        assert_eq!(heap.collection_scope(), CollectionScope::Young);
+        heap.seed_root(root);
+        if black_births {
+            heap.seed_root(born[0]);
+        }
+        heap.complete_minor_collection();
+        heap.finish_incremental_sweep_now();
+        // Check the ownership oracle BEFORE accessing possibly freed payloads.
+        for value in [root, string_owner, vector, string]
+            .into_iter()
+            .chain(born.iter().copied())
+        {
+            assert!(
+                heap.owns_heap_value_for_test(value),
+                "rooted child reclaimed by true minor {cycle}: bits={:#x}",
+                value.bits()
+            );
+            assert!(heap.value_is_old_for_test(value));
+        }
+        assert!(!unsafe { (*header_of(vector)).generation.permanent() });
+        assert!(!unsafe { (*header_of(string)).generation.permanent() });
+        assert_eq!(unsafe { (*root.xcons_ptr()).load_car() }, vector);
+        assert_eq!(
+            vector.as_vector_data().unwrap().as_slice()[0],
+            TaggedValue::fixnum(71)
+        );
+        assert_eq!(
+            unsafe { (*string.as_string_ptr().unwrap()).data.as_bytes() },
+            b"minor-child"
+        );
+        if black_births {
+            assert_eq!(
+                born[2].as_vector_data().unwrap().as_slice()[0],
+                TaggedValue::fixnum(83)
+            );
+            assert_eq!(born[3].as_float(), Some(4.25));
+        }
+        heap.assert_object_arenas_coherent();
+    }
+    assert!(heap.current_mutator_gc().black_born.is_empty());
+    assert!(heap.current_mutator_gc().black_born_regions.is_empty());
+    heap.collect_exact(std::iter::empty());
+    for value in [root, string_owner, vector, string]
+        .into_iter()
+        .chain(born.iter().copied())
+    {
+        assert!(
+            !heap.owns_heap_value_for_test(value),
+            "ordinary old must die in a full cycle"
+        );
+    }
+    assert_eq!(heap.generational.old_cons_count, 0);
+    assert_eq!(heap.generational.old_bytes, 0);
+    assert!(heap.generational.old_objects.is_null());
+    assert!(heap.tenured_objects.is_null());
+    heap.assert_object_arenas_coherent();
+}
+
+#[test]
+fn first_partition_stw_rooted_cons_children_survive_true_minors() {
+    first_partition_then_true_minors(false, false);
+}
+
+#[test]
+fn first_partition_worker_claimed_cons_children_survive_true_minors() {
+    first_partition_then_true_minors(true, false);
+}
+
+#[test]
+fn first_partition_black_birth_cons_children_survive_true_minors() {
+    first_partition_then_true_minors(true, true);
 }
 
 /// The tri-state mark byte (P3.1 C2.2): 0 is unmarked at rest under both

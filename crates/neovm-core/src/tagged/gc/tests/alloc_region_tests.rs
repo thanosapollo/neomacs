@@ -618,7 +618,7 @@ fn float_allocation_across_a_concurrent_cycle_keeps_every_live_float() {
 }
 
 /// Promotion never tenures a region's unhanded slots or retires a page for
-/// them: `promote_and_blacken` closes the regions first.
+/// them: the explicit permanent fixture closes the regions first.
 #[test]
 fn promotion_does_not_tenure_a_regions_reserved_slots() {
     let mut heap = TaggedHeap::new();
@@ -627,6 +627,7 @@ fn promotion_does_not_tenure_a_regions_reserved_slots() {
     let kept: Vec<TaggedValue> = (0..3).map(|i| heap.alloc_float(i as f64)).collect();
     let (cur, lim) = heap.float_region_for_test();
     assert!(lim > cur);
+    heap.make_survivors_permanent_for_test();
     heap.promote_and_blacken();
     assert!(!heap.alloc_regions_open());
     let page = &heap.float_arena.pages[0];

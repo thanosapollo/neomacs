@@ -51,8 +51,9 @@ fn paged_survivors_tenure_and_full_pages_retire_body(verify: bool) {
     root = heap.alloc_cons(s, root);
     root = heap.alloc_cons(v, root);
 
-    // First partition cycle: full trace + sweep, then promotion.
+    // First partition trace/sweep, then explicit fixture promotion.
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(heap.dump_blackened);
 
     // Every paged survivor is tenured (the promotion page walk).
@@ -155,6 +156,7 @@ fn mixed_page_tenured_slots_survive_alternating_parities_body(verify: bool) {
     // Promotion cycle: odd-indexed garbage is swept FIRST (its slots are
     // free at promotion), then the survivors tenure ⇒ MIXED pages.
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(heap.dump_blackened);
     assert!(!heap.float_arena.pages[0].retired);
     assert!(!heap.string_arena.pages[0].retired);
@@ -304,6 +306,7 @@ fn payload_pages_freed_at_heap_drop_body(mid_mark: bool) {
         // Promotion + retirement happen before the drop (retired pages
         // must be freed by teardown too).
         heap.collect_exact(std::iter::once(root));
+        heap.make_survivors_permanent_for_test();
         assert!(heap.dump_blackened);
         heap.assert_object_arenas_coherent();
 
@@ -432,6 +435,7 @@ fn tenured_page_owner_keeps_young_cons_child_alive_body(verify: bool) {
 
     // Promotion: v and s tenure via the page walk; y_* stay young.
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(heap.dump_blackened);
     assert!(unsafe { (*(v.as_veclike_ptr().unwrap())).gc.tenured });
     assert!(unsafe { (*(s.as_string_ptr().unwrap())).header.tenured });

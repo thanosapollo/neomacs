@@ -2915,6 +2915,10 @@ pub(crate) mod fake_image;
 /// The header's generation byte, THE generation predicate per collection
 /// scope, the byte map, and the first cycle's promotion to permanent.
 #[cfg(test)]
+#[path = "gc/tests/permanent_fixtures.rs"]
+mod permanent_fixtures;
+
+#[cfg(test)]
 #[path = "gc/tests/generation_tests.rs"]
 mod generation_tests;
 #[cfg(test)]

@@ -106,9 +106,8 @@ impl TaggedHeap {
                 !self.concurrent_mark_running && !self.sweep_in_progress,
                 "a stop-the-world cycle may only follow a finished concurrent cycle"
             );
-            // The drained first cycle kept its births for the permanent
-            // splice. This explicit entry cancels that splice; its fresh
-            // full trace must decide liveness without the previous logs.
+            // Its fresh full trace decides liveness independently of the
+            // preceding cycle's births and ordinary promotion.
             self.clear_black_births_world_stopped();
             self.first_cycle_concurrent = false;
             self.staged_mapped_cons_scan = None;
@@ -469,11 +468,11 @@ impl TaggedHeap {
                     self.push_value_children_to_gray(owner, "major-cons-written-retrace");
                 }
             }
-            if !self.is_partition_first_cycle() {
-                self.generational
-                    .promo
-                    .extend(result.promo.into_iter().map(|addr| addr as *mut GcHeader));
-            }
+            // Worker claims must join P-all even for the first partition;
+            // reseeding cannot reclaim their already-won header claims.
+            self.generational
+                .promo
+                .extend(result.promo.into_iter().map(|addr| addr as *mut GcHeader));
             self.publish_persistent_remembered_world_stopped();
         }
         // Residual SATB (children overwritten after the GC's last drain) +

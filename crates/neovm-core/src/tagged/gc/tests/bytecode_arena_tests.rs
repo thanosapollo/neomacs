@@ -538,6 +538,7 @@ fn concurrent_tenured_bytecode_dropped_not_claimed() {
     let b = heap.alloc_bytecode(bytecode_fn(vec![TaggedValue::fixnum(6), young], 4, 16));
     let root = heap.alloc_cons(b, TaggedValue::fixnum(0));
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     let b_hdr = b.as_veclike_ptr().unwrap();
     assert!(
         unsafe { (*b_hdr).gc.tenured },
@@ -960,8 +961,9 @@ fn bytecode_survivors_tenure_and_full_pages_retire_body(verify: bool) {
     assert_eq!(heap.bytecode_arena.pages.len(), 2);
     assert_eq!(heap.bytecode_arena.pages[0].allocated, BYTECODE_PAGE_SLOTS);
 
-    // First partition cycle: full trace + sweep, then promotion.
+    // First partition trace/sweep, then explicit fixture promotion.
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(heap.dump_blackened);
 
     // Every paged survivor is tenured (the promotion page walk covers
@@ -1071,6 +1073,7 @@ fn bytecode_mixed_page_tenured_survive_alternating_parities_body(verify: bool) {
     // Promotion cycle: odd-indexed garbage swept first, survivors tenure
     // ⇒ a MIXED page.
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(heap.dump_blackened);
     assert!(!heap.bytecode_arena.pages[0].retired);
 
@@ -1134,6 +1137,7 @@ fn bytecode_payload_pages_freed_at_heap_drop_body(mid_mark: bool) {
         // Promotion + (partial-page) tenure happen before the drop;
         // retired/mixed pages must be freed by teardown too.
         heap.collect_exact(std::iter::once(root));
+        heap.make_survivors_permanent_for_test();
         assert!(heap.dump_blackened);
         heap.assert_object_arenas_coherent();
 
@@ -1180,6 +1184,7 @@ fn bytecode_constants_test_seam_fires_write_barrier_body(verify: bool) {
     let b = heap.alloc_bytecode(bytecode_fn(vec![TaggedValue::fixnum(0)], 2, 0));
     let root = heap.alloc_cons(b, TaggedValue::fixnum(0));
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(unsafe { (*b.as_veclike_ptr().unwrap()).gc.tenured });
 
     // The seam refuses non-bytecode values.
@@ -1236,6 +1241,7 @@ fn tenured_page_bytecode_keeps_young_cons_child_alive_body(verify: bool) {
 
     // Promotion: b tenures via the page walk; y stays young.
     heap.collect_exact(std::iter::once(root));
+    heap.make_survivors_permanent_for_test();
     assert!(heap.dump_blackened);
     assert!(unsafe { (*b.as_veclike_ptr().unwrap()).gc.tenured });
 
