@@ -421,10 +421,11 @@ impl GcWorker {
 
 impl Drop for GcWorker {
     fn drop(&mut self) {
-        // The owning heap's `Drop` has already joined any in-flight mark
-        // (and a `MarkAll` never outlives its blocked caller), so the thread
-        // is idle in `recv`: closing the channel ends it, and joining keeps
-        // no thread alive past its heap.
+        // Explicit finish has joined any in-flight mark; heap abandonment
+        // instead cleared both handles via `detach_abandoned` while retaining
+        // marker-readable storage. A remaining thread is idle in `recv`
+        // (`MarkAll` never outlives its blocked caller), so closing the channel
+        // ends it and joining retains no idle worker past its heap.
         drop(self.requests.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
