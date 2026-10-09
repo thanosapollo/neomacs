@@ -2635,3 +2635,41 @@ fn source_attempt_checkpoint_preserves_prior_frame_artifacts_and_discards_failed
         GlyphType::Char { ch: 'y' }
     );
 }
+
+#[test]
+fn text_window_retry_checkpoint_discards_failed_background_fill_only() {
+    use crate::window_output::{
+        TextWindowOutputTarget, capture_text_window_retry_checkpoint,
+        restore_text_window_retry_checkpoint,
+    };
+    let mut builder = DisplayOutputBuilder::new();
+    let bounds = Rect::new(0.0, 0.0, 640.0, 48.0);
+    let fill = |window_id, face_id| FaceFillItem {
+        window_id: DisplayWindowId::new(window_id),
+        row_role: GlyphRowRole::Text,
+        clip_rect: Some(bounds),
+        bounds,
+        face_id: FaceId::new(face_id),
+    };
+    // A completed earlier window must survive a later window's body retry.
+    builder.add_output_face_fill(fill(1, 11));
+    let checkpoint = capture_text_window_retry_checkpoint(
+        TextWindowOutputTarget::from_builder(&mut builder),
+    );
+    // The rejected body walk publishes its default background before retrying.
+    builder.add_output_face_fill(fill(2, 22));
+    restore_text_window_retry_checkpoint(
+        TextWindowOutputTarget::from_builder(&mut builder), checkpoint,
+    );
+    // The successful retry publishes one replacement, not two overlapping fills.
+    builder.add_output_face_fill(fill(2, 33));
+    let state = builder.finish(80, 3, 8.0, 16.0);
+    assert_eq!(
+        state.face_fills.len(), 2,
+        "retry must discard the rejected body's background fill and preserve earlier windows",
+    );
+    assert_eq!(state.face_fills[0].window_id, DisplayWindowId::new(1));
+    assert_eq!(state.face_fills[0].face_id, FaceId::new(11));
+    assert_eq!(state.face_fills[1].window_id, DisplayWindowId::new(2));
+    assert_eq!(state.face_fills[1].face_id, FaceId::new(33));
+}

@@ -247,6 +247,9 @@ impl OutputFrameBuildState {
             OutputWindowMetadataInstallRequest::RestoreRetryCheckpoint(checkpoint) => {
                 self.transition_hints
                     .truncate(checkpoint.transition_hints_len);
+                // A rejected body walk has already published its default-face
+                // fill. Roll back only that attempt, preserving earlier windows.
+                self.face_fills.truncate(checkpoint.face_fills_len);
             }
         }
     }
@@ -342,6 +345,10 @@ impl OutputFrameBuildState {
         &self.transition_hints
     }
 
+    pub(crate) fn face_fills_len(&self) -> usize {
+        self.face_fills.len()
+    }
+
     pub(crate) fn phys_cursor(&self) -> Option<&PhysCursor> {
         self.phys_cursor.as_ref()
     }
@@ -391,3 +398,4 @@ impl OutputFrameBuildState {
         state.no_accept_focus = self.no_accept_focus;
     }
 }
+
