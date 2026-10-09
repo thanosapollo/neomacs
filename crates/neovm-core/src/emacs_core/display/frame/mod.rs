@@ -930,28 +930,18 @@ pub(crate) fn builtin_set_frame_size(
         char_height
     );
     if uses_window_system_pixels {
-        let desired_cols = ((text_width_px as f32) / char_width.max(1.0))
-            .floor()
-            .max(1.0) as i64;
-        let desired_total_lines = ((text_height_px as f32) / char_height.max(1.0))
-            .floor()
-            .max(1.0) as i64;
         if ctx.display_host.is_some() {
+            // GNU set-frame-size supplies TEXT pixels after check_frame_pixels,
+            // including the minibuffer but excluding realized frame chrome.
+            // Cells is a total-lines domain and would subtract that chrome again.
             request_live_gui_frame_resize_and_keep_pending(
                 &mut ctx.frames,
                 &ctx.buffers,
                 &mut ctx.display_host,
                 fid,
-                if pixelwise {
-                    FrameResizeRequest::TextPixels {
-                        width: text_width_px,
-                        height: text_height_px,
-                    }
-                } else {
-                    FrameResizeRequest::Cells {
-                        cols: desired_cols,
-                        total_lines: desired_total_lines,
-                    }
+                FrameResizeRequest::TextPixels {
+                    width: text_width_px,
+                    height: text_height_px,
                 },
             )?;
         } else {
