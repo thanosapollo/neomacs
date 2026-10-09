@@ -217,6 +217,10 @@ path = "tests/aot_spec.rs"
 name = "fringe_standard_indicators"
 path = "tests/fringe_standard_indicators.rs"
 
+[[test]]
+name = "font_at_inheritance"
+path = "tests/font_at_inheritance.rs"
+
 # Runs its checks on a child process's MAIN thread, which libtest never
 # offers; the file answers the libtest CLI subset nextest uses.
 [[test]]

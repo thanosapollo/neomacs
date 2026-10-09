@@ -156,9 +156,26 @@ impl FaceRemapping {
 enum RemappingBase {
     DefaultAndInherited,
     SpecifiedOnly,
+    InheritedOnly,
 }
 
 impl FaceTable {
+    /// Resolve a text-face contribution, including explicit inheritance but
+    /// without injecting the default face into an existing text/overlay base.
+    pub(crate) fn resolve_text_face_with_remapping(
+        &self,
+        name: &str,
+        remapping: &FaceRemapping,
+    ) -> Face {
+        self.resolve_remapped(
+            name,
+            remapping,
+            &mut HashSet::new(),
+            0,
+            RemappingBase::InheritedOnly,
+        )
+    }
+
     /// Resolve a named face with GNU's highest-priority-first remapping list.
     pub fn resolve_with_remapping(&self, name: &str, remapping: &FaceRemapping) -> Face {
         self.resolve_remapped(
@@ -210,7 +227,7 @@ impl FaceTable {
             seen.insert(key);
             let mut result = match base {
                 RemappingBase::DefaultAndInherited => self.resolve("default"),
-                RemappingBase::SpecifiedOnly => Face::new(name),
+                RemappingBase::SpecifiedOnly | RemappingBase::InheritedOnly => Face::new(name),
             };
             // GNU xfaces.c merge_face_ref merges the tail first: the first
             // entry wins, and a trailing self-reference supplies the original
@@ -230,7 +247,9 @@ impl FaceTable {
             return result;
         }
         match base {
-            RemappingBase::DefaultAndInherited => self.resolve_depth(name, 0),
+            RemappingBase::DefaultAndInherited | RemappingBase::InheritedOnly => {
+                self.resolve_depth(name, 0)
+            }
             RemappingBase::SpecifiedOnly => self
                 .faces
                 .get(&key)

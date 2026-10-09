@@ -2776,13 +2776,13 @@ fn apply_face_layers_with_remapping(
     for layer in layers {
         match layer {
             FaceLayer::Named(names) => {
-                let refs = names.iter().map(String::as_str).collect::<Vec<_>>();
-                let merged = if remapping.is_empty() {
-                    face_table.merge_faces(&refs)
-                } else {
-                    face_table.merge_faces_with_remapping(&refs, remapping)
-                };
-                face = face.merge(&merged);
+                // Named text faces contribute their explicit inheritance,
+                // not another default baseline. The first list entry wins.
+                for name in names.iter().rev() {
+                    let contribution =
+                        face_table.resolve_text_face_with_remapping(name, remapping);
+                    face = face.merge(&contribution);
+                }
             }
             FaceLayer::Inline(inline_face) => {
                 face = face.merge(inline_face);
