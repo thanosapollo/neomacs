@@ -4990,7 +4990,7 @@ fn build_replacement(template: &str, md: &MatchData, source: &[u8]) -> Result<Ve
 }
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
-fn apply_match_case(replacement: &str, matched: &str) -> String {
+pub(crate) fn apply_match_case(replacement: &str, matched: &str) -> String {
     apply_replace_match_case(replacement, matched)
 }
 

@@ -432,7 +432,7 @@ fn builtin_symbol_with_pos_pos_1_value(arg: Value) -> EvalResult {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn builtin_char_equal(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     crate::emacs_core::error::expect_args("char-equal", &args, 2)?;
     let arg = |i: usize| args.get(i).copied().unwrap_or(Value::NIL);
