@@ -104,6 +104,22 @@ fn native_page_keys_advance_and_have_confirmed_input_latency() {
     run_native_scroll(ScrollKind::Page, ScrollTarget::Selected);
 }
 
+// Run on a real surface without COPY_SRC (for example software GL).
+// Capture remains requested; unlike timing-only mode this proves the
+// capability rejection still permits input and confirmed presentation.
+#[test]
+fn unsupported_readback_preserves_native_page_input_and_presentation() {
+    run_native_scroll_with_readback(
+        ScrollKind::Page,
+        ScrollTarget::Selected,
+        400,
+        false,
+        false,
+        false,
+        true,
+    );
+}
+
 #[test]
 fn precise_native_bursts_in_a_large_buffer_return_to_the_initial_viewport() {
     run_native_scroll_in_buffer(ScrollKind::PreciseBurst, ScrollTarget::Selected, 100_000);
@@ -249,6 +265,18 @@ fn run_native_scroll_scenario(
     stalled: bool,
     resolved: bool,
 ) {
+    run_native_scroll_with_readback(kind, target, lines, rich, stalled, resolved, false);
+}
+
+fn run_native_scroll_with_readback(
+    kind: ScrollKind,
+    target: ScrollTarget,
+    lines: usize,
+    rich: bool,
+    stalled: bool,
+    resolved: bool,
+    unsupported_readback: bool,
+) {
     let profile = if rich { "rich-v1" } else { "plain" };
     let root = neomacs_infra::workspace_root();
     let artifact_root = std::env::var_os("CARGO_TARGET_DIR")
@@ -288,10 +316,14 @@ focus_follows_mouse yes
     // logging would change the workload. Burst tests cover rendered pixels.
     let timing_only = matches!(kind, ScrollKind::PreciseStream)
         || std::env::var_os("NEOMACS_GUI_SCROLL_TIMING_ONLY").is_some();
+    assert!(!unsupported_readback || !timing_only);
+    let capture_pixels = !timing_only && !unsupported_readback;
     fs::write(
         artifacts.join("measurement-mode"),
         if timing_only {
             "timing-only\n"
+        } else if unsupported_readback {
+            "unsupported-readback-input-and-presentation\n"
         } else {
             "pixel-correctness\n"
         },
@@ -311,6 +343,7 @@ focus_follows_mouse yes
         .env_remove("NEOMACS_LAYOUT_STATS_FILE");
     if !timing_only {
         command
+            .env("NEOMACS_DEBUG_FIRST_FRAME_READBACK", "1")
             .env("NEOMACS_DEBUG_SURFACE_READBACK", "10000")
             .env("NEOMACS_DEBUG_SURFACE_READBACK_PNG", &pixels_path)
             .env("WAYLAND_DEBUG", "1")
@@ -387,7 +420,7 @@ focus_follows_mouse yes
     trackpad.move_to_body();
     thread::sleep(Duration::from_millis(200));
     let mut previous = state(&state_path, initial["sample"].as_u64().unwrap());
-    let initial_pixels = (!timing_only).then(|| readback(&pixels_path));
+    let initial_pixels = capture_pixels.then(|| readback(&pixels_path));
     if let Some(pixels) = &initial_pixels {
         pixels.save(artifacts.join("before.png")).unwrap();
     }
@@ -658,7 +691,7 @@ focus_follows_mouse yes
             serde_json::to_vec_pretty(&trace).unwrap(),
         )
         .unwrap();
-        let pixels = (!timing_only).then(|| readback(&pixels_path));
+        let pixels = capture_pixels.then(|| readback(&pixels_path));
         if let Some(pixels) = &pixels {
             pixels
                 .save(artifacts.join(format!("step-{step}.png")))
@@ -727,7 +760,7 @@ focus_follows_mouse yes
             );
         }
         previous = current;
-        if (step == 11 || (step == 3 && matches!(kind, ScrollKind::Page))) && !timing_only {
+        if (step == 11 || (step == 3 && matches!(kind, ScrollKind::Page))) && capture_pixels {
             assert!(
                 Some(text_pixels(pixels.as_ref().unwrap())) != initial_text,
                 "scrolling must update rendered text, not only Lisp state: {artifacts:?}"
@@ -770,6 +803,14 @@ focus_follows_mouse yes
         );
         assert!(sample["presentation"].as_u64().unwrap() > 0);
         assert_eq!(sample["evicted_inputs"], 0);
+    }
+    if unsupported_readback {
+        let log = fs::read_to_string(artifacts.join("neomacs.log")).unwrap();
+        assert!(log.contains("surface COPY_SRC is unsupported"));
+        assert!(!log.contains("Wrote debug surface readback PNG"));
+        assert!(!log.contains("surface readback (remaining="));
+        assert!(!pixels_path.exists());
+        assert!(editor.0.try_wait().unwrap().is_none(), "editor exited");
     }
     if matches!(
         kind,

@@ -9,20 +9,21 @@ mod tests;
 pub(crate) fn surface_usage_for_debug_readback(
     supported_usages: wgpu::TextureUsages,
     pending: &mut bool,
-    continuous_enabled: bool,
+    remaining_frames: &mut u32,
 ) -> wgpu::TextureUsages {
-    if !*pending && !continuous_enabled {
+    if !*pending && *remaining_frames == 0 {
         return wgpu::TextureUsages::RENDER_ATTACHMENT;
     }
 
     if supported_usages.contains(wgpu::TextureUsages::COPY_SRC) {
-        tracing::info!("First-frame surface readback enabled (surface usage includes COPY_SRC)");
+        tracing::info!("Diagnostic surface readback enabled (surface usage includes COPY_SRC)");
         wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
     } else {
         tracing::warn!(
-            "NEOMACS_DEBUG_FIRST_FRAME_READBACK requested, but surface COPY_SRC is unsupported"
+            "Diagnostic surface readback requested, but surface COPY_SRC is unsupported"
         );
         *pending = false;
+        *remaining_frames = 0;
         wgpu::TextureUsages::RENDER_ATTACHMENT
     }
 }
@@ -75,6 +76,12 @@ fn log_surface_readback(
     width: u32,
     height: u32,
 ) {
+    // The acquired texture is the final authority, including after surface
+    // reconfiguration or device recovery. Never encode an unsupported copy.
+    if !texture.usage().contains(wgpu::TextureUsages::COPY_SRC) {
+        tracing::warn!("{label} skipped: surface texture lacks COPY_SRC");
+        return;
+    }
     let format = renderer.surface_format();
     let bytes_per_pixel = match readback_bytes_per_pixel(format) {
         Some(bytes_per_pixel) => bytes_per_pixel,
