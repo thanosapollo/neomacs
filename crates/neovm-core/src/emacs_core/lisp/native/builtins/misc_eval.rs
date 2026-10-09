@@ -2324,6 +2324,7 @@ fn prin1_to_lisp_string_value_in_state_with_overrides(
 
 pub(crate) fn builtin_princ(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     expect_min_args("princ", &args, 1)?;
+    ensure_continuous_print_number_table(eval);
     let target = resolve_print_target(eval, args.get(1));
     if print_target_is_direct(target) {
         return builtin_princ_impl(eval, args);
@@ -2348,6 +2349,7 @@ pub(crate) fn builtin_princ_impl(
     args: Vec<Value>,
 ) -> EvalResult {
     expect_min_args("princ", &args, 1)?;
+    ensure_continuous_print_number_table(ctx);
     // Issue #131: emit canonical Emacs bytes directly. A real Private-Use glyph
     // is inserted as itself, while genuine eight-bit / non-Unicode content is
     // carried as its disjoint extended encoding — neither is ever mistaken for
