@@ -34,6 +34,7 @@ mod line_spacing;
 #[path = "../../tests/engine_display_motion_test.rs"]
 mod display_motion;
 
+mod blank_newline_cursor_face_test;
 mod chrome_memo_engine_test;
 #[cfg(test)]
 mod displayed_start_key_test;
