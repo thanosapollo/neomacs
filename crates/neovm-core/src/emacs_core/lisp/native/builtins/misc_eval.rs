@@ -2379,7 +2379,7 @@ fn ensure_princ_continuous_print_number_table(
     {
         return;
     }
-    let symbol = crate::emacs_core::symbol::intern("print-number-table");
+    let symbol = intern("print-number-table");
     let local_cell = if ctx.obarray.is_localized(symbol) {
         buf.and_then(|buf| buf.local_variable_binding_cell(symbol))
     } else {
