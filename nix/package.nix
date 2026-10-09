@@ -51,6 +51,15 @@ let
     src = cargoSrc;
     strictDeps = true;
     cargoExtraArgs = cargoBuildArgs;
+    # Optimized daily builds must remain usable in coredumpctl/GDB. Apply the
+    # same policy to dependencies and xtask's fresh-build role binaries; keep
+    # DWARF in the ELF so staging/copying needs no separate debug-output root.
+    # Release opt-level, LTO and codegen-units remain Cargo's existing values.
+    CARGO_PROFILE_RELEASE_DEBUG = "2";
+    CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO = "off";
+    CARGO_PROFILE_RELEASE_STRIP = "none";
+    RUSTFLAGS = "-C force-frame-pointers=yes";
+    dontStrip = true;
     nativeBuildInputs = [
       rustToolchain
       pkgs.binutils
