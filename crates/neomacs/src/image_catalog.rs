@@ -352,7 +352,12 @@ impl AsyncImageCatalog {
 
         match state {
             ImageLookup::Ready(image) => Ok(Some(image)),
-            ImageLookup::Failed(failed) => Err(failed.error.message()),
+            ImageLookup::Failed(failed) => {
+                // A failure delivered while this caller waited owes the same
+                // diagnostic as one already cached at the initial lookup.
+                self.record_failure_always(&failed);
+                Err(failed.error.message())
+            }
             ImageLookup::Pending(_) => unreachable!("terminal decode cannot remain pending"),
         }
     }
