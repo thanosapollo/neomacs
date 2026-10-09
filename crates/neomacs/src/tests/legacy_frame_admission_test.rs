@@ -218,6 +218,11 @@ fn legacy_real_transport_redisplay_retries_silently_rejected_title_once() {
     host.realize_gui_frame(request(id.0)).unwrap();
     render.cmd_rx.try_recv().unwrap();
     eval.set_display_host(Box::new(host));
+    assert!(matches!(
+        render.cmd_rx.try_recv().unwrap(),
+        RenderCommand::Config(ConfigCommand::SetVisualConfig(_))
+    ));
+    assert!(render.cmd_rx.is_empty());
     eval.eval_str(r#"(setq frame-title-format "redisplay retry")"#).unwrap();
     fill(&emacs.cmd_tx, 64);
     sync_live_gui_frame_titles(&mut eval);
