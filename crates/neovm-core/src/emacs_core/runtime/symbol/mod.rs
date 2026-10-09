@@ -2726,7 +2726,7 @@ impl Obarray {
         for &blv_ptr in &self.blvs {
             // Safety: the pool holds live BLVs; `&mut self` excludes other
             // borrows of them.
-            let blv = unsafe { &mut *blv_ptr };
+            let blv = unsafe { &mut *blv_ptr.as_ptr() };
             if blv.where_buf_id == NO_WHERE_BUF
                 || !is_killed(crate::buffer::BufferId(blv.where_buf_id))
             {
