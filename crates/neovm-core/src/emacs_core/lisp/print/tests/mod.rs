@@ -1317,10 +1317,7 @@ fn princ_continuous_history_direct_impl_initializes_nil_table() {
         )
         .unwrap();
     let sink = ctx.eval_str("(current-buffer)").unwrap();
-    assert_eq!(
-        builtin_princ_impl(&mut ctx, vec![pair, sink]).unwrap(),
-        pair
-    );
+    assert_eq!(builtin_princ_impl(&mut ctx, vec![pair, sink]).unwrap(), pair);
     assert_eq!(
         ctx.eval_str("(buffer-string)").unwrap().as_utf8_str(),
         Some("(#1=(1) #1#)")
@@ -1336,10 +1333,7 @@ fn princ_continuous_history_direct_impl_initializes_nil_table() {
     );
     ctx.eval_str("(progn (erase-buffer) (garbage-collect))")
         .unwrap();
-    assert_eq!(
-        builtin_princ_impl(&mut ctx, vec![pair, sink]).unwrap(),
-        pair
-    );
+    assert_eq!(builtin_princ_impl(&mut ctx, vec![pair, sink]).unwrap(), pair);
     assert_eq!(
         ctx.eval_str("(buffer-string)").unwrap().as_utf8_str(),
         Some("(#1# #1#)")
@@ -1376,11 +1370,8 @@ fn check_princ_candidate_history(
     // history label, return identity, and table contents without changing
     // that pre-existing renderer behavior in this regression.
     let src = if candidate && gensym {
-        src.replace(
-            "(list (buffer-string)",
-            "(list (substring (buffer-string) 0 3)",
-        )
-        .replace("(list s", "(list (substring s 0 3)")
+        src.replace("(list (buffer-string)", "(list (substring (buffer-string) 0 3)")
+            .replace("(list s", "(list (substring s 0 3)")
     } else {
         src
     };
@@ -1738,7 +1729,7 @@ fn check_princ_effective_scope(case: usize, route: &str) {
         "(or (eq print-number-table nil) (eq print-continuous-numbering nil))"
     };
     let count = if history {
-        "(hash-table-count print-number-table)"
+        "(if (hash-table-p print-number-table) (hash-table-count print-number-table) nil)"
     } else {
         "nil"
     };
