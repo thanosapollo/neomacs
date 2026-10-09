@@ -1508,6 +1508,7 @@ pub(crate) fn builtin_window_configuration_equal_p(args: Vec<Value>) -> EvalResu
     }
 }
 
+#[inline(never)]
 pub(crate) fn builtin_current_window_configuration(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
@@ -2148,7 +2149,7 @@ pub(crate) fn builtin_featurep(eval: &mut super::eval::Context, args: Vec<Value>
 }
 
 #[cfg(test)]
-#[path = "tests/gc_tls_window_configuration.rs"]
+#[path = "tests/gc_tls_window_configuration_test.rs"]
 mod gc_tls_ownership_tests;
 
 #[cfg(test)]

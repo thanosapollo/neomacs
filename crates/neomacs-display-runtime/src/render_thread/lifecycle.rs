@@ -1,6 +1,5 @@
 use super::RenderApp;
 use super::frame_windows::{FrameLifecycle, NativeTextInputPolicy, apply_option_key_policy};
-use super::geometry_hints::apply_window_geometry_hints;
 use super::state::{
     RenderGpuContext, effective_window_scale_factor, window_size_from_emacs_pixels,
 };
@@ -227,16 +226,8 @@ impl RenderApp {
                         Err(error) => self.startup_error = Some(error),
                     }
 
-                    if let Some(geometry_hints) = self
-                        .frame_windows
-                        .primary_window()
-                        .unwrap()
-                        .lifecycle
-                        .geometry_hints()
-                    {
-                        apply_window_geometry_hints(window.as_ref(), geometry_hints);
-                    }
-
+                    self.frame_windows.primary_window().unwrap()
+                        .replay_pending_native_state(window.as_ref());
                     self.window_icon.apply(window.as_ref());
                 }
                 Err(e) => {
@@ -273,7 +264,7 @@ impl RenderApp {
             event_loop.exit();
             return;
         }
-        if self.gpu.is_none() && self.comms.keep_alive_without_frames {
+        if self.gpu.is_none() {
             if self.process_startup_commands() {
                 self.handle_exiting();
                 event_loop.exit();
@@ -739,7 +730,7 @@ impl RenderApp {
             };
 
             for (active, reason, rate) in [
-                (webkit_active, DemandReason::WebKit, max_rate),
+                (webkit_active, DemandReason::Webkit, max_rate),
                 (surfaces_active, DemandReason::ShaderSurface, surface_rate),
             ] {
                 if active {

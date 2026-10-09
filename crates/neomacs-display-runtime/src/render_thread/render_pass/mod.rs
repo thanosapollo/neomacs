@@ -106,7 +106,7 @@ fn render_frame_window_contents(
     inputs: &FrameDrawInputs<'_>,
     cursor_visible: bool,
     include_overlays: bool,
-) {
+) -> Result<(), FrameRenderFailure> {
     scene::render_frame_root_glyphs(
         renderer,
         render,
@@ -122,7 +122,7 @@ fn render_frame_window_contents(
 
     if !include_overlays {
         render.set_dirty(renderer_effects_still_active);
-        return;
+        return Ok(());
     }
 
     chrome::render_frame_window_overlays_with_toolbar_resources(
@@ -136,10 +136,11 @@ fn render_frame_window_contents(
         inputs.child_frame_style,
         inputs.scroll_indicators_enabled,
         inputs.toolbar,
-    );
+    )?;
     if renderer_effects_still_active {
         render.mark_dirty();
     }
+    Ok(())
 }
 
 fn composition_surface(
@@ -417,7 +418,7 @@ fn render_frame_window_contents_reserved(
         .unwrap_or((-1.0, -1.0));
     if retained_static::is_eligible(compositor_only_hint, &pane_blits, render) {
         let hovered_scroll_bar = render.hovered_scroll_bar(&frame);
-        retained_static::draw(
+        let draw_result = retained_static::draw(
             renderer,
             native,
             render,
@@ -427,6 +428,12 @@ fn render_frame_window_contents_reserved(
             cursor_visible,
             hovered_scroll_bar,
         );
+        if let Err(error) = draw_result {
+            renderer.set_scale_factor(old_scale_factor);
+            renderer.resize(old_width, old_height);
+            render.mark_dirty();
+            return Err(error);
+        }
         if frame_post_active {
             renderer.frame_post_to_view(
                 &composition_view,
@@ -467,7 +474,7 @@ fn render_frame_window_contents_reserved(
     let composition = need_offscreen
         .then(|| composition_targets::advance_frame_composition(renderer, render, surface_size))
         .flatten();
-    match composition.as_ref() {
+    let draw_result = match composition.as_ref() {
         Some(composition) => full_render::through_composition_ring(
             &acquired,
             renderer,
@@ -492,6 +499,12 @@ fn render_frame_window_contents_reserved(
             cursor_visible,
             feature_plan.accept_derived_effects,
         ),
+    };
+    if let Err(error) = draw_result {
+        renderer.set_scale_factor(old_scale_factor);
+        renderer.resize(old_width, old_height);
+        render.mark_dirty();
+        return Err(error);
     }
 
     if frame_post_active {
@@ -521,5 +534,5 @@ fn render_frame_window_contents_reserved(
 }
 
 #[cfg(test)]
-#[path = "tests/mod.rs"]
+#[path = "tests/render_pass_test.rs"]
 mod tests;

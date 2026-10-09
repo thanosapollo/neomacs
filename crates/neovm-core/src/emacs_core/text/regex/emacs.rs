@@ -1268,16 +1268,6 @@ fn force_pike() -> bool {
     false
 }
 
-#[cfg(any(test, feature = "fuzzing"))]
-struct RegexEngineOverrideGuard(RegexEngineOverride);
-
-#[cfg(any(test, feature = "fuzzing"))]
-impl Drop for RegexEngineOverrideGuard {
-    fn drop(&mut self) {
-        REGEX_ENGINE_OVERRIDE.with(|slot| slot.set(self.0));
-    }
-}
-
 /// Run `f` with one regex routing policy, restoring the previous policy even
 /// when `f` unwinds.
 #[cfg(any(test, feature = "fuzzing"))]
@@ -1285,8 +1275,7 @@ pub(crate) fn with_regex_engine_override<R>(
     engine: RegexEngineOverride,
     f: impl FnOnce() -> R,
 ) -> R {
-    let previous = REGEX_ENGINE_OVERRIDE.with(|slot| slot.replace(engine));
-    let _guard = RegexEngineOverrideGuard(previous);
+    let _guard = crate::tls_scope::TlsScope::new(&REGEX_ENGINE_OVERRIDE, engine);
     f()
 }
 
@@ -4031,25 +4020,6 @@ impl WordBoundaryLookup {
             return false;
         }
 
-        self.category_boundary_between(c1, c2, syntax)
-    }
-
-    /// GNU `scan_words` calls `word_boundary_p` directly, without the
-    /// regexp macro's ASCII/Latin-1 shortcut. Keep one category/script policy
-    /// while preserving those distinct caller boundaries.
-    pub(crate) fn scan_boundary_between(
-        &self,
-        c1: char,
-        c2: char,
-        syntax: &dyn SyntaxLookup,
-    ) -> bool {
-        if !syntax.char_has_category_set(c1) || !syntax.char_has_category_set(c2) {
-            return self.script_at(c1) != self.script_at(c2);
-        }
-        self.category_boundary_between(c1, c2, syntax)
-    }
-
-    fn category_boundary_between(&self, c1: char, c2: char, syntax: &dyn SyntaxLookup) -> bool {
         let same_script = self.script_at(c1) == self.script_at(c2);
         let mut categories = if same_script {
             self.word_separating_categories
@@ -4060,6 +4030,98 @@ impl WordBoundaryLookup {
 
         while categories.is_cons() {
             if Self::category_pair_matches(categories.cons_car(), c1, c2, syntax) {
+                return !default_result;
+            }
+            categories = categories.cons_cdr();
+        }
+        default_result
+    }
+
+    fn script_at_emacs(&self, c: emacs_char::EmacsChar) -> Value {
+        self.char_script_table
+            .and_then(|table| {
+                crate::emacs_core::chartable::ct_lookup(&table, i64::from(c.code())).ok()
+            })
+            .unwrap_or(Value::NIL)
+    }
+
+    // GNU category.c:406-416, with membership resolved from full-code category sets.
+    #[inline]
+    fn category_pair_matches_emacs(
+        pair: Value,
+        first_member: impl Fn(u8) -> bool,
+        second_member: impl Fn(u8) -> bool,
+    ) -> bool {
+        if !pair.is_cons() {
+            return false;
+        }
+
+        let first = pair.cons_car();
+        let second = pair.cons_cdr();
+        let first_matches = first.is_nil()
+            || first.as_fixnum().is_some_and(|category| {
+                let Ok(category @ 0x20..=0x7e) = u8::try_from(category) else {
+                    return false;
+                };
+                first_member(category) && !second_member(category)
+            });
+        let second_matches = second.is_nil()
+            || second.as_fixnum().is_some_and(|category| {
+                let Ok(category @ 0x20..=0x7e) = u8::try_from(category) else {
+                    return false;
+                };
+                !first_member(category) && second_member(category)
+            });
+        first_matches && second_matches
+    }
+
+    /// GNU category.c:377-417 for word motion's full Emacs code domain.
+    /// This call-local snapshot performs no Lisp callbacks; its category and
+    /// script table reads retain byte8/non-Unicode keys instead of Rust char.
+    pub(crate) fn boundary_between_emacs_characters(
+        &self,
+        c1: emacs_char::EmacsChar,
+        c2: emacs_char::EmacsChar,
+        syntax: &BufferSyntaxLookup,
+    ) -> bool {
+        let same_script = crate::emacs_core::value::eq_value(
+            &self.script_at_emacs(c1),
+            &self.script_at_emacs(c2),
+        );
+        let mut categories = if same_script {
+            self.word_separating_categories
+        } else {
+            self.word_combining_categories
+        };
+        let default_result = !same_script;
+        if !categories.is_cons() {
+            return default_result;
+        }
+        let Some(table) = syntax.category_table else {
+            return default_result;
+        };
+        let set1 = crate::emacs_core::chartable::ct_lookup(&table, i64::from(c1.code()))
+            .unwrap_or(Value::NIL);
+        let set2 = crate::emacs_core::chartable::ct_lookup(&table, i64::from(c2.code()))
+            .unwrap_or(Value::NIL);
+        // GNU returns its script decision before examining category wildcards
+        // when either character's category set is nil (category.c:395-400).
+        let (Some(set1), Some(set2)) = (
+            crate::emacs_core::boolvec::BoolVectorView::of(&set1),
+            crate::emacs_core::boolvec::BoolVectorView::of(&set2),
+        ) else {
+            return default_result;
+        };
+        let member = |set: crate::emacs_core::boolvec::BoolVectorView<'_>, category: u8| {
+            let index = usize::from(category);
+            index < set.len() && set.get(index)
+        };
+        while categories.is_cons() {
+            if Self::category_pair_matches_emacs(
+                categories.cons_car(),
+                |category| member(set1, category),
+                |category| member(set2, category),
+            ) {
                 return !default_result;
             }
             categories = categories.cons_cdr();
@@ -4084,12 +4146,6 @@ pub(crate) trait SyntaxLookup {
 
     /// Return true if character `c` belongs to category `cat`.
     fn char_has_category(&self, c: char, cat: u8) -> bool;
-
-    /// Scanner policy distinguishes a nil resolved set from an empty set.
-    /// Synthetic standard lookups have valid category sets by default.
-    fn char_has_category_set(&self, _c: char) -> bool {
-        true
-    }
 
     /// Return true when two adjacent word constituents have a GNU word
     /// boundary between them because of their scripts/categories.
@@ -4191,13 +4247,6 @@ impl SyntaxLookup for DefaultSyntaxLookup {
 }
 
 impl SyntaxLookup for BufferSyntaxLookup {
-    fn char_has_category_set(&self, c: char) -> bool {
-        self.category_table.is_none_or(|table| {
-            crate::emacs_core::chartable::ct_lookup(&table, c as i64)
-                .is_ok_and(|set| !set.is_nil())
-        })
-    }
-
     fn char_syntax(&self, c: char) -> SyntaxClass {
         self.syntax_table.char_syntax(c)
     }
@@ -5180,31 +5229,93 @@ pub(crate) fn re_match(
 /// The per-thread `MatchScratch`, leased out of its cell for one search and
 /// returned by `Drop` (so early returns and `?` hand it back too). A
 /// re-entrant search finds the cell empty and works on a fresh one.
-struct MatchScratchLease(Option<Box<MatchScratch>>);
+#[must_use = "the thread-local extent ends when this guard drops"]
+struct MatchScratchLease {
+    scratch: std::mem::ManuallyDrop<Box<MatchScratch>>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+static_assertions::assert_not_impl_any!(MatchScratchLease: Send, Sync);
+
+impl std::fmt::Debug for MatchScratchLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatchScratchLease")
+            .field("frame_capacity", &self.scratch.frames.capacity())
+            .field("undo_capacity", &self.scratch.undo.capacity())
+            .finish_non_exhaustive()
+    }
+}
 
 impl MatchScratchLease {
+    #[inline]
     fn take() -> Self {
-        Self(Some(MATCH_SCRATCH.with(
-            |cell| match cell.try_borrow_mut() {
-                Ok(mut cur) => cur.take().unwrap_or_default(),
-                Err(_) => Box::default(),
-            },
-        )))
+        Self {
+            scratch: std::mem::ManuallyDrop::new(MATCH_SCRATCH.with(|cell| {
+                match cell.try_borrow_mut() {
+                    Ok(mut cur) => cur.take().unwrap_or_default(),
+                    Err(_) => Box::default(),
+                }
+            })),
+            _thread: std::marker::PhantomData,
+        }
     }
+    #[inline]
     fn get(&mut self) -> &mut MatchScratch {
-        self.0
-            .as_deref_mut()
-            .expect("a lease holds its scratch until it is dropped")
+        &mut self.scratch
     }
 }
 
 impl Drop for MatchScratchLease {
+    // Keep restoration at a call boundary: inlining the TLS cleanup into
+    // `re_search` changes register allocation throughout its candidate loops.
+    #[inline(never)]
     fn drop(&mut self) {
-        let scratch = self.0.take();
-        MATCH_SCRATCH.with(|cell| {
-            if let Ok(mut cur) = cell.try_borrow_mut() {
-                *cur = scratch;
-            }
+        // SAFETY: this private field is initialized by `take`, remains owned
+        // by the lease, and is extracted exactly once by its only destructor.
+        // `ManuallyDrop` prevents a second destruction after returning the box.
+        let scratch = unsafe { std::mem::ManuallyDrop::take(&mut self.scratch) };
+        crate::tls_scope::TlsScope::restore_now(&MATCH_SCRATCH, Some(scratch));
+    }
+}
+
+#[cfg(test)]
+mod tls_scratch_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn tls_scope_match_scratch_nested_leases_return_outer_box() {
+        let mut outer = MatchScratchLease::take();
+        let outer_ptr = std::ptr::from_mut(outer.get());
+        let mut inner = MatchScratchLease::take();
+        assert_ne!(std::ptr::from_mut(inner.get()), outer_ptr);
+        drop(inner);
+        drop(outer);
+        let mut reused = MatchScratchLease::take();
+        assert_eq!(std::ptr::from_mut(reused.get()), outer_ptr);
+    }
+
+    #[test]
+    fn tls_scope_match_scratch_returns_box_during_unwind() {
+        let mut lease = MatchScratchLease::take();
+        let scratch_ptr = std::ptr::from_mut(lease.get());
+        assert!(
+            catch_unwind(AssertUnwindSafe(move || {
+                let _lease = lease;
+                panic!("exercise scratch unwind restoration");
+            }))
+            .is_err()
+        );
+        let mut reused = MatchScratchLease::take();
+        assert_eq!(std::ptr::from_mut(reused.get()), scratch_ptr);
+    }
+
+    #[test]
+    fn tls_scope_match_scratch_borrowed_cache_drop_does_not_panic() {
+        let lease = MatchScratchLease::take();
+        MATCH_SCRATCH.with(|cache| {
+            let borrowed = cache.borrow();
+            assert!(catch_unwind(AssertUnwindSafe(|| drop(lease))).is_ok());
+            assert!(borrowed.is_none());
         });
     }
 }
@@ -8819,17 +8930,10 @@ fn fastmap_force_disabled() -> bool {
 /// changes match results. The previous policy is restored even if `f` unwinds.
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn with_fastmap_disabled<R>(f: impl FnOnce() -> R) -> R {
-    struct Guard(SearchOptimizationOverride);
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            SEARCH_OPTIMIZATION_OVERRIDE.with(|slot| slot.set(self.0));
-        }
-    }
-
-    let previous = SEARCH_OPTIMIZATION_OVERRIDE
-        .with(|slot| slot.replace(SearchOptimizationOverride::Disabled));
-    let _guard = Guard(previous);
+    let _guard = crate::tls_scope::TlsScope::new(
+        &SEARCH_OPTIMIZATION_OVERRIDE,
+        SearchOptimizationOverride::Disabled,
+    );
     f()
 }
 
@@ -9023,13 +9127,7 @@ thread_local! {
 /// read when a pattern compiles, so compile inside `f`.
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn with_anchor_alt<R>(on: bool, f: impl FnOnce() -> R) -> R {
-    struct Guard(Option<bool>);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            ANCHOR_ALT_OVERRIDE.with(|slot| slot.set(self.0));
-        }
-    }
-    let _guard = Guard(ANCHOR_ALT_OVERRIDE.with(|slot| slot.replace(Some(on))));
+    let _guard = crate::tls_scope::TlsScope::new(&ANCHOR_ALT_OVERRIDE, Some(on));
     f()
 }
 
@@ -9852,29 +9950,29 @@ mod suffix_literal;
 mod short_literal;
 
 #[cfg(test)]
-#[path = "tests/short_literal.rs"]
+#[path = "tests/short_literal_test.rs"]
 mod short_literal_tests;
 
 #[cfg(test)]
-#[path = "tests/emacs.rs"]
+#[path = "tests/emacs_test.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "tests/opcode_decode.rs"]
+#[path = "tests/opcode_decode_test.rs"]
 mod opcode_decode_tests;
 
 #[cfg(test)]
-#[path = "tests/casefold_scan.rs"]
+#[path = "tests/casefold_scan_test.rs"]
 mod casefold_scan_tests;
 
 #[cfg(test)]
-#[path = "tests/fail_stack_parity.rs"]
+#[path = "tests/fail_stack_parity_test.rs"]
 mod fail_stack_parity_tests;
 
 #[cfg(test)]
-#[path = "tests/start_anchor.rs"]
+#[path = "tests/start_anchor_test.rs"]
 mod start_anchor_tests;
 
 #[cfg(test)]
-#[path = "tests/suffix_literal.rs"]
+#[path = "tests/suffix_literal_test.rs"]
 mod suffix_literal_tests;

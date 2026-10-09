@@ -217,6 +217,12 @@ thread_local! {
     /// bool whenever a heap is (re)installed on a thread — that resync, not a
     /// guard, is the panic-recovery point.
     static TAGGED_HEAP_CONCURRENT_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// The installed mutator's Tier-H activation, independently of the general
+    /// SATB window: claims-OFF cycles still mark concurrently. Derived from
+    /// running + claims + snapshot presence at launch and heap installation;
+    /// cleared at join/uninstall, before retained snapshot storage is freed.
+    /// Like the general window, this is protocol state, never scope-restored.
+    static TAGGED_HEAP_CONCURRENT_HASH_ACTIVE: Cell<bool> = const { Cell::new(false) };
     /// Mirrors `TaggedHeap::{dump_addr_lo, dump_addr_hi}` so the write
     /// barrier's partition-only path can span-test a cons owner without
     /// dereferencing the heap. `(usize::MAX, 0)` = empty span.
@@ -279,12 +285,6 @@ fn barrier_cache_slot(bits: usize) -> usize {
 
 fn clear_barrier_cache(cache: &'static std::thread::LocalKey<[Cell<usize>; BARRIER_CACHE_SLOTS]>) {
     cache.with(|slots| slots.iter().for_each(|slot| slot.set(0)));
-}
-
-static NEXT_TAGGED_HEAP_ID: AtomicUsize = AtomicUsize::new(1);
-
-fn next_tagged_heap_identity() -> usize {
-    NEXT_TAGGED_HEAP_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +389,7 @@ pub struct TaggedHeap {
     /// Lisp values.  It deliberately does not use this heap's address: boxed
     /// heaps are routinely dropped and recreated by snapshot-based tests, and
     /// the allocator may reuse an address for a different heap lifetime.
-    identity: usize,
+    identity: HeapIdentity,
 
     /// The O(1) page directory (`chunk_map.rs`) when `NEOVM_GC_CHUNK_MAP`
     /// is on (read once, at construction): every cons block and arena page
@@ -543,15 +543,6 @@ pub struct TaggedHeap {
     /// Stable video ids of `VideoObj` handles reclaimed by the sweep. The
     /// evaluator drains these after collection through `DisplayHost`.
     pending_video_destroys: Vec<neomacs_display_protocol::VideoId>,
-    /// Ids of killed buffers whose buffer object this cycle's mark left
-    /// unmarked (queued at termination, freed by the sweep). The evaluator's
-    /// cycle-completed block drains them and drops the killed buffer's record
-    /// (`BufferManager::reclaim_dead_buffer`), GNU's sweep of an unreachable
-    /// dead `struct buffer`. Plain data, never marked.
-    pending_buffer_reclaims: Vec<crate::buffer::BufferId>,
-    /// The same for deleted processes: drained into
-    /// `ProcessManager::reclaim_deleted_process`. Plain data, never marked.
-    pending_process_reclaims: Vec<crate::emacs_core::process::ProcessId>,
 
     /// Reclaimed cons cells threaded through the dead cells themselves,
     /// matching GNU alloc.c's `cons_free_list`.
@@ -634,9 +625,6 @@ pub struct TaggedHeap {
     /// a killed buffer's object lives exactly as long as Lisp references it
     /// (see [`RegistrySlot`]).
     buffer_registry: Vec<RegistrySlot>,
-    /// Ids whose registry slot is `Killed`, so the termination's prune
-    /// visits only killed objects still referenced, not every id ever made.
-    killed_buffer_ids: Vec<crate::buffer::BufferId>,
     window_registry: FxHashMap<u64, TaggedValue>,
     frame_registry: FxHashMap<u64, TaggedValue>,
     timer_registry: FxHashMap<u64, TaggedValue>,
@@ -644,10 +632,7 @@ pub struct TaggedHeap {
     /// from 1 upward and never reused). Only live processes' objects are
     /// roots; a deleted process's object lives exactly as long as Lisp
     /// references it (see [`RegistrySlot`]).
-    process_registry: Vec<RegistrySlot>,
-    /// Ids whose registry slot is `Killed` (deleted processes), as
-    /// `killed_buffer_ids`.
-    deleted_process_ids: Vec<crate::emacs_core::process::ProcessId>,
+    process_registry: process_registry::ProcessRegistry,
 
     /// Cumulative GC statistics.
     gc_collections: usize,
@@ -764,7 +749,7 @@ pub struct TaggedHeap {
     concurrent_mark_running: bool,
     /// Mutator->GC channel (Phase 5): the SATB barrier appends the overwritten
     /// children here (locked); the GC thread drains them into its gray worklist.
-    satb_shared: std::sync::Arc<std::sync::Mutex<Vec<TaggedValue>>>,
+    satb_shared: SharedMarkQueue,
     /// Per-cycle dedup for the COARSE (bulk) SATB barrier. A bulk mutator
     /// (`with_hash_table_mut`, `with_vector_data_mut`, char-table, …) hands a
     /// `&mut` to an arbitrary closure, so the barrier — which runs BEFORE the
@@ -794,7 +779,7 @@ pub struct TaggedHeap {
     /// can be reallocated by the mutator, so reading it concurrently would be a
     /// UAF). They are marked black and parked here, then traced at the
     /// termination handshake while the mutator is stopped.
-    deferred_veclikes: std::sync::Arc<std::sync::Mutex<Vec<TaggedValue>>>,
+    deferred_veclikes: SharedMarkQueue,
     /// GC thread sets this (Release) when gray + SATB are drained; the mutator
     /// polls it (Acquire) at safe points to decide when to terminate.
     gc_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -839,9 +824,6 @@ pub struct TaggedHeap {
     /// Receives when the GC thread has exited its mark loop (so the mutator's
     /// termination can safely take over the gray queue). Set at start.
     gc_exited: Option<std::sync::mpsc::Receiver<ConcurrentMarkResult>>,
-    /// This heap's own GC thread (`GcWorker`): shared with no other heap, so
-    /// no heap's mark or drop waits behind another heap's mark.
-    gc_worker: GcWorker,
     /// Stage 1b CONCURRENT OBARRAY SCAN: a start-captured obarray chunk snapshot
     /// staged by the start handshake (`start_concurrent_mark`) just before
     /// `launch_concurrent_mark`, which moves it into the `ConcurrentMarkJob`. The
@@ -957,9 +939,9 @@ pub struct TaggedHeap {
     /// read once, here at construction): the Tier-B snapshot (the default),
     /// or, for the F-G measurement only, deferral to the termination.
     vec_scan: knobs::VecScanMode,
-    /// The generation census (`census.rs`), present only under
-    /// `NEOVM_GC_CENSUS` / `NEOVM_GC_CENSUS_REMSET` (read once, here at
-    /// construction). Trace-only: it never changes what is marked or freed.
+    /// The original census pointer also carries optional U35 cold state.
+    /// A claims-only carrier has disabled measurement; the two facilities
+    /// retain independent history, snapshot and per-mutator log lifetimes.
     census: Option<Box<GenCensus>>,
 }
 
@@ -999,18 +981,20 @@ pub(crate) fn set_verify_marked_objects_for_test(on: bool) {
     VERIFY_MARKED_OBJECTS.with(|flag| flag.set(on));
 }
 
+static_assertions::assert_not_impl_any!(TaggedHeap: Send, Sync);
+
 impl TaggedHeap {
     pub fn new() -> Self {
         super::collection_reads::initialize();
         let chunk_map = knobs::chunk_map_on().then(|| std::sync::Arc::new(ChunkMap::new()));
-        let heap = Self {
+        let mut heap = Self {
             generational: generational::GenState::new(
                 std::env::var("NEOVM_GC_GENERATIONAL").as_deref() == Ok("1"),
             ),
             jit: JitHeapState::new(),
             region_book: RegionBook::new(),
             region_stats: RegionStats::default(),
-            identity: next_tagged_heap_identity(),
+            identity: HeapIdentity::issue(),
             chunk_map: chunk_map.clone().map(HeapChunkMap::new),
             cons_blocks: Vec::new(),
             cons_block_index_by_base: FxHashMap::default(),
@@ -1040,8 +1024,6 @@ impl TaggedHeap {
             doomed_finalizer_functions: Vec::new(),
             pending_surface_destroys: Vec::new(),
             pending_video_destroys: Vec::new(),
-            pending_buffer_reclaims: Vec::new(),
-            pending_process_reclaims: Vec::new(),
             cons_free_list: std::ptr::null_mut(),
             float_arena: ObjectArena::new(chunk_map.clone()),
             string_arena: ObjectArena::new(chunk_map.clone()),
@@ -1063,12 +1045,10 @@ impl TaggedHeap {
             cons_live_count: 0,
             marker_chain_head_slots: Vec::new(),
             buffer_registry: Vec::new(),
-            killed_buffer_ids: Vec::new(),
             window_registry: FxHashMap::default(),
             frame_registry: FxHashMap::default(),
             timer_registry: FxHashMap::default(),
-            process_registry: Vec::new(),
-            deleted_process_ids: Vec::new(),
+            process_registry: process_registry::ProcessRegistry::default(),
             write_tracking_mode: WriteTrackingMode::Disabled,
             dirty_owners: Vec::new(),
             first_cycle_concurrent: false,
@@ -1115,7 +1095,6 @@ impl TaggedHeap {
             gc_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gc_wake: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
             gc_exited: None,
-            gc_worker: GcWorker::default(),
             pending_obarray_scan: None,
             concurrent_obarray_start_slots: None,
             retired_vector_buffers: Vec::new(),
@@ -1174,6 +1153,9 @@ impl TaggedHeap {
             vec_scan: knobs::vec_scan_mode(),
             census: GenCensus::from_knob(),
         };
+        if knobs::concurrent_claims_on() {
+            heap.install_concurrent_claims();
+        }
         // The census's remembered-set probe widens the window compiled code
         // tests from the start (the thread-local mirror follows when the heap
         // is installed, `set_tagged_heap`).
@@ -1182,6 +1164,12 @@ impl TaggedHeap {
     }
 
     pub(crate) fn identity(&self) -> usize {
+        self.identity.get()
+    }
+
+    /// This heap lifetime's typed identity.
+    #[inline]
+    pub fn heap_identity(&self) -> HeapIdentity {
         self.identity
     }
 
@@ -1211,6 +1199,7 @@ impl TaggedHeap {
         self.write_tracking_mode
     }
 
+    #[inline(always)]
     pub fn should_collect(&self) -> bool {
         self.bytes_since_gc() >= self.gc_threshold
     }
@@ -1376,7 +1365,7 @@ impl TaggedHeap {
     /// region is never granted past the threshold
     /// (`TaggedHeap::region_budget`), so the pacing gates that read this
     /// collect when they did before — at most one region early, never late.
-    #[inline]
+    #[inline(always)]
     pub fn bytes_since_gc(&self) -> usize {
         self.mutators().map(|state| state.bytes_since_gc).sum()
     }
@@ -1454,7 +1443,7 @@ impl TaggedHeap {
             RegistrySlot::Live(value)
         };
         if killed {
-            self.killed_buffer_ids.push(id);
+            self.process_registry.cold.killed_buffer_ids.push(id);
         }
     }
 
@@ -1474,9 +1463,9 @@ impl TaggedHeap {
                 RegistrySlot::Vacant | RegistrySlot::Reclaimed => RegistrySlot::Reclaimed,
             };
             if matches!(*slot, RegistrySlot::Killed(_)) {
-                self.killed_buffer_ids.push(id);
+                self.process_registry.cold.killed_buffer_ids.push(id);
             } else {
-                self.pending_buffer_reclaims.push(id);
+                self.process_registry.cold.pending_buffer_reclaims.push(id);
             }
         }
     }
@@ -1503,7 +1492,7 @@ impl TaggedHeap {
     /// the killed record after the cycle (GNU frees the dead `struct buffer`
     /// in the same sweep). Reads marks, which are intact until the sweep.
     pub(super) fn prune_unmarked_killed_buffers(&mut self) {
-        let mut ids = std::mem::take(&mut self.killed_buffer_ids);
+        let mut ids = std::mem::take(&mut self.process_registry.cold.killed_buffer_ids);
         ids.retain(|&id| {
             let idx = id.0 as usize;
             let RegistrySlot::Killed(value) = self.buffer_registry[idx] else {
@@ -1513,12 +1502,12 @@ impl TaggedHeap {
                 return true;
             }
             self.buffer_registry[idx] = RegistrySlot::Reclaimed;
-            self.pending_buffer_reclaims.push(id);
+            self.process_registry.cold.pending_buffer_reclaims.push(id);
             false
         });
         ids.sort_unstable_by_key(|id| id.0);
         ids.dedup();
-        self.killed_buffer_ids = ids;
+        self.process_registry.cold.killed_buffer_ids = ids;
     }
 
     pub fn window_value(&self, id: u64) -> Option<TaggedValue> {
@@ -2616,15 +2605,17 @@ impl TaggedHeap {
 
 impl Drop for TaggedHeap {
     fn drop(&mut self) {
-        // A live concurrent mark holds start-of-cycle snapshots into this
-        // heap (cons blocks + their mark bitmaps, vector backings, the
-        // Context obarray) on the GC thread. Reclaim exclusive ownership
-        // BEFORE freeing anything it can still read. `tagged_heap` is the
-        // first `Context` field, so this join also runs before the obarray
-        // drops. No-op when no mark is in flight.
+        // Explicit finish is the only blocking completion handoff. Drop
+        // cannot establish exclusive ownership while a marker is active, so
+        // its fallback retains every marker-readable allocation and returns.
         if self.concurrent_mark_running {
-            self.join_concurrent_mark();
+            self.abandon_concurrent_mark();
+            crate::tagged::gc::clear_tagged_heap_if_installed(self);
+            return;
         }
+        // No marker is active, so Tier-H's snapshot and retired originals are
+        // freed with the claims state when the census carrier drops below;
+        // Drop takes none of its locks.
         // Leave no dangling thread-local pointer behind: a heap installed with
         // `set_tagged_heap` and dropped by anything but a `Context` (a failed
         // pdump load drops the half-built one on its error path) used to stay
@@ -2634,33 +2625,10 @@ impl Drop for TaggedHeap {
         // which is also why the frees below run with no heap installed either
         // way.
         crate::tagged::gc::clear_tagged_heap_if_installed(self);
-        // Free all non-cons objects via every intrusive list: young, tenured,
-        // and any objects detached for an in-flight deferred sweep.
-        for mut current in [
-            self.all_objects,
-            self.tenured_objects,
-            self.sweep_noncons_pending,
-        ] {
-            while !current.is_null() {
-                unsafe {
-                    let next = (*current).next;
-                    self.free_gc_object(current);
-                    current = next;
-                }
-            }
-        }
-        for mut old in [
-            self.generational.old_objects,
-            self.generational.old_sweep_pending,
-        ] {
-            while !old.is_null() {
-                unsafe {
-                    let next = (*old).gc_link();
-                    self.free_gc_object(old);
-                    old = next;
-                }
-            }
-        }
+        // Automatic destruction cannot invoke module finalizers or SQLite
+        // teardown. Explicit shutdown reclaims those resources beforehand;
+        // the fallback retains native payloads and frees inert Rust storage.
+        self.reclaim_intrusive_objects(ReclamationMode::DropFallback);
         // ConsBlocks are dropped automatically (they implement Drop).
         // Object arena pages likewise: page floats/strings/vectors/bytecode/
         // lambdas/macros/records/symbols-with-pos are on NONE of the lists
@@ -2673,9 +2641,8 @@ impl Drop for TaggedHeap {
         // lambdas/macros/records their slot `Vec` + cached params; floats and
         // symbols-with-pos are POD and the walk compiles out) before releasing
         // the page storage —
-        // retired pages included. The concurrent-mark join at the top of this
-        // body has already reclaimed exclusive ownership, so the GC thread
-        // cannot still be reading a page.
+        // retired pages included. This path only runs without an active mark,
+        // so the GC thread cannot still be reading a page.
     }
 }
 
@@ -2692,19 +2659,19 @@ impl Drop for TaggedHeap {
 pub(crate) mod alloc_probe;
 
 #[cfg(test)]
-#[path = "gc/tests/layout_stats_tests.rs"]
+#[path = "gc/tests/layout_stats_test.rs"]
 mod layout_stats_tests;
 
 #[cfg(test)]
-#[path = "gc/tests/pacer_tests.rs"]
+#[path = "gc/tests/pacer_test.rs"]
 mod pacer_tests;
 
 #[cfg(test)]
-#[path = "gc/tests/ownership_tests.rs"]
+#[path = "gc/tests/ownership_test.rs"]
 mod ownership_tests;
 
 #[cfg(test)]
-#[path = "gc/tests/thread_local_ownership.rs"]
+#[path = "gc/tests/thread_local_ownership_test.rs"]
 mod thread_local_ownership_tests;
 
 /// FLOAT ARENA PAGES test suite. Every scenario runs twice: plain and with
@@ -2714,7 +2681,7 @@ mod thread_local_ownership_tests;
 /// relies on nextest's process-per-test model for the env var and the global
 /// `LIVE_FLOAT_PAGES` counter.
 #[cfg(test)]
-#[path = "gc/tests/float_arena_tests.rs"]
+#[path = "gc/tests/float_arena_test.rs"]
 mod float_arena_tests;
 
 /// ARENA PROMOTION + RETIREMENT test suite (stage 3, commit 4): the
@@ -2724,7 +2691,7 @@ mod float_arena_tests;
 /// remembered-set scan. Scenarios run plain and (where the partition
 /// verifiers add coverage) with `NEOVM_GC_VERIFY_PARTITION=1`.
 #[cfg(test)]
-#[path = "gc/tests/arena_promotion_tests.rs"]
+#[path = "gc/tests/arena_promotion_test.rs"]
 mod arena_promotion_tests;
 
 /// BYTECODE ARENA test suite (task 03/3a): page-span oracle exactness for the
@@ -2739,7 +2706,7 @@ mod arena_promotion_tests;
 /// teardown counters, and the test-only constants-mutation seam. Scenarios
 /// run plain and (where the partition matters) VERIFY_PARTITION-armed.
 #[cfg(test)]
-#[path = "gc/tests/bytecode_arena_tests.rs"]
+#[path = "gc/tests/bytecode_arena_test.rs"]
 mod bytecode_arena_tests;
 
 /// LAMBDA + MACRO ARENA test suite (task 03/3b): the 128B power-of-two class
@@ -2756,7 +2723,7 @@ mod bytecode_arena_tests;
 /// exactness/sweep/tenure/teardown battery proving its own arena. Scenarios
 /// run plain and (where the partition matters) VERIFY_PARTITION-armed.
 #[cfg(test)]
-#[path = "gc/tests/lambda_macro_arena_tests.rs"]
+#[path = "gc/tests/lambda_macro_arena_test.rs"]
 mod lambda_macro_arena_tests;
 
 /// RECORD ARENA test suite (task 03/3b): the 64B class (1024 slots/page,
@@ -2770,7 +2737,7 @@ mod lambda_macro_arena_tests;
 /// parity survival, and the WindowConfiguration dual-tag sharing the arena.
 /// Scenarios run plain and (where the partition matters) VERIFY_PARTITION.
 #[cfg(test)]
-#[path = "gc/tests/record_arena_tests.rs"]
+#[path = "gc/tests/record_arena_test.rs"]
 mod record_arena_tests;
 
 /// SYMBOL-WITH-POS ARENA test suite (task 03/3b): the 64B class (1024
@@ -2802,8 +2769,21 @@ mod old_sweep;
 mod pacing;
 
 mod concurrent;
+pub use concurrent::MarkFinishError;
+mod heap_identity;
+pub use heap_identity::HeapIdentity;
+mod mark_word;
+use mark_word::{MarkStack, MarkWord, SharedMarkQueue};
+pub(crate) mod scan_contract;
+#[cfg(test)]
+#[path = "gc/tests/shutdown_tests.rs"]
+mod shutdown_tests;
+pub(crate) use concurrent::{concurrent_hash_snapshot, prepare_concurrent_hash_write};
+pub(crate) mod concurrent_hash;
 
 mod incremental;
+mod reclamation;
+use reclamation::ReclamationMode;
 
 mod cons_block_trailer;
 use cons_block_trailer::*;
@@ -2854,6 +2834,7 @@ mod chunk_map;
 use chunk_map::{CHUNK_CLASS_COUNT, ChunkClass, ChunkEntry, ChunkMap, HeapChunkMap, PageSnapshot};
 
 mod census;
+mod cold_gc;
 #[cfg(test)]
 use census::CensusRecord;
 use census::{CensusCycleKind, GenCensus, census_remset_probe_on};
@@ -2872,15 +2853,15 @@ pub(crate) use jit_state::{
 /// Allocation regions: sources, give-back, exact counters, black across
 /// the phase flags, and the close at every collector entry.
 #[cfg(test)]
-#[path = "gc/tests/alloc_region_tests.rs"]
+#[path = "gc/tests/alloc_region_test.rs"]
 mod alloc_region_tests;
 #[cfg(test)]
-#[path = "gc/tests/barrier_window_generational_tests.rs"]
+#[path = "gc/tests/barrier_window_generational_test.rs"]
 mod barrier_window_generational_tests;
 /// The write barrier's owner window against the gate it replaced, state by
 /// state and owner by owner, and its republication at every input writer.
 #[cfg(test)]
-#[path = "gc/tests/barrier_window_tests.rs"]
+#[path = "gc/tests/barrier_window_test.rs"]
 mod barrier_window_tests;
 /// BIGNUM ARENA test suite (lever P0.11): the 64B payload-bearing class
 /// (1024 slots/page, own arena). Covers the slot fit, page-span oracle
@@ -2891,22 +2872,22 @@ mod barrier_window_tests;
 /// counters and exact values after slot reuse. Scenarios run plain and
 /// (where the partition matters) VERIFY_PARTITION-armed.
 #[cfg(test)]
-#[path = "gc/tests/bignum_arena_tests.rs"]
+#[path = "gc/tests/bignum_arena_test.rs"]
 mod bignum_arena_tests;
 /// The generation census: survivor classes across cycles on both
 /// termination paths, the remembered-set probe, and that it measures without
 /// changing anything.
 #[cfg(test)]
-#[path = "gc/tests/census_tests.rs"]
+#[path = "gc/tests/census_test.rs"]
 mod census_tests;
 /// The chunk map: the radix, its entries through page and block creation,
 /// release and re-indexing, the oracles against the registries, the GC
 /// thread's snapshot semantics, and concurrent cycles classified through it.
 #[cfg(test)]
-#[path = "gc/tests/chunk_map_tests.rs"]
+#[path = "gc/tests/chunk_map_test.rs"]
 mod chunk_map_tests;
 #[cfg(test)]
-#[path = "gc/tests/cons_alloc_tests.rs"]
+#[path = "gc/tests/cons_alloc_test.rs"]
 mod cons_alloc_tests;
 /// A fake pdump image in one allocation (see the module doc for why one).
 #[cfg(test)]
@@ -2919,26 +2900,26 @@ pub(crate) mod fake_image;
 mod permanent_fixtures;
 
 #[cfg(test)]
-#[path = "gc/tests/generation_tests.rs"]
+#[path = "gc/tests/generation_test.rs"]
 mod generation_tests;
 #[cfg(test)]
-#[path = "gc/tests/generational_verifier_tests.rs"]
+#[path = "gc/tests/generational_verifier_test.rs"]
 mod generational_verifier_tests;
 #[cfg(test)]
-#[path = "gc/tests/marker_arena_tests.rs"]
+#[path = "gc/tests/marker_arena_test.rs"]
 mod marker_arena_tests;
 /// Record and closure slot stores are atomic: race-free against an atomic
 /// reader, same semantics, same barrier through a concurrent mark.
 #[cfg(test)]
-#[path = "gc/tests/slot_store_tests.rs"]
+#[path = "gc/tests/slot_store_test.rs"]
 mod slot_store_tests;
 #[cfg(test)]
-#[path = "gc/tests/symbol_with_pos_arena_tests.rs"]
+#[path = "gc/tests/symbol_with_pos_arena_test.rs"]
 mod symbol_with_pos_arena_tests;
 /// `NEOVM_GC_VEC_SCAN=defer` (F-G): no Tier-B snapshot, page vectors traced
 /// by reachability at the termination, with and without the chunk map.
 #[cfg(test)]
-#[path = "gc/tests/vec_scan_tests.rs"]
+#[path = "gc/tests/vec_scan_test.rs"]
 mod vec_scan_tests;
 
 /// Test-only growth helper mirroring the production insert resize policy closely
@@ -2953,24 +2934,24 @@ fn maybe_resize_for_test(ht: &mut crate::emacs_core::value::LispHashTable) {
 }
 
 #[cfg(test)]
-#[path = "gc/tests/generational_tests.rs"]
+#[path = "gc/tests/generational_test.rs"]
 mod generational_tests;
 
 #[cfg(test)]
-#[path = "gc/tests/birth_logs_tests.rs"]
+#[path = "gc/tests/birth_logs_test.rs"]
 mod birth_logs_tests;
 
 #[cfg(test)]
-#[path = "gc/tests/generational_major_tests.rs"]
+#[path = "gc/tests/generational_major_test.rs"]
 mod generational_major_tests;
 
 #[cfg(test)]
-#[path = "gc/tests/generational_pacing_tests.rs"]
+#[path = "gc/tests/generational_pacing_test.rs"]
 mod generational_pacing_tests;
 
 #[cfg(test)]
-#[path = "gc/tests/major_symbol_preimage_tests.rs"]
+#[path = "gc/tests/major_symbol_preimage_test.rs"]
 mod major_symbol_preimage_tests;
 #[cfg(test)]
-#[path = "gc/tests/symbol_barrier_tests.rs"]
+#[path = "gc/tests/symbol_barrier_test.rs"]
 mod symbol_barrier_tests;

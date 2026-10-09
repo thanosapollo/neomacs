@@ -464,11 +464,23 @@ pub(super) fn install(
         let font = startup_font::StartupFont::select(&opened.display, preferred.as_deref()).ok_or_else(|| display_error("No usable GUI font"))?;
         let metrics = font.metrics();
         let selected = font.into_selected();
-        let font_name = format!("-*-{}-{}-{}-*-*-{}-*-*-*-*-*-*-*",
-            selected.resolved.family,
-            startup_font_weight_symbol(FontWeight::from_css_weight(selected.resolved.weight)),
-            selected.slant.symbol_name(),
-            selected.metrics.pixel_size);
+        // Use the same canonical opened-font name as ordinary GUI startup.
+        // A synthesized family/weight XLFD can reopen a different face, and
+        // upstream no longer exposes its former startup weight-name helper.
+        let mut face = neovm_core::face::Face::new("default");
+        face.height = Some(FaceHeight::Absolute(
+            opened.display.font_sizing()
+                .face_height_tenths_for_layout_pixels(selected.metrics.pixel_size.max(1)),
+        ));
+        let matched = ResolvedFontMatch {
+            glyph_code: None,
+            font: core_opened_font_from_selection(selected, font_otf_capability_for_file),
+        };
+        let opened_font =
+            neovm_core::emacs_core::font::opened_font_from_resolved_match(&face, &matched);
+        let font_name = neovm_core::emacs_core::font::public_frame_font_parameter_value(opened_font)
+            .as_str_owned()
+            .ok_or_else(|| display_error("Selected GUI font has no canonical name"))?;
         let (width, height) = startup_dimensions(FrontendKind::Gui, metrics, false);
         let native = Rc::new(RefCell::new(Some(InitialWindow::Pending(opened.reply))));
         let primary_size = Arc::new(Mutex::new(PrimaryWindowSize { width, height }));
@@ -567,8 +579,10 @@ fn display_host(
         font_sizing: display.font_sizing(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: HashMap::new(),
         last_window_titles: Mutex::new(HashMap::new()),
         font_metrics: None,
+        font_entities: FontEntityCatalog::default(),
         primary_window_size,
         image_catalog,
         #[cfg(feature = "video")]

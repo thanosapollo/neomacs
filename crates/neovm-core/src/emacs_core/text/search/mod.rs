@@ -608,7 +608,7 @@ fn in_representation(
         LispString::from_unibyte(str_to_unibyte(text.as_bytes()))
     };
     if text.has_intervals() {
-        *converted.intervals_mut() = text.intervals().clone();
+        *converted.intervals_mut() = text.intervals().to_owned_table();
     }
     converted
 }
@@ -714,7 +714,7 @@ fn replace_match_lisp_string_with_syntax_and_properties(
             // GNU keeps a property-free string's interval pointer null; only
             // copy a table that exists.
             if replacement.has_intervals() {
-                *cased.intervals_mut() = replacement.intervals().clone();
+                *cased.intervals_mut() = replacement.intervals().to_owned_table();
             } else {
                 cased.clear_intervals();
             }
@@ -1025,5 +1025,5 @@ pub(crate) fn builtin_replace_regexp_in_string(
 // Tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]
-#[path = "tests/mod.rs"]
+#[path = "tests/search_test.rs"]
 mod tests;

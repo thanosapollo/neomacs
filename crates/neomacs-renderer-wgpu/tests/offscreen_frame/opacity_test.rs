@@ -690,21 +690,33 @@ fn child_char_and_stretch_stipple_is_foreground_at_zero_background() {
     }
 }
 
+/// Run the test named `exact` in a child test process under a 1 MiB GPU
+/// budget. Returns true inside that child, where the caller runs its body.
+/// In the parent it requires the child to have run exactly one test and
+/// passed: libtest exits successfully when `--exact` matches nothing.
+fn in_gpu_budget_child(exact: &str) -> bool {
+    if std::env::var("NEOMACS_GPU_BUDGET_MB").as_deref() == Ok("1") {
+        return true;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", exact, "--color", "never"])
+        .env_remove("RUST_TEST_NOCAPTURE")
+        .env("NEOMACS_GPU_BUDGET_MB", "1")
+        .output()
+        .unwrap();
+    child_result::assert_child_success(&out, exact);
+    false
+}
+
 /// Run in the bounded GPU lane with NEOMACS_GPU_BUDGET_MB=1. Real held
 /// leases deny the required picture; no opaque substitute is rendered.
 #[test]
 fn mandatory_child_picture_refusal_is_typed_and_recovers_after_lease_release() {
     // Isolate the budget knob in a child test process: never mutate the
     // environment of other concurrently running GPU tests.
-    if std::env::var("NEOMACS_GPU_BUDGET_MB").as_deref() != Ok("1") {
-        let exact = "opacity_test::mandatory_child_picture_refusal_is_typed_and_recovers_after_lease_release";
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", exact, "--color", "never"])
-            .env_remove("RUST_TEST_NOCAPTURE")
-            .env("NEOMACS_GPU_BUDGET_MB", "1")
-            .output()
-            .unwrap();
-        child_result::assert_child_success(&output, exact);
+    if !in_gpu_budget_child(
+        "opacity_test::mandatory_child_picture_refusal_is_typed_and_recovers_after_lease_release",
+    ) {
         return;
     }
     let mut h = try_harness().expect("real GPU adapter required");
@@ -863,4 +875,76 @@ fn source_over_transitions_fill_uncovered_geometry_with_the_background() {
             assert_eq!(px(&pixels, 94, 62), px(&before, 94, 62));
         }
     }
+}
+
+#[test]
+fn prepared_child_rejects_missing_wrong_size_and_aliased_resize_scratch() {
+    use neomacs_renderer_wgpu::renderer::{
+        ChildPreparationError, ChildResizePicture, PreparedChildFrame,
+    };
+    let mut h = try_harness().expect("GPU required for child preparation regression");
+    let child = FrameGlyphBuffer::with_size(W as f32, H as f32);
+    let size = SnapshotSize::new(W, H).unwrap();
+    let picture = h.renderer.acquire_snapshot(size).unwrap();
+    let old = h.renderer.acquire_snapshot(size).unwrap();
+    let mixed = h.renderer.acquire_snapshot(size).unwrap();
+    let small = h
+        .renderer
+        .acquire_snapshot(SnapshotSize::new(8, 8).unwrap())
+        .unwrap();
+    let resize = || ChildResizePicture {
+        old: &old,
+        old_width: W as f32,
+        old_height: H as f32,
+        mix: 0.5,
+    };
+    assert_eq!(
+        PreparedChildFrame::new(&child, 0.5, size, Some(&small), None, None).err(),
+        Some(ChildPreparationError::WrongSize)
+    );
+    assert_eq!(
+        PreparedChildFrame::new(&child, 1.0, size, Some(&picture), Some(resize()), None).err(),
+        Some(ChildPreparationError::MissingResizePicture)
+    );
+    assert_eq!(
+        PreparedChildFrame::new(
+            &child,
+            1.0,
+            size,
+            Some(&picture),
+            Some(resize()),
+            Some(&small)
+        )
+        .err(),
+        Some(ChildPreparationError::WrongSize)
+    );
+    for aliased in [&picture, &old] {
+        assert_eq!(
+            PreparedChildFrame::new(
+                &child,
+                1.0,
+                size,
+                Some(&picture),
+                Some(resize()),
+                Some(aliased)
+            )
+            .err(),
+            Some(ChildPreparationError::AliasedResizePicture)
+        );
+    }
+    assert_eq!(
+        PreparedChildFrame::new(&child, 1.0, size, Some(&old), Some(resize()), Some(&mixed)).err(),
+        Some(ChildPreparationError::AliasedResizePicture)
+    );
+    assert!(
+        PreparedChildFrame::new(
+            &child,
+            1.0,
+            size,
+            Some(&picture),
+            Some(resize()),
+            Some(&mixed)
+        )
+        .is_ok()
+    );
 }

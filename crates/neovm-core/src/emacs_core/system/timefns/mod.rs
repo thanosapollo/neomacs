@@ -2184,5 +2184,5 @@ pub(crate) fn builtin_set_time_zone_rule(args: Vec<Value>) -> EvalResult {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "tests/mod.rs"]
+#[path = "tests/timefns_test.rs"]
 mod tests;

@@ -64,7 +64,7 @@ mod casefiddle {
     use neovm_core::Value;
 
     mod tests {
-        include!("../src/emacs_core/text/casefiddle/tests/mod.rs");
+        include!("../src/emacs_core/text/casefiddle/tests/casefiddle_test.rs");
     }
 }
 

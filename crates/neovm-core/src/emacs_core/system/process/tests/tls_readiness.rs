@@ -211,6 +211,7 @@ fn prepare() -> (Context, ProcessId, TcpStream, Vec<u8>) {
     proc.coding_decode = Value::symbol("utf-8-unix");
     proc.coding_encode = Value::symbol("utf-8-unix");
     proc.live_io.tls_stream = Some(tls);
+    proc.gnutls_initstage = GnutlsInitStage::Ready;
     ev.processes.set_process_output_read_interest(pid, true);
     let ready = ev
         .processes
@@ -337,21 +338,35 @@ fn assert_drained(ev: &mut Context, pid: ProcessId, expected: &[u8]) {
     assert_eq!(output(ev, "tls-output"), expected);
 }
 
-// A command wait yields after callbacks so the real reader can restart display
-// maintenance (keyboard.rs). Resume that same native wait, with one fixed
-// deadline, rather than treating its first Interrupted result as a final wait.
+// Bounded command reads service successive fair batches until their deadline.
+// Only unbounded reads yield to display maintenance after each callback batch.
 fn wait_for_idle_command_input(ev: &mut Context, deadline: Instant) -> CommandInputWaitOutcome {
     loop {
-        let before = output(ev, "tls-output").len();
         let outcome = ev.wait_for_command_input(Some(deadline)).unwrap();
-        assert!(
-            output(ev, "tls-output").len() <= before + 16,
-            "each native command-wait visit must retain the live read budget"
-        );
         if outcome != CommandInputWaitOutcome::Interrupted {
             return outcome;
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn tls_unbounded_command_input_wait_yields_between_bounded_output_batches() {
+    let (mut ev, pid, _peer, expected) = prepare();
+    other_stream(&mut ev);
+    while output(&mut ev, "tls-output").len() < expected.len() {
+        let before = output(&mut ev, "tls-output").len();
+        assert_eq!(
+            ev.wait_for_command_input(None).unwrap(),
+            CommandInputWaitOutcome::Interrupted
+        );
+        assert!(
+            output(&mut ev, "tls-output").len() <= before + 16,
+            "unbounded command reads yield after each bounded callback batch"
+        );
+    }
+    assert_eq!(output(&mut ev, "tls-other"), b"MARKER");
+    assert_drained(&mut ev, pid, &expected);
 }
 
 #[cfg(unix)]
@@ -404,6 +419,61 @@ fn tls_buffered_response_resumes_inside_other_target_wait_without_target_activit
     );
     assert_eq!(output(&mut ev, "tls-other"), b"MARKER");
     assert_drained(&mut ev, pid, &expected);
+}
+
+#[test]
+fn tls_buffered_readiness_waits_for_completed_unsuspended_handshake() {
+    let (mut ev, pid, _peer, expected) = prepare();
+    ev.processes.get_mut(pid).unwrap().gnutls_initstage = GnutlsInitStage::Ready;
+    // Real plaintext is buffered and the TCP descriptor has no ciphertext.
+    // A pending handshake cannot consume it, even if the rustls client has
+    // finished reading peer records but still owes its final outbound bytes.
+    ev.processes.get_mut(pid).unwrap().gnutls_initstage = GnutlsInitStage::HandshakeTried;
+    for suspended in [false, true] {
+        if suspended {
+            assert!(ev.processes.suspend_tls_handshake_polling(pid));
+        }
+        let events = ev
+            .processes
+            .wait_for_backend_events_for_service(
+                Duration::ZERO,
+                ProcessWaitBackendInterest::ProcessesOnly,
+                ProcessOutputServiceRequest::any(None),
+            )
+            .unwrap();
+        assert!(
+            !events.has_ready_process(pid),
+            "incomplete handshake plaintext must not bypass readiness suspension"
+        );
+    }
+    // Completion alone must not override a nested wait's suspension owner.
+    ev.processes.get_mut(pid).unwrap().gnutls_initstage = GnutlsInitStage::Ready;
+    let events = ev
+        .processes
+        .wait_for_backend_events_for_service(
+            Duration::ZERO,
+            ProcessWaitBackendInterest::ProcessesOnly,
+            ProcessOutputServiceRequest::any(None),
+        )
+        .unwrap();
+    assert!(!events.has_ready_process(pid));
+    ev.processes.resume_tls_handshake_polling(pid);
+    let events = ev
+        .processes
+        .wait_for_backend_events_for_service(
+            Duration::ZERO,
+            ProcessWaitBackendInterest::ProcessesOnly,
+            ProcessOutputServiceRequest::any(None),
+        )
+        .unwrap();
+    assert!(events.has_ready_process(pid));
+    assert_eq!(output(&mut ev, "tls-output"), expected[..16]);
+    ev.poll_ready_process_output_for_service_request(
+        events,
+        &ProcessOutputServiceRequest::target_only(pid),
+    )
+    .unwrap();
+    assert_eq!(output(&mut ev, "tls-output"), expected[..32]);
 }
 
 #[test]

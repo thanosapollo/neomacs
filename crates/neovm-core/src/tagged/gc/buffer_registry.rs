@@ -36,7 +36,7 @@ impl TaggedHeap {
             match *slot {
                 RegistrySlot::Live(value) => {
                     *slot = RegistrySlot::Killed(value);
-                    self.killed_buffer_ids.push(id);
+                    self.process_registry.cold.killed_buffer_ids.push(id);
                 }
                 RegistrySlot::Vacant => *slot = RegistrySlot::Reclaimed,
                 RegistrySlot::Killed(_) | RegistrySlot::Reclaimed => {}

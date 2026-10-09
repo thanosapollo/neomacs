@@ -7083,6 +7083,28 @@ pub(crate) fn builtin_x_create_frame(
     let explicit = parse_gui_frame_params(args.first());
     let defaults = eval.eval_symbol_by_id(intern("default-frame-alist")).ok();
     let defaults = parse_gui_frame_params(defaults.as_ref());
+    // GNU xfns.c supplies mode-derived defaults through gui_default_parameter
+    // at creation, never through redisplay. Preserve explicit nil/zero and
+    // default-frame-alist overrides. Child/minibuffer-only frames have no bars.
+    for (parameter, mode) in [
+        (FrameParam::MenuBarLines, "menu-bar-mode"),
+        (FrameParam::ToolBarLines, "tool-bar-mode"),
+    ] {
+        let symbol = parameter.symbol();
+        let key = symbol.as_symbol_id().expect("known frame parameter symbol");
+        if !explicit.all.contains_key(&key) {
+            let value = defaults.all.get(&key).copied().unwrap_or_else(|| {
+                let enabled = explicit.parent_frame.is_none()
+                    && explicit.minibuffer != Some(Value::symbol("only"))
+                    && eval
+                        .obarray()
+                        .symbol_value_id_copied(intern(mode))
+                        .is_some_and(|value| value.is_truthy());
+                Value::fixnum(i64::from(enabled))
+            });
+            args[0] = Value::cons(Value::cons(symbol, value), args[0]);
+        }
+    }
     for name in ["alpha", "alpha-background"] {
         let key = intern(name);
         if !explicit.all.contains_key(&key)
@@ -7283,9 +7305,15 @@ pub(crate) fn x_create_frame_impl(
                 .and_then(|host| host.gui_frame_metrics())
                 .map(
                     |(char_width, char_height, font_pixel_size, device_scale_factor)| {
+                        // Size every deferred frame like the first one.
+                        let (width_px, height_px) = crate::window::default_gui_frame_pixel_size(
+                            char_width,
+                            char_height,
+                            font_pixel_size,
+                        );
                         GuiFrameMetrics {
-                            width_px: 80 * char_width as u32,
-                            height_px: 40 * char_height as u32,
+                            width_px,
+                            height_px,
                             char_width,
                             char_height,
                             font_pixel_size,
@@ -7722,9 +7750,8 @@ pub(crate) fn delete_frame_owned(
         } => {}
     }
     if let Some(host) = eval.display_host.as_mut() {
-        // Lisp deletion has committed. A failed opacity notification must not
-        // skip native destruction or leave a deferred window lease live.
-        let opacity_result = host.retire_gui_frame_alpha(fid);
+        // Lisp deletion has committed. Retire the native identity before any
+        // fallible cosmetic notification, then attempt both and keep diagnostics.
         let destruction_result = if was_gui_child_frame {
             tracing::info!(
                 frame_id = fid.0,
@@ -7736,6 +7763,7 @@ pub(crate) fn delete_frame_owned(
         } else {
             Ok(())
         };
+        let opacity_result = host.retire_gui_frame_alpha(fid);
         let result = match (opacity_result, destruction_result) {
             (Err(opacity), Err(destruction)) => Err(format!(
                 "{opacity}; native GUI destruction failed: {destruction}"
@@ -8254,8 +8282,9 @@ pub(crate) fn builtin_force_window_update(
 // Tests
 // ===========================================================================
 #[cfg(test)]
+#[path = "tests/window_cmds_test.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "tests/selection_chrome.rs"]
+#[path = "tests/selection_chrome_test.rs"]
 mod selection_chrome_tests;

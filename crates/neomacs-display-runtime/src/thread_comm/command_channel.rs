@@ -1,4 +1,5 @@
 //! Capacity-bounded command transport with CPU-only startup extraction.
+//! Shutdown is one independent coalescing bit; len includes that pending bit.
 //!
 //! Deferred startup already applies window/configuration/clipboard commands
 //! ahead of staged GPU work. Extract the same commands without moving or
@@ -18,6 +19,7 @@ use std::time::{Duration, Instant};
 struct Pending {
     queue: VecDeque<RenderCommand>,
     receiver_alive: bool,
+    shutdown: bool,
 }
 struct Shared {
     pending: Mutex<Pending>,
@@ -42,6 +44,7 @@ pub fn command_channel(capacity: usize) -> (CommandSender, CommandReceiver) {
         pending: Mutex::new(Pending {
             queue: VecDeque::new(),
             receiver_alive: true,
+            shutdown: false,
         }),
         space: Condvar::new(),
         capacity,
@@ -67,11 +70,16 @@ impl CommandSender {
         if !pending.receiver_alive {
             return Err(TrySendError::Disconnected(command));
         }
-        if pending.queue.len() == self.shared.capacity {
-            return Err(TrySendError::Full(command));
+        if matches!(&command, RenderCommand::Lifecycle(LifecycleCommand::Shutdown)) {
+            // Cancellation is one coalescing bit, independent of FIFO capacity.
+            pending.shutdown = true;
+        } else {
+            if pending.queue.len() == self.shared.capacity {
+                return Err(TrySendError::Full(command));
+            }
+            pending.queue.push_back(command);
         }
         // Publish and notify under the same lock, as in the frame mailbox.
-        pending.queue.push_back(command);
         let _ = self.wake.try_send(());
         Ok(())
     }
@@ -93,18 +101,16 @@ impl CommandSender {
     }
 
     pub fn len(&self) -> usize {
-        self.shared.pending.lock().unwrap().queue.len()
+        let pending = self.shared.pending.lock().unwrap();
+        pending.queue.len() + usize::from(pending.shutdown)
     }
 }
 
-fn startup_command(command: &RenderCommand) -> bool {
-    matches!(
-        command,
-        RenderCommand::Lifecycle(LifecycleCommand::Shutdown)
-            | RenderCommand::Window(_)
-            | RenderCommand::Config(_)
-            | RenderCommand::Clipboard(_)
-    )
+fn startup_command(command: &RenderCommand, daemon: bool) -> bool {
+    matches!(command, RenderCommand::Window(super::WindowCommand::RealizeFrame { .. }))
+        || (daemon && matches!(command,
+            RenderCommand::Window(_) | RenderCommand::Config(_) | RenderCommand::Clipboard(_)
+        ))
 }
 
 impl CommandReceiver {
@@ -113,17 +119,18 @@ impl CommandReceiver {
         select: impl FnOnce(&VecDeque<RenderCommand>) -> Option<usize>,
     ) -> Result<RenderCommand, TryRecvError> {
         let mut pending = self.shared.pending.lock().unwrap();
+        if std::mem::take(&mut pending.shutdown) {
+            self.rearm(&pending);
+            return Ok(RenderCommand::Lifecycle(LifecycleCommand::Shutdown));
+        }
         if let Some(index) = select(&pending.queue) {
             let command = pending.queue.remove(index).unwrap();
             self.shared.space.notify_all();
-            if !pending.queue.is_empty()
-                && let Some(wake) = self.wake.upgrade()
-            {
-                let _ = wake.try_send(());
-            }
+            self.rearm(&pending);
             return Ok(command);
         }
-        if self.wake.strong_count() == 0 {
+        // Unserviceable startup work still belongs to this stream.
+        if pending.queue.is_empty() && self.wake.strong_count() == 0 {
             Err(TryRecvError::Disconnected)
         } else {
             Err(TryRecvError::Empty)
@@ -132,17 +139,41 @@ impl CommandReceiver {
     pub fn try_recv(&self) -> Result<RenderCommand, TryRecvError> {
         self.take(|queue| (!queue.is_empty()).then_some(0))
     }
-    pub(crate) fn try_recv_startup(&self) -> Result<RenderCommand, TryRecvError> {
-        self.take(|queue| queue.iter().position(startup_command))
+    fn rearm(&self, pending: &Pending) {
+        if (!pending.queue.is_empty() || pending.shutdown)
+            && let Some(wake) = self.wake.upgrade()
+        {
+            let _ = wake.try_send(());
+        }
     }
-    pub(crate) fn has_startup_command(&self) -> bool {
-        self.shared
-            .pending
-            .lock()
-            .unwrap()
-            .queue
-            .iter()
-            .any(startup_command)
+    pub(crate) fn take_shutdown(&self) -> bool {
+        let mut pending = self.shared.pending.lock().unwrap();
+        let shutdown = std::mem::take(&mut pending.shutdown);
+        if shutdown {
+            self.rearm(&pending);
+        }
+        shutdown
+    }
+    #[cfg(test)]
+    pub(crate) fn try_recv_startup(&self) -> Result<RenderCommand, TryRecvError> {
+        self.try_recv_startup_for(true, true)
+    }
+    pub(crate) fn try_recv_startup_for(
+        &self,
+        staging_full: bool,
+        daemon: bool,
+    ) -> Result<RenderCommand, TryRecvError> {
+        self.take(|queue| {
+            if staging_full {
+                queue.iter().position(|command| startup_command(command, daemon))
+            } else {
+                (!queue.is_empty()).then_some(0)
+            }
+        })
+    }
+    pub(crate) fn has_startup_command_for(&self, daemon: bool) -> bool {
+        let pending = self.shared.pending.lock().unwrap();
+        pending.shutdown || pending.queue.iter().any(|command| startup_command(command, daemon))
     }
     pub fn recv(&self) -> Result<RenderCommand, RecvError> {
         loop {
@@ -176,7 +207,8 @@ impl CommandReceiver {
         std::iter::from_fn(|| self.try_recv().ok())
     }
     pub fn len(&self) -> usize {
-        self.shared.pending.lock().unwrap().queue.len()
+        let pending = self.shared.pending.lock().unwrap();
+        pending.queue.len() + usize::from(pending.shutdown)
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -187,9 +219,14 @@ impl CommandReceiver {
 }
 impl Drop for CommandReceiver {
     fn drop(&mut self) {
-        let mut pending = self.shared.pending.lock().unwrap();
-        pending.receiver_alive = false;
-        pending.queue.clear();
+        let commands = {
+            let mut pending = self.shared.pending.lock().unwrap();
+            pending.receiver_alive = false;
+            pending.shutdown = false;
+            std::mem::take(&mut pending.queue)
+        };
         self.shared.space.notify_all();
+        // Drop queued replies/resources outside the transport lock.
+        drop(commands);
     }
 }

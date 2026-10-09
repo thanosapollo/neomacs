@@ -23,7 +23,7 @@ use num_enum::{IntoPrimitive, TryFromPrimitive};
 use rustc_hash::{FxHashMap, FxHasher};
 use strum::{EnumString, IntoStaticStr};
 
-use super::error::{Flow, signal};
+use super::error::{Flow, LispCondition, signal};
 use super::intern::{SymId, intern};
 use crate::buffer::text_props::{PropertyInterval, TextPropertyPlistRun, TextPropertyTable};
 use crate::buffer::{CharPos0, CharRange, EmacsBytePos};
@@ -300,7 +300,7 @@ pub(crate) fn bytecode_data_access_count() -> usize {
     BYTECODE_DATA_ACCESS_COUNT.with(Cell::get)
 }
 
-#[inline]
+#[inline(always)]
 fn add_wrapping(counter: MemoryUseCountSlot, delta: u64) {
     THREAD_LOCAL_ALLOCATION_COUNTS.with(|counts| {
         let mut values = counts.get();
@@ -342,7 +342,11 @@ fn reclaimed_string_borrowed(ptr: *const crate::tagged::header::StringObj) -> ! 
 
 fn string_text_props(value: Value) -> Option<&'static TextPropertyTable> {
     let ptr = value.as_string_ptr()?;
-    Some(unsafe { (*ptr).data.intervals() })
+    // SAFETY: callers keep their live string rooted on its mutator while the
+    // interval borrow is used, with no callback or collection that can free
+    // the table. The read view returns its actual table borrow, or None for
+    // an interval-free string; it never manufactures an empty table borrow.
+    unsafe { (*ptr).data.intervals().as_table() }
 }
 
 /// String text properties now live on the string object itself.
@@ -1107,6 +1111,7 @@ impl HashTableStorage {
 
     /// `puthash`'s probe: where `value`'s entry is, or the hash a new entry
     /// for it is filed under ([`Self::insert_absent`]).
+    #[inline(always)]
     pub fn try_probe_for_insert(
         &self,
         value: Value,
@@ -1185,6 +1190,7 @@ impl HashTableStorage {
 
     /// [`Self::remove_by_value`] for `remhash`, which signals what the
     /// `equal` comparison signals.
+    #[inline(always)]
     pub fn try_remove_by_value(
         &mut self,
         value: Value,
@@ -1423,6 +1429,30 @@ impl HashTableStorage {
 
     pub fn slot_count(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Capture the slots allocation before a concurrent hash-table mark.
+    ///
+    /// The collector must keep this allocation attached and unchanged, or
+    /// retire it through `clone_slots_for_concurrent_mark`, until an admitted
+    /// reader completes its lease. After DONE or DEFERRED, the collector must
+    /// never dereference this pointer again. The `Option` cells have no promised
+    /// atomic word layout: match them only in immutable storage, then atomically
+    /// load the typed initialized key/value fields of `Some`.
+    #[inline]
+    pub(crate) fn concurrent_slots_snapshot(&self) -> (*const Option<HashTableEntry>, usize) {
+        (self.slots.as_ptr(), self.slots.len())
+    }
+
+    /// Detach the immutable start-of-cycle allocation before its first write.
+    ///
+    /// The index and free-slot numbers continue to describe the cloned slots.
+    /// The collector owns the returned original until every snapshot reader
+    /// has joined and the cycle's termination has completed.
+    #[inline]
+    pub(crate) fn clone_slots_for_concurrent_mark(&mut self) -> Vec<Option<HashTableEntry>> {
+        let replacement = self.slots.clone();
+        std::mem::replace(&mut self.slots, replacement)
     }
 
     pub fn live_hash_keys_in_slot_order(&self) -> Vec<&HashKey> {
@@ -2560,7 +2590,7 @@ impl TaggedValue {
     }
 
     /// Allocate a cons cell.
-    #[inline]
+    #[inline(always)]
     pub fn make_cons(car: Value, cdr: Value) -> Self {
         // Keep the expensive corruption diagnostic out of release allocation hot paths.
         #[cfg(debug_assertions)]
@@ -2750,13 +2780,7 @@ impl TaggedValue {
 
     /// Allocate an overlay.
     pub fn make_overlay(data: impl Into<crate::heap_types::OverlayData>) -> Self {
-        let mut data = data.into();
-        if data.serial == 0 {
-            data.serial = crate::heap_types::next_overlay_serial();
-        } else {
-            crate::heap_types::observe_overlay_serial(data.serial);
-        }
-        with_tagged_heap(|h| h.alloc_overlay(data))
+        with_tagged_heap(|h| h.alloc_overlay(data.into()))
     }
 
     /// Allocate a buffer reference.
@@ -2916,7 +2940,7 @@ impl TaggedValue {
     }
 
     /// Check if this is a bytecode function.
-    #[inline]
+    #[inline(always)]
     pub fn is_bytecode(self) -> bool {
         self.veclike_type() == Some(VecLikeType::ByteCode)
     }
@@ -3971,6 +3995,29 @@ impl TaggedValue {
         mutate::with_hash_table_mut(self, f)
     }
 
+    /// Base mutation accessor after an immediate inactive Tier-H dispatch.
+    ///
+    /// # Safety
+    /// Tier-H must stay inactive until return. The closure must not invoke
+    /// Lisp or collect, and the mode decision must not span a GC safepoint.
+    #[inline]
+    pub(crate) unsafe fn with_hash_table_mut_inactive<R>(
+        self,
+        f: impl FnOnce(&mut LispHashTable) -> R,
+    ) -> Option<R> {
+        // SAFETY: the caller supplies the same inactive-mutation contract.
+        unsafe { mutate::with_hash_table_mut_inactive(self, f) }
+    }
+
+    /// Active mutation accessor for a caller that has already dispatched.
+    #[inline]
+    pub(crate) fn with_hash_table_mut_concurrent<R>(
+        self,
+        f: impl FnOnce(&mut LispHashTable) -> R,
+    ) -> Option<R> {
+        mutate::with_hash_table_mut_concurrent(self, f)
+    }
+
     /// Replace the entire contents of a hash table value.
     pub fn replace_hash_table(self, table: LispHashTable) -> bool {
         self.with_hash_table_mut(|current| *current = table)
@@ -4837,7 +4884,7 @@ fn try_equal_value_inner(
 ) -> Result<bool, Flow> {
     if depth > 200 {
         return Err(signal(
-            "error",
+            LispCondition::Error,
             vec![Value::string("Stack overflow in equal")],
         ));
     }
@@ -4887,6 +4934,15 @@ fn try_equal_value_inner(
     if left.is_cons() {
         if !right.is_cons() {
             return Ok(false);
+        }
+        // GNU fns.c:2860-2885 remembers object pairs past depth ten.
+        // The tail guard covers cdr cycles; this shared pair table also covers
+        // cycles reached through cars or mixed cons/vector edges.
+        if depth > 10 {
+            let pair = EqualSeenPair::new(left, right);
+            if !seen.get_or_insert_with(HashSet::new).insert(pair) {
+                return Ok(true);
+            }
         }
         let mut left_tail = left;
         let mut right_tail = right;
@@ -5487,6 +5543,7 @@ pub fn list_iter(value: Value) -> ListIter {
     }
 }
 
+#[inline(never)]
 pub fn list_to_vec(value: &Value) -> Option<Vec<Value>> {
     // Answer the two non-list cases BEFORE reserving anything. The capacity
     // below is deliberate but it is not free, and callers in hot loops ask
@@ -5701,21 +5758,21 @@ use hash_index::{HashIndex, fx_hash_key, stored_hash};
 // Tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]
-#[path = "tests/mod.rs"]
+#[path = "tests/value_test.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "tests/bytecode_capture.rs"]
+#[path = "tests/bytecode_capture_test.rs"]
 mod bytecode_capture_tests;
 
 #[cfg(test)]
-#[path = "tests/metadata_capture.rs"]
+#[path = "tests/metadata_capture_test.rs"]
 mod metadata_capture_tests;
 
 #[cfg(test)]
-#[path = "tests/heap_mut_closure_guard.rs"]
+#[path = "tests/heap_mut_closure_guard_test.rs"]
 mod heap_mut_closure_guard;
 
 #[cfg(test)]
-#[path = "tests/gc_generational_hydration.rs"]
+#[path = "tests/gc_generational_hydration_test.rs"]
 mod gc_generational_hydration;

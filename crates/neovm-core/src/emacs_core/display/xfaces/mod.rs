@@ -344,14 +344,16 @@ use num_enum::{IntoPrimitive, TryFromPrimitive};
 use strum::{EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 
 use super::error::{Flow, LispCondition, signal};
+#[cfg(test)]
+use super::font::alternative_font_registry_alist;
 use super::font::{
-    FrameFontRealization, alternative_font_family_alist, alternative_font_registry_alist,
-    default_face_font_attr_affects_frame_font, face_remapping_for_current_buffer, font_name_value,
-    font_string_text, font_value_fields, font_value_text, font_vector_get_flexible,
-    frame_device_designator_p, frame_id_from_designator, frame_parameter_for_face_attribute,
-    is_font, is_font_entity, is_font_spec, live_frame_designator_in_state,
-    live_frame_font_attribute_fallback, opened_font_from_resolved_match,
-    publish_face_attribute_to_frame_parameter, resolve_font_match, resolve_live_frame_font_request,
+    FrameFontRealization, alternative_font_family_alist, default_face_font_attr_affects_frame_font,
+    face_remapping_for_current_buffer, font_name_value, font_string_text, font_value_fields,
+    font_value_text, font_vector_get_flexible, frame_device_designator_p, frame_id_from_designator,
+    frame_parameter_for_face_attribute, is_font, is_font_entity, is_font_spec,
+    live_frame_designator_in_state, live_frame_font_attribute_fallback,
+    opened_font_from_resolved_match, publish_face_attribute_to_frame_parameter,
+    replace_alternative_font_registry_alist, resolve_font_match, resolve_live_frame_font_request,
     sync_live_default_face_font_state, sync_live_frame_font_state,
 };
 
@@ -3341,7 +3343,7 @@ pub(crate) fn builtin_internal_set_lisp_face_attribute(
                     if face_name == "default"
                         && let FontFaceRealizationTarget::LiveFrame(frame_id) = target
                     {
-                        sync_live_frame_font_state(eval, frame_id, &value, &resolution)?;
+                        sync_live_frame_font_state(eval, frame_id, &resolution)?;
                     }
                 }
             } else if face_name == "default"
@@ -4684,9 +4686,7 @@ pub(crate) fn builtin_internal_set_alternative_font_registry_alist(args: Vec<Val
         }
         normalized.push(Value::list(converted));
     }
-    if let Ok(mut state) = alternative_font_registry_alist().write() {
-        *state = alist;
-    }
+    replace_alternative_font_registry_alist(alist);
     crate::emacs_core::fontset::invalidate_font_selection_policy();
     clear_font_cache_state();
     Ok(Value::list(normalized))
@@ -4808,11 +4808,11 @@ pub(crate) fn builtin_x_load_color_file(args: Vec<Value>) -> EvalResult {
 }
 
 #[cfg(test)]
-#[path = "tests/mod.rs"]
+#[path = "tests/xfaces_test.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "tests/builtins.rs"]
+#[path = "tests/builtins_test.rs"]
 mod builtins_test;
 
 #[cfg(test)]
@@ -4824,5 +4824,5 @@ mod font_size_test;
 mod font_remapping_test;
 
 #[cfg(test)]
-#[path = "tests/gc_tls_ownership.rs"]
+#[path = "tests/gc_tls_ownership_test.rs"]
 mod gc_tls_ownership_tests;

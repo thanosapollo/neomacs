@@ -60,6 +60,10 @@ impl TaggedHeap {
     /// (`begin_stw_collection`) called it: only that entry pre-marks the
     /// image for a first partition cycle (`premark_mapped_image`).
     pub(super) fn begin_collection_with(&mut self, stw_entry: bool) {
+        assert!(
+            !self.concurrent_mark_running,
+            "collection requires an explicit successful marker finish"
+        );
         #[cfg(debug_assertions)]
         crate::tagged::mutate::debug_assert_no_heap_mut_closure();
         if stw_entry {
@@ -698,7 +702,7 @@ impl TaggedHeap {
         // owner inserted meanwhile would be merged back.
         let owners = std::mem::take(&mut self.mapped_remembered);
         for &bits in &owners {
-            self.push_value_children_to_gray(TaggedValue(bits), "remembered-dump-child");
+            self.push_value_children_to_gray(TaggedValue::from_bits(bits), "remembered-dump-child");
         }
         let inserted = std::mem::replace(&mut self.mapped_remembered, owners);
         self.mapped_remembered.extend(inserted);
@@ -1491,13 +1495,18 @@ impl TaggedHeap {
                     .values()
                     .map(|value| (*value, "timer-registry")),
             )
-            .chain(self.process_registry.iter().filter_map(|slot| match slot {
-                // Only live processes are roots (GNU marks them from
-                // `Vprocess_alist`); a deleted one lives only through
-                // references.
-                RegistrySlot::Live(value) => Some((*value, "process-registry")),
-                _ => None,
-            }))
+            .chain(
+                self.process_registry
+                    .slots
+                    .iter()
+                    .filter_map(|slot| match slot {
+                        // Only live processes are roots (GNU marks them from
+                        // `Vprocess_alist`); a deleted one lives only through
+                        // references.
+                        RegistrySlot::Live(value) => Some((*value, "process-registry")),
+                        _ => None,
+                    }),
+            )
             .chain(
                 self.canonical_empty_strings
                     .values()
@@ -1524,6 +1533,10 @@ impl TaggedHeap {
     }
 
     pub(crate) fn complete_collection(&mut self) {
+        assert!(
+            !self.concurrent_mark_running,
+            "sweeping requires an explicit successful marker finish"
+        );
         // Collector code never sees an open allocation region
         // (`alloc_region.rs`, invariant I2).
         self.close_alloc_regions();
@@ -1958,7 +1971,9 @@ impl TaggedHeap {
     pub(super) fn mark_all_on_gc_thread(&mut self) {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let ptr = self as *mut TaggedHeap;
-        self.gc_worker
+        self.process_registry
+            .cold
+            .gc_worker
             .send(GcRequest::MarkAll(HeapPtr(ptr), done_tx));
         // Block until the GC thread has finished marking on the shared heap.
         done_rx.recv().expect("neovm-gc thread did not respond");
