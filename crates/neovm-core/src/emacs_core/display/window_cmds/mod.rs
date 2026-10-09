@@ -7049,12 +7049,31 @@ pub(crate) fn builtin_x_create_frame(
     mut args: Vec<Value>,
 ) -> EvalResult {
     expect_args("x-create-frame", &args, 1)?;
-    if eval.daemon.is_some() && eval.display_host.is_none() {
+    if eval.gui_display_initializer.is_some() {
+        let display = parse_gui_frame_params(args.first())
+            .all
+            .get(&intern("display"))
+            .copied();
+        let display = display
+            .filter(|value| !value.is_nil())
+            .map(|value| {
+                value
+                    .as_lisp_string()
+                    .and_then(|text| text.as_utf8_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        signal(
+                            LispCondition::WrongTypeArgument,
+                            vec![Value::symbol("stringp"), value],
+                        )
+                    })
+            })
+            .transpose()?;
+        eval.initialize_gui_display(display.as_deref())?;
+    } else if eval.daemon.is_some() && eval.display_host.is_none() {
         return Err(signal(
             "error",
-            vec![Value::string(
-                "Graphical frames are not yet supported by the headless Neomacs daemon; use a TTY client",
-            )],
+            vec![Value::string("Graphical display host unavailable")],
         ));
     }
     // GNU gui_display_get_arg resolves frame alist, default-frame-alist,
@@ -7115,6 +7134,15 @@ pub(crate) fn builtin_x_create_frame(
         };
         if let Some(font) = font {
             args[0] = Value::cons(Value::cons(Value::symbol("font"), font), args[0]);
+        } else if let Some(font) = eval
+            .display_host
+            .as_ref()
+            .and_then(|host| host.default_gui_font())
+        {
+            args[0] = Value::cons(
+                Value::cons(Value::symbol("font"), Value::string(font)),
+                args[0],
+            );
         }
     }
     tracing::debug!(
@@ -7131,6 +7159,40 @@ pub(crate) fn builtin_x_create_frame(
         &mut eval.display_host,
         args,
     );
+    let result = result.and_then(|frame| {
+        let fid = FrameId(frame.as_frame_id().expect("x-create-frame returns a frame"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let ready = loop {
+            if let Err(flow) = eval.maybe_quit() {
+                break Err(flow);
+            }
+            match eval
+                .display_host
+                .as_mut()
+                .map(|host| host.poll_gui_frame_ready(fid))
+                .unwrap_or(Some(Ok(())))
+            {
+                Some(Ok(())) => break Ok(frame),
+                Some(Err(message)) => break Err(signal("error", vec![Value::string(message)])),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                None => {
+                    break Err(signal(
+                        "error",
+                        vec![Value::string("Native frame creation timed out")],
+                    ));
+                }
+            }
+        };
+        if ready.is_err() {
+            if let Some(host) = eval.display_host.as_mut() {
+                let _ = host.destroy_gui_frame(fid);
+            }
+            let _ = eval.frames.delete_frame(fid);
+        }
+        ready
+    });
     eval.sync_keyboard_terminal_owner();
     if let Ok(value) = &result
         && let Some(id) = value.as_frame_id()
@@ -7206,10 +7268,17 @@ pub(crate) fn x_create_frame_impl(
                 Some((public_font, font_parameter))
             })
     };
+    let gui_terminal = display_host.as_ref().and_then(|host| host.gui_terminal());
     let inherited_display_identity = parent_id
         .and_then(|parent_id| frames.get(parent_id))
         .or_else(|| frames.selected_frame())
+        .filter(|frame| frame.effective_window_system().is_some())
         .map(|frame| frame.display_identity().clone())
+        .or_else(|| {
+            gui_terminal.as_ref().map(|(_, identity)| {
+                crate::window::FrameDisplayIdentity::Graphical(identity.clone())
+            })
+        })
         .unwrap_or_default();
     let metrics = parent_id
         .and_then(|parent_id| frames.get(parent_id))
@@ -7227,6 +7296,30 @@ pub(crate) fn x_create_frame_impl(
                 // A frame's minibuffer defaults to one text line (GNU
                 // `make-frame`); see current_gui_frame_metrics_in_state.
                 .unwrap_or_else(|| parent.char_height.max(1.0)),
+        })
+        .or_else(|| {
+            display_host
+                .as_ref()
+                .and_then(|host| host.gui_frame_metrics())
+                .map(
+                    |(char_width, char_height, font_pixel_size, device_scale_factor)| {
+                        // Size every deferred frame like the first one.
+                        let (width_px, height_px) = crate::window::default_gui_frame_pixel_size(
+                            char_width,
+                            char_height,
+                            font_pixel_size,
+                        );
+                        GuiFrameMetrics {
+                            width_px,
+                            height_px,
+                            char_width,
+                            char_height,
+                            font_pixel_size,
+                            device_scale_factor,
+                            minibuffer_height: char_height,
+                        }
+                    },
+                )
         })
         .unwrap_or_else(|| current_gui_frame_metrics_in_state(frames));
     let host_size = current_primary_window_size(&*display_host);
@@ -7300,7 +7393,17 @@ pub(crate) fn x_create_frame_impl(
     } else {
         buffers.find_buffer_by_name(" *Minibuf-0*")
     };
-    let fid = frames.create_frame_value(name, width_px, height_px, current_buffer_id);
+    let fid = if let Some((terminal_id, _)) = gui_terminal {
+        frames.create_frame_value_on_terminal(
+            name,
+            terminal_id,
+            width_px,
+            height_px,
+            current_buffer_id,
+        )
+    } else {
+        frames.create_frame_value(name, width_px, height_px, current_buffer_id)
+    };
     {
         let frame = frames
             .get_mut(fid)
@@ -7424,15 +7527,21 @@ pub(crate) fn x_create_frame_impl(
             .get(fid)
             .map(|frame| frame.gui_geometry_hints())
             .ok_or_else(|| signal("error", vec![Value::string("Frame not found")]))?;
-        host.realize_gui_frame(super::eval::GuiFrameHostRequest {
+        let realized = host.realize_gui_frame(super::eval::GuiFrameHostRequest {
             frame_id: fid,
             width: width_px,
             height: height_px,
             title: host_title,
             geometry_hints,
             fullscreen: parsed.fullscreen,
-        })
-        .map_err(|message| signal("error", vec![Value::string(message)]))?;
+        });
+        if let Err(message) = realized {
+            // Realization can admit native work before a later step fails.
+            // Retire that exact frame even when there is no readiness receiver.
+            let _ = host.destroy_gui_frame(fid);
+            let _ = frames.delete_frame(fid);
+            return Err(signal("error", vec![Value::string(message)]));
+        }
     }
     if is_child_frame {
         tracing::info!(
@@ -7639,26 +7748,38 @@ pub(crate) fn delete_frame_owned(
         } => {}
     }
     if let Some(host) = eval.display_host.as_mut() {
-        host.retire_gui_frame_alpha(fid)
-            .map_err(|message| signal("error", vec![Value::string(message)]))?;
-        if was_gui_child_frame {
+        // Once the Lisp identity is gone, native retirement must happen before
+        // any fallible cosmetic refresh. Attempt both; never let opacity queue
+        // saturation leave the deleted frame's native window behind.
+        let retirement = if was_gui_child_frame {
             tracing::info!(
                 frame_id = fid.0,
                 "child_frame_lifecycle: core_delete_notify_remove"
             );
             host.remove_gui_child_frame(fid)
-                .map_err(|message| signal("error", vec![Value::string(message)]))?;
         } else if was_top_level_gui_frame {
             host.destroy_gui_frame(fid)
-                .map_err(|message| signal("error", vec![Value::string(message)]))?;
-        }
+        } else {
+            Ok(())
+        };
+        let opacity = host.retire_gui_frame_alpha(fid);
+        retirement.map_err(|message| signal("error", vec![Value::string(message)]))?;
+        opacity.map_err(|message| signal("error", vec![Value::string(message)]))?;
     }
     let terminal_is_empty = eval.frames.frame_list().into_iter().all(|frame_id| {
         eval.frames
             .get(frame_id)
             .is_none_or(|frame| frame.terminal_id != terminal_id)
     });
+    // A live display connection owns its terminal independently of its frames.
+    // Closing the last GUI frame must not invalidate the next make-frame.
+    let terminal_owned_by_display = eval
+        .display_host
+        .as_ref()
+        .and_then(|host| host.gui_terminal())
+        .is_some_and(|(id, _)| id == terminal_id);
     if mode.allows_terminal_cascade()
+        && !terminal_owned_by_display
         && terminal_is_empty
         && !eval.frames.frame_list().is_empty()
         && let Some(terminal) =

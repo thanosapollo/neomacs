@@ -10,6 +10,36 @@ use neomacs_display_protocol::FrameFaceMap;
 use neomacs_display_protocol::types::Color;
 use neovm_core::window::GuiFrameGeometryHints;
 
+#[test]
+fn deferred_gui_native_ready_requires_realized_frame() {
+    let mut windows = GuiFrameWindowManager::new();
+    let (reply, receive) = crossbeam_channel::bounded(1);
+    windows.await_ready(42, reply);
+    assert!(receive.recv().unwrap().is_err());
+    windows.request_create(43, 320, 200, "deferred".into(), default_geometry_hints());
+    let (reply, receive) = crossbeam_channel::bounded(1);
+    windows.await_ready(43, reply);
+    assert!(matches!(
+        receive.try_recv(),
+        Err(crossbeam_channel::TryRecvError::Empty)
+    ));
+    windows.pending_creates.clear(); // Native constructor failed: no realized window.
+    windows.settle_ready_replies();
+    assert!(receive.recv().unwrap().is_err());
+    assert!(windows.ready_replies.is_empty());
+}
+
+#[test]
+fn deferred_gui_pending_ready_is_cancelled_on_connection_shutdown() {
+    let mut windows = GuiFrameWindowManager::new();
+    windows.request_create(43, 320, 200, "deferred".into(), default_geometry_hints());
+    let (reply, receive) = crossbeam_channel::bounded(1);
+    windows.await_ready(43, reply);
+    windows.destroy_all();
+    assert!(matches!(receive.recv(), Err(crossbeam_channel::RecvError)));
+    assert!(windows.pending_creates.is_empty());
+}
+
 // =======================================================================
 // Helper: create a FrameGlyphBuffer with specified identity fields
 // =======================================================================
@@ -473,6 +503,7 @@ fn zero_size_observation_stays_suspended_after_scale_refresh() {
             last_ime_cursor_area: None,
             chrome: Default::default(),
             geometry_hints: None,
+            fullscreen: None,
         },
         render: GuiFrameRenderState::new_without_device(
             42,
@@ -1553,6 +1584,7 @@ fn pending_window_stores_all_fields() {
         height: 1080,
         title: "My Emacs Frame".to_string(),
         geometry_hints: default_geometry_hints(),
+        fullscreen: None,
     };
 
     assert_eq!(pw.emacs_frame_id, 123);
@@ -1569,6 +1601,7 @@ fn pending_window_unicode_title() {
         height: 600,
         title: "Emacs \u{2014} \u{1F680} Neomacs".to_string(),
         geometry_hints: default_geometry_hints(),
+        fullscreen: None,
     };
 
     assert!(pw.title.contains('\u{2014}')); // em dash

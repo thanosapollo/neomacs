@@ -9,6 +9,9 @@ pub(crate) mod child_frames;
 mod command_processing;
 mod cursor;
 mod cursor_runtime;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tests/deferred_gui_native_test.rs"]
+mod deferred_gui_native_test;
 mod device_loss;
 mod frame_compositor;
 mod frame_ingest;
@@ -36,6 +39,12 @@ mod terminal_commands;
 #[cfg(feature = "neo-term")]
 mod terminal_expansion;
 #[cfg(test)]
+#[path = "tests/legacy_frame_admission_test.rs"]
+mod legacy_frame_admission_test;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tests/legacy_ready_native_test.rs"]
+mod legacy_ready_native_test;
+#[cfg(test)]
 #[path = "tests/render_thread_test.rs"]
 mod tests;
 #[cfg(test)]
@@ -56,7 +65,11 @@ mod window_events;
 
 #[cfg(feature = "neo-term")]
 pub use bootstrap::run_render_loop_current_thread_with_terminals;
-pub use bootstrap::{build_render_event_loop, run_render_loop, run_render_loop_current_thread};
+pub use bootstrap::{
+    DaemonRenderRoot, build_render_event_loop, run_render_loop, run_render_loop_current_thread,
+};
+#[cfg(target_os = "linux")]
+pub use bootstrap::{build_render_event_loop_wayland, build_render_event_loop_wayland_stream};
 pub(crate) use lifecycle::PopupCommit;
 pub use startup::{
     InitialWindowLifetime, InitialWindowReceiver, InitialWindowReply, InitialWindowSize,

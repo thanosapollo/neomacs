@@ -446,6 +446,7 @@ pub(super) enum FrameLifecycle {
         last_ime_cursor_area: Option<ImeCursorArea>,
         chrome: WindowChrome,
         geometry_hints: Option<GuiFrameGeometryHints>,
+        fullscreen: Option<WindowFullscreenMode>,
     },
     /// Window with a live winit native window and wgpu surface.
     Active {
@@ -1597,6 +1598,20 @@ impl GuiFrameWindowState {
         }
     }
 
+    /// Replay retained cosmetic state onto this frame's owner-held window.
+    /// Never request a size: primary adoption must preserve native host geometry.
+    pub(super) fn replay_pending_native_state(&self, window: &dyn Window) {
+        if let FrameLifecycle::Pending { chrome, fullscreen, .. } = &self.lifecycle {
+            window.set_title(&chrome.title);
+            if let Some(hints) = self.lifecycle.geometry_hints() {
+                apply_window_geometry_hints(window, hints);
+            }
+            if let Some(mode) = fullscreen {
+                apply_native_fullscreen_mode(window, *mode);
+            }
+        }
+    }
+
     pub(super) fn set_title(&mut self, title: String) {
         match &mut self.lifecycle {
             FrameLifecycle::Active { native, .. } => {
@@ -1613,30 +1628,19 @@ impl GuiFrameWindowState {
     }
 
     pub(super) fn set_fullscreen_mode(&mut self, mode: WindowFullscreenMode) {
-        let FrameLifecycle::Active { native, .. } = &mut self.lifecycle else {
-            return;
-        };
-        match mode {
-            WindowFullscreenMode::Fullscreen | WindowFullscreenMode::Fullboth => {
-                native
-                    .window
-                    .set_fullscreen(Some(Fullscreen::Borderless(None)));
-                native.chrome.is_fullscreen = true;
-            }
-            WindowFullscreenMode::Maximized => {
-                native.window.set_fullscreen(None);
-                native.window.set_maximized(true);
-                native.chrome.is_fullscreen = false;
-            }
-            WindowFullscreenMode::None => {
-                native.window.set_fullscreen(None);
-                native.window.set_maximized(false);
-                native.chrome.is_fullscreen = false;
-            }
-            WindowFullscreenMode::Fullwidth | WindowFullscreenMode::Fullheight => {
-                tracing::warn!(
-                    "partial fullscreen modes are not implemented by the native window backend"
-                );
+        match &mut self.lifecycle {
+            FrameLifecycle::Pending { fullscreen, .. } => *fullscreen = Some(mode),
+            FrameLifecycle::Active { native, .. } => {
+                apply_native_fullscreen_mode(native.window.as_ref(), mode);
+                match mode {
+                    WindowFullscreenMode::Fullscreen | WindowFullscreenMode::Fullboth => {
+                        native.chrome.is_fullscreen = true;
+                    }
+                    WindowFullscreenMode::None | WindowFullscreenMode::Maximized => {
+                        native.chrome.is_fullscreen = false;
+                    }
+                    WindowFullscreenMode::Fullwidth | WindowFullscreenMode::Fullheight => {}
+                }
             }
         }
         self.render.compositor.dirty = true;
@@ -1911,6 +1915,7 @@ pub(crate) struct GuiFrameWindowManager {
     pub pending_creates: Vec<PendingWindow>,
     /// Pending window destruction requests
     pub pending_destroys: Vec<u64>,
+    ready_replies: HashMap<u64, crossbeam_channel::Sender<Result<(), String>>>,
     /// Native chrome defaults applied to future secondary frame windows.
     pub(super) chrome_defaults: WindowChrome,
     /// Whether future secondary frame windows should start with FPS enabled.
@@ -1920,6 +1925,25 @@ pub(crate) struct GuiFrameWindowManager {
     pub(super) option_as_alt: neomacs_display_protocol::OptionAsAltShape,
 }
 
+fn apply_native_fullscreen_mode(window: &dyn Window, mode: WindowFullscreenMode) {
+    match mode {
+        WindowFullscreenMode::Fullscreen | WindowFullscreenMode::Fullboth => {
+            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        }
+        WindowFullscreenMode::Maximized => {
+            window.set_fullscreen(None);
+            window.set_maximized(true);
+        }
+        WindowFullscreenMode::None => {
+            window.set_fullscreen(None);
+            window.set_maximized(false);
+        }
+        WindowFullscreenMode::Fullwidth | WindowFullscreenMode::Fullheight => {
+            tracing::warn!("partial fullscreen modes are not implemented by the native window backend");
+        }
+    }
+}
+
 /// A request to create a new OS window.
 pub(crate) struct PendingWindow {
     pub emacs_frame_id: u64,
@@ -1927,6 +1951,7 @@ pub(crate) struct PendingWindow {
     pub height: u32,
     pub title: String,
     pub geometry_hints: GuiFrameGeometryHints,
+    pub fullscreen: Option<WindowFullscreenMode>,
 }
 
 impl GuiFrameWindowManager {
@@ -1938,6 +1963,7 @@ impl GuiFrameWindowManager {
             primary_winit_id: None,
             pending_creates: Vec::new(),
             pending_destroys: Vec::new(),
+            ready_replies: HashMap::new(),
             chrome_defaults: WindowChrome::default(),
             fps_enabled: false,
             option_as_alt: neomacs_display_protocol::OptionAsAltShape::Both,
@@ -2018,6 +2044,12 @@ impl GuiFrameWindowManager {
         native.refresh_content_geometry();
         let key = self.primary_frame_key();
         if let Some(window_state) = self.windows.get_mut(&key) {
+            window_state.replay_pending_native_state(native.window.as_ref());
+            if let FrameLifecycle::Pending { fullscreen: Some(mode), .. } = &window_state.lifecycle {
+                native.chrome.is_fullscreen = matches!(
+                    mode, WindowFullscreenMode::Fullscreen | WindowFullscreenMode::Fullboth
+                );
+            }
             let winit_id = native.window.id();
             let surface_state = native.surface_state();
             self.primary_winit_id = Some(winit_id);
@@ -2074,6 +2106,7 @@ impl GuiFrameWindowManager {
             height,
             title,
             geometry_hints,
+            fullscreen: None,
         });
     }
 
@@ -2084,6 +2117,32 @@ impl GuiFrameWindowManager {
 
     pub fn destroy_pending(&self, emacs_frame_id: u64) -> bool {
         self.pending_destroys.contains(&emacs_frame_id)
+    }
+
+    pub fn await_ready(
+        &mut self,
+        frame: u64,
+        reply: crossbeam_channel::Sender<Result<(), String>>,
+    ) {
+        if self
+            .get(frame)
+            .is_some_and(|window| matches!(window.lifecycle, FrameLifecycle::Active { .. }))
+        {
+            if reply.send(Ok(())).is_err() {
+                self.request_destroy(frame);
+            }
+        } else if self.get(frame).is_some()
+            || self
+                .pending_creates
+                .iter()
+                .any(|request| request.emacs_frame_id == frame)
+        {
+            self.ready_replies.insert(frame, reply);
+        } else {
+            let _ = reply.send(Err(format!(
+                "Native window for frame {frame} was not realized"
+            )));
+        }
     }
 
     /// Process pending window creations. Must be called from the event loop
@@ -2099,6 +2158,9 @@ impl GuiFrameWindowManager {
     ) {
         let pending = std::mem::take(&mut self.pending_creates);
         for req in pending {
+            if self.destroy_pending(req.emacs_frame_id) {
+                continue;
+            }
             if self
                 .windows
                 .contains_key(&FrameKey::Adopted(req.emacs_frame_id))
@@ -2118,7 +2180,7 @@ impl GuiFrameWindowManager {
             );
             let attrs = crate::window_identity::apply_platform_window_identity(attrs, event_loop);
 
-            match event_loop.create_window(attrs) {
+            match comms.create_window(event_loop, attrs, req.emacs_frame_id) {
                 Ok(window) => {
                     let window: Arc<dyn winit::window::Window> = Arc::from(window);
                     window_icon.apply(window.as_ref());
@@ -2248,6 +2310,11 @@ impl GuiFrameWindowManager {
                             render,
                         },
                     );
+                    if let Some(mode) = req.fullscreen
+                        && let Some(state) = self.windows.get_mut(&FrameKey::Adopted(req.emacs_frame_id))
+                    {
+                        state.set_fullscreen_mode(mode);
+                    }
                     if let Some(state) =
                         self.windows.get_mut(&FrameKey::Adopted(req.emacs_frame_id))
                         && let FrameLifecycle::Active { native, .. } = &mut state.lifecycle
@@ -2279,6 +2346,64 @@ impl GuiFrameWindowManager {
                 }
             }
         }
+        self.settle_ready_replies();
+    }
+
+    pub(super) fn reject_ready(&mut self, frame: u64, error: &str) {
+        if let Some(reply) = self.ready_replies.remove(&frame) {
+            let _ = reply.try_send(Err(error.to_owned()));
+        }
+    }
+
+    pub(super) fn prepare_primary(
+        &mut self,
+        frame: u64,
+        width: u32,
+        height: u32,
+        title: String,
+        geometry_hints: Option<GuiFrameGeometryHints>,
+    ) {
+        self.set_primary_pending(GuiFrameWindowState {
+            pending_scale_factor: None,
+            lifecycle: FrameLifecycle::Pending {
+                width,
+                height,
+                scale_factor: 1.0,
+                mouse_hidden_for_typing: false,
+                ime_enabled: false,
+                last_ime_cursor_area: None,
+                chrome: WindowChrome {
+                    title,
+                    ..WindowChrome::default()
+                },
+                geometry_hints,
+                fullscreen: None,
+            },
+            render: GuiFrameRenderState::new_without_device(
+                frame,
+                false,
+                neomacs_display_protocol::frame_time::observe_platform_now(),
+            ),
+        });
+        self.adopt_primary_frame_id(frame);
+    }
+
+    fn settle_ready_replies(&mut self) {
+        for (frame, reply) in std::mem::take(&mut self.ready_replies) {
+            let ready = self
+                .get(frame)
+                .is_some_and(|window| matches!(window.lifecycle, FrameLifecycle::Active { .. }));
+            let result = if ready {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Native window/surface creation failed for frame {frame}"
+                ))
+            };
+            if reply.send(result).is_err() && ready {
+                self.request_destroy(frame);
+            }
+        }
     }
 
     /// Process pending window destructions, reporting the frames that went
@@ -2302,6 +2427,7 @@ impl GuiFrameWindowManager {
     pub fn destroy_all(&mut self) {
         self.pending_creates.clear();
         self.pending_destroys.clear();
+        self.ready_replies.clear();
         self.winit_to_emacs.clear();
         self.primary_winit_id = None;
         self.primary_emacs_frame_id = None;

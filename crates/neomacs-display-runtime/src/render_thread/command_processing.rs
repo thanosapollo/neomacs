@@ -2,8 +2,66 @@ use super::RenderApp;
 use crate::thread_comm::{ClipboardCommand, LifecycleCommand, RenderCommand, WindowCommand};
 
 impl RenderApp {
+    /// During connection-only/GPU startup, configuration and frame lifecycle
+    /// live in CPU state. Other commands retain order in a bounded staging queue;
+    /// full staging stops GPU admission to the owner, not shutdown or daemon
+    /// CPU work. Limit each pass as well as both queues to 64 ordinary commands.
+    pub(super) fn process_startup_commands(&mut self) -> bool {
+        if self.comms.cmd_rx.take_shutdown() {
+            self.lifecycle_flags
+                .request_shutdown(super::state::RenderShutdownReason::EvaluatorShutdown);
+            return true;
+        }
+        self.retire_cancelled_frames();
+        for _ in 0..64 {
+            let Ok(command) = self.comms.cmd_rx.try_recv_startup(
+                self.startup_commands.len() == 64,
+                self.comms.keep_alive_without_frames,
+            ) else {
+                break;
+            };
+            // Frame transactions and their cancellation are CPU lifecycle,
+            // including the legacy owner held behind pending GPU preparation.
+            if let RenderCommand::Window(command @ WindowCommand::RealizeFrame { .. }) = command {
+                self.handle_window(command);
+                continue;
+            }
+            if !self.comms.keep_alive_without_frames {
+                if matches!(
+                    command,
+                    RenderCommand::Lifecycle(LifecycleCommand::Shutdown)
+                ) {
+                    self.lifecycle_flags
+                        .request_shutdown(super::state::RenderShutdownReason::EvaluatorShutdown);
+                    return true;
+                }
+                self.startup_commands.push_back(command);
+                continue;
+            }
+            match command {
+                RenderCommand::Lifecycle(LifecycleCommand::Shutdown) => {
+                    self.lifecycle_flags
+                        .request_shutdown(super::state::RenderShutdownReason::EvaluatorShutdown);
+                    return true;
+                }
+                RenderCommand::Config(command) => self.handle_config(command),
+                RenderCommand::Window(command) => self.handle_window(command),
+                RenderCommand::Clipboard(command) => self.handle_clipboard(command),
+                other => self.startup_commands.push_back(other),
+            }
+        }
+        self.retire_cancelled_frames();
+        false
+    }
+
     /// Process pending commands from Emacs.
     pub(super) fn process_commands(&mut self) -> bool {
+        if self.comms.cmd_rx.take_shutdown() {
+            self.lifecycle_flags
+                .request_shutdown(super::state::RenderShutdownReason::EvaluatorShutdown);
+            return true;
+        }
+        self.retire_cancelled_frames();
         let mut should_exit = false;
 
         while let Some(cmd) = self
@@ -38,6 +96,7 @@ impl RenderApp {
             }
         }
 
+        self.retire_cancelled_frames();
         should_exit
     }
 

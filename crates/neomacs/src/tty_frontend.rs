@@ -14,7 +14,7 @@ pub use neomacs_display_runtime::tty_input::TtyInputReader;
 /// `suspend-tty`, `resume-tty`, and `delete-terminal` functions can
 /// send commands to the render thread.
 pub struct TtyTerminalHost {
-    pub cmd_tx: crossbeam_channel::Sender<RenderCommand>,
+    pub cmd_tx: neomacs_display_runtime::thread_comm::RenderCommandSender,
 }
 
 pub struct TtyPopupDisplayHost {

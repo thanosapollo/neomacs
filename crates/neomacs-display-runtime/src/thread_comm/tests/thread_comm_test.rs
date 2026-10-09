@@ -307,18 +307,18 @@ fn concurrent_take_and_replace_assign_every_revision_exactly_once() {
 fn thread_comms_cmd_channel_bounded_capacity() {
     let comms = ThreadComms::new();
 
-    // Fill up the command channel to capacity
+    // Ordinary work occupies the bounded FIFO; shutdown is independent.
     for _ in 0..COMMAND_CHANNEL_CAPACITY {
         comms
             .cmd_tx
-            .try_send(RenderCommand::Lifecycle(LifecycleCommand::Shutdown))
+            .try_send(RenderCommand::Config(ConfigCommand::SetShowFps { enabled: true }))
             .unwrap();
     }
 
-    // Next try_send should fail (channel full)
+    // Next ordinary try_send should fail (channel full)
     let result = comms
         .cmd_tx
-        .try_send(RenderCommand::Lifecycle(LifecycleCommand::Shutdown));
+        .try_send(RenderCommand::Config(ConfigCommand::SetShowFps { enabled: true }));
     assert!(
         result.is_err(),
         "cmd channel should be full after {} sends",

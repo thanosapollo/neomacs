@@ -91,6 +91,8 @@ mod platform_fonts;
 #[cfg(test)]
 #[path = "frame_snapshot_policy_test.rs"]
 mod frame_snapshot_policy;
+#[path = "legacy_frame_admission_test.rs"]
+mod legacy_frame_admission;
 
 fn gui_display() -> BootstrapDisplayConfig {
     let observation = neomacs_display_protocol::DisplayObservation::X11(
@@ -2316,19 +2318,59 @@ fn assert_selected_frame_matches_materialized_default_metrics(eval: &Context) {
 }
 
 #[test]
-fn opening_gui_frame_adoption_does_not_push_stale_window_size() {
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
-    let mut host = PrimaryWindowDisplayHost {
+fn ordinary_display_host_full_startup_admission_returns_error() {
+    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(1);
+    cmd_tx.try_send(RenderCommand::Config(ConfigCommand::SetShowFps { enabled: true })).unwrap();
+    let host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
+        last_window_titles: Mutex::new(std::collections::HashMap::new()),
+        font_metrics: None,
+        primary_window_size: shared_primary_window_size(800, 600),
+        image_catalog: test_image_catalog(&cmd_tx, Arc::new(ImageRenderState::default())),
+        #[cfg(feature = "video")]
+        resolved_videos: Mutex::new(super::super::ResolvedVideoRegistry::default()),
+        resolved_webkits: Mutex::new(std::collections::HashMap::new()),
+        resolved_surfaces: Mutex::new(super::super::ResolvedSurfaceMemo::default()),
+        render_capabilities: Arc::new(SharedRenderCapabilities::default()),
+        requested_frame_shader: Mutex::new(None),
+        #[cfg(feature = "neo-term")]
+        terminal_state: super::super::TerminalHostState::new(new_shared_terminals()),
+    };
+    assert!(host.send_render_command(
+        RenderCommand::Config(ConfigCommand::SetShowFps { enabled: false }),
+        "startup admission",
+    ).is_err());
+    assert!(matches!(cmd_rx.try_recv().unwrap(), RenderCommand::Config(ConfigCommand::SetShowFps { enabled: true })));
+    assert!(cmd_rx.try_recv().is_err());
+}
+
+#[test]
+fn opening_gui_frame_adoption_does_not_push_stale_window_size() {
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let mut host = PrimaryWindowDisplayHost {
+        frame_opacity: Default::default(),
+        deferred_frame: None,
+        resources: Default::default(),
+        system_fonts: Default::default(),
+        font_entities: Default::default(),
+        tooltip_client: Default::default(),
+        cmd_tx: cmd_tx.clone().into(),
+        render_waker: None,
+        font_sizing: FontSizing::gnu_x11_fallback(),
+        primary_window_adopted: false,
+        primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2343,6 +2385,7 @@ fn opening_gui_frame_adoption_does_not_push_stale_window_size() {
         terminal_state: super::super::TerminalHostState::new(new_shared_terminals()),
     };
 
+    assert!(neovm_core::emacs_core::DisplayHost::opening_gui_frame_pending(&host));
     neovm_core::emacs_core::DisplayHost::realize_gui_frame(
         &mut host,
         GuiFrameHostRequest {
@@ -2364,33 +2407,16 @@ fn opening_gui_frame_adoption_does_not_push_stale_window_size() {
     .expect("adopt opening gui frame");
 
     let commands: Vec<_> = cmd_rx.try_iter().collect();
-    assert_eq!(commands.len(), 3);
-    assert!(
-        commands.iter().any(
-            |cmd| matches!(cmd, RenderCommand::Window(WindowCommand::SetWindowTitle { title }) if title == "Neomacs")
-        )
-    );
-    assert!(commands.iter().any(|cmd| matches!(
-        cmd,
-        RenderCommand::Window(WindowCommand::SetFrameGeometryHints {
-            frame: FrameRef::Primary,
-            geometry_hints,
-        }) if *geometry_hints
-            == GuiFrameGeometryHints {
-                base_width: 24,
-                base_height: 16,
-                min_width: 24,
-                min_height: 16,
-                width_inc: 8,
-                height_inc: 16,
-            }
-    )));
-    assert!(commands.iter().any(|cmd| matches!(
-        cmd,
-        RenderCommand::Window(WindowCommand::AdoptPrimaryFrame {
-            frame: FrameRef::Frame(0x100000001),
-        })
-    )));
+    assert_eq!(commands.len(), 1);
+    assert!(matches!(&commands[0],
+        RenderCommand::Window(WindowCommand::RealizeFrame {
+            frame: FrameRef::Frame(0x100000001), title, geometry_hints,
+            width: 960, height: 640, adopt_primary: true, fullscreen: None, ..
+        }) if title == "Neomacs" && *geometry_hints == GuiFrameGeometryHints {
+            base_width: 24, base_height: 16, min_width: 24, min_height: 16,
+            width_inc: 8, height_inc: 16,
+        }
+    ));
     assert!(host.primary_window_adopted);
     assert_eq!(host.primary_frame_id, Some(FrameId(0x100000001)));
 }
@@ -2400,15 +2426,17 @@ fn opening_gui_frame_adoption_applies_fullscreen_mode() {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let mut host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2423,6 +2451,7 @@ fn opening_gui_frame_adoption_applies_fullscreen_mode() {
         terminal_state: super::super::TerminalHostState::new(new_shared_terminals()),
     };
 
+    assert!(neovm_core::emacs_core::DisplayHost::opening_gui_frame_pending(&host));
     neovm_core::emacs_core::DisplayHost::realize_gui_frame(
         &mut host,
         GuiFrameHostRequest {
@@ -2446,9 +2475,10 @@ fn opening_gui_frame_adoption_applies_fullscreen_mode() {
     let commands: Vec<_> = cmd_rx.try_iter().collect();
     assert!(commands.iter().any(|cmd| matches!(
         cmd,
-        RenderCommand::Window(WindowCommand::SetWindowFullscreen {
-            frame: FrameRef::Primary,
-            mode: WindowFullscreenMode::Maximized,
+        RenderCommand::Window(WindowCommand::RealizeFrame {
+            frame: FrameRef::Frame(0x100000001),
+            fullscreen: Some(WindowFullscreenMode::Maximized),
+            adopt_primary: true, ..
         })
     )));
 }
@@ -2458,15 +2488,17 @@ fn primary_display_host_destroy_gui_frame_routes_primary_and_secondary_windows()
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let mut host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: true,
         primary_frame_id: Some(FrameId(0x100000001)),
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::from([
             (FrameId(0x100000001), LispString::from_utf8("primary")),
             (FrameId(0x100000002), LispString::from_utf8("secondary")),
@@ -2484,25 +2516,19 @@ fn primary_display_host_destroy_gui_frame_routes_primary_and_secondary_windows()
         terminal_state: super::super::TerminalHostState::new(new_shared_terminals()),
     };
 
+    let primary = Arc::new(AtomicBool::new(true));
+    let secondary = Arc::new(AtomicBool::new(true));
+    host.legacy_frame_leases.insert(FrameId(0x100000001), primary.clone());
+    host.legacy_frame_leases.insert(FrameId(0x100000002), secondary.clone());
     neovm_core::emacs_core::DisplayHost::destroy_gui_frame(&mut host, FrameId(0x100000002))
         .expect("destroy secondary frame");
+    assert!(!secondary.load(std::sync::atomic::Ordering::Acquire));
+    assert!(primary.load(std::sync::atomic::Ordering::Acquire));
     neovm_core::emacs_core::DisplayHost::destroy_gui_frame(&mut host, FrameId(0x100000001))
         .expect("destroy primary frame");
-
-    let commands: Vec<_> = cmd_rx.try_iter().collect();
-    assert_eq!(commands.len(), 2);
-    assert!(matches!(
-        commands[0],
-        RenderCommand::Window(WindowCommand::DestroyWindow {
-            frame: FrameRef::Frame(0x100000002),
-        })
-    ));
-    assert!(matches!(
-        commands[1],
-        RenderCommand::Window(WindowCommand::DestroyWindow {
-            frame: FrameRef::Primary
-        })
-    ));
+    assert!(!primary.load(std::sync::atomic::Ordering::Acquire));
+    assert!(host.legacy_frame_leases.is_empty());
+    assert!(cmd_rx.try_recv().is_err(), "cancellation consumes no FIFO slot");
     assert_eq!(host.primary_frame_id, None);
     let cached_titles = host.last_window_titles.lock().expect("title cache");
     assert!(cached_titles.is_empty());
@@ -2513,15 +2539,17 @@ fn primary_display_host_popup_menu_routes_primary_and_secondary_frames() {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let mut host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: true,
         primary_frame_id: Some(FrameId(0x100000001)),
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2599,15 +2627,17 @@ fn primary_image_catalog_lookup_returns_pending_without_waiting_for_render_threa
     let image_metadata = Arc::new(ImageRenderState::default());
     let host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2772,15 +2802,17 @@ fn primary_image_catalog_does_not_block_on_render_command_backpressure() {
     let worker = std::thread::spawn(move || {
         let host = PrimaryWindowDisplayHost {
             frame_opacity: Default::default(),
+            deferred_frame: None,
             resources: Default::default(),
             system_fonts: Default::default(),
             font_entities: Default::default(),
             tooltip_client: Default::default(),
-            cmd_tx: worker_cmd_tx.clone(),
+            cmd_tx: worker_cmd_tx.clone().into(),
             render_waker: None,
             font_sizing: FontSizing::gnu_x11_fallback(),
             primary_window_adopted: false,
             primary_frame_id: None,
+            legacy_frame_leases: Default::default(),
             last_window_titles: Mutex::new(std::collections::HashMap::new()),
             font_metrics: None,
             primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2836,15 +2868,17 @@ fn primary_image_catalog_does_not_wait_for_renderer_metadata_lock() {
     let image_metadata = Arc::new(ImageRenderState::default());
     let host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2905,15 +2939,17 @@ fn primary_display_host_expands_tilde_in_image_file_before_render_command() {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -2998,15 +3034,17 @@ fn primary_display_host_resolve_image_sync_returns_cached_decode_failure_promptl
     let image_metadata: SharedImageRenderState = Arc::new(ImageRenderState::default());
     let host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3093,15 +3131,17 @@ fn primary_display_host_request_video_queues_create_once_with_stable_id() {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3181,15 +3221,17 @@ fn primary_display_host_request_video_preserves_uri_source() {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3232,15 +3274,17 @@ fn primary_display_host_routes_one_typed_video_session_lifecycle() {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3293,15 +3337,17 @@ fn primary_display_host_request_webkit_queues_create_and_load_once_with_stable_i
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3349,15 +3395,17 @@ fn primary_display_host_preserves_file_navigation_as_a_typed_path() {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3395,15 +3443,17 @@ fn primary_display_host_xwidget_lifecycle_uses_explicit_xwidget_id() {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 1800),
@@ -3471,15 +3521,17 @@ fn bootstrap_gui_frame_adoption_routes_future_resizes_to_primary_window() {
 
     eval.set_display_host(Box::new(PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(843, 489),
@@ -3502,24 +3554,21 @@ fn bootstrap_gui_frame_adoption_routes_future_resizes_to_primary_window() {
     assert!(
         commands.iter().any(|cmd| matches!(
             cmd,
-            RenderCommand::Window(WindowCommand::SetWindowTitle { .. })
+            RenderCommand::Window(WindowCommand::RealizeFrame { .. })
         )),
         "expected bootstrap adoption to set the primary window title, got {commands:?}"
     );
     assert!(
         commands.iter().any(|cmd| matches!(
             cmd,
-            RenderCommand::Window(WindowCommand::SetFrameGeometryHints {
-                frame: FrameRef::Primary,
-                ..
-            })
+            RenderCommand::Window(WindowCommand::RealizeFrame { adopt_primary: true, .. })
         )),
         "expected bootstrap adoption to publish primary window geometry hints, got {commands:?}"
     );
     assert!(
         commands.iter().any(|cmd| matches!(
             cmd,
-            RenderCommand::Window(WindowCommand::AdoptPrimaryFrame { .. })
+            RenderCommand::Window(WindowCommand::RealizeFrame { adopt_primary: true, .. })
         )),
         "expected bootstrap adoption to publish the primary frame identity, got {commands:?}"
     );
@@ -3541,15 +3590,17 @@ fn primary_window_resize_does_not_wait_for_host_acknowledgement() {
     let shared = shared_primary_window_size(843, 489);
     let mut host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: true,
         primary_frame_id: Some(FrameId(0x100000001)),
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: Arc::clone(&shared),
@@ -3610,15 +3661,17 @@ fn primary_window_display_host_forwards_visual_config_to_renderer() {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let mut host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: true,
         primary_frame_id: Some(FrameId(0x100000001)),
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(843, 489),
@@ -3686,15 +3739,17 @@ fn primary_window_display_host_round_trips_clipboard_requests_through_renderer()
     });
     let mut host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: true,
         primary_frame_id: Some(FrameId(0x100000001)),
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(843, 489),
@@ -3760,15 +3815,17 @@ fn redisplay_title_sync_formats_frame_title_format_for_primary_window() {
 
     eval.set_display_host(Box::new(PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(843, 489),
@@ -3811,15 +3868,17 @@ fn frame_host_title_formats_the_restored_runtime_system_name() {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     eval.set_display_host(Box::new(PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(843, 489),
@@ -3866,7 +3925,7 @@ fn frame_host_title_formats_the_restored_runtime_system_name() {
 #[test]
 fn tty_terminal_host_delete_terminal_sends_shutdown() {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
-    let mut host = TtyTerminalHost { cmd_tx };
+    let mut host = TtyTerminalHost { cmd_tx: cmd_tx.into() };
 
     host.delete_terminal()
         .expect("delete terminal should succeed");
@@ -6910,15 +6969,17 @@ fn primary_display_host_reports_quality_policy_frame_shader_suppression() {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let mut host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 900),
@@ -6993,15 +7054,17 @@ fn primary_display_host_routes_typed_terminal_requests_to_the_renderer() {
     let shared_terminals = new_shared_terminals();
     let host = PrimaryWindowDisplayHost {
         frame_opacity: Default::default(),
+        deferred_frame: None,
         resources: Default::default(),
         system_fonts: Default::default(),
         font_entities: Default::default(),
         tooltip_client: Default::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: cmd_tx.clone().into(),
         render_waker: None,
         font_sizing: FontSizing::gnu_x11_fallback(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
         primary_window_size: shared_primary_window_size(1600, 900),

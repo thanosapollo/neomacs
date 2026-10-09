@@ -1,4 +1,6 @@
 use crate::emacs_core::error::{FlowKind, FlowResultExt as _};
+#[path = "deferred_gui_test.rs"]
+mod deferred_gui_test;
 #[path = "menu_buttons_test.rs"]
 mod menu_buttons_test;
 #[path = "menu_semantics_test.rs"]

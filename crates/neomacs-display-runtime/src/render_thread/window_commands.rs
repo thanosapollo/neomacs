@@ -7,6 +7,25 @@ use winit::dpi::PhysicalPosition;
 use winit::window::UserAttentionType;
 
 impl RenderApp {
+    pub(super) fn retire_cancelled_frames(&mut self) {
+        let cancelled: Vec<_> = self
+            .frame_leases
+            .iter()
+            .filter_map(|(frame, live)| {
+                (!live.load(std::sync::atomic::Ordering::Acquire)).then_some(*frame)
+            })
+            .collect();
+        for frame in cancelled {
+            self.frame_leases.remove(&frame);
+            if let Some(waits) = &self.comms.native_window_waits {
+                waits.remove(frame);
+            }
+            self.handle_window(WindowCommand::DestroyWindow {
+                frame: crate::thread_comm::FrameRef::Frame(frame),
+            });
+        }
+    }
+
     pub(super) fn refresh_frame_opacity(&mut self) {
         // Never hold this CPU lock across GPU work or callback-capable code.
         let controls = self
@@ -44,6 +63,18 @@ impl RenderApp {
     }
 
     pub(super) fn handle_window(&mut self, cmd: WindowCommand) {
+        // PendingGpu already owns the exact primary native window, while the
+        // frame lifecycle still retains CPU state. Replay only native-state
+        // commands targeting that identity, never stale Lisp size requests.
+        let replay_primary = match &cmd {
+            WindowCommand::SetWindowTitle { .. } => true,
+            WindowCommand::SetFrameWindowTitle { frame, .. }
+            | WindowCommand::SetFrameGeometryHints { frame, .. }
+            | WindowCommand::SetWindowFullscreen { frame, .. } => {
+                self.frame_windows.is_primary_frame_id(frame.raw_id())
+            }
+            _ => false,
+        };
         match cmd {
             WindowCommand::RefreshFrameOpacity => self.refresh_frame_opacity(),
             WindowCommand::ScrollPreview(intent) => {
@@ -132,6 +163,10 @@ impl RenderApp {
                         .expect("primary window state")
                         .chrome_mut()
                         .title = title;
+                } else if let Some(pending) = self.frame_windows.pending_creates.iter_mut()
+                    .find(|request| request.emacs_frame_id == emacs_frame_id)
+                {
+                    pending.title = title;
                 } else {
                     tracing::warn!(
                         "SetFrameWindowTitle requested for unknown frame_id=0x{:x}",
@@ -143,6 +178,10 @@ impl RenderApp {
                 let emacs_frame_id = frame.raw_id();
                 if let Some(window_state) = self.frame_windows.get_mut(emacs_frame_id) {
                     window_state.set_fullscreen_mode(mode);
+                } else if let Some(pending) = self.frame_windows.pending_creates.iter_mut()
+                    .find(|request| request.emacs_frame_id == emacs_frame_id)
+                {
+                    pending.fullscreen = Some(mode);
                 } else {
                     tracing::warn!(
                         "SetWindowFullscreen requested for unknown frame_id=0x{:x}",
@@ -233,6 +272,10 @@ impl RenderApp {
                 );
                 if let Some(window_state) = self.frame_windows.get_mut(emacs_frame_id) {
                     window_state.apply_geometry_hints(geometry_hints);
+                } else if let Some(pending) = self.frame_windows.pending_creates.iter_mut()
+                    .find(|request| request.emacs_frame_id == emacs_frame_id)
+                {
+                    pending.geometry_hints = geometry_hints;
                 } else {
                     tracing::warn!(
                         "SetFrameGeometryHints requested for unknown frame_id=0x{:x}",
@@ -262,6 +305,68 @@ impl RenderApp {
                     window.request_user_attention(attention);
                 }
             }
+            WindowCommand::RealizeFrame {
+                frame,
+                width,
+                height,
+                title,
+                geometry_hints,
+                fullscreen,
+                visual,
+                adopt_primary,
+                reply,
+                live,
+                deadline,
+            } => {
+                if !live.load(std::sync::atomic::Ordering::Acquire) {
+                    // Legacy adoption owns the pre-existing initial window.
+                    // Never let a stale cancellation retire a newer identity.
+                    if adopt_primary && self.frame_windows.primary_frame_id().is_none() {
+                        self.handle_window(WindowCommand::DestroyWindow {
+                            frame: crate::thread_comm::FrameRef::Primary,
+                        });
+                    }
+                    return;
+                }
+                let id = frame.raw_id();
+                if let Some(waits) = &self.comms.native_window_waits {
+                    if waits.terminal() {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Err(
+                                "Native connection closed during frame preparation".into(),
+                            ));
+                        }
+                        return;
+                    }
+                    waits.register(id, live.clone(), deadline);
+                }
+                self.frame_leases.insert(id, live);
+                if let Some(visual) = visual {
+                    self.handle_config(crate::thread_comm::ConfigCommand::SetVisualConfig(visual));
+                }
+                if adopt_primary {
+                    self.handle_window(WindowCommand::SetWindowTitle { title });
+                    self.handle_window(WindowCommand::SetFrameGeometryHints {
+                        frame: crate::thread_comm::FrameRef::Primary,
+                        geometry_hints,
+                    });
+                    self.handle_window(WindowCommand::AdoptPrimaryFrame { frame });
+                } else {
+                    self.handle_window(WindowCommand::CreateWindow {
+                        frame,
+                        width,
+                        height,
+                        title,
+                        geometry_hints,
+                    });
+                }
+                if let Some(mode) = fullscreen {
+                    self.handle_window(WindowCommand::SetWindowFullscreen { frame, mode });
+                }
+                if let Some(reply) = reply {
+                    self.frame_windows.await_ready(id, reply);
+                }
+            }
             WindowCommand::CreateWindow {
                 frame,
                 width,
@@ -277,6 +382,20 @@ impl RenderApp {
                     height,
                     title
                 );
+                if self.gpu.is_none()
+                    && self.comms.keep_alive_without_frames
+                    && self.frame_windows.primary_window().is_none()
+                {
+                    self.frame_windows.prepare_primary(
+                        emacs_frame_id,
+                        width,
+                        height,
+                        title,
+                        Some(geometry_hints),
+                    );
+                    self.pending_content_size = super::startup::InitialWindowSize { width, height };
+                    return;
+                }
                 self.frame_windows.request_create(
                     emacs_frame_id,
                     width,
@@ -288,6 +407,11 @@ impl RenderApp {
             WindowCommand::DestroyWindow { frame } => {
                 let emacs_frame_id = frame.raw_id();
                 tracing::info!("DestroyWindow request: frame_id=0x{:x}", emacs_frame_id);
+                // Cancel CPU preparation immediately, not after GPU readiness.
+                self.frame_windows.pending_creates.retain(|request| {
+                    request.emacs_frame_id != emacs_frame_id
+                });
+                self.frame_windows.reject_ready(emacs_frame_id, "Native frame creation cancelled");
                 let mut retirements = Vec::new();
                 if let Some(window) = self.frame_windows.get_mut(emacs_frame_id) {
                     // Destruction cancels capture first, flushing any older
@@ -312,9 +436,12 @@ impl RenderApp {
                         .send_input(InputEvent::PresentationRetired { presentation });
                 }
                 if self.frame_windows.is_primary_frame_id(emacs_frame_id) {
+                    self.cancel_gpu_startup();
+                    self.frame_windows
+                        .reject_ready(emacs_frame_id, "Native frame creation cancelled");
                     self.frame_windows.take_primary_window();
                     self.frame_windows.clear_primary_mapping();
-                } else {
+                } else if self.frame_windows.get(emacs_frame_id).is_some() {
                     self.frame_windows.request_destroy(emacs_frame_id);
                 }
             }
@@ -340,6 +467,9 @@ impl RenderApp {
                 // its deadlines and request token cannot go stale.
                 self.frame_coordinator
                     .remove_window(super::frame_sched::NativeWindowId(0));
+            }
+            WindowCommand::AwaitFrameReady { frame, reply } => {
+                self.frame_windows.await_ready(frame.raw_id(), reply);
             }
             WindowCommand::ShowChildFrame { frame_id } => {
                 tracing::info!(
@@ -375,6 +505,12 @@ impl RenderApp {
             WindowCommand::ScrollBlit { .. } => {
                 // handled above in dispatch, here as exhaustive match
             }
+        }
+        if replay_primary
+            && let Some(pending) = &self.gpu_startup
+            && let Some(primary) = self.frame_windows.primary_window()
+        {
+            primary.replay_pending_native_state(pending.window());
         }
     }
 }

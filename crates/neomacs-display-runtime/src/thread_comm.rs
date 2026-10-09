@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+mod command_mailbox;
+pub use command_mailbox::{RenderCommandReceiver, RenderCommandSender};
 mod frame_mailbox;
 mod frame_opacity;
 pub use frame_mailbox::{FrameReceiver, FrameSender, QueuedPresentation, SupersededPresentation};
@@ -398,8 +400,28 @@ pub enum WindowCommand {
         title: String,
         geometry_hints: GuiFrameGeometryHints,
     },
+    /// One bounded admission owns creation and independent lease rollback.
+    /// A readiness reply owns deferred realization; None is admission-only legacy.
+    RealizeFrame {
+        frame: FrameRef,
+        width: u32,
+        height: u32,
+        title: String,
+        geometry_hints: GuiFrameGeometryHints,
+        fullscreen: Option<WindowFullscreenMode>,
+        visual: Option<VisualConfig>,
+        adopt_primary: bool,
+        reply: Option<Sender<Result<(), String>>>,
+        live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: std::time::Instant,
+    },
     /// Associate the already-created primary OS window with its real Emacs frame ID.
     AdoptPrimaryFrame { frame: FrameRef },
+    /// Acknowledge actual native window/surface realization, not queue admission.
+    AwaitFrameReady {
+        frame: FrameRef,
+        reply: Sender<Result<(), String>>,
+    },
     /// Destroy an OS window for a top-level Emacs frame
     DestroyWindow { frame: FrameRef },
     /// Mark a child frame visible again.
@@ -980,8 +1002,8 @@ pub struct ThreadComms {
     pub frame_rx: FrameReceiver,
 
     /// Commands: Emacs → Render
-    pub cmd_tx: Sender<RenderCommand>,
-    pub cmd_rx: Receiver<RenderCommand>,
+    pub cmd_tx: RenderCommandSender,
+    pub cmd_rx: RenderCommandReceiver,
 
     /// Input events: Render → Emacs
     pub input_tx: Sender<InputEvent>,
@@ -996,7 +1018,7 @@ impl ThreadComms {
     /// Create new thread communication channels
     pub fn new() -> Self {
         let (frame_tx, frame_rx) = frame_mailbox::channel();
-        let (cmd_tx, cmd_rx) = bounded(COMMAND_CHANNEL_CAPACITY);
+        let (cmd_tx, cmd_rx) = command_mailbox::channel();
         let (input_tx, input_rx) = bounded(INPUT_CHANNEL_CAPACITY);
         let capabilities = Arc::new(SharedRenderCapabilities::default());
         Self {
@@ -1024,6 +1046,8 @@ impl ThreadComms {
         };
 
         let render = RenderComms {
+            keep_alive_without_frames: false,
+            native_window_waits: None,
             input_stream: Default::default(),
             tooltip_context: self.tooltip_context,
             frame_opacity: self.frame_opacity,
@@ -1046,7 +1070,7 @@ impl Default for ThreadComms {
 /// Emacs thread communication handle
 pub struct EmacsComms {
     pub frame_tx: FrameSender,
-    pub cmd_tx: Sender<RenderCommand>,
+    pub cmd_tx: RenderCommandSender,
     pub input_rx: Receiver<InputEvent>,
     pub capabilities: Arc<SharedRenderCapabilities>,
     pub tooltip_context: Arc<neomacs_display_protocol::tooltip::TooltipContext>,
@@ -1055,9 +1079,12 @@ pub struct EmacsComms {
 
 /// Render thread communication handle
 pub struct RenderComms {
+    /// Daemon root, rather than the primary native frame, owns display lifetime.
+    pub keep_alive_without_frames: bool,
+    pub native_window_waits: Option<Arc<crate::native_window_wait::NativeWindowWaits>>,
     input_stream: neomacs_display_protocol::input_progress::InputStream,
     pub frame_rx: FrameReceiver,
-    pub cmd_rx: Receiver<RenderCommand>,
+    pub cmd_rx: RenderCommandReceiver,
     pub input_tx: Sender<InputEvent>,
     pub capabilities: Arc<SharedRenderCapabilities>,
     pub tooltip_context: Arc<neomacs_display_protocol::tooltip::TooltipContext>,
@@ -1065,6 +1092,22 @@ pub struct RenderComms {
 }
 
 impl RenderComms {
+    pub(crate) fn create_window(
+        &self,
+        event_loop: &dyn winit::event_loop::ActiveEventLoop,
+        attrs: winit::window::WindowAttributes,
+        frame: u64,
+    ) -> Result<Box<dyn winit::window::Window>, String> {
+        let create = || {
+            event_loop
+                .create_window(attrs)
+                .map_err(|error| error.to_string())
+        };
+        match &self.native_window_waits {
+            Some(waits) => waits.run(frame, create),
+            None => create(),
+        }
+    }
     fn observe_scroll_input(event: InputEvent) -> InputEvent {
         #[cfg(target_os = "linux")]
         if neomacs_display_protocol::input_latency::enabled() {

@@ -4433,9 +4433,26 @@ impl crate::emacs_core::eval::Context {
         idle_policy: IdleTransitionPolicy,
     ) -> Result<(), crate::emacs_core::error::Flow> {
         idle_policy.resume_idle(self);
+        // A late event for a retired daemon GUI frame cannot terminate the root.
+        if self.daemon.is_some()
+            && emacs_frame_id != 0
+            && self
+                .frames
+                .get(crate::window::FrameId(emacs_frame_id))
+                .is_none()
+        {
+            return Ok(());
+        }
         if let Some(event) = self.make_lispy_delete_frame_event(emacs_frame_id)
             && self.execute_special_event_if_bound(event)?
         {
+            return Ok(());
+        }
+        if self.daemon.is_some() && emacs_frame_id != 0 {
+            crate::emacs_core::frame::builtin_delete_frame(
+                self,
+                vec![Value::make_frame(emacs_frame_id)],
+            )?;
             return Ok(());
         }
         self.command_loop.running = false;

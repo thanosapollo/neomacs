@@ -320,12 +320,16 @@ impl TtyInputReader {
 
                 // Forward events to the RenderComms channel and listen for
                 // shutdown commands.
-                loop {
+                'forward: loop {
                     crossbeam_channel::select! {
-                        recv(comms.cmd_rx) -> msg => {
-                            match msg {
-                                Ok(RenderCommand::Lifecycle(LifecycleCommand::Shutdown)) | Err(_) => break,
-                                Ok(_) => {}
+                        recv(comms.cmd_rx.wake) -> _ => {
+                            loop {
+                                match comms.cmd_rx.try_recv() {
+                                    Ok(RenderCommand::Lifecycle(LifecycleCommand::Shutdown))
+                                    | Err(crossbeam_channel::TryRecvError::Disconnected) => break 'forward,
+                                    Ok(_) => {}
+                                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                                }
                             }
                         }
                         recv(rx) -> msg => {
