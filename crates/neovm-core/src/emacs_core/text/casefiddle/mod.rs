@@ -77,6 +77,45 @@ fn upcase_char_override(code: i64, casetab: &CaseTableOverride) -> i64 {
         .unwrap_or_else(|| upcase_char(code))
 }
 
+/// Character title casing prepares all GNU casing properties before selecting
+/// the authoritative current-buffer table. Only the simple title table survives
+/// subsequent lazy-load callbacks; special strings never enter this result.
+fn titlecase_character_in_state(eval: &mut super::eval::Context, code: i64) -> EvalResult {
+    if !(0..=super::emacs_char::MAX_CHAR as i64).contains(&code) {
+        let casetab = CaseTableOverride::for_current_buffer(eval)?;
+        return Ok(Value::fixnum(upcase_char_override(code, &casetab)));
+    }
+    let title_table =
+        super::chartable::uniprop_table_in_state(eval, Value::symbol("titlecase"))?;
+    let roots = eval.save_specpdl_roots();
+    if !title_table.is_nil() {
+        eval.push_specpdl_root(title_table);
+    }
+    let result = (|| {
+        // `prepare_casing_context` loads these even for character operations.
+        // A callback on the final property can replace the buffer table or Up.
+        for property in ["special-uppercase", "special-lowercase", "special-titlecase"] {
+            let _ = super::chartable::uniprop_table_in_state(eval, Value::symbol(property))?;
+        }
+        // No copied case-table Values cross a Lisp-loading boundary. Rooting
+        // an old Up snapshot would not make that snapshot authoritative.
+        let casetab = CaseTableOverride::for_current_buffer(eval)?;
+        if !title_table.is_nil() {
+            // GNU character casing uses CHAR_TABLE_REF, not the public decoded
+            // property API. Accept explicit identity but reject non-characters.
+            let mapped = super::chartable::ct_lookup(&title_table, code)?;
+            if let ValueKind::Fixnum(title) = mapped.kind() {
+                if (0..=super::emacs_char::MAX_CHAR as i64).contains(&title) {
+                    return Ok(mapped);
+                }
+            }
+        }
+        Ok(Value::fixnum(upcase_char_override(code, &casetab)))
+    })();
+    eval.restore_specpdl_roots(roots);
+    result
+}
+
 /// Uppercase a single character code, returning the new code.
 fn upcase_char(code: i64) -> i64 {
     if preserve_casefiddle_upcase_payload(code) {
@@ -249,23 +288,44 @@ fn standard_word_predicate(code: u32) -> bool {
         == crate::emacs_core::syntax::SyntaxClass::Word
 }
 
+/// GNU unibyte object casing falls back to the ASCII Unicode property when
+/// an ASCII input maps outside 0..=255. Buffer casing instead keeps the low
+/// byte (`do_casify_unibyte_region`), including replace-match after insertion.
+/// High input bytes are raw-byte characters, not Latin-1 case-table indices.
+pub(crate) fn casify_unibyte_string(
+    text: &LispString,
+    which: CaseMap,
+    casetab: &CaseTableOverride,
+    target: CaseTarget,
+) -> LispString {
+    let bytes = text
+        .as_bytes()
+        .iter()
+        .map(|&byte| {
+            let code = crate::emacs_core::emacs_char::unibyte_to_char(byte) as i64;
+            let ascii = if which == CaseMap::Down {
+                byte.to_ascii_lowercase()
+            } else {
+                byte.to_ascii_uppercase()
+            };
+            let mapped = casetab.map(which, code).unwrap_or(ascii as i64);
+            if target == CaseTarget::String && byte.is_ascii() && mapped >= 0x100 {
+                ascii
+            } else {
+                make_char_unibyte(mapped)
+            }
+        })
+        .collect();
+    LispString::from_unibyte(bytes)
+}
+
 fn downcase_lisp_string_emacs_compat(
     text: &LispString,
     is_word: impl Fn(u32) -> bool,
     casetab: &CaseTableOverride,
 ) -> LispString {
     if !text.is_multibyte() {
-        let bytes = text
-            .as_bytes()
-            .iter()
-            .map(|&byte| {
-                casetab
-                    .map(CaseMap::Down, byte as i64)
-                    .map(|m| m as u8)
-                    .unwrap_or_else(|| byte.to_ascii_lowercase())
-            })
-            .collect();
-        return LispString::from_unibyte(bytes);
+        return casify_unibyte_string(text, CaseMap::Down, casetab, CaseTarget::Buffer);
     }
 
     // Greek capital sigma down-cases to its final form ς at the end of a word
@@ -304,25 +364,24 @@ fn downcase_lisp_string_emacs_compat(
     LispString::from_emacs_bytes(out)
 }
 
-fn upcase_lisp_string_emacs_compat(text: &LispString, casetab: &CaseTableOverride) -> LispString {
+fn upcase_lisp_string_emacs_compat(
+    text: &LispString,
+    casetab: &CaseTableOverride,
+    target: CaseTarget,
+) -> LispString {
     if !text.is_multibyte() {
-        let bytes = text
-            .as_bytes()
-            .iter()
-            .map(|&byte| {
-                casetab
-                    .map(CaseMap::Up, byte as i64)
-                    .map(|m| m as u8)
-                    .unwrap_or_else(|| byte.to_ascii_uppercase())
-            })
-            .collect();
-        return LispString::from_unibyte(bytes);
+        return casify_unibyte_string(text, CaseMap::Up, casetab, target);
     }
 
     let mut out = Vec::with_capacity(text.sbytes());
     for code in super::builtins::lisp_string_char_codes(text) {
         let code_i64 = code as i64;
-        // GNU `upcase` consults the per-buffer case table first.
+        // GNU `case_character_impl` checks special-uppercase before the
+        // one-to-one Up table, but only for multibyte strings/buffer text.
+        if let Some(expansion) = special_upcase_expansion(code) {
+            push_multibyte_chars(&mut out, expansion);
+            continue;
+        }
         if let Some(mapped) = casetab.map(CaseMap::Up, code_i64) {
             push_multibyte_char_code(&mut out, mapped as u32);
             continue;
@@ -338,6 +397,14 @@ fn upcase_lisp_string_emacs_compat(text: &LispString, casetab: &CaseTableOverrid
         }
     }
     LispString::from_emacs_bytes(out)
+}
+
+/// The one-to-many uppercase mappings already used by string casing. GNU
+/// applies these before a custom Up entry; single-character/unibyte casing
+/// still consults only the one-to-one table (`case_single_character`).
+pub(crate) fn special_upcase_expansion(code: u32) -> Option<std::char::ToUppercase> {
+    let expansion = char::from_u32(code)?.to_uppercase();
+    expansion.clone().nth(1).is_some().then_some(expansion)
 }
 
 /// Whether [`capitalize_like_gnu`] cases a string or buffer text.  GNU
@@ -837,7 +904,7 @@ fn capitalize_with_word_pred(
 }
 
 /// Pure form (used by tests); word boundaries follow the standard syntax table.
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn builtin_capitalize(args: Vec<Value>) -> EvalResult {
     capitalize_with_word_pred(args, standard_word_predicate, &CaseTableOverride::none())
 }
@@ -849,6 +916,11 @@ pub(crate) fn builtin_capitalize_in_state(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
+    if args.len() == 1 {
+        if let ValueKind::Fixnum(code) = args[0].kind() {
+            return titlecase_character_in_state(eval, code);
+        }
+    }
     let is_word = crate::emacs_core::syntax::casing_word_predicate(eval);
     let casetab = CaseTableOverride::for_current_buffer(eval)?;
     capitalize_with_word_pred(args, is_word, &casetab)
@@ -887,7 +959,7 @@ fn upcase_initials_with_word_pred(
 }
 
 /// Pure form (used by tests); word boundaries follow the standard syntax table.
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn builtin_upcase_initials(args: Vec<Value>) -> EvalResult {
     upcase_initials_with_word_pred(args, standard_word_predicate, &CaseTableOverride::none())
 }
@@ -897,6 +969,11 @@ pub(crate) fn builtin_upcase_initials_in_state(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
+    if args.len() == 1 {
+        if let ValueKind::Fixnum(code) = args[0].kind() {
+            return titlecase_character_in_state(eval, code);
+        }
+    }
     let is_word = crate::emacs_core::syntax::casing_word_predicate(eval);
     let casetab = CaseTableOverride::for_current_buffer(eval)?;
     upcase_initials_with_word_pred(args, is_word, &casetab)
@@ -1064,7 +1141,9 @@ where
     let casetab = CaseTableOverride::none();
     match replace_match_case_action_lisp(matched, is_word_char) {
         ReplaceMatchCaseAction::NoChange => replacement.clone(),
-        ReplaceMatchCaseAction::AllCaps => upcase_lisp_string_emacs_compat(replacement, &casetab),
+        ReplaceMatchCaseAction::AllCaps => {
+            upcase_lisp_string_emacs_compat(replacement, &casetab, CaseTarget::String)
+        }
         ReplaceMatchCaseAction::CapInitial => {
             // replace-match's case adjustment has no buffer syntax table in
             // scope, so word boundaries here follow the Unicode-alphanumeric
@@ -1100,7 +1179,9 @@ pub(crate) fn apply_replace_match_case_lisp_cased(
     );
     match action {
         ReplaceMatchCaseAction::NoChange => replacement.clone(),
-        ReplaceMatchCaseAction::AllCaps => upcase_lisp_string_emacs_compat(replacement, casetab),
+        ReplaceMatchCaseAction::AllCaps => {
+            upcase_lisp_string_emacs_compat(replacement, casetab, target)
+        }
         // GNU applies `Fupcase_initials` to a string replacement and
         // `Fupcase_initials_region` to a buffer one.
         ReplaceMatchCaseAction::CapInitial => capitalize_like_gnu(
@@ -1231,7 +1312,7 @@ pub(crate) fn builtin_upcase_region(
 ) -> EvalResult {
     let casetab = CaseTableOverride::for_current_buffer(ctx)?;
     casify_region_in_state(ctx, args, "upcase-region", move |s| {
-        upcase_lisp_string_emacs_compat(s, &casetab)
+        upcase_lisp_string_emacs_compat(s, &casetab, CaseTarget::Buffer)
     })
 }
 
@@ -1287,7 +1368,7 @@ pub(crate) fn builtin_downcase_word(
 pub(crate) fn builtin_upcase_word(ctx: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     let casetab = CaseTableOverride::for_current_buffer(ctx)?;
     casify_word_in_state(ctx, args, "upcase-word", move |s| {
-        upcase_lisp_string_emacs_compat(s, &casetab)
+        upcase_lisp_string_emacs_compat(s, &casetab, CaseTarget::Buffer)
     })
 }
 
@@ -1336,3 +1417,15 @@ pub(crate) fn builtin_char_resolve_modifiers(args: Vec<Value>) -> EvalResult {
 #[cfg(test)]
 #[path = "tests/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/r014_unibyte.rs"]
+mod r014_unibyte_tests;
+
+#[cfg(test)]
+#[path = "tests/r017_special_up.rs"]
+mod r017_special_up_tests;
+
+#[cfg(test)]
+#[path = "tests/r018_nil_up.rs"]
+mod r018_nil_up_tests;

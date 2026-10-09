@@ -301,7 +301,7 @@ fn make_standard_case_table_value() -> Value {
 /// does (`lisp/case-table.el`): downcase[UC]=LC, downcase[LC]=LC, upcase[UC]=UC,
 /// upcase[LC]=UC. The canon/eqv extras are left nil so they are recomputed from
 /// the down/up tables by `ensure_case_table_derived_slots` (GNU `set_case_table`).
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn make_case_table_with_pair(uc: i64, lc: i64) -> Value {
     let mut downcase_pairs = Vec::with_capacity(128);
     let mut upcase_pairs = Vec::with_capacity(128);
@@ -527,12 +527,11 @@ pub(crate) enum CaseMap {
 /// range for the standard table, plus whatever a custom table overrides. This
 /// override resolves a single character against that table, returning:
 ///
-/// * `Some(mapped)` — the table has an explicit (fixnat) entry for `code`,
-///   which is GNU's `downcase`/`upcase`/canon result (`buffer.h` `downcase`).
-/// * `None` — no explicit entry, so the caller falls through to the hardwired
-///   Unicode path. This keeps the default/standard path byte-identical: the
-///   standard table's ASCII entries equal the hardwired ASCII mapping, and
-///   characters outside the table (all of non-ASCII) are deferred entirely.
+/// * `Some(mapped)` — the table has a valid character entry for `code`, or a
+///   custom downcase/upcase lookup resolves to nil and returns `code` unchanged
+///   (GNU `buffer.h` `downcase`/`upcase`). Default and parent entries resolve first.
+/// * `None` — use the hardwired Unicode path: no custom table is installed,
+///   or a lookup has no valid entry (except nil in custom downcase/upcase tables).
 ///
 /// When the installed table is the standard object (by identity), the whole
 /// override is skipped so the hot path stays allocation-free.
@@ -619,7 +618,7 @@ impl CaseTableOverride {
     }
 
     /// GNU `UPPERCASEP(c)`: downcasing through the case table changes the char.
-    /// Falls back to Unicode when the table has no explicit entry.
+    /// An absent custom mapping leaves the char unchanged, not Unicode-cased.
     pub(crate) fn is_upper(&self, ch: char) -> bool {
         match self.map(CaseMap::Down, ch as i64) {
             Some(down) => down != ch as i64,
@@ -628,7 +627,7 @@ impl CaseTableOverride {
     }
 
     /// GNU `LOWERCASEP(c)`: not uppercase, and upcasing through the case table
-    /// changes the char. Falls back to Unicode when the table has no entry.
+    /// changes the char. A resolved nil custom Up entry leaves it unchanged.
     pub(crate) fn is_lower(&self, ch: char) -> bool {
         if self.is_upper(ch) {
             return false;
@@ -639,10 +638,10 @@ impl CaseTableOverride {
         }
     }
 
-    /// Look up `code` in the requested subsidiary table. Returns `Some(mapped)`
-    /// only when the table holds an explicit fixnat entry (GNU's `downcase`
-    /// returns the entry if `FIXNATP`, else the char unchanged); otherwise
-    /// `None`, signalling the caller to use the hardwired Unicode path.
+    /// Look up `code` after resolving char-table default and parent entries.
+    /// A nil custom Down/Up entry is identity, as in GNU `buffer.h` downcase/upcase.
+    /// Other unmapped results and the standard path still return `None` to
+    /// select the hardwired Unicode path.
     pub(crate) fn map(&self, which: CaseMap, code: i64) -> Option<i64> {
         if !self.custom {
             return None;
@@ -662,6 +661,7 @@ impl CaseTableOverride {
                 {
                     Some(n)
                 }
+                ValueKind::Nil if matches!(which, CaseMap::Down | CaseMap::Up) => Some(code),
                 _ => None,
             },
             Err(_) => None,

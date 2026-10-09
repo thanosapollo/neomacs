@@ -46,14 +46,14 @@ pub(crate) fn parse_builtin_frontend_knob(value: Option<&str>) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 thread_local! {
     static KNOB_TEST_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Force the knob on this thread (tests only); `None` returns to the
 /// environment.
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 pub(crate) fn set_builtin_frontend_for_test(on: Option<bool>) {
     KNOB_TEST_OVERRIDE.with(|cell| cell.set(on));
 }
@@ -62,7 +62,7 @@ pub(crate) fn set_builtin_frontend_for_test(on: Option<bool>) {
 /// once the knob has been read.
 #[inline(always)]
 pub(crate) fn builtin_frontend_on() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "case68-test-support"))]
     if let Some(on) = KNOB_TEST_OVERRIDE.with(|cell| cell.get()) {
         return on;
     }

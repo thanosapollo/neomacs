@@ -15,9 +15,13 @@ pub mod keyboard;
 mod keyboard_input;
 pub mod logging;
 pub mod tagged;
-#[cfg(test)]
+#[cfg(any(test, feature = "case68-test-support"))]
 #[path = "tests/test_utils.rs"]
+#[doc(hidden)]
 pub mod test_utils;
+#[cfg(feature = "case68-test-support")]
+#[doc(hidden)]
+pub mod case68_test_support;
 pub mod window;
 
 // Curated facade: the front door for consumers of the Lisp engine. The
