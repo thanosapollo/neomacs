@@ -582,6 +582,7 @@ fn display_host(
         legacy_frame_leases: HashMap::new(),
         last_window_titles: Mutex::new(HashMap::new()),
         font_metrics: None,
+        font_entities: FontEntityCatalog::default(),
         primary_window_size,
         image_catalog,
         #[cfg(feature = "video")]

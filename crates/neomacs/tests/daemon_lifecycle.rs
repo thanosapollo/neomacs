@@ -1448,6 +1448,136 @@ fn foreground_daemon_initializes_headlessly_and_services_eval_timers_and_process
     );
 }
 
+// Observe the production executable, not mallctl in this system-allocator
+// test runner. jemalloc disables background workers in the forked child.
+#[cfg(any(feature = "platform-allocator", feature = "jemalloc"))]
+fn jemalloc_daemon_background_workers(background: bool) {
+    let fixture = Fixture::new();
+    fixture.write_init("(setq allocator-probe-init t)");
+    let errors = tempfile::NamedTempFile::new().unwrap();
+    let name = "allocator";
+    let mut command = fixture.editor();
+    command
+        .arg(if background {
+            "--bg-daemon=allocator"
+        } else {
+            "--fg-daemon=allocator"
+        })
+        .env_remove("_RJEM_MALLOC_CONF")
+        .env_remove("MALLOC_CONF")
+        .env("NEOMACS_ALLOCATOR_CHILD_PROBE", "preserved")
+        .stdout(Stdio::null())
+        .stderr(errors.reopen().unwrap());
+    let mut launcher = OwnedChild(command.spawn().unwrap());
+    let launcher_pid = launcher.0.id();
+    if background {
+        let status = wait_child(&mut launcher.0, Duration::from_secs(70));
+        assert!(
+            status.success(),
+            "background launcher: {status}; {}",
+            fs::read_to_string(errors.path()).unwrap()
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !fixture.socket(name).exists() {
+        if !background && let Some(status) = launcher.0.try_wait().unwrap() {
+            panic!(
+                "foreground daemon exited before readiness: {status}; {}",
+                fs::read_to_string(errors.path()).unwrap()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon never ready; {}",
+            fs::read_to_string(errors.path()).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(fixture.eval(name, "(+ 20 22)"), "42");
+    let pid: i32 = fixture.eval(name, "(emacs-pid)").parse().unwrap();
+    assert_eq!(
+        fs::read_to_string(fixture.path("owned-pid"))
+            .unwrap()
+            .trim(),
+        pid.to_string()
+    );
+    assert_eq!(pid as u32 == launcher_pid, !background);
+    // The daemon is our verified init-marker writer; pin it before inspecting
+    // its threads or requesting normal shutdown, including on regression RED.
+    let daemon = PinnedProcess::new(pid);
+    let image_mappings: Vec<_> = fs::read_to_string(format!("/proc/{pid}/maps"))
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains(".pdump"))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        !image_mappings.is_empty(),
+        "daemon did not map its runtime image"
+    );
+    eprintln!("jemalloc production runtime image: {image_mappings:?}");
+    assert_eq!(
+        fixture.eval(
+            name,
+            "(list (daemonp) noninteractive allocator-probe-init (not (null after-init-time)))"
+        ),
+        "(\"allocator\" nil t t)"
+    );
+    assert_eq!(
+        fixture.eval(name, "(progn (setq allocator-probe-live (list 7 11) allocator-probe-alias allocator-probe-live) (garbage-collect) (list (eq allocator-probe-live allocator-probe-alias) allocator-probe-live))"),
+        "(t (7 11))"
+    );
+    let environment = fixture.eval(name, "(with-temp-buffer (call-process \"sh\" nil t nil \"-c\" \"printf '%s' \\\"$NEOMACS_ALLOCATOR_CHILD_PROBE|${_RJEM_MALLOC_CONF-unset}|${MALLOC_CONF-unset}\\\"\") (buffer-string))");
+    assert_eq!(environment, "\"preserved|unset|unset\"");
+    let mut samples = Vec::new();
+    for delay in [
+        Duration::from_millis(100),
+        Duration::from_secs(1),
+        Duration::from_secs(3),
+    ] {
+        std::thread::sleep(delay);
+        let mut workers: Vec<_> = fs::read_dir(format!("/proc/{pid}/task"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|task| {
+                fs::read_to_string(task.join("comm"))
+                    .unwrap_or_default()
+                    .trim()
+                    == "jemalloc_bg_thd"
+            })
+            .map(|task| task.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        workers.sort();
+        samples.push(workers);
+    }
+    eprintln!(
+        "jemalloc production: background={background} launcher_pid={launcher_pid} daemon_pid={pid} samples={samples:?} child_environment={environment}"
+    );
+    fixture.eval(name, "(kill-emacs)");
+    daemon.assert_exited();
+    if !background {
+        assert!(wait_child(&mut launcher.0, Duration::from_secs(5)).success());
+    }
+    assert!(!fixture.socket(name).exists(), "server socket not cleaned");
+    // Assert after normal owned shutdown so RED also proves cleanup.
+    assert!(
+        samples.iter().all(|workers| !workers.is_empty()),
+        "missing settled jemalloc background workers: background={background}, samples={samples:?}"
+    );
+}
+
+#[cfg(any(feature = "platform-allocator", feature = "jemalloc"))]
+#[test]
+fn jemalloc_workers_activate_in_production_foreground_daemon() {
+    jemalloc_daemon_background_workers(false);
+}
+
+#[cfg(any(feature = "platform-allocator", feature = "jemalloc"))]
+#[test]
+fn jemalloc_workers_reactivate_in_production_forked_daemon() {
+    jemalloc_daemon_background_workers(true);
+}
+
 #[test]
 fn background_daemon_reports_ready_then_cleans_up_and_allows_same_name_restart() {
     let fixture = Fixture::new();

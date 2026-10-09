@@ -3468,6 +3468,25 @@ fn jemalloc_release_startup_slack() {
             0,
         );
     }
+
+    // Enable only after startup image construction (and the daemon fork).
+    // jemalloc resets background-thread state in the child; enabling it in
+    // the compiled configuration would not provide idle reclamation there.
+    let mut enabled = true;
+    // SAFETY: the control takes a live bool pointer and its exact byte size;
+    // no output pointers are requested and mallctl does not retain the input.
+    let result = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            c"background_thread".as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            (&mut enabled as *mut bool).cast(),
+            std::mem::size_of::<bool>(),
+        )
+    };
+    if result != 0 {
+        tracing::warn!(result, "jemalloc background-thread activation failed");
+    }
 }
 
 #[cfg(not(all(

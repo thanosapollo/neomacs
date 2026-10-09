@@ -19,6 +19,7 @@ fn host_for_transport(cmd_tx: &CommandSender) -> PrimaryWindowDisplayHost {
         legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(Default::default()),
         font_metrics: None,
+        font_entities: Default::default(),
         primary_window_size: shared_primary_window_size(800, 600),
         image_catalog: Rc::new(AsyncImageCatalog::new(
             cmd_tx.clone(), None, Arc::new(ImageRenderState::default()), None,

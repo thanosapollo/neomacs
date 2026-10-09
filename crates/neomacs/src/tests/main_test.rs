@@ -2335,6 +2335,7 @@ fn ordinary_display_host_full_startup_admission_returns_error() {
         legacy_frame_leases: Default::default(),
         last_window_titles: Mutex::new(std::collections::HashMap::new()),
         font_metrics: None,
+        font_entities: Default::default(),
         primary_window_size: shared_primary_window_size(800, 600),
         image_catalog: test_image_catalog(&cmd_tx, Arc::new(ImageRenderState::default())),
         #[cfg(feature = "video")]
