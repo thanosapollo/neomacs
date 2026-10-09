@@ -674,7 +674,7 @@ fn concurrent_worker_channel_dispatch_preserves_legacy_and_enabled_symbol_polici
                 };
                 // Exercise the actual per-heap channel match, not a direct loop
                 // call or a model of its enabled/legacy election.
-                heap.gc_worker.send(request);
+                heap.process_registry.cold.gc_worker.send(request);
                 let result = harness
                     .result
                     // Keep the heap alive until the actual exit handoff. A

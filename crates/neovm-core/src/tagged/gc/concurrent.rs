@@ -461,7 +461,7 @@ impl TaggedHeap {
         } else {
             GcRequest::ConcurrentMark(job)
         };
-        self.gc_worker.send(request);
+        self.process_registry.cold.gc_worker.send(request);
         self.handshake.last_start_jobasm_us = jobasm_t0.elapsed().as_micros() as u64;
         // Pacer: open this cycle's mark window (closed by `incremental_finish`).
         self.pace_mark_start = Some(std::time::Instant::now());
@@ -807,7 +807,7 @@ impl TaggedHeap {
         // worker waits is bounded by its existing 100us timeout; stop remains
         // visible until it exits. No storage is reclaimed during that delay.
         self.gc_wake.1.notify_all();
-        self.gc_worker.detach_abandoned();
+        self.process_registry.cold.gc_worker.detach_abandoned();
         std::mem::forget(std::mem::take(&mut self.cons_blocks));
         std::mem::forget(std::mem::take(&mut self.float_arena.pages));
         std::mem::forget(std::mem::take(&mut self.string_arena.pages));

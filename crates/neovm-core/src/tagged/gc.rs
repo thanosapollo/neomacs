@@ -543,15 +543,6 @@ pub struct TaggedHeap {
     /// Stable video ids of `VideoObj` handles reclaimed by the sweep. The
     /// evaluator drains these after collection through `DisplayHost`.
     pending_video_destroys: Vec<neomacs_display_protocol::VideoId>,
-    /// Ids of killed buffers whose buffer object this cycle's mark left
-    /// unmarked (queued at termination, freed by the sweep). The evaluator's
-    /// cycle-completed block drains them and drops the killed buffer's record
-    /// (`BufferManager::reclaim_dead_buffer`), GNU's sweep of an unreachable
-    /// dead `struct buffer`. Plain data, never marked.
-    pending_buffer_reclaims: Vec<crate::buffer::BufferId>,
-    /// The same for deleted processes: drained into
-    /// `ProcessManager::reclaim_deleted_process`. Plain data, never marked.
-    pending_process_reclaims: Vec<crate::emacs_core::process::ProcessId>,
 
     /// Reclaimed cons cells threaded through the dead cells themselves,
     /// matching GNU alloc.c's `cons_free_list`.
@@ -634,9 +625,6 @@ pub struct TaggedHeap {
     /// a killed buffer's object lives exactly as long as Lisp references it
     /// (see [`RegistrySlot`]).
     buffer_registry: Vec<RegistrySlot>,
-    /// Ids whose registry slot is `Killed`, so the termination's prune
-    /// visits only killed objects still referenced, not every id ever made.
-    killed_buffer_ids: Vec<crate::buffer::BufferId>,
     window_registry: FxHashMap<u64, TaggedValue>,
     frame_registry: FxHashMap<u64, TaggedValue>,
     timer_registry: FxHashMap<u64, TaggedValue>,
@@ -644,10 +632,7 @@ pub struct TaggedHeap {
     /// from 1 upward and never reused). Only live processes' objects are
     /// roots; a deleted process's object lives exactly as long as Lisp
     /// references it (see [`RegistrySlot`]).
-    process_registry: Vec<RegistrySlot>,
-    /// Ids whose registry slot is `Killed` (deleted processes), as
-    /// `killed_buffer_ids`.
-    deleted_process_ids: Vec<crate::emacs_core::process::ProcessId>,
+    process_registry: process_registry::ProcessRegistry,
 
     /// Cumulative GC statistics.
     gc_collections: usize,
@@ -839,9 +824,6 @@ pub struct TaggedHeap {
     /// Receives when the GC thread has exited its mark loop (so the mutator's
     /// termination can safely take over the gray queue). Set at start.
     gc_exited: Option<std::sync::mpsc::Receiver<ConcurrentMarkResult>>,
-    /// This heap's own GC thread (`GcWorker`): shared with no other heap, so
-    /// no heap's mark or drop waits behind another heap's mark.
-    gc_worker: GcWorker,
     /// Stage 1b CONCURRENT OBARRAY SCAN: a start-captured obarray chunk snapshot
     /// staged by the start handshake (`start_concurrent_mark`) just before
     /// `launch_concurrent_mark`, which moves it into the `ConcurrentMarkJob`. The
@@ -1042,8 +1024,6 @@ impl TaggedHeap {
             doomed_finalizer_functions: Vec::new(),
             pending_surface_destroys: Vec::new(),
             pending_video_destroys: Vec::new(),
-            pending_buffer_reclaims: Vec::new(),
-            pending_process_reclaims: Vec::new(),
             cons_free_list: std::ptr::null_mut(),
             float_arena: ObjectArena::new(chunk_map.clone()),
             string_arena: ObjectArena::new(chunk_map.clone()),
@@ -1065,12 +1045,10 @@ impl TaggedHeap {
             cons_live_count: 0,
             marker_chain_head_slots: Vec::new(),
             buffer_registry: Vec::new(),
-            killed_buffer_ids: Vec::new(),
             window_registry: FxHashMap::default(),
             frame_registry: FxHashMap::default(),
             timer_registry: FxHashMap::default(),
-            process_registry: Vec::new(),
-            deleted_process_ids: Vec::new(),
+            process_registry: process_registry::ProcessRegistry::default(),
             write_tracking_mode: WriteTrackingMode::Disabled,
             dirty_owners: Vec::new(),
             first_cycle_concurrent: false,
@@ -1117,7 +1095,6 @@ impl TaggedHeap {
             gc_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gc_wake: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
             gc_exited: None,
-            gc_worker: GcWorker::default(),
             pending_obarray_scan: None,
             concurrent_obarray_start_slots: None,
             retired_vector_buffers: Vec::new(),
@@ -1465,7 +1442,7 @@ impl TaggedHeap {
             RegistrySlot::Live(value)
         };
         if killed {
-            self.killed_buffer_ids.push(id);
+            self.process_registry.cold.killed_buffer_ids.push(id);
         }
     }
 
@@ -1485,9 +1462,9 @@ impl TaggedHeap {
                 RegistrySlot::Vacant | RegistrySlot::Reclaimed => RegistrySlot::Reclaimed,
             };
             if matches!(*slot, RegistrySlot::Killed(_)) {
-                self.killed_buffer_ids.push(id);
+                self.process_registry.cold.killed_buffer_ids.push(id);
             } else {
-                self.pending_buffer_reclaims.push(id);
+                self.process_registry.cold.pending_buffer_reclaims.push(id);
             }
         }
     }
@@ -1514,7 +1491,7 @@ impl TaggedHeap {
     /// the killed record after the cycle (GNU frees the dead `struct buffer`
     /// in the same sweep). Reads marks, which are intact until the sweep.
     pub(super) fn prune_unmarked_killed_buffers(&mut self) {
-        let mut ids = std::mem::take(&mut self.killed_buffer_ids);
+        let mut ids = std::mem::take(&mut self.process_registry.cold.killed_buffer_ids);
         ids.retain(|&id| {
             let idx = id.0 as usize;
             let RegistrySlot::Killed(value) = self.buffer_registry[idx] else {
@@ -1524,12 +1501,12 @@ impl TaggedHeap {
                 return true;
             }
             self.buffer_registry[idx] = RegistrySlot::Reclaimed;
-            self.pending_buffer_reclaims.push(id);
+            self.process_registry.cold.pending_buffer_reclaims.push(id);
             false
         });
         ids.sort_unstable_by_key(|id| id.0);
         ids.dedup();
-        self.killed_buffer_ids = ids;
+        self.process_registry.cold.killed_buffer_ids = ids;
     }
 
     pub fn window_value(&self, id: u64) -> Option<TaggedValue> {

@@ -1564,13 +1564,18 @@ impl TaggedHeap {
                     .values()
                     .map(|value| (*value, "timer-registry")),
             )
-            .chain(self.process_registry.iter().filter_map(|slot| match slot {
-                // Only live processes are roots (GNU marks them from
-                // `Vprocess_alist`); a deleted one lives only through
-                // references.
-                RegistrySlot::Live(value) => Some((*value, "process-registry")),
-                _ => None,
-            }))
+            .chain(
+                self.process_registry
+                    .slots
+                    .iter()
+                    .filter_map(|slot| match slot {
+                        // Only live processes are roots (GNU marks them from
+                        // `Vprocess_alist`); a deleted one lives only through
+                        // references.
+                        RegistrySlot::Live(value) => Some((*value, "process-registry")),
+                        _ => None,
+                    }),
+            )
             .chain(
                 self.canonical_empty_strings
                     .values()
@@ -2035,7 +2040,9 @@ impl TaggedHeap {
     pub(super) fn mark_all_on_gc_thread(&mut self) {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let ptr = self as *mut TaggedHeap;
-        self.gc_worker
+        self.process_registry
+            .cold
+            .gc_worker
             .send(GcRequest::MarkAll(HeapPtr(ptr), done_tx));
         // Block until the GC thread has finished marking on the shared heap.
         done_rx.recv().expect("neovm-gc thread did not respond");
