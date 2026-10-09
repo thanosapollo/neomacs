@@ -539,33 +539,44 @@ type ReaderTokenBytes = SmallVec<[u8; 64]>;
 /// keeps its own stack, as data read from `#N=` may nest as deep as `read0`
 /// allows, and visits each object once, so cycles made by `#N#` end it.
 fn substitute_read_placeholder(object: Value, placeholder: Value) {
+    enum Work {
+        Visit(Value),
+        WriteStringProperties(Value, Vec<StringTextPropertyRun>),
+    }
+
     let mut seen = std::collections::HashSet::new();
-    let mut pending = vec![object];
-    let substitute = |item: Value, pending: &mut Vec<Value>| {
+    let mut pending = vec![Work::Visit(object)];
+    let substitute = |item: Value, pending: &mut Vec<Work>| {
         if eq_value(&item, &placeholder) {
             return Some(object);
         }
         if !(item.is_symbol() || item.is_number()) {
-            pending.push(item);
+            pending.push(Work::Visit(item));
         }
         None
     };
-    while let Some(subtree) = pending.pop() {
+    while let Some(work) = pending.pop() {
+        let subtree = match work {
+            Work::Visit(subtree) => subtree,
+            Work::WriteStringProperties(string, runs) => {
+                set_string_text_properties_for_value(string, runs);
+                continue;
+            }
+        };
         if subtree.is_symbol() || subtree.is_number() || !seen.insert(subtree.bits()) {
             continue;
         }
         if subtree.is_string() {
             if let Some(mut runs) = get_string_text_properties_for_value(subtree) {
-                let mut changed = false;
+                let mark = pending.len();
                 for run in &mut runs {
                     if let Some(replacement) = substitute(run.plist, &mut pending) {
                         run.plist = replacement;
-                        changed = true;
                     }
                 }
-                if changed {
-                    set_string_text_properties_for_value(subtree, runs);
-                }
+                // These plists are snapshots, not the string's live table.
+                // Write them back only after their queued descendants finish.
+                pending.insert(mark, Work::WriteStringProperties(subtree, runs));
             }
         } else if subtree.is_cons() {
             if let Some(car) = substitute(subtree.cons_car(), &mut pending) {
