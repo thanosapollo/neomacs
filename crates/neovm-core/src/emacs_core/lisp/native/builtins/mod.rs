@@ -632,6 +632,13 @@ pub(crate) fn dispatch_builtin_without_eval_state(
         static CTX: std::cell::RefCell<Context> = std::cell::RefCell::new(Context::new());
     }
 
+    // This explicitly no-eval fixture API must keep pure DOWN semantics.
+    // The registered subr uses real prepared properties; a bare Context has
+    // no Unicode support and is not a GNU runtime/property authority.
+    if name == "downcase" {
+        return Some(builtin_downcase(args));
+    }
+
     CTX.with(|cell| {
         let ctx = &mut *cell.borrow_mut();
         let sym_id = intern(name);

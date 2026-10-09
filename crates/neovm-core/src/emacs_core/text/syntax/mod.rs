@@ -1442,6 +1442,8 @@ fn forward_word_with_options(
             let abs_char = offset_char_pos(accessible_chars.start(), idx);
             return (buffer_char_to_emacs_byte_pos(buf, abs_char), false);
         }
+        // Scanner script/category boundaries select the endpoint; casing still
+        // uses syntax-only state across the entire selected span.
         // Skip word characters
         let mut adjacent = None;
         while idx < accessible_len {
@@ -6147,8 +6149,8 @@ pub(crate) fn builtin_forward_word(
         buf.point_emacs_byte_pos()
     };
     // When `find-word-boundary-function-table` is active (subword/superword),
-    // GNU's scan_words consults it per word; otherwise the plain syntax scan is
-    // used unchanged.
+    // GNU's scan_words consults it per word; otherwise syntax plus
+    // script/category boundaries select the endpoint.
     let wbtable = eval.visible_variable_value_or_nil("find-word-boundary-function-table");
     let (raw_byte, completed) = if word_boundary_table_active(&wbtable) {
         word_motion_with_table(eval, count, honor, wbtable)

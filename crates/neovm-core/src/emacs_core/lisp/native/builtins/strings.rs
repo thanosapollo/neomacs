@@ -868,7 +868,7 @@ fn upcase_with_override(
                 .then(|| get_string_text_properties_table_for_value(source))
                 .flatten();
             let result =
-                Value::heap_string(transform_string_case(string, true, |_| false, &casetab));
+                Value::heap_string(transform_string_case(string, true, |_| false, &casetab, None));
             if let Some(table) = source_props {
                 set_string_text_properties_table_for_value(result, table);
             }
@@ -957,6 +957,7 @@ fn transform_string_case(
     upcase: bool,
     is_word: impl Fn(u32) -> bool,
     casetab: &super::super::casetab::CaseTableOverride,
+    special_lowercase: Option<Value>,
 ) -> crate::heap_types::LispString {
     use super::super::casetab::CaseMap;
     if !s.is_multibyte() {
@@ -968,12 +969,12 @@ fn transform_string_case(
             crate::emacs_core::casefiddle::CaseTarget::String,
         );
     }
-    // Greek capital sigma down-cases to the final form ς at the end of a word
-    // (GNU `casefiddle.c` `case_character`): when the preceding character is a
-    // word constituent and the following one is not.
-    const GREEK_CAPITAL_SIGMA: u32 = 0x03A3;
-    const GREEK_SMALL_SIGMA: u32 = 0x03C3;
-    const GREEK_SMALL_FINAL_SIGMA: u32 = 0x03C2;
+    if !upcase {
+        return crate::emacs_core::casefiddle::downcase_lisp_string_emacs_compat(
+            s, is_word, |_| false, casetab,
+            crate::emacs_core::casefiddle::CaseTarget::String, special_lowercase,
+        );
+    }
 
     let bytes = s.as_bytes();
     let multibyte = s.is_multibyte();
@@ -988,7 +989,6 @@ fn transform_string_case(
         }
     };
     let mut pos = 0;
-    let mut prev_word = false;
     while pos < bytes.len() {
         let (code, len) = if multibyte {
             crate::emacs_core::emacs_char::string_char(&bytes[pos..])
@@ -998,26 +998,18 @@ fn transform_string_case(
         pos += len;
         // GNU `case_character_impl` checks special-uppercase before the
         // one-to-one Up table. Character and unibyte conversion do not expand.
-        if upcase {
-            if let Some(expansion) = crate::emacs_core::casefiddle::special_upcase_expansion(code) {
-                for upper in expansion {
-                    push(&mut out, upper as u32);
-                }
-                continue;
+        if let Some(expansion) = crate::emacs_core::casefiddle::special_upcase_expansion(code) {
+            for upper in expansion {
+                push(&mut out, upper as u32);
             }
+            continue;
         }
-        // Keep the ordinary custom up/down mappings unchanged. Lowercase
-        // special-casing precedence is a separate Tracker #68 item.
-        if casetab.is_custom() {
-            let which = if upcase { CaseMap::Up } else { CaseMap::Down };
-            if let Some(mapped) = casetab.map(which, code as i64) {
-                push(&mut out, mapped as u32);
-                prev_word = is_word(code);
-                continue;
-            }
+        if let Some(mapped) = casetab.map(CaseMap::Up, code as i64) {
+            push(&mut out, mapped as u32);
+            continue;
         }
         match char::from_u32(code).filter(|_| multibyte || code < 0x80) {
-            Some(ch) if upcase => {
+            Some(ch) => {
                 if ch == '\u{0131}' || preserve_emacs_upcase_string_payload(code as i64) {
                     push(&mut out, code);
                 } else {
@@ -1026,38 +1018,8 @@ fn transform_string_case(
                     }
                 }
             }
-            Some(_) if code == GREEK_CAPITAL_SIGMA => {
-                let next_word = if pos < bytes.len() {
-                    let (next_code, _) = if multibyte {
-                        crate::emacs_core::emacs_char::string_char(&bytes[pos..])
-                    } else {
-                        (bytes[pos] as u32, 1)
-                    };
-                    is_word(next_code)
-                } else {
-                    false
-                };
-                push(
-                    &mut out,
-                    if prev_word && !next_word {
-                        GREEK_SMALL_FINAL_SIGMA
-                    } else {
-                        GREEK_SMALL_SIGMA
-                    },
-                );
-            }
-            Some(ch) => {
-                if ch == '\u{212A}' || preserve_emacs_downcase_string_payload(code as i64) {
-                    push(&mut out, code);
-                } else {
-                    for low in ch.to_lowercase() {
-                        push(&mut out, low as u32);
-                    }
-                }
-            }
             None => push(&mut out, code),
         }
-        prev_word = is_word(code);
     }
     if multibyte {
         crate::heap_types::LispString::from_emacs_bytes(out)
@@ -1167,6 +1129,7 @@ fn downcase_with_word_pred(
     args: &[Value],
     is_word: impl Fn(u32) -> bool,
     casetab: super::super::casetab::CaseTableOverride,
+    special_lowercase: Option<Value>,
 ) -> EvalResult {
     expect_args("downcase", args, 1)?;
     match args[0].kind() {
@@ -1177,7 +1140,7 @@ fn downcase_with_word_pred(
                 .then(|| get_string_text_properties_table_for_value(source))
                 .flatten();
             let result =
-                Value::heap_string(transform_string_case(string, false, is_word, &casetab));
+                Value::heap_string(transform_string_case(string, false, is_word, &casetab, special_lowercase));
             if let Some(table) = source_props {
                 set_string_text_properties_table_for_value(result, table);
             }
@@ -1214,6 +1177,7 @@ pub(crate) fn builtin_downcase(args: Vec<Value>) -> EvalResult {
         &args,
         |_| false,
         super::super::casetab::CaseTableOverride::none(),
+        None,
     )
 }
 
@@ -1235,10 +1199,13 @@ pub(crate) fn builtin_downcase_in_state_1(
     eval: &mut crate::emacs_core::eval::Context,
     obj: Value,
 ) -> EvalResult {
-    let args: [Value; 1] = [obj];
-    let is_word = casing_word_predicate(eval);
-    let casetab = super::super::casetab::CaseTableOverride::for_current_buffer(eval)?;
-    downcase_with_word_pred(&args, is_word, casetab)
+    eval.with_specpdl_roots(&[obj], |eval| {
+        crate::emacs_core::casefiddle::with_text_downcase_table(eval, false, |eval, lower| {
+            let is_word = casing_word_predicate(eval);
+            let casetab = super::super::casetab::CaseTableOverride::for_current_buffer(eval)?;
+            downcase_with_word_pred(&[obj], is_word, casetab, Some(lower))
+        })
+    })
 }
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up

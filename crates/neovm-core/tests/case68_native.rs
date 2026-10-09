@@ -33,6 +33,17 @@ mod test_utils {
         static FIXTURE_HEAP: RefCell<Option<Box<TaggedHeap>>> = const { RefCell::new(None) };
     }
 
+    /// Bind the lazy Unicode fixture to the running test's workspace root,
+    /// including nextest archive remaps, and escape its quoted Lisp token.
+    pub fn r022_eval_with_support(src: &str) -> String {
+        let directory = neovm_core::test_utils::workspace_root()
+            .join("crates/neovm-core/src/emacs_core/text/casefiddle/tests/r019_unicode_support");
+        let directory = directory.to_str().expect("Unicode fixture path is UTF-8")
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        runtime_startup_eval_one(&src.replace("__CASE68_SUPPORT_DIRECTORY__", &directory))
+    }
+
     pub fn init_test_tracing() {
         neovm_core::test_utils::init_test_tracing();
         if !tagged_heap_is_installed() {
@@ -53,7 +64,7 @@ mod casefiddle {
     use neovm_core::Value;
 
     mod tests {
-        include!("../src/emacs_core/text/casefiddle/tests/mod.rs");
+        include!("../src/emacs_core/text/casefiddle/tests/casefiddle_test.rs");
     }
 }
 
@@ -85,5 +96,20 @@ mod regex;
 mod strings;
 #[path = "case68_native/native_strings.rs"]
 mod native_strings;
+
+#[path = "case68_native/r022_text_downcase.rs"]
+mod r022_text_downcase;
+
+#[path = "case68_native/r022_review_musts.rs"]
+mod r022_review_musts;
+
+#[path = "case68_native/r022_callback_text.rs"]
+mod r022_callback_text;
+
+#[path = "case68_native/r022_callback_buffer.rs"]
+mod r022_callback_buffer;
+
+#[path = "case68_native/r022_raw_identity.rs"]
+mod r022_raw_identity;
 
 pub use neovm_core::case68_test_support::dispatch_builtin_without_eval_state;
