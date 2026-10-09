@@ -528,10 +528,10 @@ pub(crate) enum CaseMap {
 /// override resolves a single character against that table, returning:
 ///
 /// * `Some(mapped)` — the table has a valid character entry for `code`, or a
-///   custom downcase lookup resolves to nil and returns `code` unchanged
-///   (GNU `buffer.h` `downcase`). Default and parent entries are resolved first.
+///   custom downcase/upcase lookup resolves to nil and returns `code` unchanged
+///   (GNU `buffer.h` `downcase`/`upcase`). Default and parent entries resolve first.
 /// * `None` — use the hardwired Unicode path: no custom table is installed,
-///   or a lookup has no valid entry (except nil in a custom downcase table).
+///   or a lookup has no valid entry (except nil in custom downcase/upcase tables).
 ///
 /// When the installed table is the standard object (by identity), the whole
 /// override is skipped so the hot path stays allocation-free.
@@ -627,7 +627,7 @@ impl CaseTableOverride {
     }
 
     /// GNU `LOWERCASEP(c)`: not uppercase, and upcasing through the case table
-    /// changes the char. Falls back to Unicode when the table has no entry.
+    /// changes the char. A resolved nil custom Up entry leaves it unchanged.
     pub(crate) fn is_lower(&self, ch: char) -> bool {
         if self.is_upper(ch) {
             return false;
@@ -639,7 +639,7 @@ impl CaseTableOverride {
     }
 
     /// Look up `code` after resolving char-table default and parent entries.
-    /// A nil custom downcase entry is identity, as in GNU `buffer.h` downcase.
+    /// A nil custom Down/Up entry is identity, as in GNU `buffer.h` downcase/upcase.
     /// Other unmapped results and the standard path still return `None` to
     /// select the hardwired Unicode path.
     pub(crate) fn map(&self, which: CaseMap, code: i64) -> Option<i64> {
@@ -661,7 +661,7 @@ impl CaseTableOverride {
                 {
                     Some(n)
                 }
-                ValueKind::Nil if which == CaseMap::Down => Some(code),
+                ValueKind::Nil if matches!(which, CaseMap::Down | CaseMap::Up) => Some(code),
                 _ => None,
             },
             Err(_) => None,

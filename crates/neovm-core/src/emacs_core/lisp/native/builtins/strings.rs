@@ -1007,11 +1007,18 @@ fn transform_string_case(
             (bytes[pos] as u32, 1)
         };
         pos += len;
-        // GNU `case_character_impl` resolves each character through the
-        // per-buffer up/down case table (`buffer.h` `downcase`/`upcase`) before
-        // the Unicode special-casing. When a custom table is installed and has
-        // an explicit entry for this character, use it and skip the hardwired
-        // path; otherwise fall through unchanged (byte-identical default).
+        // GNU `case_character_impl` checks special-uppercase before the
+        // one-to-one Up table. Character and unibyte conversion do not expand.
+        if upcase {
+            if let Some(expansion) = crate::emacs_core::casefiddle::special_upcase_expansion(code) {
+                for upper in expansion {
+                    push(&mut out, upper as u32);
+                }
+                continue;
+            }
+        }
+        // Keep the ordinary custom up/down mappings unchanged. Lowercase
+        // special-casing precedence is a separate Tracker #68 item.
         if casetab.is_custom() {
             let which = if upcase { CaseMap::Up } else { CaseMap::Down };
             if let Some(mapped) = casetab.map(which, code as i64) {

@@ -60,6 +60,18 @@ mod casefiddle {
 #[path = "../src/emacs_core/text/casefiddle/tests/r014_unibyte.rs"]
 mod r014_unibyte_tests;
 
+#[path = "../src/emacs_core/text/casefiddle/tests/r017_special_up.rs"]
+mod r017_special_up_tests;
+
+#[path = "../src/emacs_core/text/casefiddle/tests/r018_nil_up.rs"]
+mod r018_nil_up_tests;
+
+#[path = "../src/emacs_core/text/casefiddle/tests/r019_lazy_unicode.rs"]
+mod r019_lazy_unicode_tests;
+
+#[path = "../src/emacs_core/text/casefiddle/tests/r020_after_load_flow.rs"]
+mod r020_after_load_flow_tests;
+
 #[path = "case68_native/casetab.rs"]
 mod casetab;
 #[path = "case68_native/search.rs"]

@@ -1856,6 +1856,60 @@ fn char_code_property_cell(eval: &Context, prop: Value) -> Result<Value, Flow> {
     assq_cell_eq(prop, alist)
 }
 
+/// GNU `chartab.c:uniprop_table`: resolve a C-usable Unicode property table.
+/// Unlike the public primitive, unavailable support and unusable tables are nil.
+/// Genuine loading/evaluation errors still propagate. The original alist cell
+/// must survive loading, even if Lisp replaces `char-code-property-alist`.
+pub(crate) fn uniprop_table_in_state(eval: &mut Context, prop: Value) -> EvalResult {
+    let cell = char_code_property_cell(eval, prop)?;
+    if cell.is_nil() {
+        return Ok(Value::NIL);
+    }
+    let table = cell.cons_cdr();
+    let table = if table.is_string() {
+        let file_name = table
+            .as_lisp_string()
+            .map(|ls| crate::emacs_core::emacs_char::to_utf8_lossy(ls.as_bytes()))
+            .expect("string");
+        let load_name = Value::string(format!("international/{file_name}"));
+        eval.with_specpdl_roots(&[cell, load_name], |eval| {
+            let loaded = crate::emacs_core::autoload::with_implicit_load_state(eval, |eval| {
+                let count = eval.specpdl.len();
+                eval.try_specbind_or_unwind_to(
+                    count,
+                    intern("coding-system-for-read"),
+                    Value::symbol("utf-8-emacs-unix"),
+                )?;
+                let result = crate::emacs_core::load::builtin_load_in_vm_runtime(
+                    eval,
+                    &[load_name, Value::T, Value::T, Value::T, Value::T],
+                );
+                eval.unbind_to_with_result(count, result)
+            })?;
+            if loaded.is_nil() {
+                Ok(Value::NIL)
+            } else {
+                Ok(cell.cons_cdr())
+            }
+        })?
+    } else {
+        table
+    };
+    if !is_char_code_property_table(&table) {
+        return Ok(Value::NIL);
+    }
+    // GNU has one C decoder (index 0). A Lisp decoder, or any other index,
+    // makes the table unusable for casing, not a public-API type error.
+    if !matches!(
+        char_table_extra_slot_value(&table, 1).map(|v| v.kind()),
+        Some(ValueKind::Nil | ValueKind::Fixnum(0))
+    ) {
+        return Ok(Value::NIL);
+    }
+    prepare_uniprop_ascii_cache(&table);
+    Ok(table)
+}
+
 /// `(unicode-property-table-internal PROP)`.
 ///
 /// GNU's `chartab.c:uniprop_table` lazily loads `international/<file>` when
