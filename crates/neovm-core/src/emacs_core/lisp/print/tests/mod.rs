@@ -1168,6 +1168,176 @@ fn hash_table_printer_omits_default_eql_test_like_gnu() {
 // whole lexical environment, trailing `t' included, as in a bare Context.
 // ---------------------------------------------------------------------------
 
+// Public `princ` must publish its initially nil continuous history before
+// rendering. These primitive-only forms need no bootstrap Lisp; GC runs
+// between prints and assertions inspect returned fields, not a formatter.
+fn assert_princ_history_fields(src: &str, strings: &[&str], fields: &[Value]) {
+    let mut ctx = crate::emacs_core::Context::new();
+    ctx.set_lexical_binding(true);
+    let mut result = ctx.eval_str(src).expect("primitive princ history fixture");
+    for (index, expected) in strings.iter().enumerate() {
+        assert!(result.is_cons(), "missing string field {index}");
+        assert_eq!(
+            result.cons_car().as_utf8_str(),
+            Some(*expected),
+            "string field {index}"
+        );
+        result = result.cons_cdr();
+    }
+    for (index, expected) in fields.iter().enumerate() {
+        assert!(result.is_cons(), "missing field {index}");
+        assert_eq!(result.cons_car(), *expected, "field {index}");
+        result = result.cons_cdr();
+    }
+    assert!(result.is_nil(), "unexpected trailing fields");
+}
+
+fn check_princ_continuous_history(buffer: bool, supplied: bool, continuous: bool) {
+    let src = r#"(progn
+  (let ((print-continuous-numbering nil)) (prin1-to-string nil))
+  (let* ((print-circle t) (print-continuous-numbering CONTINUOUS)
+         (caller TABLE) (print-number-table caller)
+         (x (list 1)) (pair (list x x)) (s "")
+         (sink SINK) first first-return second-return)
+    (setq first-return (eq pair (princ pair sink)))
+    (setq first SNAPSHOT s "")
+    CLEAR
+    (garbage-collect)
+    (setq second-return (eq pair (princ pair sink)))
+    (list first SNAPSHOT first-return second-return
+          (or (not caller) (eq caller print-number-table))
+          (and print-continuous-numbering (hash-table-p print-number-table))
+          (and print-continuous-numbering (hash-table-count print-number-table)))))"#
+        .replace("CONTINUOUS", if continuous { "t" } else { "nil" })
+        .replace("TABLE", if supplied { "(make-hash-table :test 'eq)" } else { "nil" })
+        .replace("SINK", if buffer { "(progn (set-buffer (get-buffer-create \" princ-history\")) (erase-buffer) (current-buffer))" }
+                 else { "(lambda (ch) (setq s (concat s (string ch))))" })
+        .replace("SNAPSHOT", if buffer { "(progn (set-buffer sink) (buffer-string))" } else { "s" })
+        .replace("CLEAR", if buffer { "(erase-buffer)" } else { "nil" });
+    assert_princ_history_fields(
+        &src,
+        &[
+            "(#1=(1) #1#)",
+            if continuous {
+                "(#1# #1#)"
+            } else {
+                "(#1=(1) #1#)"
+            },
+        ],
+        &[
+            Value::T,
+            Value::T,
+            Value::T,
+            if continuous { Value::T } else { Value::NIL },
+            if continuous {
+                Value::fixnum(1)
+            } else {
+                Value::NIL
+            },
+        ],
+    );
+}
+
+#[test]
+fn princ_continuous_history_callable_nil_across_gc() {
+    check_princ_continuous_history(false, false, true);
+}
+
+#[test]
+fn princ_continuous_history_callable_supplied_across_gc() {
+    check_princ_continuous_history(false, true, true);
+}
+
+#[test]
+fn princ_continuous_history_callable_disabled_across_gc() {
+    check_princ_continuous_history(false, false, false);
+}
+
+#[test]
+fn princ_continuous_history_buffer_nil_across_gc() {
+    check_princ_continuous_history(true, false, true);
+}
+
+#[test]
+fn princ_continuous_history_buffer_supplied_across_gc() {
+    check_princ_continuous_history(true, true, true);
+}
+
+#[test]
+fn princ_continuous_history_buffer_disabled_across_gc() {
+    check_princ_continuous_history(true, false, false);
+}
+
+#[test]
+fn princ_continuous_history_scope_reset() {
+    assert_princ_history_fields(
+        r#"(let* ((print-circle t) (print-continuous-numbering t)
+       (caller (make-hash-table :test 'eq)) (print-number-table caller)
+       (x (list 1)) (pair (list x x)) (s "")
+       (sink (lambda (ch) (setq s (concat s (string ch))))) first second)
+  (let ((print-number-table nil)) (princ pair sink) (setq first s))
+  (setq s "")
+  (garbage-collect)
+  (let ((print-number-table nil)) (princ pair sink) (setq second s))
+  (list first second (eq caller print-number-table) (hash-table-count caller)))"#,
+        &["(#1=(1) #1#)", "(#1=(1) #1#)"],
+        &[Value::T, Value::fixnum(0)],
+    );
+}
+
+#[test]
+fn princ_continuous_history_nonlocal_recovery() {
+    assert_princ_history_fields(
+        r#"(let* ((print-circle t) (print-continuous-numbering t)
+       (print-number-table nil) (x (list 1)) (pair (list x x)) (s "")
+       (sink (lambda (ch) (setq s (concat s (string ch))))) table stopped returned)
+  (princ pair sink)
+  (setq table print-number-table s "")
+  (setq stopped (catch 'abort (princ pair (lambda (ch) (throw 'abort 'stopped)))))
+  (garbage-collect)
+  (setq returned (eq pair (princ pair sink)))
+  (list s (eq stopped 'stopped) returned (eq table print-number-table)
+        (hash-table-count print-number-table)))"#,
+        &["(#1# #1#)"],
+        &[Value::T, Value::T, Value::T, Value::fixnum(1)],
+    );
+}
+
+#[test]
+fn princ_continuous_history_direct_impl_initializes_nil_table() {
+    use crate::emacs_core::builtins::misc_eval::builtin_princ_impl;
+    let mut ctx = crate::emacs_core::Context::new();
+    let pair = ctx
+        .eval_str(
+            r#"(progn
+        (setq print-circle t print-continuous-numbering t print-number-table nil)
+        (set-buffer (get-buffer-create " princ-history-direct"))
+        (setq princ-history-pair (let ((x (list 1))) (list x x))))"#,
+        )
+        .unwrap();
+    assert_eq!(builtin_princ_impl(&mut ctx, vec![pair]).unwrap(), pair);
+    assert_eq!(
+        ctx.eval_str("(buffer-string)").unwrap(),
+        Value::string("(#1=(1) #1#)")
+    );
+    assert_eq!(
+        ctx.eval_str("(hash-table-p print-number-table)").unwrap(),
+        Value::T
+    );
+    assert_eq!(
+        ctx.eval_str("(hash-table-count print-number-table)")
+            .unwrap(),
+        Value::fixnum(1)
+    );
+    ctx.eval_str("(progn (erase-buffer) (garbage-collect))")
+        .unwrap();
+    assert_eq!(builtin_princ_impl(&mut ctx, vec![pair]).unwrap(), pair);
+    assert_eq!(
+        ctx.eval_str("(buffer-string)").unwrap(),
+        Value::string("(#1# #1#)")
+    );
+}
+
 fn princ_eval(src: &str) -> String {
     let mut ev = crate::emacs_core::Context::new();
     ev.set_lexical_binding(true);
