@@ -445,6 +445,23 @@ impl ReaderSourceSemantics {
     }
 }
 
+/// A list, vector or quotation `read_form` has begun and not yet finished:
+/// an entry of GNU `read0`'s `read_stack`.
+enum ReadFrame {
+    /// After `(`: the elements read so far, the scratch-root mark to restore
+    /// when the list is built, and, after ` . `, the tail.
+    List {
+        saved: usize,
+        items: Vec<Value>,
+        dotted: bool,
+        tail: Option<Value>,
+    },
+    /// After `[`: the elements read so far.
+    Vector { saved: usize, items: Vec<Value> },
+    /// After `'`, `#'`, `` ` ``, `,` or `,@`: the form is `(HEAD X)`.
+    Quoted { saved: usize, head: &'static str },
+}
+
 struct Reader<'a> {
     source: ReaderSource<'a>,
     source_semantics: ReaderSourceSemantics,
@@ -517,72 +534,87 @@ impl ReaderToken {
 
 type ReaderTokenBytes = SmallVec<[u8; 64]>;
 
+/// Replace PLACEHOLDER by OBJECT throughout OBJECT, in place: GNU
+/// `substitute_object_recurse` for `#N=` data that is not a cons.  The walk
+/// keeps its own stack, as data read from `#N=` may nest as deep as `read0`
+/// allows, and visits each object once, so cycles made by `#N#` end it.
 fn substitute_read_placeholder(object: Value, placeholder: Value) {
-    let mut seen = Vec::new();
-    let result = substitute_read_placeholder_recurse(object, placeholder, object, &mut seen);
-    debug_assert!(eq_value(&result, &object));
-}
-
-fn substitute_read_placeholder_recurse(
-    object: Value,
-    placeholder: Value,
-    subtree: Value,
-    seen: &mut Vec<Value>,
-) -> Value {
-    if eq_value(&subtree, &placeholder) {
-        return object;
+    enum Work {
+        Visit(Value),
+        WriteStringProperties(Value, Vec<StringTextPropertyRun>),
     }
 
-    if subtree.is_symbol() || subtree.is_number() {
-        return subtree;
-    }
-
-    if seen.iter().any(|seen| eq_value(seen, &subtree)) {
-        return subtree;
-    }
-    seen.push(subtree);
-
-    if subtree.is_string() {
-        if let Some(runs) = get_string_text_properties_for_value(subtree) {
-            let remapped = runs
-                .into_iter()
-                .map(|mut run| {
-                    run.plist =
-                        substitute_read_placeholder_recurse(object, placeholder, run.plist, seen);
-                    run
-                })
-                .collect();
-            set_string_text_properties_for_value(subtree, remapped);
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = vec![Work::Visit(object)];
+    let substitute = |item: Value, pending: &mut Vec<Work>| {
+        if eq_value(&item, &placeholder) {
+            return Some(object);
         }
-        return subtree;
-    }
-
-    if subtree.is_cons() {
-        let car =
-            substitute_read_placeholder_recurse(object, placeholder, subtree.cons_car(), seen);
-        let cdr =
-            substitute_read_placeholder_recurse(object, placeholder, subtree.cons_cdr(), seen);
-        subtree.set_car(car);
-        subtree.set_cdr(cdr);
-    } else if subtree.is_vector() {
-        if let Some(items) = subtree.as_vector_data() {
-            let mut items = items.clone();
-            for item in &mut items {
-                *item = substitute_read_placeholder_recurse(object, placeholder, *item, seen);
+        if !(item.is_symbol() || item.is_number()) {
+            pending.push(Work::Visit(item));
+        }
+        None
+    };
+    while let Some(work) = pending.pop() {
+        let subtree = match work {
+            Work::Visit(subtree) => subtree,
+            Work::WriteStringProperties(string, runs) => {
+                set_string_text_properties_for_value(string, runs);
+                continue;
             }
-            let _ = subtree.replace_vector_data(items);
+        };
+        if subtree.is_symbol() || subtree.is_number() || !seen.insert(subtree.bits()) {
+            continue;
         }
-    } else if subtree.is_record()
-        && let Some(items) = subtree.as_record_data()
-    {
-        let mut items = items.clone();
-        for item in &mut items {
-            *item = substitute_read_placeholder_recurse(object, placeholder, *item, seen);
+        if subtree.is_string() {
+            if let Some(mut runs) = get_string_text_properties_for_value(subtree) {
+                let mark = pending.len();
+                for run in &mut runs {
+                    if let Some(replacement) = substitute(run.plist, &mut pending) {
+                        run.plist = replacement;
+                    }
+                }
+                // These plists are snapshots, not the string's live table.
+                // Write them back only after their queued descendants finish.
+                pending.insert(mark, Work::WriteStringProperties(subtree, runs));
+            }
+        } else if subtree.is_cons() {
+            if let Some(car) = substitute(subtree.cons_car(), &mut pending) {
+                subtree.set_car(car);
+            }
+            if let Some(cdr) = substitute(subtree.cons_cdr(), &mut pending) {
+                subtree.set_cdr(cdr);
+            }
+        } else if subtree.is_vector() {
+            if let Some(items) = subtree.as_vector_data() {
+                let mut items = items.clone();
+                let mut changed = false;
+                for item in &mut items {
+                    if let Some(replacement) = substitute(*item, &mut pending) {
+                        *item = replacement;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let _ = subtree.replace_vector_data(items);
+                }
+            }
+        } else if subtree.is_record()
+            && let Some(items) = subtree.as_record_data()
+        {
+            let mut items = items.clone();
+            let mut changed = false;
+            for item in &mut items {
+                if let Some(replacement) = substitute(*item, &mut pending) {
+                    *item = replacement;
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = subtree.replace_record_data(items);
+            }
         }
-        let _ = subtree.replace_record_data(items);
     }
-
-    subtree
 }
 
 impl<'a> Reader<'a> {
@@ -758,7 +790,93 @@ impl<'a> Reader<'a> {
 
     // -- Main read dispatch --------------------------------------------------
 
+    /// Read one form.  Lists, vectors and quotations nest on an explicit
+    /// stack, like GNU `read0`'s `read_stack`, so deeply nested data cannot
+    /// exhaust the native stack.
     fn read_form(&mut self) -> Result<Value, ReadError> {
+        self.read_nested(Vec::new())
+    }
+
+    /// Finish reading the forms opened on STACK, or one form if it is empty.
+    fn read_nested(&mut self, mut stack: Vec<ReadFrame>) -> Result<Value, ReadError> {
+        let saved = match stack.first() {
+            Some(
+                ReadFrame::List { saved, .. }
+                | ReadFrame::Vector { saved, .. }
+                | ReadFrame::Quoted { saved, .. },
+            ) => *saved,
+            None => save_scratch_gc_roots(),
+        };
+        let result = self.read_nested_1(&mut stack);
+        if result.is_err() {
+            restore_scratch_gc_roots(saved);
+        }
+        result
+    }
+
+    fn read_nested_1(&mut self, stack: &mut Vec<ReadFrame>) -> Result<Value, ReadError> {
+        let mut completed = if stack.is_empty() {
+            None
+        } else {
+            self.close_or_continue(stack)?
+        };
+        loop {
+            let mut value = match completed.take() {
+                Some(value) => value,
+                None => match self.read_form_start(stack)? {
+                    Some(value) => value,
+                    None if matches!(stack.last(), Some(ReadFrame::Quoted { .. })) => continue,
+                    None => match self.close_or_continue(stack)? {
+                        Some(value) => value,
+                        None => continue,
+                    },
+                },
+            };
+            // Hand VALUE to the frames it completes.
+            loop {
+                match stack.last_mut() {
+                    None => return Ok(value),
+                    Some(ReadFrame::Quoted { saved, head }) => {
+                        let (saved, head) = (*saved, *head);
+                        stack.pop();
+                        push_scratch_gc_root(value);
+                        let result = Value::list(vec![Value::symbol(intern(head)), value]);
+                        restore_scratch_gc_roots(saved);
+                        value = result;
+                    }
+                    Some(ReadFrame::List {
+                        items,
+                        dotted,
+                        tail,
+                        ..
+                    }) => {
+                        push_scratch_gc_root(value);
+                        if *dotted {
+                            *tail = Some(value);
+                        } else {
+                            items.push(value);
+                        }
+                        match self.close_or_continue(stack)? {
+                            Some(list) => value = list,
+                            None => break,
+                        }
+                    }
+                    Some(ReadFrame::Vector { items, .. }) => {
+                        push_scratch_gc_root(value);
+                        items.push(value);
+                        match self.close_or_continue(stack)? {
+                            Some(vector) => value = vector,
+                            None => break,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Begin the next form: return it when it is complete in itself, else
+    /// push the list, vector or quotation it opens onto STACK.
+    fn read_form_start(&mut self, stack: &mut Vec<ReadFrame>) -> Result<Option<Value>, ReadError> {
         self.skip_ws_and_comments();
         // Record the byte position before reading — used by locate_syms
         // to tag symbols with their source offset (mirrors GNU read0).
@@ -767,53 +885,66 @@ impl<'a> Reader<'a> {
             return Err(self.end_of_file_error());
         };
 
+        let quoted = |head| ReadFrame::Quoted {
+            saved: save_scratch_gc_roots(),
+            head,
+        };
         let value = match ch {
-            x if x == b'(' as u32 => self.read_list_or_dotted(),
+            x if x == b'(' as u32 => {
+                self.bump();
+                stack.push(ReadFrame::List {
+                    saved: save_scratch_gc_roots(),
+                    items: Vec::new(),
+                    dotted: false,
+                    tail: None,
+                });
+                return Ok(None);
+            }
             x if x == b')' as u32 => {
                 self.bump();
-                Err(self.error(")"))
+                return Err(self.error(")"));
             }
-            x if x == b'[' as u32 => self.read_vector(),
+            x if x == b'[' as u32 => {
+                self.bump();
+                stack.push(ReadFrame::Vector {
+                    saved: save_scratch_gc_roots(),
+                    items: Vec::new(),
+                });
+                return Ok(None);
+            }
             x if x == b'\'' as u32 => {
                 self.bump();
-                let saved = save_scratch_gc_roots();
-                let quoted = self.read_form()?;
-                push_scratch_gc_root(quoted);
-                let result = Value::list(vec![Value::symbol("quote"), quoted]);
-                restore_scratch_gc_roots(saved);
-                Ok(result)
+                stack.push(quoted("quote"));
+                return Ok(None);
             }
             x if x == b'`' as u32 => {
                 self.bump();
-                let saved = save_scratch_gc_roots();
-                let quoted = self.read_form()?;
-                push_scratch_gc_root(quoted);
-                let result = Value::list(vec![Value::symbol(intern("`")), quoted]);
-                restore_scratch_gc_roots(saved);
-                Ok(result)
+                stack.push(quoted("`"));
+                return Ok(None);
             }
             x if x == b',' as u32 => {
                 self.bump();
                 if self.current_code() == Some(b'@' as u32) {
                     self.bump();
-                    let saved = save_scratch_gc_roots();
-                    let expr = self.read_form()?;
-                    push_scratch_gc_root(expr);
-                    let result = Value::list(vec![Value::symbol(intern(",@")), expr]);
-                    restore_scratch_gc_roots(saved);
-                    Ok(result)
+                    stack.push(quoted(",@"));
                 } else {
-                    let saved = save_scratch_gc_roots();
-                    let expr = self.read_form()?;
-                    push_scratch_gc_root(expr);
-                    let result = Value::list(vec![Value::symbol(intern(",")), expr]);
-                    restore_scratch_gc_roots(saved);
-                    Ok(result)
+                    stack.push(quoted(","));
                 }
+                return Ok(None);
+            }
+            x if x == b'#' as u32 && self.peek_code_at(1) == Some(b'\'' as u32) => {
+                // #'function
+                self.bump();
+                self.bump();
+                stack.push(quoted("function"));
+                return Ok(None);
             }
             x if x == b'"' as u32 => self.read_string(),
             x if x == b'?' as u32 => self.read_char_literal(),
-            x if x == b'#' as u32 => self.read_hash_syntax(),
+            // The other `#` syntaxes read what they contain recursively.
+            x if x == b'#' as u32 => {
+                stacker::maybe_grow(64 * 1024, 1024 * 1024, || self.read_hash_syntax())
+            }
             _ => self.read_atom(),
         }?;
 
@@ -821,11 +952,96 @@ impl<'a> Reader<'a> {
         // Matches GNU read0: SYMBOLP(val) && !NILP(val).
         if self.locate_syms && value.is_symbol() && !value.is_nil() {
             let pos_val = Value::fixnum(self.symbol_position(form_start) as i64);
-            Ok(crate::tagged::gc::with_tagged_heap(|heap| {
+            Ok(Some(crate::tagged::gc::with_tagged_heap(|heap| {
                 heap.alloc_symbol_with_pos(value, pos_val)
-            }))
+            })))
         } else {
-            Ok(value)
+            Ok(Some(value))
+        }
+    }
+
+    /// After the opening of the innermost list or vector, or one of its
+    /// elements: return the aggregate if it closes here, else None when an
+    /// element follows.
+    fn close_or_continue(
+        &mut self,
+        stack: &mut Vec<ReadFrame>,
+    ) -> Result<Option<Value>, ReadError> {
+        self.skip_ws_and_comments();
+        let current = self.current_code();
+        match stack.last_mut() {
+            Some(ReadFrame::List {
+                saved,
+                items,
+                dotted,
+                tail,
+            }) => {
+                let saved = *saved;
+                if let Some(cdr) = *tail {
+                    if current != Some(b')' as u32) {
+                        restore_scratch_gc_roots(saved);
+                        return Err(self.error("expected ')' after dotted pair"));
+                    }
+                    self.bump();
+                    // Build cons chain: (a b c . d)
+                    // items = [a, b, c], cdr = d
+                    let items = std::mem::take(items);
+                    stack.pop();
+                    let mut acc = cdr;
+                    for item in items.into_iter().rev() {
+                        acc = Value::cons(item, acc);
+                        push_scratch_gc_root(acc);
+                    }
+                    restore_scratch_gc_roots(saved);
+                    return Ok(Some(acc));
+                }
+                match current {
+                    Some(code) if code == b')' as u32 => {
+                        self.bump();
+                        let items = std::mem::take(items);
+                        stack.pop();
+                        let result = Value::list(items);
+                        restore_scratch_gc_roots(saved);
+                        Ok(Some(result))
+                    }
+                    Some(code) if code == b'.' as u32 && self.is_dot_separator() => {
+                        self.bump(); // consume '.'
+                        if items.is_empty() {
+                            restore_scratch_gc_roots(saved);
+                            return Err(self.error("."));
+                        }
+                        // Dotted pair: the tail is read next.
+                        *dotted = true;
+                        Ok(None)
+                    }
+                    Some(_) => Ok(None),
+                    None => {
+                        restore_scratch_gc_roots(saved);
+                        Err(self.end_of_file_error())
+                    }
+                }
+            }
+            Some(ReadFrame::Vector { saved, items }) => {
+                let saved = *saved;
+                match current {
+                    Some(code) if code == b']' as u32 => {
+                        self.bump();
+                        let items = std::mem::take(items);
+                        stack.pop();
+                        let result = Value::make_vector(items);
+                        restore_scratch_gc_roots(saved);
+                        Ok(Some(result))
+                    }
+                    Some(_) => Ok(None),
+                    None => {
+                        restore_scratch_gc_roots(saved);
+                        Err(self.end_of_file_error())
+                    }
+                }
+            }
+            Some(ReadFrame::Quoted { .. }) | None => {
+                unreachable!("only a list or vector waits for its closing delimiter")
+            }
         }
     }
 
@@ -885,58 +1101,12 @@ impl<'a> Reader<'a> {
 
     fn read_list_or_dotted(&mut self) -> Result<Value, ReadError> {
         self.expect('(')?;
-        let saved = save_scratch_gc_roots();
-        let mut items = Vec::new();
-        loop {
-            self.skip_ws_and_comments();
-            match self.current_code() {
-                Some(code) if code == b')' as u32 => {
-                    self.bump();
-                    let result = Value::list(items);
-                    restore_scratch_gc_roots(saved);
-                    return Ok(result);
-                }
-                Some(code) if code == b'.' as u32 && self.is_dot_separator() => {
-                    if items.is_empty() {
-                        self.bump();
-                        restore_scratch_gc_roots(saved);
-                        return Err(self.error("."));
-                    }
-                    // Dotted pair
-                    self.bump(); // consume '.'
-                    let cdr = self.read_form()?;
-                    push_scratch_gc_root(cdr);
-                    self.skip_ws_and_comments();
-                    match self.current_code() {
-                        Some(code) if code == b')' as u32 => {
-                            self.bump();
-                            // Build cons chain: (a b c . d)
-                            // items = [a, b, c], cdr = d
-                            let mut acc = cdr;
-                            for item in items.into_iter().rev() {
-                                acc = Value::cons(item, acc);
-                                push_scratch_gc_root(acc);
-                            }
-                            restore_scratch_gc_roots(saved);
-                            return Ok(acc);
-                        }
-                        _ => {
-                            restore_scratch_gc_roots(saved);
-                            return Err(self.error("expected ')' after dotted pair"));
-                        }
-                    }
-                }
-                Some(_) => {
-                    let item = self.read_form()?;
-                    push_scratch_gc_root(item);
-                    items.push(item);
-                }
-                None => {
-                    restore_scratch_gc_roots(saved);
-                    return Err(self.end_of_file_error());
-                }
-            }
-        }
+        self.read_nested(vec![ReadFrame::List {
+            saved: save_scratch_gc_roots(),
+            items: Vec::new(),
+            dotted: false,
+            tail: None,
+        }])
     }
 
     /// Check if current '.' is a dot separator (not part of a number like 1.5).
@@ -988,17 +1158,6 @@ impl<'a> Reader<'a> {
                 }
             }
         }
-    }
-
-    fn read_vector(&mut self) -> Result<Value, ReadError> {
-        let saved = save_scratch_gc_roots();
-        let items = self.read_vector_items()?;
-        for item in &items {
-            push_scratch_gc_root(*item);
-        }
-        let result = Value::make_vector(items);
-        restore_scratch_gc_roots(saved);
-        Ok(result)
     }
 
     // -- Strings "..." -------------------------------------------------------
