@@ -1931,6 +1931,10 @@ pub(crate) fn note_string_interval_preimage(
 mod concurrent_major_worker_tests;
 
 #[cfg(test)]
+#[path = "tests/chartable_concurrent_write_test.rs"]
+mod chartable_concurrent_write_tests;
+
+#[cfg(test)]
 #[path = "tests/concurrent_leaf_claim_tests.rs"]
 mod concurrent_leaf_claim_tests;
 
