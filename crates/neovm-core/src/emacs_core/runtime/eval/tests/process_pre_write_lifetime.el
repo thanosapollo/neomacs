@@ -52,9 +52,12 @@
             (catch 'dps-pre-write-exit
               (condition-case err
                   (with-temp-buffer
-                    (insert "x")
+                    ;; ASCII string sends can bypass the encoder (GNU
+                    ;; send_process); use multibyte input so both primitives
+                    ;; must run the pre-write hook before writing.
+                    (insert "λ")
                     (if (eq primitive 'process-send-string)
-                        (process-send-string "dps-pre-write" "x")
+                        (process-send-string "dps-pre-write" "λ")
                       (process-send-region "dps-pre-write" (point-min) (point-max)))
                     'sent)
                 (error err))))

@@ -434,13 +434,12 @@ fn pre_write_deletion_keeps_the_process(throwp: bool) {
             &mut ev,
             &format!("(dps-pre-write-lifetime-send '{primitive})"),
         );
-        // Preserve the existing send helper's missing-live-record diagnostic.
-        // This is a source-derived local assertion, not a measured GNU result;
-        // the shared oracle fixture compares the full diagnostic separately.
+        // GNU retains the deleted process across the conversion hook, then
+        // reports its closed output descriptor unless the hook unwinds first.
         let expected = if throwp {
             "OK (1 (t closed \"dps-pre-write\" t) 1 escaped)"
         } else {
-            "OK (1 (t closed \"dps-pre-write\" t) 1 (error \"Process not found\"))"
+            "OK (1 (t closed \"dps-pre-write\" t) 1 (error \"Output file descriptor of dps-pre-write is closed\"))"
         };
         assert_eq!(result, expected, "{primitive}, throw={throwp}");
 

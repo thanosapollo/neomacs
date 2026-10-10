@@ -4441,6 +4441,19 @@ impl super::super::eval::Context {
         input: &LispString,
     ) -> Result<(), Flow> {
         if !self.processes.queue_input(id, input)? {
+            // A pre-write conversion may delete the process. The caller
+            // still owns its rooted record, just as GNU send_process owns
+            // its Lisp process object; this is a closed descriptor, not an
+            // unresolved process designator.
+            if let Some(process) = self.processes.get_any(id) {
+                return Err(signal(
+                    "error",
+                    vec![Value::string(format!(
+                        "Output file descriptor of {} is closed",
+                        process_name_runtime(process.name)
+                    ))],
+                ));
+            }
             return Err(signal("error", vec![Value::string("Process not found")]));
         }
 
