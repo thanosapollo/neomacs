@@ -423,8 +423,8 @@ fn the_mask_comes_from_the_source_pixels_not_from_the_raster() {
     let raster = raster.expect("a completed source yields the raster");
     assert_eq!(
         raster.mask(),
-        ImageMaskKind::Clipping,
-        "the source's own alphas are clear or opaque"
+        ImageMaskKind::AlphaChannel,
+        "intrinsic PNG alpha is not a clipping bitmap, even when its samples are binary"
     );
     assert!(
         raster

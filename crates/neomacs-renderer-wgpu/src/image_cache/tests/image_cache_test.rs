@@ -250,6 +250,131 @@ fn animated_gif_bytes() -> Vec<u8> {
     bytes
 }
 
+fn semantic_request(data: Vec<u8>) -> SemanticImageRequest {
+    SemanticImageRequest {
+        source: SemanticImageSource::Data {
+            data: EncodedBytes::new(data),
+            resources: crate::svg::SvgResourceContext::Isolated,
+        },
+        size: Default::default(),
+        rotation: Default::default(),
+        realization: Default::default(),
+        colors: Default::default(),
+        mask: Default::default(),
+        animation: ImageAnimationPolicy::disabled(),
+        frame: Default::default(),
+        sequence: ImageSequenceId::new(1).unwrap(),
+        limit: neomacs_display_protocol::ImageSizeLimit::UNLIMITED,
+        identity: ImageLoadIdentity::unspecified(),
+    }
+}
+
+#[test]
+fn png_intrinsic_binary_alpha_is_not_a_clipping_bitmap() {
+    let decoder = SemanticImageDecoder::default();
+    for alphas in [[0, 0, 0, 0], [0, 255, 0, 255]] {
+        let rgba: Vec<u8> = alphas
+            .into_iter()
+            .flat_map(|alpha| [0x12, 0x34, 0x56, alpha])
+            .collect();
+        for policy in [ImageMaskPolicy::Preserve, ImageMaskPolicy::Suppress] {
+            let mut request = semantic_request(png_bytes(rgba.clone(), 2, 2));
+            request.mask = policy;
+            let decoded = decoder.decode_pixels(request).unwrap();
+            assert_eq!(decoded.metadata().mask, ImageMaskKind::AlphaChannel);
+            assert_eq!(decoded.metadata().background, 0x123456);
+            assert!(decoded.metadata().background_transparent);
+            assert_eq!(decoded.data.as_slice(), rgba.as_slice());
+        }
+    }
+}
+
+#[test]
+fn semantic_decoder_completes_masks_and_background_from_real_pixels() {
+    let decoder = SemanticImageDecoder::default();
+    for (alpha, mask, transparent) in [
+        (255, ImageMaskKind::None, false),
+        (0, ImageMaskKind::AlphaChannel, true),
+        (128, ImageMaskKind::AlphaChannel, false),
+    ] {
+        let bytes = png_bytes([0x12, 0x34, 0x56, alpha].repeat(4), 2, 2);
+        let result = decoder.decode(semantic_request(bytes)).unwrap();
+        assert_eq!(result.layout.dimensions(), (2, 2));
+        assert_eq!(result.background, 0x123456);
+        assert_eq!(result.background_transparent, transparent);
+        assert_eq!(result.mask, mask);
+    }
+    let mut request = semantic_request(png_bytes([0x12, 0x34, 0x56, 0].repeat(4), 2, 2));
+    request.mask = ImageMaskPolicy::Suppress;
+    assert_eq!(
+        decoder.decode(request).unwrap().mask,
+        ImageMaskKind::AlphaChannel
+    );
+    let mut request = semantic_request(png_bytes([0x12, 0x34, 0x56, 255].repeat(4), 2, 2));
+    request.mask = ImageMaskPolicy::Heuristic(ImageHeuristicMask::FourCorners);
+    let result = decoder.decode(request).unwrap();
+    assert_eq!(result.mask, ImageMaskKind::Clipping);
+    assert!(result.background_transparent);
+}
+
+#[test]
+fn semantic_decoder_completes_animation_metadata_and_retires_sequences() {
+    let decoder = SemanticImageDecoder::default();
+    let mut request = semantic_request(animated_gif_bytes());
+    request.frame = ImageFrameIndex::new(1);
+    let result = decoder.decode(request).unwrap();
+    assert_eq!(result.background, 0x00ff00);
+    assert_eq!(result.embedded.frame_count(), Some(2));
+    assert_eq!(
+        result.embedded.frame_delay(),
+        Some(ImageFrameDelay::milliseconds(40, 1).unwrap())
+    );
+    assert!(decoder.cached_size_bytes() > 0);
+    decoder.retire(ImageSequenceRetirement::One(
+        ImageSequenceId::new(1).unwrap(),
+    ));
+    assert_eq!(decoder.cached_size_bytes(), 0);
+    let mut request = semantic_request(animated_gif_bytes());
+    request.sequence = ImageSequenceId::new(2).unwrap();
+    request.frame = ImageFrameIndex::new(2);
+    assert!(decoder.decode(request).is_err());
+}
+
+#[test]
+fn semantic_decoder_retirement_fences_jobs_reserved_before_decode() {
+    let decoder = SemanticImageDecoder::default();
+    let sequence = ImageSequenceId::new(1).unwrap();
+    let queued = decoder.reserve_sequence(sequence);
+    decoder.retire(ImageSequenceRetirement::One(sequence));
+    assert!(
+        decoder
+            .decode(semantic_request(animated_gif_bytes()))
+            .is_ok()
+    );
+    assert_eq!(
+        decoder.cached_size_bytes(),
+        0,
+        "queued work cannot resurrect retired sequence bytes"
+    );
+    drop(queued);
+    assert_eq!(decoder.cached_size_bytes(), 0);
+}
+
+#[test]
+fn semantic_decoder_admission_and_errors_do_not_accept_header_only_success() {
+    let decoder = SemanticImageDecoder::default();
+    let bytes = png_bytes([0x12, 0x34, 0x56, 255].repeat(4), 2, 2);
+    let mut request = semantic_request(bytes.clone());
+    request.limit = neomacs_display_protocol::ImageSizeLimit::from_axis_pixels(1);
+    assert_eq!(decoder.decode(request), Err(ImageDiagnostic::InvalidSize));
+    // The complete IHDR is retained, but there are no complete decoded pixels.
+    assert!(
+        decoder
+            .decode(semantic_request(bytes[..33].to_vec()))
+            .is_err()
+    );
+}
+
 #[test]
 fn animated_gif_decodes_selected_frame_and_publishes_gnu_sequence_metadata() {
     let decoded = ImageCache::decode_data_with_metadata_for_frame(
@@ -310,7 +435,7 @@ fn decoded_transparent_png_stays_transparent_with_explicit_lisp_background() {
     .unwrap();
 
     assert!(decoded.metadata.background_transparent);
-    assert_eq!(decoded.metadata.mask, ImageMaskKind::Clipping);
+    assert_eq!(decoded.metadata.mask, ImageMaskKind::AlphaChannel);
     assert_ne!(decoded.metadata.background, 0xaa_bb_cc);
 }
 

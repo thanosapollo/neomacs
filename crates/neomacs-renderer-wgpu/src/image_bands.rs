@@ -418,6 +418,21 @@ pub(crate) fn classify_alpha(rgba: &[u8]) -> ImageMaskKind {
     }
 }
 
+/// Intrinsic PNG alpha is an image channel, even if its samples are binary.
+pub(crate) fn png_intrinsic_alpha(info: &png::Info<'_>) -> bool {
+    matches!(
+        info.color_type,
+        png::ColorType::Rgba | png::ColorType::GrayscaleAlpha
+    ) && info.trns.is_none()
+}
+
+pub(crate) fn classify_source_alpha(rgba: &[u8], intrinsic_alpha: bool) -> ImageMaskKind {
+    match classify_alpha(rgba) {
+        ImageMaskKind::Clipping if intrinsic_alpha => ImageMaskKind::AlphaChannel,
+        kind => kind,
+    }
+}
+
 /// The mask identity of two runs of pixels together.
 ///
 /// The classification is a property of every pixel of the source, and a row-wise
@@ -795,6 +810,8 @@ impl BandedDecoder for JpegRows {
 /// to build, and the resample of it that followed, are both gone.
 pub(crate) struct PngRows {
     reader: png::Reader<Cursor<EncodedBytes>>,
+    /// Original samples carry alpha, rather than tRNS-expanded RGB.
+    intrinsic_alpha: bool,
     format: RowFormat,
     native: ImageNativeExtent,
     /// Rows one band carries, before the target's own floor of one raster row
@@ -832,6 +849,7 @@ impl PngRows {
         // picture from the one the whole-image path decodes.
         decoder.set_transformations(png::Transformations::EXPAND);
         let reader = decoder.read_info().ok()?;
+        let intrinsic_alpha = png_intrinsic_alpha(reader.info());
         let (width, height) = (reader.info().width, reader.info().height);
         // Adam7 rows are partial rows, so an interlaced source is read whole
         // rather than guessed at — see
@@ -854,6 +872,7 @@ impl PngRows {
         }
         let native = ImageNativeExtent::new(width, height);
         Some(Self {
+            intrinsic_alpha,
             target: plan.target(native)?,
             row: vec![0; width as usize * 4],
             native,
@@ -874,6 +893,7 @@ impl PngRows {
             target,
             row,
             mask,
+            intrinsic_alpha,
             ..
         } = self;
         let format = *format;
@@ -889,7 +909,7 @@ impl PngRows {
         // gives a source with only opaque and clear pixels alphas in between,
         // and asking the raster which mask it has would be asking the filter.
         if format.may_be_transparent() {
-            *mask = merge_mask(*mask, classify_alpha(row));
+            *mask = merge_mask(*mask, classify_source_alpha(row, *intrinsic_alpha));
         }
         target.push_row(row);
         Ok(())
