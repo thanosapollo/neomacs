@@ -274,3 +274,264 @@ fn bound_text(rng: &mut BoundRng, max_len: usize) -> Vec<u8> {
         .map(|_| b"aab c"[rng.below(5)])
         .collect()
 }
+
+/// Exercise the native cached evaluator with an explicitly selected owned
+/// measurement form.  Ignored in ordinary semantic test selections.
+#[test]
+#[ignore = "private matched optimized measurement, not a semantic acceptance test"]
+fn r26_native_matched_measurement() {
+    let path = std::env::var("NEOMACS_REGEX_MEASURE_FORM").expect("explicit owned form");
+    let form = std::fs::read_to_string(path).expect("read owned form");
+    let observed = crate::test_utils::runtime_startup_eval_one(&form);
+    println!("R26-MEASURE {observed}");
+    assert!(observed.starts_with("OK ("), "{observed}");
+}
+
+/// #74: one-character greedy loops whose exit is the pattern's final
+/// non-POSIX `succeed`, with nothing in between.  GNU proves them safe in
+/// `mutually_exclusive_one`'s `case succeed` (regex-emacs.c:3938-3951,
+/// `unconstrained` still true) and rewrites them to one keep-string failure
+/// point for the whole loop (regex-emacs.c:4896-4906).
+const UNCONSTRAINED_TERMINAL_LOOPS: &[&str] = &[
+    "[ \t\n\r]+",
+    " +",
+    "x* *",
+    "[ ]+",
+    "[^a]+",
+    ".+",
+    "[ \t]*",
+    "[ A]+",
+];
+
+/// Structural: the loop right before the final `Succeed` is GNU's
+/// keep-string shape `OFKSJ exit; P; Jump P; exit: Succeed`, not the
+/// per-character backtracking loop.
+#[test]
+fn unconstrained_terminal_loops_resolve_to_one_keep_string_frame_like_gnu() {
+    for &pattern in UNCONSTRAINED_TERMINAL_LOOPS {
+        for case_fold in [false, true] {
+            let compiled = regex_compile(pattern, false, case_fold).expect("pattern compiles");
+            let bc = &compiled.buffer;
+            let n = bc.len();
+            assert_eq!(bc[n - 1], RegexOp::Succeed as u8, "{pattern:?}");
+            assert!(
+                !bc.contains(&(RegexOp::OnFailureJumpSmart as u8)),
+                "{pattern:?}: no unresolved smart jump"
+            );
+            let jump_at = n - 4;
+            assert_eq!(
+                bc[jump_at],
+                RegexOp::Jump as u8,
+                "{pattern:?} (fold {case_fold})"
+            );
+            let body = (jump_at as i64 + 3 + extract_number(bc, jump_at + 1) as i64) as usize;
+            let ofksj = body - 3;
+            assert_eq!(
+                bc[ofksj],
+                RegexOp::OnFailureKeepStringJump as u8,
+                "{pattern:?} (fold {case_fold}): the jump back targets the body of a keep-string loop"
+            );
+            let exit = (ofksj as i64 + 3 + extract_number(bc, ofksj + 1) as i64) as usize;
+            assert_eq!(
+                exit,
+                n - 1,
+                "{pattern:?}: the loop exits straight to Succeed"
+            );
+        }
+    }
+}
+
+/// Instrumented: a long run holds one failure point for the whole loop, as
+/// in GNU, instead of one per character.
+#[test]
+fn unconstrained_terminal_loops_hold_one_fail_frame_per_run() {
+    let syntax = DefaultSyntaxLookup;
+    let text = vec![b' '; 1_000];
+    for &pattern in UNCONSTRAINED_TERMINAL_LOOPS {
+        let compiled = regex_compile(pattern, false, false).expect("pattern compiles");
+        let _ = take_fail_stack_probe();
+        let _ = take_matcher_overflow();
+        let mut scratch = MatchScratch::default();
+        let mut registers = MatchRegisters::default();
+        let end = re_match_internal(
+            &mut scratch,
+            &compiled,
+            &text,
+            0,
+            text.len(),
+            &syntax,
+            0,
+            false,
+            &mut registers,
+        );
+        assert_eq!(end, Some(text.len()), "{pattern:?}: greedy run to the end");
+        assert!(!take_matcher_overflow());
+        let probe = take_fail_stack_probe();
+        assert!(
+            probe.max_depth <= 2,
+            "{pattern:?}: fail stack reached {} entries over a {}-char run",
+            probe.max_depth,
+            text.len()
+        );
+    }
+}
+
+/// GNU 32.0.50 (commit b28750b822dc45ffdceda3ea44a3c8b93f4e5a6b)
+/// `(string-match RE S)` + `(match-data t)` over 400,000 characters, past the fail-stack limit for a per-character loop: GNU
+/// answers `(0 400000)` for every unconstrained terminal loop.
+#[test]
+fn unconstrained_terminal_loops_match_long_runs_like_gnu() {
+    let spaces = " ".repeat(400_000);
+    let mixed = " \t\n\r".repeat(100_000);
+    for (pattern, text) in [
+        ("[ \t\n\r]+", &mixed),
+        (" +", &spaces),
+        ("x* *", &spaces),
+        ("[ ]+", &spaces),
+        ("[^a]+", &spaces),
+        (".+", &spaces),
+    ] {
+        let (found, overflow) = string_match(pattern, text);
+        assert!(!overflow, "{pattern:?}: GNU does not overflow");
+        assert_eq!(found, Some(vec![0, 400_000]), "{pattern:?}");
+    }
+}
+
+/// A pending quit must still interrupt the keep-string loop, without becoming
+/// an overflow or consuming the request.  Clearing it permits the full match.
+#[test]
+fn terminal_success_refinement_preserves_quit_polling() {
+    let text = vec![b' '; 400_000];
+    for &pattern in UNCONSTRAINED_TERMINAL_LOOPS {
+        let compiled = regex_compile(pattern, false, false).expect("pattern compiles");
+        let mut scratch = MatchScratch::default();
+        let mut registers = MatchRegisters::default();
+        let _ = take_matcher_overflow();
+        let flag = crate::emacs_core::eval::install_quit_requested_for_test(true);
+        let interrupted = re_match_internal(
+            &mut scratch,
+            &compiled,
+            &text,
+            0,
+            text.len(),
+            &DefaultSyntaxLookup,
+            0,
+            false,
+            &mut registers,
+        );
+        let pending = crate::emacs_core::eval::tls_quit_pending();
+        crate::emacs_core::eval::clear_quit_requested_for_test();
+        drop(flag);
+        assert_eq!(interrupted, None, "{pattern:?}: quit must interrupt");
+        assert!(pending, "{pattern:?}: the matcher must not consume quit");
+        assert!(
+            !take_matcher_overflow(),
+            "{pattern:?}: quit is not overflow"
+        );
+        let completed = re_match_internal(
+            &mut scratch,
+            &compiled,
+            &text,
+            0,
+            text.len(),
+            &DefaultSyntaxLookup,
+            0,
+            false,
+            &mut registers,
+        );
+        assert_eq!(completed, Some(text.len()), "{pattern:?}: clear then retry");
+        assert_eq!(match_data(&registers), vec![0, 400_000], "{pattern:?}");
+        assert!(!take_matcher_overflow());
+    }
+}
+
+/// Negative controls that keep the per-character loop: an assertion
+/// between the loop and `succeed` clears GNU's `unconstrained`
+/// (RETURN_CONSTRAIN for `wordbound`), and POSIX patterns stay out of this
+/// rewrite by scope.  The POSIX exclusion follows the cited GNU source
+/// (45b0f7699d, `forall_firstchar` returns false at the pattern end,
+/// regex-emacs.c:2847-2853); it is not a parity claim against the 32.0.50
+/// oracle, whose POSIX first-character walk differs.
+#[test]
+fn constrained_or_posix_terminal_loops_keep_the_backtracking_loop() {
+    for (pattern, posix) in [("[ ]+\\b", false), ("[ ]+\\B", false), ("[ ]+", true)] {
+        let compiled = regex_compile(pattern, posix, false).expect("pattern compiles");
+        assert!(
+            !compiled
+                .buffer
+                .contains(&(RegexOp::OnFailureKeepStringJump as u8)),
+            "{pattern:?} (posix {posix}) must stay a backtracking loop"
+        );
+    }
+    // GNU: (error "Stack overflow in regexp matcher").
+    let (found, overflow) = string_match("[ ]+\\b", &" ".repeat(400_000));
+    assert_eq!(found, None);
+    assert!(overflow, "GNU signals the fail-stack overflow");
+}
+
+/// The same answers through the Lisp front end, against GNU 32.0.50
+/// (commit b28750b822dc45ffdceda3ea44a3c8b93f4e5a6b) running this exact form (`-Q --batch`): folding, custom case tables, unibyte
+/// high bytes, multibyte, START, buffer BOUND, `looking-at`, and
+/// `string-match-p` leaving the match data alone.
+#[test]
+fn unconstrained_terminal_loops_answer_like_gnu_from_lisp() {
+    let observed = crate::test_utils::runtime_startup_eval_one(
+        r##"(progn
+  (require 'case-table)
+  (let ((sp (make-string 400000 ?\s))
+        (ws (apply #'concat (make-list 100000 " \t\n\r")))
+        (case-fold-search nil)
+        (probe (lambda (re s fold)
+                 (let ((case-fold-search fold))
+                   (condition-case err (and (string-match re s) (match-data t))
+                     (error err)))))
+        out)
+    (push (funcall probe "[ \t\n\r]+" ws nil) out)
+    (push (funcall probe " +" sp nil) out)
+    (push (funcall probe "x* *" sp nil) out)
+    (push (funcall probe "[ ]+" sp nil) out)
+    (push (funcall probe "[^a]+" sp nil) out)
+    (push (funcall probe ".+" sp nil) out)
+    (push (funcall probe "[ A]+" sp t) out)
+    (push (funcall probe "[ ]+\\b" sp nil) out)
+    (push (funcall probe "[ \t\n\r]+" "ab \t\ncd" nil) out)
+    (push (funcall probe "[ \t\n\r]+" "a  b   c" nil) out)
+    (push (funcall probe "[ \t\n\r]+" "abc" nil) out)
+    (push (funcall probe "[ \t\n\r]+" "" nil) out)
+    (push (funcall probe "[ \t]*" "abc" nil) out)
+    (push (funcall probe "[a-c]+" "xxABCabcD" t) out)
+    (push (funcall probe "[a-c]+" "xxABCabcD" nil) out)
+    (push (funcall probe "[\200-\377]+" (string-to-unibyte "a\200\377\201b") nil) out)
+    (push (funcall probe "[αβ]+" "xαββαy" nil) out)
+    (push (and (string-match "[ ]+" "  a   b" 3) (match-data t)) out)
+    (with-temp-buffer
+      (let ((tbl (copy-case-table (standard-case-table))))
+        (set-case-syntax-pair ?! ?\s tbl)
+        (set-case-table tbl)
+        (push (funcall probe "[ ]+" "x! !y" t) out)
+        (push (funcall probe "[ ]+" "x! !y" nil) out)
+        (push (funcall probe "[ ]+" (apply #'concat (make-list 200000 "! ")) t) out)))
+    (with-temp-buffer
+      (insert "a     b")
+      (goto-char 1)
+      (push (list (re-search-forward "[ ]+" 4 t) (point) (match-beginning 0) (match-end 0))
+            out))
+    (with-temp-buffer
+      (insert sp)
+      (goto-char 1)
+      (push (condition-case err (list (looking-at "[ ]+") (match-end 0)) (error err)) out))
+    (set-match-data '(7 9))
+    (push (condition-case err (list (string-match-p "[ ]+" sp) (match-data t))
+            (error err))
+          out)
+    (nreverse out)))"##,
+    );
+    assert_eq!(
+        observed,
+        concat!(
+            "OK ((0 400000) (0 400000) (0 400000) (0 400000) (0 400000) (0 400000) (0 400000) ",
+            "(error \"Stack overflow in regexp matcher\") (2 5) (1 3) nil nil (0 0) (2 8) (5 8) ",
+            "(1 4) (1 5) (3 6) (1 4) (2 3) (0 400000) (4 4 2 4) (t 400001) (0 (7 9)))"
+        )
+    );
+}
