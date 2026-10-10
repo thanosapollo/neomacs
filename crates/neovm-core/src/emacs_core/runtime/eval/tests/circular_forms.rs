@@ -110,8 +110,8 @@ fn circular_form_macroexpand_all_signals_circular_list() {
 }
 
 /// Special forms: the up-front `list_length` in `eval_sub` signals before
-/// the form runs, reporting the argument list for a cycle through it and
-/// the looping cons for a prefixed cycle.
+/// the form runs, reporting the cons found by the pinned GNU Brent schedule.
+/// For a three-cons cycle this need not be the argument-list head.
 #[test]
 fn circular_form_special_form_args_signal_circular_list() {
     let gnu = "(circular-list t)";
@@ -123,7 +123,7 @@ fn circular_form_special_form_args_signal_circular_list() {
         ),
         (
             "(let ((c (list 'progn 1 2 3))) (setcdr (nthcdr 3 c) (cdr c))
-               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) (cdr c))))))",
+               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) (nthcdr 3 c))))))",
             gnu,
         ),
         (
@@ -150,7 +150,7 @@ fn circular_form_special_form_args_signal_circular_list() {
         ),
         (
             "(let ((c (list 'setq 'x 1))) (setcdr (nthcdr 2 c) c)
-               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) (cdr c))))))",
+               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) c)))))",
             gnu,
         ),
         (
@@ -314,7 +314,7 @@ fn circular_form_call_and_macro_args_signal_circular_list() {
         ),
         (
             "(let ((c (list 'when t 1))) (setcdr (nthcdr 2 c) c)
-               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) (cdr c))))))",
+               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) c)))))",
             gnu,
         ),
     ]);
@@ -335,7 +335,7 @@ fn circular_form_macroexpand_args_signal_circular_list() {
         (
             "(let ((c (list 'when t 1))) (setcdr (nthcdr 2 c) c)
                (condition-case e (macroexpand c)
-                 (error (list (car e) (eq (cadr e) (cdr c))))))",
+                 (error (list (car e) (eq (cadr e) c)))))",
             gnu,
         ),
         (

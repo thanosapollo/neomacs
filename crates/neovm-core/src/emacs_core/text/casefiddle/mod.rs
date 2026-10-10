@@ -627,7 +627,7 @@ fn casify_text_with_context(
                 // uses Unicode ASCII casing instead of truncating its code.
                 let mapped = if matches!(target, CaseTarget::String)
                     && code < 128
-                    && mapped >= 128
+                    && mapped >= 256
                     && !super::emacs_char::char_byte8_p(mapped)
                 {
                     match char_action {
