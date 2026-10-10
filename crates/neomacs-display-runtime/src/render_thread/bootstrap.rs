@@ -18,6 +18,10 @@ use x11_dl::xlib;
 
 impl RenderApp {
     pub(super) fn init_wgpu(&mut self, event_loop: &dyn ActiveEventLoop, window: Arc<dyn Window>) {
+        #[cfg(all(feature = "gui-test-hooks", target_os = "linux"))]
+        if super::native_image_probe::fail_init_once() {
+            return;
+        }
         tracing::info!("Initializing wgpu for render thread");
 
         let instance_descriptor =
@@ -236,7 +240,7 @@ impl RenderApp {
                 window_chrome: Default::default(),
                 content_insets: Default::default(),
                 window,
-                surface,
+                surface: Some(surface),
                 surface_generation: super::frame_windows::next_surface_generation(),
                 surface_backend: adapter_info.backend,
                 surface_config: config,
@@ -314,7 +318,7 @@ impl RenderApp {
     /// blank for a moment while the native video system reopens its retained
     /// GPU-independent recovery manifests; other media is re-resolved after
     /// `InputEvent::DisplayReset`.
-    pub(super) fn recover_from_device_loss(&mut self, event_loop: &dyn ActiveEventLoop) {
+    pub(super) fn recover_from_device_loss(&mut self, event_loop: &dyn ActiveEventLoop) -> bool {
         tracing::error!(
             "wgpu device lost — rebuilding GPU state and asking the evaluator to re-resolve media"
         );
@@ -345,9 +349,11 @@ impl RenderApp {
         // re-uploads the icons into the new renderer.
         self.toolbar.forget_after_device_loss();
 
-        // Old instance/adapter/device/queue handles. The old per-window
-        // surfaces still hold internal references; they die as they are
-        // replaced below.
+        // Destroy every old swapchain/native association before replacement creation.
+        // Keep the windows and their CPU/input state, not their old surfaces.
+        self.frame_windows.retire_native_surfaces();
+
+        // Old instance/adapter/device/queue handles can now be released.
         self.gpu = None;
 
         let Some(primary_window) = self
@@ -357,7 +363,7 @@ impl RenderApp {
             .cloned()
         else {
             tracing::error!("device-loss recovery: no active primary window, cannot rebuild wgpu");
-            return;
+            return false;
         };
 
         // New instance/adapter/device/queue + primary surface + renderer;
@@ -375,18 +381,21 @@ impl RenderApp {
                 "device-loss recovery: wgpu re-initialization failed; will retry on the next wake"
             );
             self.device_lost.mark_lost_now();
-            return;
+            return false;
         }
 
         // Secondary top-level windows: their surfaces belong to the dropped
         // instance and can never be configured against the new device;
         // recreate them on the new instance and rebuild their glyph atlases.
         if let Some(gpu) = self.gpu.as_ref() {
-            self.frame_windows.recreate_secondary_native_surfaces(
+            if !self.frame_windows.recreate_secondary_native_surfaces(
                 &gpu.instance,
                 &gpu.device,
                 &gpu.adapter,
-            );
+            ) {
+                self.device_lost.mark_lost_now();
+                return false;
+            }
         }
 
         // Everything re-renders from the kept CPU frames on the next pass.
@@ -399,6 +408,7 @@ impl RenderApp {
         // native sessions, the frame shader/images are re-uploaded, and a
         // full redisplay is forced.
         self.comms.send_input(InputEvent::DisplayReset);
+        true
     }
 }
 

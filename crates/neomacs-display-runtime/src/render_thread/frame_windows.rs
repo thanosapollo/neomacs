@@ -59,7 +59,8 @@ pub(crate) struct GuiFrameNativeWindowState {
     pub(super) window_chrome: crate::window_chrome::WindowChromeController,
     pub(super) content_insets: neomacs_display_protocol::ContentInsets,
     pub window: Arc<dyn Window>,
-    pub surface: wgpu::Surface<'static>,
+    /// Absent during device-loss recovery; the retained native window stays live.
+    pub surface: Option<wgpu::Surface<'static>>,
     pub surface_generation: u64,
     /// Backend of the adapter this surface presents through; wgpu surfaces
     /// do not expose it, and the GL resize quirk needs it.
@@ -95,6 +96,9 @@ impl GuiFrameNativeWindowState {
     }
 
     pub(super) fn surface_state(&self) -> SurfaceState {
+        if self.surface.is_none() {
+            return SurfaceState::Suspended;
+        }
         match SurfaceState::from_device_size(
             self.width,
             self.height,
@@ -119,6 +123,9 @@ impl GuiFrameNativeWindowState {
         device: &wgpu::Device,
         instance: &wgpu::Instance,
     ) -> bool {
+        if self.surface.is_none() {
+            return false;
+        }
         self.surface_generation = next_surface_generation();
         if self.surface_backend == wgpu::Backend::Gl {
             let rebuilt = instance
@@ -129,16 +136,19 @@ impl GuiFrameNativeWindowState {
                 });
             match rebuilt {
                 Ok(surface) => {
-                    self.surface = surface;
+                    self.surface = Some(surface);
                     #[cfg(target_os = "linux")]
                     // SAFETY: the rebuilt surface and device share this renderer instance.
                     unsafe {
                         neomacs_renderer_wgpu::native_presentation::prepare_surface(
                             device,
-                            &self.surface,
+                            self.surface.as_ref().expect("configured surface"),
                         );
                     }
-                    self.surface.configure(device, &self.surface_config);
+                    self.surface
+                        .as_ref()
+                        .expect("configured surface")
+                        .configure(device, &self.surface_config);
                     return true;
                 }
                 Err(_) => {
@@ -151,9 +161,15 @@ impl GuiFrameNativeWindowState {
         #[cfg(target_os = "linux")]
         // SAFETY: this surface and device share the renderer instance; configure follows immediately.
         unsafe {
-            neomacs_renderer_wgpu::native_presentation::prepare_surface(device, &self.surface);
+            neomacs_renderer_wgpu::native_presentation::prepare_surface(
+                device,
+                self.surface.as_ref().expect("configured surface"),
+            );
         }
-        self.surface.configure(device, &self.surface_config);
+        self.surface
+            .as_ref()
+            .expect("configured surface")
+            .configure(device, &self.surface_config);
         false
     }
 }
@@ -1607,7 +1623,10 @@ impl GuiFrameWindowState {
     /// Replay retained cosmetic state onto this frame's owner-held window.
     /// Never request a size: primary adoption must preserve native host geometry.
     pub(super) fn replay_pending_native_state(&self, window: &dyn Window) {
-        if let FrameLifecycle::Pending { chrome, fullscreen, .. } = &self.lifecycle {
+        if let FrameLifecycle::Pending {
+            chrome, fullscreen, ..
+        } = &self.lifecycle
+        {
             window.set_title(&chrome.title);
             if let Some(hints) = self.lifecycle.geometry_hints() {
                 apply_window_geometry_hints(window, hints);
@@ -1958,7 +1977,9 @@ fn apply_native_fullscreen_mode(window: &dyn Window, mode: WindowFullscreenMode)
             window.set_maximized(false);
         }
         WindowFullscreenMode::Fullwidth | WindowFullscreenMode::Fullheight => {
-            tracing::warn!("partial fullscreen modes are not implemented by the native window backend");
+            tracing::warn!(
+                "partial fullscreen modes are not implemented by the native window backend"
+            );
         }
     }
 }
@@ -2064,9 +2085,14 @@ impl GuiFrameWindowManager {
         let key = self.primary_frame_key();
         if let Some(window_state) = self.windows.get_mut(&key) {
             window_state.replay_pending_native_state(native.window.as_ref());
-            if let FrameLifecycle::Pending { fullscreen: Some(mode), .. } = &window_state.lifecycle {
+            if let FrameLifecycle::Pending {
+                fullscreen: Some(mode),
+                ..
+            } = &window_state.lifecycle
+            {
                 native.chrome.is_fullscreen = matches!(
-                    mode, WindowFullscreenMode::Fullscreen | WindowFullscreenMode::Fullboth
+                    mode,
+                    WindowFullscreenMode::Fullscreen | WindowFullscreenMode::Fullboth
                 );
             }
             let winit_id = native.window.id();
@@ -2313,7 +2339,7 @@ impl GuiFrameWindowManager {
                                     window_chrome: Default::default(),
                                     content_insets: Default::default(),
                                     window,
-                                    surface,
+                                    surface: Some(surface),
                                     surface_generation: next_surface_generation(),
                                     surface_backend: adapter.get_info().backend,
                                     surface_config: config,
@@ -2331,7 +2357,8 @@ impl GuiFrameWindowManager {
                         },
                     );
                     if let Some(mode) = req.fullscreen
-                        && let Some(state) = self.windows.get_mut(&FrameKey::Adopted(req.emacs_frame_id))
+                        && let Some(state) =
+                            self.windows.get_mut(&FrameKey::Adopted(req.emacs_frame_id))
                     {
                         state.set_fullscreen_mode(mode);
                     }
@@ -2821,6 +2848,20 @@ impl GuiFrameWindowManager {
         });
     }
 
+    /// Destroy all old native associations before creating any replacements.
+    /// Windows, input state and CPU frames remain owned by the same lifecycle.
+    pub(super) fn retire_native_surfaces(&mut self) {
+        self.for_each_top_level_window_mut(|window_state| {
+            if let FrameLifecycle::Active { native, .. } = &mut window_state.lifecycle {
+                drop(native.surface.take());
+                native.surface_generation = next_surface_generation();
+                window_state
+                    .render
+                    .set_surface_state(SurfaceState::Suspended);
+            }
+        });
+    }
+
     /// Recreate the wgpu surface of every non-primary Active window on a new
     /// instance/device after device-loss recovery (the primary window is
     /// rebuilt by `init_wgpu` via `populate_primary_native`). Surfaces are
@@ -2832,7 +2873,8 @@ impl GuiFrameWindowManager {
         instance: &wgpu::Instance,
         device: &wgpu::Device,
         adapter: &wgpu::Adapter,
-    ) {
+    ) -> bool {
+        let mut complete = true;
         let primary_key = self.primary_frame_key();
         for (key, window_state) in self.windows.iter_mut() {
             if *key == primary_key {
@@ -2841,6 +2883,11 @@ impl GuiFrameWindowManager {
             let FrameLifecycle::Active { native, .. } = &mut window_state.lifecycle else {
                 continue;
             };
+            #[cfg(all(feature = "gui-test-hooks", target_os = "linux"))]
+            if super::native_image_probe::fail_secondary_once() {
+                complete = false;
+                continue;
+            }
             let surface = match instance.create_surface(native.window.clone()) {
                 Ok(surface) => surface,
                 Err(error) => {
@@ -2849,6 +2896,7 @@ impl GuiFrameWindowManager {
                         ?error,
                         "device-loss recovery: failed to recreate window surface"
                     );
+                    complete = false;
                     continue;
                 }
             };
@@ -2885,8 +2933,8 @@ impl GuiFrameWindowManager {
             }
             surface.configure(device, &config);
             native.surface_generation = next_surface_generation();
-            // Replacing the fields drops the old-instance surface in place.
-            native.surface = surface;
+            // All old associations were retired before primary re-initialization.
+            native.surface = Some(surface);
             native.surface_config = config;
             let scale_factor = native.scale_factor;
             window_state
@@ -2894,6 +2942,7 @@ impl GuiFrameWindowManager {
                 .populate_glyph_atlas(device, scale_factor);
             window_state.render.compositor.dirty = true;
         }
+        complete
     }
 
     pub(super) fn apply_top_level_visual_cursor_animations(&mut self) {

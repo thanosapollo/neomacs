@@ -274,8 +274,14 @@ fn render_frame_window_contents_reserved(
             native_mapping.content_logical_size(),
         ),
     );
-    let surface::AcquiredSurface { output, acquired } =
-        surface::acquire_current_texture(&native.surface, device_lost, render.emacs_frame_id)?;
+    let surface::AcquiredSurface { output, acquired } = surface::acquire_current_texture(
+        native
+            .surface
+            .as_ref()
+            .ok_or(FrameRenderFailure::WindowNotReady)?,
+        device_lost,
+        render.emacs_frame_id,
+    )?;
 
     // Placed here, after the surface is in hand: `sample_pane_layout`
     // advances the motion and republishes the projection, and every path
