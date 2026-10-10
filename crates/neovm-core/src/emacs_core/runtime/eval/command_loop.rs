@@ -840,6 +840,12 @@ impl Context {
             });
 
             let input_measurement = neomacs_display_protocol::input_latency::CommandInputs::begin();
+            let mut flight_command = crate::flight_recorder::CommandSpan::begin(
+                self.frames.selected_frame().map_or(0, |frame| frame.id.0),
+                self.input_progress
+                    .current_command_identity()
+                    .unwrap_or((0, 0)),
+            );
 
             // Finding 2: this-original-command stays at the original
             // (pre-remap) command for the duration of the iteration
@@ -939,6 +945,7 @@ impl Context {
             // at keyboard.c:1563.
             self.safe_run_hook_if_bound("post-command-hook")?;
             input_measurement.complete(|frame| self.input_latency_viewport(frame));
+            flight_command.finish();
 
             // GNU `command_loop_1` (src/keyboard.c:1342-1345): "If displaying a
             // message, resize the echo area window to fit that message's size
@@ -1843,6 +1850,9 @@ impl Context {
         let has_fn = self.redisplay_fn.is_some();
         tracing::debug!("redisplay called (has_fn={})", has_fn);
         if let Some(mut f) = self.redisplay_fn.take() {
+            let _flight_redisplay = crate::flight_recorder::RedisplaySpan::begin(
+                self.frames.selected_frame().map_or(0, |frame| frame.id.0),
+            );
             let saved = self.buffers.reset_outermost_restrictions();
             f(self);
             // The layout pass inside `f` consumes any pending exact echo-area

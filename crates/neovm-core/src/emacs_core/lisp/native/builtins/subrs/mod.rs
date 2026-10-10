@@ -6606,6 +6606,22 @@ pub(crate) fn register_subrs(ctx: &mut crate::emacs_core::eval::Context) {
     );
 
     // -----------------------------------------------------------------------
+    // Numeric-only bounded flight recorder inspection/export.
+    register_pure_subr!(
+        ctx,
+        "neomacs-flight-recorder-recent",
+        crate::emacs_core::builtins_extra::flight_recorder::recent,
+        0,
+        Some(0)
+    );
+    register_pure_subr!(
+        ctx,
+        "neomacs-flight-recorder-dump",
+        crate::emacs_core::builtins_extra::flight_recorder::dump,
+        1,
+        Some(1)
+    );
+
     // Additional native subr declarations.
     // -----------------------------------------------------------------------
 

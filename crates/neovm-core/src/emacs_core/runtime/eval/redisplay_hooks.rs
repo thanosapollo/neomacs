@@ -980,6 +980,12 @@ impl RedisplayTransaction<'_> {
         let accepted_before = self.eval.gnu_redisplay_hooks.accepted_serial;
         self.callback = self.eval.redisplay_fn.take();
         if let Some(callback) = self.callback.as_mut() {
+            let _flight_redisplay = crate::flight_recorder::RedisplaySpan::begin(
+                self.eval
+                    .frames
+                    .selected_frame()
+                    .map_or(0, |frame| frame.id.0),
+            );
             callback(self.eval);
         }
         // Main's mode-line safe evaluator transfers non-local exits through

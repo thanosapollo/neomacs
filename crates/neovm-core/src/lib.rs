@@ -1,9 +1,13 @@
 pub mod buffer;
+#[cfg(feature = "case68-test-support")]
+#[doc(hidden)]
+pub mod case68_test_support;
 mod code_conversion_workspace;
 pub mod display_evaluation;
 pub mod emacs_core;
 pub mod encoding;
 pub mod face;
+pub mod flight_recorder;
 mod frontend_events;
 #[cfg(any(test, feature = "fuzzing"))]
 #[doc(hidden)]
@@ -19,9 +23,6 @@ pub mod tagged;
 #[path = "tests/test_utils.rs"]
 #[doc(hidden)]
 pub mod test_utils;
-#[cfg(feature = "case68-test-support")]
-#[doc(hidden)]
-pub mod case68_test_support;
 pub mod window;
 
 // Curated facade: the front door for consumers of the Lisp engine. The

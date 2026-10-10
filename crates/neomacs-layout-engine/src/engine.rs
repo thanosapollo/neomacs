@@ -1699,18 +1699,60 @@ impl LayoutEngine {
         purpose: LayoutPurpose,
     ) -> FrameLayoutAttempt {
         debug_assert!(purpose.query_window().is_none());
+        let (command, event_seq) = neovm_core::flight_recorder::correlation();
+        let input_stream = neovm_core::flight_recorder::input_identity().0;
         if evaluator.redisplay_hook_flow_pending() {
+            neomacs_display_protocol::flight_recorder::record_input(
+                neomacs_display_protocol::flight_recorder::Phase::Discarded,
+                command,
+                input_stream,
+                event_seq,
+                frame_id.0,
+                0,
+            );
             return FrameLayoutAttempt::Aborted;
         }
         self.layout_frame_rust_for_purpose_inner(evaluator, frame_id, purpose);
         if evaluator.has_mode_line_display_flow() {
             self.last_frame_display_state = None;
+            neomacs_display_protocol::flight_recorder::record_input(
+                neomacs_display_protocol::flight_recorder::Phase::Discarded,
+                command,
+                input_stream,
+                event_seq,
+                frame_id.0,
+                0,
+            );
             return FrameLayoutAttempt::Aborted;
         }
         self.report_image_failures(evaluator);
-        self.last_frame_display_state
+        let attempt = self
+            .last_frame_display_state
             .take()
-            .map_or(FrameLayoutAttempt::Aborted, FrameLayoutAttempt::Prepared)
+            .map_or(FrameLayoutAttempt::Aborted, FrameLayoutAttempt::Prepared);
+        match &attempt {
+            FrameLayoutAttempt::Prepared(state) => {
+                neomacs_display_protocol::flight_recorder::record_input(
+                    neomacs_display_protocol::flight_recorder::Phase::LayoutSealed,
+                    command,
+                    input_stream,
+                    event_seq,
+                    frame_id.0,
+                    state.presentation().get(),
+                );
+            }
+            FrameLayoutAttempt::Aborted => {
+                neomacs_display_protocol::flight_recorder::record_input(
+                    neomacs_display_protocol::flight_recorder::Phase::Discarded,
+                    command,
+                    input_stream,
+                    event_seq,
+                    frame_id.0,
+                    0,
+                );
+            }
+        }
+        attempt
     }
 
     /// Report every image failure this pass observed.
@@ -1725,6 +1767,44 @@ impl LayoutEngine {
     }
 
     fn layout_frame_rust_for_purpose_inner(
+        &mut self,
+        evaluator: &mut neovm_core::emacs_core::Context,
+        frame_id: neovm_core::window::FrameId,
+        purpose: LayoutPurpose,
+    ) -> Option<neovm_core::window::WindowLayoutQuery> {
+        use neomacs_display_protocol::flight_recorder::{Phase, record_input};
+        let (command, event_seq) = neovm_core::flight_recorder::correlation();
+        let input_stream = neovm_core::flight_recorder::input_identity().0;
+        record_input(
+            Phase::LayoutStart,
+            command,
+            input_stream,
+            event_seq,
+            frame_id.0,
+            0,
+        );
+        let result = self.layout_frame_rust_for_purpose_measured(evaluator, frame_id, purpose);
+        // Queries do not produce a new presentation. Never attribute the
+        // previous retained state's revision to a query or an aborted pass.
+        let revision = if purpose.query_window().is_none() {
+            self.last_frame_display_state
+                .as_ref()
+                .map_or(0, |state| state.presentation().get())
+        } else {
+            0
+        };
+        record_input(
+            Phase::LayoutEnd,
+            command,
+            input_stream,
+            event_seq,
+            frame_id.0,
+            revision,
+        );
+        result
+    }
+
+    fn layout_frame_rust_for_purpose_measured(
         &mut self,
         evaluator: &mut neovm_core::emacs_core::Context,
         frame_id: neovm_core::window::FrameId,

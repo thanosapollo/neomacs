@@ -148,7 +148,7 @@ pub fn init() {
 }
 
 #[cfg(target_os = "linux")]
-fn clock_ns(clock: libc::clockid_t) -> Option<u64> {
+pub(crate) fn clock_ns(clock: libc::clockid_t) -> Option<u64> {
     let mut time = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -227,7 +227,22 @@ fn record_to(
 
 #[inline]
 pub fn record(stage: Stage, frame: u64, presentation: PresentationId) {
+    rolling(stage, frame, presentation);
     record_to(recorder(), stage, frame, presentation, sample);
+}
+fn rolling(stage: Stage, frame: u64, presentation: PresentationId) {
+    use crate::flight_recorder::{self, Phase};
+    let phase = match stage {
+        Stage::Publish => Phase::RenderHandoff,
+        Stage::Prepared => Phase::Prepared,
+        Stage::RenderStart => Phase::RenderStart,
+        Stage::Submit => Phase::Submit,
+        Stage::Present => Phase::CpuPresentCall,
+        Stage::Superseded => Phase::Superseded,
+        Stage::Discarded => Phase::Discarded,
+        Stage::Presented => return,
+    };
+    flight_recorder::record(phase, 0, 0, frame, presentation.get());
 }
 
 /// A stage timestamp taken now and queued later by [`Stamp::emit`], so a
@@ -238,6 +253,7 @@ pub struct Stamp(Record);
 /// Sample a stage without queueing it. `None` when the trace is disabled.
 #[inline]
 pub fn stamp(stage: Stage, frame: u64, presentation: PresentationId) -> Option<Stamp> {
+    rolling(stage, frame, presentation);
     stamp_with(recorder()?, stage, frame, presentation, sample).map(Stamp)
 }
 

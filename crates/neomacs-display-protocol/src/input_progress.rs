@@ -254,6 +254,16 @@ impl InputProgress {
             })
     }
 
+    /// Payload-free observation of the last tracked delivery in the current
+    /// command. This does not acknowledge input or acquire a frontier lock.
+    /// Missing tracking or RefCell contention is explicitly unavailable.
+    pub fn current_command_identity(&self) -> Option<(u64, u64)> {
+        let staging = self.staging.try_borrow().ok()?;
+        let delivery = staging.scopes.last()?.1.last()?;
+        let receipt = &delivery.0.receipt;
+        Some((receipt.stream.as_ref()?.0.id, receipt.serial))
+    }
+
     pub fn checkpoint(&self) -> Vec<InputCheckpoint> {
         self.streams
             .values()
@@ -292,6 +302,30 @@ mod repeat_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flight_recorder_identity_observation_preserves_delivery() {
+        let stream = InputStream::default();
+        let delivery = stream.issue().unwrap();
+        let receipt = delivery.receipt();
+        let expected = (stream.0.id, receipt.serial);
+        let mut progress = InputProgress::default();
+        progress.consumed(delivery);
+        let command = progress.begin_command();
+        assert_eq!(progress.current_command_identity(), Some(expected));
+        assert!(!receipt.acknowledged_by(&progress.checkpoint()));
+        let inner = progress.begin_command();
+        assert_eq!(progress.current_command_identity(), None);
+        drop(inner);
+        assert_eq!(progress.current_command_identity(), Some(expected));
+        {
+            let _borrow = progress.staging.borrow_mut();
+            assert_eq!(progress.current_command_identity(), None);
+        }
+        drop(command);
+        assert_eq!(progress.current_command_identity(), None);
+        assert!(receipt.acknowledged_by(&progress.checkpoint()));
+    }
 
     #[test]
     fn preview_observation_belongs_only_to_innermost_command() {

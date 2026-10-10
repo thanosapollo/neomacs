@@ -26,6 +26,7 @@ use malachite::base::num::conversion::traits::RoundingFrom;
 use malachite::base::num::logic::traits::SignificantBits;
 use malachite::base::rounding_modes::RoundingMode;
 use malachite::integer::Integer;
+pub(crate) mod flight_recorder;
 
 // ---------------------------------------------------------------------------
 // Argument helpers
