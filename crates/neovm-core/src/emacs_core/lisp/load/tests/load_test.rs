@@ -10502,9 +10502,45 @@ fn after_load_error_formatting_handles_raw_unibyte_signal_names() {
     )
     .expect("install raw-signal after-load hook");
 
-    let loaded = load_file(&mut eval, &file)
-        .expect("a raw condition name in an after-load error must remain reportable");
-    assert_eq!(loaded, Value::T);
+    let bindings = ["load-file-name", "load-true-file-name", "current-load-list"];
+    for name in bindings {
+        eval.set_variable(name, Value::symbol("vm-outer-load-binding"));
+    }
+
+    // GNU 32.0.50 lread.c:1536-1540 propagates do-after-load-evaluation errors.
+    // GNU -Q --batch oracle: SIGNAL-BYTES=(255) DATA=nil LOADED=t.
+    let err = load_file(&mut eval, &file).expect_err("after-load signal must propagate");
+    match &err {
+        EvalError::Signal { symbol, data, .. } => {
+            assert_eq!(
+                crate::emacs_core::intern::resolve_sym_lisp_string(*symbol).as_bytes(),
+                &[255],
+            );
+            assert!(data.is_empty(), "the raw signal must retain nil data");
+        }
+        other => panic!("expected raw after-load signal, got {other:?}"),
+    }
+    // Formatting the propagated error must not corrupt or panic on its raw name.
+    assert_eq!(format_eval_error_in_state(&eval, &err), "(\\xFF nil)");
+    for name in bindings {
+        assert_eq!(
+            eval.obarray().symbol_value_copied(name),
+            Some(Value::symbol("vm-outer-load-binding")),
+            "{name} must be restored after an after-load signal",
+        );
+    }
+    let history = eval
+        .obarray()
+        .symbol_value_copied("load-history")
+        .expect("load-history");
+    let filename = crate::emacs_core::fileio::host_path_to_lisp_file_name_string(&file);
+    assert!(
+        list_to_vec(&history)
+            .expect("load-history list")
+            .iter()
+            .any(|entry| entry.cons_car().as_utf8_str() == Some(filename.as_str())),
+        "the completed file must be recorded despite its after-load signal",
+    );
     assert_eq!(
         eval.obarray()
             .symbol_value_copied("vm-after-load-raw-signal-file-loaded"),
