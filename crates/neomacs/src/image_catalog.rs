@@ -257,11 +257,16 @@ impl AsyncImageCatalog {
         if let ImageResolveSource::File(path) = &source
             && let Some(path_str) = path.as_utf8_str()
         {
-            let resolution = ImageFileRequest::classify(
+            // Only relative searches consume the directory snapshot. Direct
+            // and deferred-home requests must not allocate and discard it.
+            let mut resolution = ImageFileRequest::classify(
                 path_str,
                 self.home_directory.as_deref(),
-                self.search_path.clone(),
+                Vec::new(),
             );
+            if let ImageFileRequest::Search { search_path, .. } = &mut resolution {
+                *search_path = self.search_path.clone();
+            }
             return (
                 ImageResolveSource::File(ImageFileName::from_utf8(resolution.cache_key())),
                 Some(resolution),

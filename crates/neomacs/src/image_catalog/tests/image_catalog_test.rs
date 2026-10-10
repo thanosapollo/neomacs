@@ -59,6 +59,34 @@ fn classify(file: &str) -> (ImageResolveRequest, Option<ImageFileRequest>) {
 }
 
 #[test]
+fn file_classification_preserves_search_and_home_policy() {
+    let (tx, _) = neomacs_display_runtime::thread_comm::command_channel(64);
+    let mut catalog = AsyncImageCatalog::new(
+        tx,
+        None,
+        Arc::new(ImageRenderState::default()),
+        None,
+    );
+    catalog.search_path = vec!["/images/first".into(), "/images/second".into()];
+    for home in [Some("/cached/home".to_string()), None] {
+        catalog.home_directory = home;
+        for path in ["/abs/icon.png", "/:/abs/icon.png", "relative.png", "~", "~/icon.png", "~named-user/icon.png"] {
+            let expected = ImageFileRequest::classify(
+                path,
+                catalog.home_directory.as_deref(),
+                catalog.search_path.clone(),
+            );
+            let (request, actual) = catalog.classify_request(file_request(path));
+            let actual = actual.expect("UTF-8 file classified");
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "{path}");
+            assert_eq!(actual.cache_key(), expected.cache_key());
+            assert_eq!(actual.needs_off_thread(), expected.needs_off_thread());
+            assert!(matches!(&request.source, ImageResolveSource::File(p) if p.as_utf8_str() == Some(expected.cache_key())));
+        }
+    }
+}
+
+#[test]
 fn relative_file_is_classified_for_off_thread_search() {
     // The #242 fix: a bare relative `:file` must be searched against
     // data-directory/images off-thread, not opened verbatim from the cwd.
