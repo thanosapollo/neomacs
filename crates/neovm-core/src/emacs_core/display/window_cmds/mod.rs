@@ -3153,8 +3153,44 @@ pub(crate) fn builtin_window_discard_buffer_from_window(
         Some(wid) if frames.is_live_window_id(wid) => wid,
         _ => return Err(signal("error", vec![Value::string("Not a live window")])),
     };
-    discard_buffers_from_window_history(frames, wid, &[Value::make_buffer(buffer_id)])?;
+    let buffer = Value::make_buffer(buffer_id);
+    discard_buffers_from_window_history(frames, wid, &[buffer])?;
+    if args.get(2).is_some_and(|all| all.is_truthy()) {
+        let quit_restore = Value::symbol("quit-restore");
+        let quit_restore_prev = Value::symbol("quit-restore-prev");
+        let current = frames
+            .window_parameter(wid, &quit_restore)
+            .unwrap_or(Value::NIL);
+        let previous = frames
+            .window_parameter(wid, &quit_restore_prev)
+            .unwrap_or(Value::NIL);
+
+        // GNU removes a matching previous entry first, then promotes the
+        // surviving entry if current matches. Preserve every other root.
+        if quit_restore_references_buffer(previous, buffer)? {
+            frames.set_window_parameter(wid, quit_restore_prev, Value::NIL);
+        }
+        if quit_restore_references_buffer(current, buffer)? {
+            let previous = frames
+                .window_parameter(wid, &quit_restore_prev)
+                .unwrap_or(Value::NIL);
+            frames.set_window_parameter(wid, quit_restore, previous);
+            frames.set_window_parameter(wid, quit_restore_prev, Value::NIL);
+        }
+    }
     Ok(Value::NIL)
+}
+
+fn quit_restore_references_buffer(parameter: Value, buffer: Value) -> Result<bool, Flow> {
+    use super::builtins::builtin_nth_values;
+
+    // Match GNU's nth/car/cdr inspection, including malformed-list errors
+    // and the short circuit when the fourth element already matches.
+    if builtin_nth_values(Value::make_int(3), parameter)? == buffer {
+        return Ok(true);
+    }
+    let second = builtin_nth_values(Value::make_int(1), parameter)?;
+    Ok(second.is_cons() && second.cons_car() == buffer)
 }
 
 /// `(combine-windows FIRST LAST)` -> nil or a new internal parent window.
@@ -8284,6 +8320,10 @@ pub(crate) fn builtin_force_window_update(
 #[cfg(test)]
 #[path = "tests/window_cmds_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/discard_buffer_test.rs"]
+mod discard_buffer_tests;
 
 #[cfg(test)]
 #[path = "tests/selection_chrome_test.rs"]
