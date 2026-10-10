@@ -14,53 +14,109 @@ use std::sync::Condvar;
 type DecodeResult =
     Result<(ResolvedImageMetadata, Option<Arc<SemanticImageDecoded>>), ImageDiagnostic>;
 
+// Retain complete answers/admission errors until explicit Lisp invalidation,
+// but keep only a bounded FIFO of optional prepared RGBA. This is a CPU budget,
+// independent of renderer residency and the decoder's sequence-cache budget.
+const PREPARED_RGBA_BUDGET: u64 = 64 * 1024 * 1024;
+
 #[derive(Default)]
+struct CompletedLoads {
+    results: HashMap<ImageLoadToken, Option<DecodeResult>>,
+    pixels: std::collections::VecDeque<ImageLoadToken>,
+    pixel_bytes: u64,
+}
+
 struct Completion {
-    loads: Mutex<HashMap<ImageLoadToken, Option<DecodeResult>>>,
+    loads: Mutex<CompletedLoads>,
     changed: Condvar,
-    pixel_bytes: std::sync::atomic::AtomicU64,
+    pixel_budget: u64,
+}
+
+impl Default for Completion {
+    fn default() -> Self {
+        Self::new(PREPARED_RGBA_BUDGET)
+    }
 }
 
 impl Completion {
+    fn new(pixel_budget: u64) -> Self {
+        Self {
+            loads: Mutex::new(CompletedLoads::default()),
+            changed: Condvar::new(),
+            pixel_budget,
+        }
+    }
+
     fn begin(&self, load: ImageLoadToken) {
         self.loads
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .results
             .insert(load, None);
     }
 
-    fn publish(&self, load: ImageLoadToken, result: DecodeResult) {
+    fn publish(&self, load: ImageLoadToken, mut result: DecodeResult) {
         let mut loads = self.loads.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = loads.get_mut(&load) {
-            if slot.is_none() {
-                if let Ok((_, Some(decoded))) = &result {
-                    self.pixel_bytes
-                        .fetch_add(decoded.size_bytes() as u64, Ordering::Release);
-                }
-                *slot = Some(result);
-            }
-            self.changed.notify_all();
+        // Retired or already completed tokens cannot add bytes or evict others.
+        if !matches!(loads.results.get(&load), Some(None)) {
+            return;
         }
+        if let Ok((_, pixels)) = &mut result {
+            if let Some(decoded) = pixels.as_ref() {
+                let bytes = decoded.size_bytes() as u64;
+                if bytes > self.pixel_budget {
+                    // Oversized realizations still answer complete semantics.
+                    // Do not evict useful retained images for an uncacheable one.
+                    *pixels = None;
+                } else {
+                    while loads.pixel_bytes > self.pixel_budget - bytes {
+                        let oldest = loads
+                            .pixels
+                            .pop_front()
+                            .expect("accounted pixels have a token");
+                        if let Some(Some(Ok((_, pixels)))) = loads.results.get_mut(&oldest) {
+                            let decoded = pixels.take().expect("FIFO token owns prepared pixels");
+                            loads.pixel_bytes -= decoded.size_bytes() as u64;
+                        }
+                    }
+                    loads.pixel_bytes += bytes;
+                    loads.pixels.push_back(load);
+                }
+            }
+        }
+        loads.results.insert(load, Some(result));
+        self.changed.notify_all();
     }
 
     fn retire(&self, load: ImageLoadToken) {
-        let removed = self
-            .loads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&load);
-        if let Some(Some(Ok((_, Some(decoded))))) = removed {
-            self.pixel_bytes
-                .fetch_sub(decoded.size_bytes() as u64, Ordering::Release);
+        let mut loads = self.loads.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Some(Ok((_, Some(decoded))))) = loads.results.remove(&load) {
+            loads.pixel_bytes -= decoded.size_bytes() as u64;
+            loads.pixels.retain(|token| *token != load);
         }
         self.changed.notify_all();
+    }
+
+    fn pixels(&self, load: ImageLoadToken) -> Option<Arc<SemanticImageDecoded>> {
+        let loads = self.loads.lock().unwrap_or_else(|e| e.into_inner());
+        match loads.results.get(&load) {
+            Some(Some(Ok((_, pixels)))) => pixels.clone(),
+            _ => None,
+        }
+    }
+
+    fn pixel_bytes(&self) -> u64 {
+        self.loads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pixel_bytes
     }
 
     fn wait(&self, load: ImageLoadToken, timeout: Duration) -> Option<DecodeResult> {
         let deadline = std::time::Instant::now() + timeout;
         let mut loads = self.loads.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            match loads.get(&load)? {
+            match loads.results.get(&load)? {
                 Some(result) => return Some(result.clone()),
                 None => {}
             }
@@ -78,13 +134,20 @@ impl Completion {
 pub(super) struct SemanticQueries {
     entries: RefCell<HashMap<ImageResolveRequest, PendingImage>>,
     limits: RefCell<HashMap<ImageResolveRequest, ImageSizeLimit>>,
-    pixels: RefCell<HashMap<ImageResolveRequest, Arc<SemanticImageDecoded>>>,
     admissions: RefCell<HashMap<ImageResolveRequest, Result<ImageSizeLimit, ImageDiagnostic>>>,
     completion: Arc<Completion>,
     decoder: Arc<SemanticImageDecoder>,
 }
 
 impl SemanticQueries {
+    #[cfg(test)]
+    pub(super) fn with_pixel_budget(bytes: u64) -> Self {
+        Self {
+            completion: Arc::new(Completion::new(bytes)),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn resolve(
         &self,
         catalog: &AsyncImageCatalog,
@@ -167,15 +230,10 @@ impl SemanticQueries {
             .borrow_mut()
             .insert(request.clone(), admission);
         match result {
-            Ok((metadata, pixels)) => {
-                if let Some(pixels) = pixels {
-                    self.pixels.borrow_mut().insert(request, pixels);
-                }
-                Ok(Some(ReadyImage {
-                    load: pending.load(),
-                    metadata,
-                }))
-            }
+            Ok((metadata, _)) => Ok(Some(ReadyImage {
+                load: pending.load(),
+                metadata,
+            })),
             Err(error) => {
                 let failed = pending.failed(error);
                 catalog.record_failure_always(&failed);
@@ -202,7 +260,6 @@ impl SemanticQueries {
                 catalog.admission_limits.borrow_mut().remove(request);
                 self.limits.borrow_mut().remove(request);
                 self.admissions.borrow_mut().remove(request);
-                self.pixels.borrow_mut().remove(request);
                 catalog
                     .reported_failures
                     .borrow_mut()
@@ -225,7 +282,8 @@ impl SemanticQueries {
         &self,
         request: &ImageResolveRequest,
     ) -> Option<Arc<SemanticImageDecoded>> {
-        self.pixels.borrow().get(request).cloned()
+        let load = self.entries.borrow().get(request)?.load();
+        self.completion.pixels(load)
     }
 
     pub(super) fn retire_sequence(&self, retirement: ImageSequenceRetirement) {
@@ -235,7 +293,7 @@ impl SemanticQueries {
     pub(super) fn cached_size_bytes(&self) -> u64 {
         u64::try_from(self.decoder.cached_size_bytes())
             .unwrap_or(u64::MAX)
-            .saturating_add(self.completion.pixel_bytes.load(Ordering::Acquire))
+            .saturating_add(self.completion.pixel_bytes())
     }
 }
 
