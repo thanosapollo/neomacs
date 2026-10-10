@@ -674,9 +674,7 @@ fn case_table_extra(table: Value, idx: usize) -> Value {
 
 fn set_case_table_extra(table: Value, idx: usize, value: Value) {
     let _ = table.with_char_table_mut(|obj| {
-        if let Some(slot) = obj.extras.ensure_owned().get_mut(idx) {
-            *slot = value;
-        }
+        obj.set_extra(idx, value);
     });
 }
 

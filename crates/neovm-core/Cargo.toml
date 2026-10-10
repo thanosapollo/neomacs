@@ -194,6 +194,10 @@ name = "thread_safety_contracts"
 path = "tests/thread_safety_contracts.rs"
 
 [[test]]
+name = "chartable_write_contracts"
+path = "tests/chartable_write_contracts.rs"
+
+[[test]]
 name = "p0s3_contracts"
 path = "tests/p0s3_contracts.rs"
 

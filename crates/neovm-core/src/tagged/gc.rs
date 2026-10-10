@@ -640,8 +640,8 @@ pub struct TaggedHeap {
     /// Mapped cons ranges staged by `begin_collection` for the concurrent
     /// first cycle; `launch_concurrent_mark` moves them into the job.
     staged_mapped_cons_scan: Option<Vec<(usize, usize)>>,
-    /// Mapped veclike header addresses staged alongside (see the job field).
-    staged_mapped_veclikes: Option<Vec<usize>>,
+    /// Stopped-start mapped veclike backing descriptors (see the job field).
+    staged_mapped_veclikes: Option<MappedVeclikeScanSnapshot>,
     /// Set while a stop-the-world FIRST partition cycle runs with the image
     /// pre-marked (`premark_mapped_image`): every mapped object is marked in
     /// the side tables and the flat seed pushes all their heap children, so
@@ -2656,7 +2656,9 @@ mod heap_identity;
 pub use heap_identity::HeapIdentity;
 mod mark_word;
 use mark_word::{MarkStack, MarkWord, SharedMarkQueue};
+pub(crate) mod mapped_veclike_scan;
 pub(crate) mod scan_contract;
+use mapped_veclike_scan::MappedVeclikeScanSnapshot;
 #[cfg(test)]
 #[path = "gc/tests/shutdown_tests.rs"]
 mod shutdown_tests;
