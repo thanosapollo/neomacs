@@ -192,9 +192,13 @@ fn external_sigcont_live_output_yields_to_input_timer_and_independent_pipe() {
         ev.eval_symbol("fair-continued-count").unwrap(),
         Value::fixnum(1)
     );
+    // The notification filter arms this timer after the first timer phase.
+    // Its callback stays deferred through that pass's ordinary poll, then
+    // observes both live allowances when the next wait services timers.
+    assert_eq!(ev.eval_symbol("fair-tick-at").unwrap(), Value::NIL);
     ev.wait_for_command_input(Some(Instant::now() + Duration::from_secs(1)))
         .unwrap();
-    assert_eq!(ev.eval_symbol("fair-tick-at").unwrap(), Value::fixnum(16));
+    assert_eq!(ev.eval_symbol("fair-tick-at").unwrap(), Value::fixnum(32));
     for _ in 0..256 {
         ev.poll_process_output_for_ids(vec![owner, stderr], Some(owner), false)
             .unwrap();
