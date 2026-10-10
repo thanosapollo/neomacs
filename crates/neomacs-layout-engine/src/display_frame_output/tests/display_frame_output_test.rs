@@ -391,13 +391,96 @@ fn window_frame_geometry_reserves_terminal_border_column() {
     frame.window_system = false;
     frame.right_divider_width = 0;
 
-    let geometry = WindowFrameGeometryRequest::new(&params, &frame, 200.0).resolve();
+    let geometry = WindowFrameGeometryRequest::new(&params, &frame, frame.width, 200.0).resolve();
 
     assert_eq!(geometry.right_edge, 130.0);
     assert_eq!(geometry.bottom_edge, 120.0);
     assert!(!geometry.is_rightmost);
     assert!(!geometry.is_bottommost);
     assert!(geometry.reserve_terminal_right_border_col);
+}
+
+// Retained GUI geometry: frame width 842, internal border 8, root right 834.
+// Exercise the production geometry request and divider partition, not a copy
+// of their predicates. The root and its right sibling own no right border;
+// the left sibling must keep the real separator and the TTY reserved column.
+fn root_border_r035_geometry(left: f32, width: f32, terminal: bool) -> WindowFrameGeometry {
+    let mut params = window_params();
+    params.bounds = Rect::new(left, 68.0, width, 525.0);
+    let mut frame = frame_params();
+    frame.width = 842.0;
+    frame.window_system = !terminal;
+    frame.right_divider_width = 0;
+    WindowFrameGeometryRequest::new(&params, &frame, 834.0, 593.0).resolve()
+}
+
+#[test]
+fn window_root_border_r035_inset_root_is_rightmost() {
+    let geometry = root_border_r035_geometry(8.0, 826.0, false);
+    assert_eq!(geometry.right_edge, 834.0);
+    assert!(
+        geometry.is_rightmost,
+        "inset root must not paint a right border"
+    );
+    assert!(!geometry.reserve_terminal_right_border_col);
+}
+
+#[test]
+fn window_root_border_r035_left_split_keeps_separator() {
+    let geometry = root_border_r035_geometry(8.0, 413.0, false);
+    assert_eq!(geometry.right_edge, 421.0);
+    assert!(!geometry.is_rightmost);
+    assert!(!geometry.reserve_terminal_right_border_col);
+}
+
+#[test]
+fn window_root_border_r035_right_split_is_rightmost() {
+    let geometry = root_border_r035_geometry(421.0, 413.0, false);
+    assert_eq!(geometry.right_edge, 834.0);
+    assert!(
+        geometry.is_rightmost,
+        "right split ends at the root, not the frame"
+    );
+}
+
+#[test]
+fn window_root_border_r035_terminal_control_keeps_reserved_column() {
+    let geometry = root_border_r035_geometry(8.0, 413.0, true);
+    assert!(!geometry.is_rightmost);
+    assert!(geometry.reserve_terminal_right_border_col);
+}
+
+#[test]
+fn window_root_border_r035_real_divider_only_between_siblings() {
+    use crate::window_layout::{WindowChromeMetrics, WindowDividerLayout, WindowLayoutBox};
+
+    let mut frame = frame_params();
+    frame.width = 842.0;
+    frame.right_divider_width = 6;
+    frame.bottom_divider_width = 0;
+    for (left, width, has_divider) in [(8.0, 413.0, true), (421.0, 413.0, false)] {
+        let mut params = window_params();
+        params.bounds = Rect::new(left, 68.0, width, 525.0);
+        let geometry = WindowFrameGeometryRequest::new(&params, &frame, 834.0, 593.0).resolve();
+        let layout = WindowLayoutBox::resolve(
+            &params,
+            WindowChromeMetrics::from_params(&params),
+            WindowDividerLayout::resolve(&params, &frame, geometry),
+        );
+        assert_eq!(layout.regions().right_divider.is_some(), has_divider);
+        if let Some(divider) = layout.regions().right_divider {
+            assert_eq!(divider, Rect::new(415.0, 68.0, 6.0, 525.0));
+        }
+    }
+}
+
+#[test]
+fn window_root_border_r035_zero_inset_control_is_rightmost() {
+    let mut params = window_params();
+    let frame = frame_params();
+    params.bounds = Rect::new(0.0, 0.0, frame.width, 120.0);
+    let geometry = WindowFrameGeometryRequest::new(&params, &frame, frame.width, 120.0).resolve();
+    assert!(geometry.is_rightmost);
 }
 
 #[test]
