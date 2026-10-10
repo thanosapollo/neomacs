@@ -412,13 +412,15 @@ pub struct OtfCapability {
 /// caches. Store only parsed capabilities, never whole font allocations.
 #[derive(Default)]
 pub(crate) struct OtfCapabilityCache {
-    entries: std::collections::HashMap<(String, u32), (OtfFileIdentity, Option<OtfCapability>)>,
+    entries: std::collections::HashMap<(String, u32), (FontFileObservation, Option<OtfCapability>)>,
 }
 
 const OTF_CAPABILITY_CACHE_CAP: usize = 64;
 
+/// Strong file metadata observation shared by native font caches. This is
+/// not an atomic snapshot against concurrent adversarial file replacement.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct OtfFileIdentity {
+pub(crate) struct FontFileObservation {
     len: u64,
     modified: std::time::SystemTime,
     #[cfg(unix)]
@@ -429,8 +431,8 @@ struct OtfFileIdentity {
     changed: (i64, i64),
 }
 
-impl OtfFileIdentity {
-    fn for_file(file: &str) -> Option<Self> {
+impl FontFileObservation {
+    pub(crate) fn for_file(file: &str) -> Option<Self> {
         // On Unix, inode/device distinguish replacement, and ctime catches
         // in-place changes even if mtime is restored. Other platforms retain
         // the uncached probe until an equally strong native identity is used.
@@ -473,7 +475,7 @@ impl OtfCapabilityCache {
         read: impl FnOnce(&str) -> std::io::Result<Vec<u8>>,
     ) -> Option<OtfCapability> {
         let key = (file.to_owned(), face_index);
-        let identity = OtfFileIdentity::for_file(file);
+        let identity = FontFileObservation::for_file(file);
         if let Some(identity) = &identity
             && let Some((cached_identity, capability)) = self.entries.get(&key)
             && identity == cached_identity
@@ -489,7 +491,7 @@ impl OtfCapabilityCache {
         // asset is not cached. This is a metadata observation, not an atomic
         // defense against adversarial concurrent file replacement.
         if let Some(identity) = identity
-            && Some(&identity) == OtfFileIdentity::for_file(file).as_ref()
+            && Some(&identity) == FontFileObservation::for_file(file).as_ref()
         {
             if self.entries.len() >= OTF_CAPABILITY_CACHE_CAP {
                 self.clear();

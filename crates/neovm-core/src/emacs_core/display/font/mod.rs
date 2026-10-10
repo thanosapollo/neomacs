@@ -2478,6 +2478,9 @@ fn match_font_spec_request(
 pub(crate) fn clear_font_cache(args: Vec<Value>) -> EvalResult {
     expect_max_args("clear-font-cache", &args, 0)?;
     clear_font_cache_state();
+    // Native font observations share this revision with fontset policy.
+    // Retire successful openings too, without removing any fontset rules.
+    super::fontset::invalidate_font_selection_policy();
     Ok(Value::NIL)
 }
 
