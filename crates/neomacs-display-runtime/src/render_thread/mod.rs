@@ -85,6 +85,11 @@ pub use state::{
 };
 pub use thread_handle::RenderThread;
 
+pub use neomacs_renderer_wgpu::SvgResourceContext;
+/// Complete CPU semantic decoding, independent of render-loop service.
+pub use neomacs_renderer_wgpu::image_cache::{
+    SemanticImageDecoded, SemanticImageDecoder, SemanticImageRequest, SemanticImageSource, SemanticImageSequenceReservation,
+};
 /// Header-only image geometry, for placing an image whose pixels have not been
 /// decoded yet (see `neomacs_renderer_wgpu::image_probe`).
 pub use neomacs_renderer_wgpu::image_probe::{ImageProbeSource, probe_image_layout};

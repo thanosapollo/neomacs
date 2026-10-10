@@ -135,7 +135,10 @@ impl RedisplayWaker {
 
 /// Deep host-side module that owns image request identity, state transitions,
 /// renderer scheduling, and completion observation.
+mod semantic_queries;
+
 pub(super) struct AsyncImageCatalog {
+    semantic_queries: semantic_queries::SemanticQueries,
     cmd_tx: neomacs_display_runtime::thread_comm::CommandSender,
     render_waker: Option<GuiEventLoopWaker>,
     image_metadata: SharedImageRenderState,
@@ -144,18 +147,11 @@ pub(super) struct AsyncImageCatalog {
     /// Woken once per header probe that produced geometry.
     redisplay_waker: Option<RedisplayWaker>,
     entries: RefCell<HashMap<ImageResolveRequest, CatalogEntry>>,
+    /// First admission survives GPU residency changes; Lisp invalidation retires it.
+    admission_limits: RefCell<HashMap<ImageResolveRequest, ImageSizeLimit>>,
     sequence_ids: RefCell<HashMap<ImageResolveSource, ImageSequenceId>>,
     next_load_attempt: Cell<u64>,
     next_sequence_id: Cell<u64>,
-    /// The `max-image-size` bound the most recent lookup resolved.
-    ///
-    /// Only the device-loss re-queue needs it: that path rebuilds every
-    /// entry's load command without a frame in hand, and it runs while the
-    /// same frames are being redisplayed, so the bound those entries were
-    /// built under is the one to re-check them against. It starts at GNU's
-    /// registered initializer rather than at "no limit", so a re-queue can
-    /// never be the one path that loads without a bound.
-    size_limit: Cell<ImageSizeLimit>,
     home_directory: Option<String>,
     /// GNU `image_find_image_fd` search path (`data-directory/images`, then
     /// `x-bitmap-file-path`), used to resolve relative image `:file`s.
@@ -189,16 +185,17 @@ impl AsyncImageCatalog {
         redisplay_waker: Option<RedisplayWaker>,
     ) -> Self {
         Self {
+            semantic_queries: Default::default(),
             cmd_tx,
             render_waker,
             image_metadata,
             header_layouts: Arc::new(Mutex::new(HashMap::new())),
             redisplay_waker,
             entries: RefCell::new(HashMap::new()),
+            admission_limits: RefCell::new(HashMap::new()),
             sequence_ids: RefCell::new(HashMap::new()),
             next_load_attempt: Cell::new(0),
             next_sequence_id: Cell::new(0),
-            size_limit: Cell::new(ImageSizeLimit::default()),
             home_directory: home_directory_from_environment(),
             search_path: vec![image_data_directory().to_string_lossy().into_owned()],
             failed_diagnostics: RefCell::new(Vec::new()),
@@ -286,9 +283,9 @@ impl AsyncImageCatalog {
     pub(super) fn invalidate_all(&self) {
         let mut entries = self.entries.borrow_mut();
         // No frame is in hand on this path; re-check every entry against the
-        // bound the redisplay that built it resolved (see `size_limit`).
-        let limit = self.size_limit.get();
+        // first admission of that identity, independent of other lookups.
         for (request, state) in entries.iter_mut() {
+            let limit = self.admission_limits.borrow()[request];
             let placement = state.placement();
             let image_id = placement.image_id();
             let load = self.next_load(image_id);
@@ -296,12 +293,7 @@ impl AsyncImageCatalog {
             let command =
                 image_load_command(&request, load, self.sequence_id(&request.source), limit);
             let pending = PendingImage::new(load, self.renew_header_layout(&request, load));
-            *state = match schedule_image_command(
-                &self.cmd_tx,
-                self.render_waker.as_ref(),
-                command,
-                resolution.as_ref(),
-            ) {
+            *state = match self.schedule_decode_command(&request, command, resolution.as_ref()) {
                 Ok(()) => CatalogEntry::Pending(pending),
                 Err(error) => {
                     tracing::warn!(
@@ -309,7 +301,7 @@ impl AsyncImageCatalog {
                         %error,
                         "failed to re-queue image decode after display reset"
                     );
-                    CatalogEntry::Failed(pending.failed(ImageDiagnostic::NotDrawable))
+                    CatalogEntry::Failed(pending.failed(self.semantic_failure(&request)))
                 }
             };
         }
@@ -320,45 +312,7 @@ impl AsyncImageCatalog {
         request: ImageResolveRequest,
         limit: ImageSizeLimit,
     ) -> Result<Option<ReadyImage>, String> {
-        let normalized_request = self.classify_request(request.clone()).0;
-        let pending = match self.lookup_inner(request.clone(), limit) {
-            ImageLookup::Ready(image) => return Ok(Some(image)),
-            ImageLookup::Pending(image) => image,
-            ImageLookup::Failed(failed) => {
-                // `image-size` asks about one image and GNU logs every time it
-                // is asked, so this path reports even a failure the display
-                // side has already reported.
-                self.record_failure_always(&failed);
-                return Err(failed.error.message());
-            }
-        };
-        let placement = pending.placement();
-
-        let Some(terminal) =
-            wait_for_image_metadata(&self.image_metadata, pending.load(), Duration::from_secs(1))
-        else {
-            // Bounded wait: do not invent dimensions. Callers (image-size, etc.)
-            // surface this as a failed resolve rather than a wrong pixel size.
-            return Err(format!(
-                "Timed out waiting for image decode (id {})",
-                placement.image_id()
-            ));
-        };
-        let state = image_lookup_from_terminal(pending, terminal);
-        self.entries
-            .borrow_mut()
-            .insert(normalized_request, CatalogEntry::from_lookup(state.clone()));
-
-        match state {
-            ImageLookup::Ready(image) => Ok(Some(image)),
-            ImageLookup::Failed(failed) => {
-                // A failure delivered while this caller waited owes the same
-                // diagnostic as one already cached at the initial lookup.
-                self.record_failure_always(&failed);
-                Err(failed.error.message())
-            }
-            ImageLookup::Pending(_) => unreachable!("terminal decode cannot remain pending"),
-        }
+        self.semantic_queries.resolve(self, request, limit)
     }
 }
 
@@ -372,6 +326,22 @@ impl ImageCatalog for AsyncImageCatalog {
             self.record_failure(failed);
         }
         lookup
+    }
+
+    fn invalidate(&self, target: ImageInvalidation) -> ImageInvalidationResult {
+        AsyncImageCatalog::invalidate(self, target)
+    }
+
+    fn invalidate_animation(&self, target: ImageAnimationInvalidation) -> ImageInvalidationResult {
+        AsyncImageCatalog::invalidate_animation(self, target)
+    }
+
+    fn reconcile_renderer_state(&self, event: ImageStateEvent) {
+        AsyncImageCatalog::reconcile_renderer_state(self, event);
+    }
+
+    fn cached_size_bytes(&self) -> i64 {
+        AsyncImageCatalog::cached_size_bytes(self)
     }
 
     fn take_pending_diagnostics(&self) -> Vec<String> {
@@ -410,9 +380,64 @@ impl AsyncImageCatalog {
             .push(failed.error.clone());
     }
 
+    fn admission_limit(
+        &self,
+        request: &ImageResolveRequest,
+        proposed: ImageSizeLimit,
+    ) -> ImageSizeLimit {
+        *self
+            .admission_limits
+            .borrow_mut()
+            .entry(request.clone())
+            .or_insert(proposed)
+    }
+
+    fn semantic_failure(&self, request: &ImageResolveRequest) -> ImageDiagnostic {
+        self.semantic_queries
+            .admission(request)
+            .and_then(Result::err)
+            .unwrap_or(ImageDiagnostic::NotDrawable)
+    }
+
+    fn schedule_decode_command(
+        &self,
+        request: &ImageResolveRequest,
+        mut command: RenderCommand,
+        resolution: Option<&ImageFileRequest>,
+    ) -> Result<(), String> {
+        if let Some(decoded) = self.semantic_queries.pixels(request) {
+            let load = match command {
+                RenderCommand::Asset(
+                    AssetCommand::ImageLoadFile { load, .. }
+                    | AssetCommand::ImageLoadData { load, .. },
+                ) => load,
+                _ => unreachable!("catalog decode submission owns encoded loads"),
+            };
+            command = RenderCommand::Asset(AssetCommand::ImageLoadDecoded { load, decoded });
+            return schedule_image_command(&self.cmd_tx, self.render_waker.as_ref(), command, None);
+        }
+        match self.semantic_queries.admission(request) {
+            Some(Ok(admitted_limit)) => match &mut command {
+                RenderCommand::Asset(
+                    AssetCommand::ImageLoadFile { limit, .. }
+                    | AssetCommand::ImageLoadData { limit, .. },
+                ) => *limit = admitted_limit,
+                _ => unreachable!("catalog decode submission owns encoded loads"),
+            },
+            Some(Err(error)) => return Err(error.message()),
+            None => {}
+        }
+        schedule_image_command(
+            &self.cmd_tx,
+            self.render_waker.as_ref(),
+            command,
+            resolution,
+        )
+    }
+
     fn lookup_inner(&self, request: ImageResolveRequest, limit: ImageSizeLimit) -> ImageLookup {
-        self.size_limit.set(limit);
         let (request, resolution) = self.classify_request(request);
+        let limit = self.admission_limit(&request, limit);
         let mut entries = self.entries.borrow_mut();
         if !entries.contains_key(&request) {
             let image_id = next_host_image_id();
@@ -421,19 +446,14 @@ impl AsyncImageCatalog {
             let pending = PendingImage::new(load, layout);
             let command =
                 image_load_command(&request, load, self.sequence_id(&request.source), limit);
-            let state = match schedule_image_command(
-                &self.cmd_tx,
-                self.render_waker.as_ref(),
-                command,
-                resolution.as_ref(),
-            ) {
+            let state = match self.schedule_decode_command(&request, command, resolution.as_ref()) {
                 Ok(()) => CatalogEntry::Pending(pending),
                 Err(error) => {
                     // Not a decode failure: the render thread could not be
                     // handed the job at all. GNU has no sentence for this,
                     // because it has no second thread to lose.
                     tracing::warn!(%error, "image load command could not be scheduled");
-                    CatalogEntry::Failed(pending.failed(ImageDiagnostic::NotDrawable))
+                    CatalogEntry::Failed(pending.failed(self.semantic_failure(&request)))
                 }
             };
             entries.insert(request.clone(), state);
@@ -444,23 +464,19 @@ impl AsyncImageCatalog {
             .get_mut(&request)
             .expect("image catalog entry inserted above");
         if let CatalogEntry::Evicted(placement) = state {
+            let limit = self.admission_limits.borrow()[&request];
             let load = self.next_load(placement.image_id());
             let pending = PendingImage::new(load, placement.layout());
             let command =
                 image_load_command(&request, load, self.sequence_id(&request.source), limit);
-            *state = match schedule_image_command(
-                &self.cmd_tx,
-                self.render_waker.as_ref(),
-                command,
-                resolution.as_ref(),
-            ) {
+            *state = match self.schedule_decode_command(&request, command, resolution.as_ref()) {
                 Ok(()) => CatalogEntry::Pending(pending),
                 Err(error) => {
                     // Not a decode failure: the render thread could not be
                     // handed the job at all. GNU has no sentence for this,
                     // because it has no second thread to lose.
                     tracing::warn!(%error, "image load command could not be scheduled");
-                    CatalogEntry::Failed(pending.failed(ImageDiagnostic::NotDrawable))
+                    CatalogEntry::Failed(pending.failed(self.semantic_failure(&request)))
                 }
             };
             self.schedule_header_probe(&request, resolution.as_ref(), load);
@@ -503,6 +519,7 @@ impl AsyncImageCatalog {
             }
             other => other,
         };
+        let semantic_changed = self.semantic_queries.invalidate(&target, self);
         let (removed, invalidated) = {
             let mut entries = self.entries.borrow_mut();
             let requests = entries
@@ -519,6 +536,7 @@ impl AsyncImageCatalog {
                 .into_iter()
                 .filter_map(|request| {
                     let state = entries.remove(&request)?;
+                    self.admission_limits.borrow_mut().remove(&request);
                     invalidated.push(request);
                     Some(state.placement().image_id())
                 })
@@ -535,7 +553,7 @@ impl AsyncImageCatalog {
             }
         }
 
-        let result = if removed.is_empty() {
+        let result = if removed.is_empty() && !semantic_changed {
             ImageInvalidationResult::Unchanged
         } else {
             ImageInvalidationResult::Changed
@@ -545,7 +563,12 @@ impl AsyncImageCatalog {
     }
 
     fn cached_size_bytes(&self) -> i64 {
-        i64::try_from(self.image_metadata.cached_size_bytes()).unwrap_or(i64::MAX)
+        i64::try_from(
+            self.image_metadata
+                .cached_size_bytes()
+                .saturating_add(self.semantic_queries.cached_size_bytes()),
+        )
+        .unwrap_or(i64::MAX)
     }
 
     fn invalidate_animation(&self, target: ImageAnimationInvalidation) -> ImageInvalidationResult {
@@ -568,6 +591,7 @@ impl AsyncImageCatalog {
                 )
             }
         };
+        self.semantic_queries.retire_sequence(retirement);
         let command = RenderCommand::Asset(AssetCommand::ImageSequenceRetire { retirement });
         if let Err(error) =
             schedule_image_command(&self.cmd_tx, self.render_waker.as_ref(), command, None)
