@@ -2799,9 +2799,18 @@ fn start_process_buffer_name_program_and_arg_contracts_match_oracle() {
         r#"(with-temp-buffer
              (let ((p (start-process "neo-sp-contract-buffer" (current-buffer) "{cat}")))
                (unwind-protect
-                   (list (processp p)
-                         (null (condition-case err (process-send-eof nil) (error err)))
-                         (null (condition-case err (process-running-child-p nil) (error err))))
+                   (progn
+                     ;; Establish a live PTY before querying its foreground
+                     ;; group. EOF can retire cat and its descriptor at once.
+                     (process-send-string p "ready\n")
+                     (let ((deadline (+ (float-time) 5)))
+                       (while (and (= (buffer-size) 0)
+                                   (< (float-time) deadline))
+                         (accept-process-output p 0.05)))
+                     (list (processp p)
+                           (> (buffer-size) 0)
+                           (null (process-running-child-p nil))
+                           (null (process-send-eof nil))))
                  (ignore-errors (delete-process p)))))
            (condition-case err (start-process 'neo-sp-contract-name nil "{cat}") (error err))
            (condition-case err (start-process t nil "{cat}") (error err))
@@ -2817,7 +2826,7 @@ fn start_process_buffer_name_program_and_arg_contracts_match_oracle() {
            (condition-case err (start-process "neo-sp-contract-arg-nil" nil "{cat}" nil) (error err))
            (condition-case err (start-process "neo-sp-contract-arg-int" nil "{cat}" 1) (error err))"#,
     ));
-    assert_eq!(results[0], "OK (t t t)");
+    assert_eq!(results[0], "OK (t t t t)");
     assert_eq!(results[1], r#"OK (error ":name value not a string")"#);
     assert_eq!(results[2], r#"OK (error ":name value not a string")"#);
     assert_eq!(results[3], r#"OK (error ":name value not a string")"#);
@@ -3384,8 +3393,15 @@ fn process_send_string_reenters_wait_and_runs_filter_when_write_blocks() {
                           :filter (lambda (_ string)
                                     (push (length string) events))))
                    (process-send-string p (make-string 262144 ?x))
-                   (list (> (apply #'+ events) 0)
-                         (apply #'+ events)))
+                   ;; Sending waits for input capacity, not for every output
+                   ;; byte: GNU can leave a tail unread when its write drains.
+                   ;; Keep the reentry assertion separate from the exact drain.
+                   (let ((reentered (> (apply #'+ events) 0))
+                         (deadline (+ (float-time) 5)))
+                     (while (and (< (apply #'+ events) 262144)
+                                 (< (float-time) deadline))
+                       (accept-process-output p 0.05))
+                     (list reentered (apply #'+ events))))
                (when p
                  (ignore-errors
                    (delete-process p)))))"#
@@ -13652,29 +13668,39 @@ fn stderr_pipe_sentinel_neighbour_audit() {
     );
 }
 
-/// A bare integer argument to `signal-process` is an OS pid, and GNU never
-/// looks it up: `internal-default-signal-process` calls `get_process` only for
-/// a NON-number (src/process.c:7369-7370), and a number goes straight to
-/// `CONS_TO_INTEGER (process, pid_t, pid)` (:7375-7376).  The docstring says so
-/// too (:7405-7407).
-///
-/// This port consulted the live process table first, so a small integer
-/// answered for whichever process happened to hold that internal `ProcessId`.
-/// Measured, `-Q --batch`, with exactly one live child:
-///
-/// ```text
-///                          GNU 31.0.90   Neomacs, before
-/// (signal-process 1 0)     -1            0      <- this port's process #1
-/// (signal-process 2 0)     -1            -1
-/// (signal-process 3 0)     -1            -1
-/// ```
-///
-/// `-1` is `kill (1, 0)` failing with EPERM against init.  Signal 0 only, so
-/// nothing is actually signalled.  Found by ledger 169's neighbour audit, not
-/// by the bug it set out to fix.
+/// Signal zero is an OS existence/permission query, not a lookup of the
+/// evaluator's process IDs. Small PIDs can belong to the sandbox supervisor;
+/// compare their syscall results rather than assuming a host init's EPERM.
 #[test]
 fn signal_process_reads_an_integer_as_an_os_pid_like_gnu() {
     crate::test_utils::init_test_tracing();
+    // A live internal ID can numerically equal a valid OS PID in a namespace.
+    // Equal signal-zero answers must not hide resolving the wrong target.
+    {
+        let mut processes = ProcessManager::new();
+        let buffers = crate::buffer::BufferManager::new();
+        let id = processes.create_process(
+            "integer-target-control".into(),
+            Value::NIL,
+            "program".into(),
+            vec![],
+            ProcessCodingSystems::gnu_make_process_initial(),
+        );
+        assert_eq!(id, 1);
+        assert!(matches!(
+            resolve_signal_process_target_in_state(&processes, &buffers, Some(&Value::fixnum(1))),
+            Ok(SignalProcessTarget::Pid(1))
+        ));
+        assert!(matches!(
+            resolve_signal_process_target_in_state(
+                &processes,
+                &buffers,
+                Some(&Value::make_process(id))
+            ),
+            Ok(SignalProcessTarget::Process(process)) if process == id
+        ));
+    }
+    let expected_small = [1, 2, 3].map(|pid| sys::send_signal(pid, 0));
     let sh = find_bin("sh");
     let result = eval_one(&format!(
         r#"(let* ((p (make-process
@@ -13691,14 +13717,17 @@ fn signal_process_reads_an_integer_as_an_os_pid_like_gnu() {
                          (error (list 'error (cadr e))))))
              (prog1 (list :small answers
                           :own own
-                          :own-pid-is-large (and (> (process-id p) 100) t)
+                          :self (signal-process (emacs-pid) 0)
                           :still-live (and (process-live-p p) t))
                (delete-process p)))"#
     ));
 
     assert_eq!(
         result,
-        "OK (:small (-1 -1 -1) :own 0 :own-pid-is-large t :still-live t)"
+        format!(
+            "OK (:small ({} {} {}) :own 0 :self 0 :still-live t)",
+            expected_small[0], expected_small[1], expected_small[2]
+        )
     );
 }
 
