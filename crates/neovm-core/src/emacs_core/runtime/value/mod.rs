@@ -3839,22 +3839,13 @@ impl TaggedValue {
         }
     }
 
-    /// Mutate a GNU-shaped char-table object.
-    pub fn with_char_table_mut<R>(self, f: impl FnOnce(&mut CharTableObj) -> R) -> Option<R> {
-        if !self.is_char_table() {
-            return None;
-        }
-        // Write barrier: char-tables are dumped (syntax/category/case tables)
-        // and mutated in place, so the GC remembered set must learn about
-        // dumped char-table → heap edges through this single mutation
-        // chokepoint. Fired before `f` (conservative: any `_mut` borrow may
-        // store a heap pointer). No-op unless write tracking is enabled.
-        mutate::LispCollectionRevision::changed(self);
-        note_heap_write(self, HeapWriteKind::CharTableData);
-        let ptr = self.as_veclike_ptr().unwrap() as *mut CharTableObj;
-        #[cfg(debug_assertions)]
-        let _guard = mutate::HeapMutClosureGuard::enter();
-        Some(f(unsafe { &mut *ptr }))
+    /// Write a char-table through its barriered fixed-slot capability.
+    /// The closure cannot expose mutable slots or resize the backing.
+    pub fn with_char_table_mut<R>(
+        self,
+        f: impl FnOnce(&mut mutate::CharTableWrite<'_>) -> R,
+    ) -> Option<R> {
+        mutate::with_char_table_write(self, f)
     }
 
     /// Borrow a GNU-shaped sub-char-table object.
@@ -3868,22 +3859,12 @@ impl TaggedValue {
         }
     }
 
-    /// Mutate a GNU-shaped sub-char-table object.
+    /// Write an interior node through its barriered fixed-slot capability.
     pub fn with_sub_char_table_mut<R>(
         self,
-        f: impl FnOnce(&mut SubCharTableObj) -> R,
+        f: impl FnOnce(&mut mutate::SubCharTableWrite<'_>) -> R,
     ) -> Option<R> {
-        if !self.is_sub_char_table() {
-            return None;
-        }
-        // Write barrier — see `with_char_table_mut`. Sub-char-tables are the
-        // dumped char-table interior nodes and are mutated the same way.
-        mutate::LispCollectionRevision::changed(self);
-        note_heap_write(self, HeapWriteKind::SubCharTableData);
-        let ptr = self.as_veclike_ptr().unwrap() as *mut SubCharTableObj;
-        #[cfg(debug_assertions)]
-        let _guard = mutate::HeapMutClosureGuard::enter();
-        Some(f(unsafe { &mut *ptr }))
+        mutate::with_sub_char_table_write(self, f)
     }
 
     /// Expose GNU's readable char-table slots:
