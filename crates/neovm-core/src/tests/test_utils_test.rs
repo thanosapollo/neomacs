@@ -182,7 +182,10 @@ pub fn load_gnu_undo_auto_runtime(eval: &mut Context) {
 
 /// Load the real GNU `simple.el` special-mode surface required by help buffers.
 pub fn load_gnu_special_mode_runtime(eval: &mut Context) {
-    if eval.obarray().symbol_value("special-mode-map").is_some()
+    if eval
+        .obarray()
+        .symbol_value_copied("special-mode-map")
+        .is_some()
         && eval.obarray().symbol_function("special-mode").is_some()
     {
         return;
@@ -342,7 +345,7 @@ pub fn load_gnu_separator_line_runtime(eval: &mut Context) {
 pub fn load_gnu_elisp_syntax_table_runtime(eval: &mut Context) {
     if eval
         .obarray()
-        .symbol_value("emacs-lisp-mode-syntax-table")
+        .symbol_value_copied("emacs-lisp-mode-syntax-table")
         .is_some()
     {
         return;
@@ -644,8 +647,9 @@ mod tests {
 
         result.expect("the probe tree should load as an early runtime");
         assert_eq!(
-            eval.obarray().symbol_value("neomacs-test-workspace-probe"),
-            Some(&Value::symbol("from-nextest-remap")),
+            eval.obarray()
+                .symbol_value_copied("neomacs-test-workspace-probe"),
+            Some(Value::symbol("from-nextest-remap")),
             "load_minimal_gnu_backquote_runtime must load from NEXTEST_WORKSPACE_ROOT, \
              not the compile-time CARGO_WORKSPACE_DIR"
         );

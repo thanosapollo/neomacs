@@ -379,7 +379,7 @@ fn assert_tier_i_cases(cases: &[(&'static str, &'static str)]) {
                         Ok(value) => print_value(&value),
                         Err(err) => format!("ERR {err:?}"),
                     };
-                    let datum = eval.obarray.symbol_value("fix15-datum").copied();
+                    let datum = eval.obarray.symbol_value_copied("fix15-datum");
                     if let Some(datum) = datum.filter(|datum| datum.is_cons()) {
                         let live = eval.tagged_heap.owns_heap_value_for_test(datum);
                         printed.push_str(if live { " live" } else { " FREED" });
@@ -647,7 +647,7 @@ fn improper_let_star_keeps_original_datum_after_moving_roots_advance() {
                         print_value(&eval.eval_str("(fix15-original-datum)").unwrap()),
                         "3"
                     );
-                    let original_bits = eval.obarray.symbol_value("fix15-c").unwrap().bits();
+                    let original_bits = eval.obarray.symbol_value_copied("fix15-c").unwrap().bits();
                     eval.eval_str("(setq fix15-gc t fix15-n 0)").unwrap();
                     let runs_before = eval.tier_i.stats().count(TierIEvent::Run);
                     let condition = eval
@@ -658,7 +658,7 @@ fn improper_let_star_keeps_original_datum_after_moving_roots_advance() {
                         )
                         .unwrap();
                     assert_eq!(print_value(&condition), "(wrong-type-argument listp)");
-                    let datum = *eval.obarray.symbol_value("fix15-datum").unwrap();
+                    let datum = eval.obarray.symbol_value_copied("fix15-datum").unwrap();
                     assert_eq!(datum.bits(), original_bits, "{mode:?}, lexical={lex}");
                     // Check ownership before dereferencing/printing the cons.
                     assert!(eval.tagged_heap.owns_heap_value_for_test(datum));
@@ -677,7 +677,10 @@ fn improper_let_star_keeps_original_datum_after_moving_roots_advance() {
             }
         })
         .expect("spawn improper-let-star-datum thread");
-    assert_eq!(rx.recv_timeout(STARTUP_TIMEOUT).expect("runtime startup"), "");
+    assert_eq!(
+        rx.recv_timeout(STARTUP_TIMEOUT).expect("runtime startup"),
+        ""
+    );
     for mode in MODES {
         for lex in ["nil", "t"] {
             assert_eq!(

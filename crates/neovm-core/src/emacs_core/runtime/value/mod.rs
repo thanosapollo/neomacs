@@ -833,17 +833,31 @@ impl std::ops::Index<&HashKey> for HashTableStorage {
 }
 
 impl HashTableStorage {
-    /// [`Self::with_capacity`], or `None` when the memory is not available.
-    fn try_with_capacity(capacity: usize) -> Option<Self> {
-        let mut storage = Self::with_capacity(0);
-        storage.slots.try_reserve_exact(capacity).ok()?;
-        storage.index.try_reserve(capacity).then_some(storage)
+    fn try_with_capacity(
+        capacity: crate::emacs_core::alloc::HashTableSize,
+    ) -> Result<Self, crate::emacs_core::error::Flow> {
+        use crate::emacs_core::alloc::AllocLen;
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(capacity.capacity())
+            .map_err(|_| crate::emacs_core::alloc::memory_exhausted())?;
+        Ok(Self::with_index_and_slots(
+            HashIndex::try_with_capacity(capacity.capacity())?,
+            slots,
+        ))
     }
 
     fn with_capacity(capacity: usize) -> Self {
+        Self::with_index_and_slots(
+            HashIndex::with_capacity(capacity),
+            Vec::with_capacity(capacity),
+        )
+    }
+
+    fn with_index_and_slots(index: HashIndex, slots: Vec<Option<HashTableEntry>>) -> Self {
         Self {
-            index: HashIndex::with_capacity(capacity),
-            slots: Vec::with_capacity(capacity),
+            index,
+            slots,
             free_slots: Vec::new(),
             user_hashes: rustc_hash::FxHashMap::default(),
             user_buckets: rustc_hash::FxHashMap::default(),
@@ -2124,18 +2138,14 @@ impl LispHashTable {
         rehash_size: f64,
         rehash_threshold: f64,
     ) -> Self {
-        Self {
+        Self::with_storage(
             test,
-            test_name: None,
-            user_cmp_function: None,
-            user_hash_function: None,
-            mutable: true,
             size,
             weakness,
             rehash_size,
             rehash_threshold,
-            data: HashTableStorage::default(),
-        }
+            HashTableStorage::default(),
+        )
     }
 
     pub fn new_with_options(
@@ -2144,6 +2154,24 @@ impl LispHashTable {
         weakness: Option<HashTableWeakness>,
         rehash_size: f64,
         rehash_threshold: f64,
+    ) -> Self {
+        Self::with_storage(
+            test,
+            size,
+            weakness,
+            rehash_size,
+            rehash_threshold,
+            HashTableStorage::with_capacity(size.max(0) as usize),
+        )
+    }
+
+    fn with_storage(
+        test: HashTableTest,
+        size: i64,
+        weakness: Option<HashTableWeakness>,
+        rehash_size: f64,
+        rehash_threshold: f64,
+        data: HashTableStorage,
     ) -> Self {
         Self {
             test,
@@ -2155,7 +2183,7 @@ impl LispHashTable {
             weakness,
             rehash_size,
             rehash_threshold,
-            data: HashTableStorage::with_capacity(size.max(0) as usize),
+            data,
         }
     }
 
@@ -2168,7 +2196,12 @@ impl LispHashTable {
         rehash_size: f64,
         rehash_threshold: f64,
     ) -> Option<Self> {
-        let data = HashTableStorage::try_with_capacity(size.max(0) as usize)?;
+        if size > Value::MOST_POSITIVE_FIXNUM {
+            return None;
+        }
+        let capacity =
+            crate::emacs_core::alloc::HashTableSize::try_from(Value::fixnum(size.max(0))).ok()?;
+        let data = HashTableStorage::try_with_capacity(capacity).ok()?;
         let mut table = Self::new_with_options(test, 0, weakness, rehash_size, rehash_threshold);
         table.size = size;
         table.data = data;
@@ -2521,10 +2554,11 @@ impl TaggedValue {
     /// the value is outside the fixnum range.
     #[inline]
     pub fn make_int(value: i64) -> Self {
-        if (Self::MOST_NEGATIVE_FIXNUM..=Self::MOST_POSITIVE_FIXNUM).contains(&value) {
-            Self::fixnum(value)
-        } else {
-            Self::bignum_from_i64(value)
+        match crate::tagged::value::Fixnum::try_from(value) {
+            Ok(value) => Self::from_fixnum(value),
+            Err(crate::tagged::value::FixnumRangeError::OutOfRange(_)) => {
+                Self::bignum_from_i64(value)
+            }
         }
     }
 
@@ -2657,6 +2691,21 @@ impl TaggedValue {
         with_tagged_heap(|h| h.alloc_char_table(purpose, init, n_extras))
     }
 
+    /// Allocate Lisp-supplied extra slots only after GNU count validation.
+    pub(crate) fn try_char_table(
+        purpose: Value,
+        init: Value,
+        count: crate::emacs_core::alloc::CharTableExtras,
+    ) -> Result<Self, crate::emacs_core::error::Flow> {
+        use crate::emacs_core::alloc::{AllocLen, reserved_values};
+        let mut extras = reserved_values(count)?;
+        extras.resize(count.capacity(), init);
+        crate::emacs_core::chartable::bump_char_table_write_tick();
+        Ok(with_tagged_heap(|h| {
+            h.alloc_char_table_with_extras(purpose, init, extras)
+        }))
+    }
+
     /// Allocate a GNU-shaped sub-char-table.
     pub fn make_sub_char_table(depth: i32, min_char: i32, contents: Vec<Value>) -> Self {
         with_tagged_heap(|h| h.alloc_sub_char_table(depth, min_char, contents))
@@ -2730,8 +2779,7 @@ impl TaggedValue {
         with_tagged_heap(|h| h.alloc_hash_table(LispHashTable::new(test)))
     }
 
-    /// [`Self::hash_table_with_options`], or `None` when SIZE entries cannot
-    /// be allocated.
+    /// Allocate a hash table fallibly with explicit rehash options.
     pub fn try_hash_table_with_options(
         test: HashTableTest,
         size: i64,
@@ -2768,9 +2816,33 @@ impl TaggedValue {
         })
     }
 
+    /// Allocate a hash table after validating the Lisp capacity and reserving
+    /// all of its backing storage through fallible collection APIs.
+    pub(crate) fn try_hash_table_with_validated_size(
+        test: HashTableTest,
+        size: crate::emacs_core::alloc::HashTableSize,
+        weakness: Option<HashTableWeakness>,
+    ) -> Result<Self, crate::emacs_core::error::Flow> {
+        use crate::emacs_core::alloc::AllocLen;
+        let data = HashTableStorage::try_with_capacity(size)?;
+        let table =
+            LispHashTable::with_storage(test, size.capacity() as i64, weakness, 1.5, 0.8125, data);
+        Ok(with_tagged_heap(|h| h.alloc_hash_table(table)))
+    }
+
     /// Allocate a GNU-shaped obarray object.
     pub fn obarray(size: usize) -> Self {
         with_tagged_heap(|h| h.alloc_obarray(vec![Value::NIL; size]))
+    }
+
+    /// Allocate obarray buckets after validating GNU's size-hint boundary.
+    pub(crate) fn try_obarray(
+        size: crate::emacs_core::alloc::ObarrayBits,
+    ) -> Result<Self, crate::emacs_core::error::Flow> {
+        use crate::emacs_core::alloc::{AllocLen, reserved_values};
+        let mut buckets = reserved_values(size)?;
+        buckets.resize(size.capacity(), Value::NIL);
+        Ok(with_tagged_heap(|h| h.alloc_obarray(buckets)))
     }
 
     /// Allocate a marker.
@@ -3582,7 +3654,7 @@ impl TaggedValue {
                 crate::emacs_core::pdump::stub_params_required_only(ptr, data.closure_slot_count)
             });
         }
-        Some(data.params.optional.is_empty() && data.params.rest.is_none())
+        Some(data.params.fixed_arity().is_some())
     }
 
     /// The required-parameter count of a byte-code function that takes only
@@ -3599,8 +3671,7 @@ impl TaggedValue {
                 crate::emacs_core::pdump::stub_required_only_arity(ptr, data.closure_slot_count)
             };
         }
-        (data.params.optional.is_empty() && data.params.rest.is_none())
-            .then_some(data.params.required.len())
+        data.params.fixed_arity()
     }
 
     pub(crate) fn bytecode_interactive_probe(self) -> Option<BytecodeInteractiveProbe> {
