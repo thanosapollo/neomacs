@@ -555,6 +555,10 @@ mod tests {
     #[test]
     fn dropped_armed_permit_cannot_blacken_before_a_completed_cycle() {
         let mut heap = TaggedHeap::new();
+        // This fixture asserts promotion to ordinary old after recovery, not
+        // the removed first-partition promotion to permanent. Select the
+        // generational collector explicitly instead of inheriting GEN0.
+        heap.generational.enabled = true;
         let image_child = heap.alloc_float(8.25);
         let image = Box::into_raw(Box::new(ConsCell {
             car: image_child,
@@ -593,6 +597,10 @@ mod tests {
         let exclusion = idle.exclude_concurrent_mark().unwrap();
         assert!(heap.dump_blackened);
         assert!(heap.value_is_tenured(image_child));
+        // A completed first partition must not pin this session allocation.
+        let child_header = TaggedHeap::value_heap_addr(image_child).unwrap() as *const GcHeader;
+        // SAFETY: the registered image retains the live child through recovery.
+        assert!(!unsafe { (*child_header).generation.permanent() });
         assert_eq!(image_child.xfloat(), 8.25);
         assert!(!heap.first_cycle_concurrent);
         assert!(!heap.mark_in_progress && !heap.sweep_in_progress);
