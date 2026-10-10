@@ -1,8 +1,12 @@
 use super::*;
 
 #[test]
-fn casify_expansion_constructor_excludes_empty_and_single_char_outputs() {
-    assert!(CasifyExpansion::new(CharPos0::ZERO, CharLen::ZERO).is_none());
+fn casify_expansion_constructor_keeps_empty_but_excludes_single_char_outputs() {
+    let contraction = CasifyExpansion::new(CharPos0::ZERO, CharLen::ZERO).unwrap();
+    assert_eq!(
+        contraction.delta().apply_to_pos(CharPos0::new(2)),
+        CharPos0::new(1)
+    );
     assert!(CasifyExpansion::new(CharPos0::ZERO, CharLen::new(1)).is_none());
     let expansion = CasifyExpansion::new(CharPos0::new(3), CharLen::new(2)).unwrap();
     assert_eq!(expansion.source, CharPos0::new(3));

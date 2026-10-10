@@ -94,7 +94,7 @@ pub(in crate::buffer) fn convert_lisp_string_for_buffer_mode(
     converted
 }
 
-/// One source character whose case mapping grows in character count.
+/// One source character whose case mapping changes in character count.
 /// Positions are relative to the original region, never byte offsets. The
 /// validating constructor excludes unchanged extents. This value contains no
 /// Lisp state and may be shared between mutators; edits retain buffer ownership.
@@ -118,7 +118,7 @@ static_assertions::assert_impl_all!(CasifyStorageShape: Send, Sync);
 
 impl CasifyExpansion {
     pub(crate) fn new(source: CharPos0, replacement_len: CharLen) -> Option<Self> {
-        (replacement_len.get() > 1).then_some(Self {
+        (replacement_len.get() != 1).then_some(Self {
             source,
             replacement_len,
         })
@@ -129,9 +129,17 @@ impl CasifyExpansion {
     }
 
     pub(in crate::buffer) fn growth(self) -> CharLen {
-        // Construction proves that the replacement contains at least two
-        // characters for the single source character.
+        // Only the positive-extent property-insertion branch calls this.
+        debug_assert!(self.replacement_len.get() > 1);
         CharLen::new(self.replacement_len.get() - 1)
+    }
+
+    pub(in crate::buffer) fn contracts(self) -> bool {
+        self.replacement_len == CharLen::ZERO
+    }
+
+    pub(in crate::buffer) fn delta(self) -> super::position::CharDelta {
+        super::position::CharDelta::replacement(CharLen::new(1), self.replacement_len)
     }
 }
 
@@ -531,7 +539,7 @@ impl Buffer {
                         .char_start()
                         .add_len(CharLen::new(expansion.source.get()));
                     if position > source {
-                        result = result.add_len(expansion.growth());
+                        result = expansion.delta().apply_to_pos(result);
                     }
                 }
                 result
@@ -540,17 +548,18 @@ impl Buffer {
                 TextPositionAnchor::new(position, self.text.char_pos_to_emacs_byte_pos(position))
             };
             let state = snapshot.state;
-            // GNU replace_range_2 always grows ZV by the replacement's
+            // GNU replace_range_2 always adjusts ZV by the replacement's signed
             // character delta (insdel.c:1738-1745,1764-1776). A before hook
             // can narrow ZV before a later expansion in the physical range.
             // Re-derive its byte position so the paired anchor stays coherent.
-            let growth = expansions.iter().fold(CharLen::ZERO, |growth, expansion| {
-                growth.add_len(expansion.growth())
-            });
+            let delta = super::position::CharDelta::replacement(
+                replacement.old_char_len(),
+                replacement.new_char_len(),
+            );
             self.set_edit_state(BufferEditState::new(
                 anchor(shifted(state.point().char_pos())),
                 anchor(state.begv().char_pos()),
-                anchor(state.zv().char_pos().add_len(growth)),
+                anchor(delta.apply_to_pos(state.zv().char_pos())),
             ));
         }
         let old_range = replacement.old_range();

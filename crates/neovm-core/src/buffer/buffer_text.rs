@@ -2493,15 +2493,30 @@ impl BufferText {
         let mut table = self.storage.borrow().text_props.as_ref().clone();
         table.invalidate_casify_syntax_caches();
         let mut object_len = self.char_count();
-        let mut added = CharLen::new(0);
         for expansion in expansions {
-            let pos = start
-                .add_len(CharLen::new(expansion.source_pos().get()))
-                .add_len(added);
-            let growth = expansion.growth();
-            table.adjust_for_casify_insertion(pos, growth, object_len, context, &roots)?;
-            object_len = object_len.add_len(growth);
-            added = added.add_len(growth);
+            let delta = super::position::CharDelta::replacement(self.char_count(), object_len);
+            let pos =
+                delta.apply_to_pos(start.add_len(CharLen::new(expansion.source_pos().get())));
+            if expansion.contracts() {
+                table.adjust_for_delete_char_range(CharRange::new(
+                    pos,
+                    pos.add_len(CharLen::new(1)),
+                ));
+            } else {
+                table.adjust_for_casify_insertion(
+                    pos,
+                    expansion.growth(),
+                    object_len,
+                    context,
+                    &roots,
+                )?;
+            }
+            object_len = CharLen::new(
+                expansion
+                    .delta()
+                    .apply_to_pos(CharPos0::new(object_len.get()))
+                    .get(),
+            );
         }
         // Preparation has no Lisp callbacks or evaluator GC safepoints. The
         // helper roots each newly allocated plist; collect the final table's
