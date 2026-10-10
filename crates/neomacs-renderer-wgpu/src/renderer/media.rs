@@ -13,6 +13,16 @@ use neomacs_display_protocol::{
 use neomacs_video::{PlaybackAction, VideoOpenRequest};
 
 impl WgpuRenderer {
+    pub fn upload_semantic_image(
+        &mut self,
+        load: ImageLoadToken,
+        decoded: &crate::image_cache::SemanticImageDecoded,
+    ) -> crate::image_cache::ImageCacheEvent {
+        self.caches
+            .image
+            .upload_semantic_image(&self.device, &self.queue, load, decoded)
+    }
+
     /// Retire completed timestamp queries and reserve one bounded slot for a
     /// frame-content pass that can actually draw video.
     ///

@@ -451,7 +451,9 @@ impl CompiledPattern {
 /// position cannot represent.  The rewind form re-evaluates the exit at every
 /// position, which such an engine handles correctly and which is semantically
 /// identical (the compiler only applies the keep-string optimization when body
-/// and continuation are mutually exclusive, GNU `mutually_exclusive_p`).  The
+/// and continuation are mutually exclusive, GNU `mutually_exclusive_p`, or
+/// when the loop exits straight to the final non-POSIX `Succeed`, where the
+/// greedy longest run is the rewind loop's first success too).  The
 /// transform preserves byte LENGTH and all opcode positions, so the
 /// position-keyed charset side tables stay valid.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7735,8 +7737,10 @@ fn continuation_first_superset(buf: &CompiledPattern, from: usize) -> Option<Cha
             if pc >= bytecode.len() {
                 // Pattern may end right after the loop: a shorter
                 // iteration count could produce an overall match, so the
-                // fast loop is not safe (GNU only allows this in its
-                // `unconstrained` refinement, which we skip).
+                // fast loop is not safe here.  (GNU's `unconstrained`
+                // refinement is applied separately, and only to an
+                // immediately terminal `Succeed`: see
+                // `unconstrained_terminal_success`.)
                 return None;
             }
             let op = RegexOp::from_byte(bytecode[pc])?;
@@ -7833,6 +7837,51 @@ fn mutually_exclusive_p(buf: &CompiledPattern, body_start: usize, cont: usize) -
     body.disjoint(&cont_set)
 }
 
+/// GNU `mutually_exclusive_one`'s `case succeed` (regex-emacs.c:3938-3951),
+/// in its narrowest form: the loop exit at `cont` reaches the pattern's
+/// final non-POSIX `Succeed` with nothing but `NoOp`s on the way.
+///
+/// GNU's argument: when N and N+1 iterations of the one-char body both
+/// match, the `succeed` after N+1 always wins (the greedy path reaches it
+/// first and `succeed` ends the whole match), so the `succeed` after N
+/// may be treated as a failure and the loop needs no per-iteration
+/// failure point.  It holds only while the path from the loop exit to
+/// `succeed` is *unconstrained* — no operator that could reject the
+/// longer run.  GNU tracks that with `data->unconstrained`; here only the
+/// trivially unconstrained path qualifies.  Assertions, captures, jumps,
+/// alternation, `PosixEnd` and every other continuation keep the
+/// existing analysis (and, failing it, the backtracking loop).
+///
+/// The body must be the verified one-character shape
+/// ([`simple_one_char_body`]) and analyzable by
+/// [`one_char_match_superset`]: a single opcode that either matches one
+/// character or fails without consuming, so the keep-string exit resumes
+/// at the same string position the per-iteration frame would have
+/// restored.  Matching predicates, case translation, ranges, stops,
+/// registers and quit polling are untouched — only the frame protocol of
+/// this one loop changes, exactly as in GNU's rewrite.
+fn unconstrained_terminal_success(
+    buf: &CompiledPattern,
+    body_start: usize,
+    body_end: usize,
+    cont: usize,
+) -> bool {
+    if buf.posix
+        || !simple_one_char_body(buf, body_start, body_end)
+        || one_char_match_superset(buf, body_start).is_none()
+    {
+        return false;
+    }
+    let bytecode = &buf.buffer;
+    let mut pc = cont;
+    while bytecode.get(pc) == Some(&(RegexOp::NoOp as u8)) {
+        pc += 1;
+    }
+    // The compiler emits exactly one `Succeed`, as the last byte of a
+    // non-POSIX pattern (see `regex_compile_lisp_with_translation`).
+    pc + 1 == bytecode.len() && bytecode[pc] == RegexOp::Succeed as u8
+}
+
 /// Resolve every `on_failure_jump_smart` in freshly-compiled bytecode.
 ///
 /// GNU performs this rewrite lazily on first execution
@@ -7841,7 +7890,9 @@ fn mutually_exclusive_p(buf: &CompiledPattern, body_start: usize, cont: usize) -
 /// rewrite happens once here, immediately after compilation — same
 /// resulting bytecode, no runtime mutation:
 ///
-/// - exclusive loop (`mutually_exclusive_p`): the opcode becomes
+/// - exclusive loop (`mutually_exclusive_p`, or GNU's `unconstrained`
+///   terminal-`succeed` case, `unconstrained_terminal_success`): the opcode
+///   becomes
 ///   `on_failure_keep_string_jump` and the trailing jump is retargeted
 ///   from the opcode to the loop body (GNU `STORE_NUMBER (p2 - 2,
 ///   mcnt + 3)`), so ONE failure point is pushed for the whole loop and
@@ -7887,7 +7938,9 @@ fn resolve_one_smart_jump(buf: &mut CompiledPattern, p3: usize, prev_start: Opti
     if ((jump_at + 3) as i64 + back as i64) as usize != p3 {
         return;
     }
-    if mutually_exclusive_p(buf, p3 + 3, p2) {
+    if mutually_exclusive_p(buf, p3 + 3, p2)
+        || unconstrained_terminal_success(buf, p3 + 3, jump_at, p2)
+    {
         buf.buffer[p3] = RegexOp::OnFailureKeepStringJump as u8;
         store_number(&mut buf.buffer, jump_at + 1, back + 3);
         return;
