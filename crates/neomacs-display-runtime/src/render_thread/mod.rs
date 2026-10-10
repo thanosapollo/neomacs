@@ -4,6 +4,8 @@
 
 mod app_handler;
 mod asset_commands;
+#[cfg(all(feature = "gui-test-hooks", target_os = "linux"))]
+pub mod native_image_probe;
 mod bootstrap;
 pub(crate) mod child_frames;
 mod command_processing;
