@@ -46,6 +46,7 @@ pub(crate) struct WindowFrameGeometry {
 pub(crate) struct WindowFrameGeometryRequest<'a> {
     params: &'a WindowParams,
     frame_params: &'a FrameParams,
+    root_right_edge: f32,
     main_area_bottom: f32,
 }
 
@@ -419,11 +420,13 @@ impl<'a> WindowFrameGeometryRequest<'a> {
     pub(crate) fn new(
         params: &'a WindowParams,
         frame_params: &'a FrameParams,
+        root_right_edge: f32,
         main_area_bottom: f32,
     ) -> Self {
         Self {
             params,
             frame_params,
+            root_right_edge,
             main_area_bottom,
         }
     }
@@ -431,7 +434,9 @@ impl<'a> WindowFrameGeometryRequest<'a> {
     pub(crate) fn resolve(self) -> WindowFrameGeometry {
         let right_edge = self.params.bounds.x + self.params.bounds.width;
         let bottom_edge = self.params.bounds.y + self.params.bounds.height;
-        let is_rightmost = right_edge >= self.frame_params.width - 1.0;
+        // GNU WINDOW_RIGHTMOST_P compares with the root window, not the
+        // outer frame: GUI internal borders inset the entire window tree.
+        let is_rightmost = right_edge == self.root_right_edge;
         let is_bottommost =
             self.params.is_minibuffer() || bottom_edge >= self.main_area_bottom - 1.0;
         let reserve_terminal_right_border_col = !self.frame_params.window_system

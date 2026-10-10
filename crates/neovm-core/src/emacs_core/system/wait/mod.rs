@@ -1072,7 +1072,23 @@ impl super::eval::Context {
         &mut self,
         request: &WaitRequest,
     ) -> Result<WaitServiceOutcome, Flow> {
-        self.service_wait_request_processes(request, WaitProcessService::Poll, true)
+        self.service_wait_request_processes(request, WaitProcessService::Poll, true, None)
+    }
+
+    /// The first pass of `wait_reading_process_output`: an ordinary poll
+    /// service pass that also carries GNU's before-the-block
+    /// `status_notify`, placed between the timers and the process poll the
+    /// way GNU's loop places it.
+    fn service_wait_request_first_pass(
+        &mut self,
+        request: &WaitRequest,
+    ) -> Result<WaitServiceOutcome, Flow> {
+        self.service_wait_request_processes(
+            request,
+            WaitProcessService::Poll,
+            true,
+            Some(WaitStatusNotifySite::before_the_block()),
+        )
     }
 
     #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
@@ -1111,16 +1127,26 @@ impl super::eval::Context {
             request,
             activity.into_process_service(),
             run_timers,
+            None,
         )?;
         outcome.handshake_ready = handshake_ready;
         Ok(outcome)
     }
 
+    /// One service pass: special input, due timers, then (when
+    /// `status_notify` names a site) GNU's `status_notify`, then the process
+    /// poll.
+    ///
+    /// Only `wait_reading_process_output`'s first pass passes a site.  The
+    /// after-the-block notify stays in the wait loop, ahead of this pass,
+    /// because GNU's post-select notify (src/process.c:5876) likewise
+    /// precedes the next loop-top `timer_check`.
     fn service_wait_request_processes(
         &mut self,
         request: &WaitRequest,
         process_service: WaitProcessService,
         run_timers: bool,
+        status_notify: Option<WaitStatusNotifySite>,
     ) -> Result<WaitServiceOutcome, Flow> {
         let mut outcome = WaitServiceOutcome::default();
         let special_input = if request.services_special_input() {
@@ -1153,6 +1179,18 @@ impl super::eval::Context {
         // Honor it before invoking display hooks or more process callbacks;
         // the caller's binding still determines whether quitting is allowed.
         self.maybe_quit()?;
+        // GNU's first pass reaches `if (update_tick != process_tick)` and its
+        // `status_notify (NULL, wait_proc)` (src/process.c:5546, :5576) only
+        // AFTER the `timer_check` loop above (:5512), and before it reads any
+        // process fd (the non-running WAIT_PROC drain at :5581ff, then the
+        // select).  So due timers run before an already-exited child's
+        // remaining output (filter) and sentinel, both of which
+        // `status_notify` delivers.  Deliberately not gated on the timer
+        // condition: GNU's :5546 check does not depend on :5503's.
+        if let Some(site) = status_notify {
+            let notified = self.record_and_notify_status_changes(request, site)?;
+            outcome.absorb_process_activity(notified);
+        }
 
         // Drain ready process output (a non-blocking poll of already-readable
         // fds plus filter dispatch) BEFORE yielding to pending command input.
@@ -1351,14 +1389,14 @@ impl super::eval::Context {
         &mut self,
         request: WaitRequest,
     ) -> Result<WaitCompletion, Flow> {
-        // GNU src/process.c:5540-5556, on the first pass through the loop:
+        // GNU src/process.c:5546-5576, on the first pass through the loop:
         // before anything blocks, notify any status that changed while Lisp
         // was busy.  Here that means running `handle_child_signal`'s walk
-        // first, because this port could not run it in the handler.
-        let notified = self
-            .record_and_notify_status_changes(&request, WaitStatusNotifySite::before_the_block())?;
-        let mut outcome = self.service_wait_request_once_outcome(&request)?;
-        outcome.absorb_process_activity(notified);
+        // first, because this port could not run it in the handler.  GNU
+        // does it after the first `timer_check` (:5512), so the notify runs
+        // inside the first service pass, between its timers and its process
+        // poll -- not ahead of the pass.
+        let mut outcome = self.service_wait_request_first_pass(&request)?;
         if let Some(completion) =
             self.complete_wait_after_required_minimum_drain(&request, outcome)?
         {
