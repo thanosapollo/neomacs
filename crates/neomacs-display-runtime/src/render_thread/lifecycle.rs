@@ -226,7 +226,9 @@ impl RenderApp {
                         Err(error) => self.startup_error = Some(error),
                     }
 
-                    self.frame_windows.primary_window().unwrap()
+                    self.frame_windows
+                        .primary_window()
+                        .unwrap()
                         .replay_pending_native_state(window.as_ref());
                     self.window_icon.apply(window.as_ref());
                 }
@@ -286,6 +288,26 @@ impl RenderApp {
                 }
             }
         }
+        // Device-loss recovery (SHADER_SURFACES.md: user shader hang → TDR):
+        // latched by the wgpu device-lost callback, by a streak of
+        // consecutive surface-Lost acquisitions, or by the debug simulation
+        // command. Rebuild the whole GPU stack before doing anything else
+        // with it.
+        if self.device_lost.take() {
+            if self.process_startup_commands() {
+                self.handle_exiting();
+                event_loop.exit();
+                return;
+            }
+            self.comms.tooltip_context.invalidate();
+            self.tooltips.shutdown();
+            self.menus.cancel();
+            self.menus.shutdown();
+            if !self.recover_from_device_loss(event_loop) {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                return;
+            }
+        }
         if self.gpu.is_none() {
             if self.process_startup_commands() {
                 self.handle_exiting();
@@ -294,18 +316,6 @@ impl RenderApp {
             }
             event_loop.set_control_flow(self.startup_control_flow());
             return;
-        }
-        // Device-loss recovery (SHADER_SURFACES.md: user shader hang → TDR):
-        // latched by the wgpu device-lost callback, by a streak of
-        // consecutive surface-Lost acquisitions, or by the debug simulation
-        // command. Rebuild the whole GPU stack before doing anything else
-        // with it.
-        if self.device_lost.take() {
-            self.comms.tooltip_context.invalidate();
-            self.tooltips.shutdown();
-            self.menus.cancel();
-            self.menus.shutdown();
-            self.recover_from_device_loss(event_loop);
         }
         self.refresh_monitor_snapshot(event_loop, true);
         self.complete_pending_scale_changes();
@@ -318,7 +328,12 @@ impl RenderApp {
                     .get(frame)?
                     .lifecycle
                     .native()
-                    .map(|native| (&native.surface, native.surface_generation))
+                    .and_then(|native| {
+                        native
+                            .surface
+                            .as_ref()
+                            .map(|surface| (surface, native.surface_generation))
+                    })
             },
         );
         if self.process_commands_with_waker(Some(event_loop.create_proxy())) {

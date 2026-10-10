@@ -171,11 +171,13 @@ impl RenderApp {
             self.presentation_observer.before_present(
                 window.as_ref(),
                 renderer.device(),
-                &window_state
+                window_state
                     .lifecycle
                     .native()
                     .expect("live window")
-                    .surface,
+                    .surface
+                    .as_ref()
+                    .expect("acquired surface remains live through present"),
                 window_state
                     .lifecycle
                     .native()

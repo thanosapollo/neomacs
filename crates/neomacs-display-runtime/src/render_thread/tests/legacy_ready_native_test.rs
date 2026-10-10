@@ -48,7 +48,7 @@ fn present_blank(app: &RenderApp, id: WindowId) {
         state.lifecycle.native().filter(|native| native.window.id() == id)
     }) else { return; };
     if let wgpu::CurrentSurfaceTexture::Success(output)
-        | wgpu::CurrentSurfaceTexture::Suboptimal(output) = native.surface.get_current_texture()
+        | wgpu::CurrentSurfaceTexture::Suboptimal(output) = native.surface.as_ref().expect("ready surface").get_current_texture()
     {
         let view = output.texture.create_view(&Default::default());
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
