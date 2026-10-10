@@ -9,6 +9,8 @@ fn two_windows() -> Context {
           (set-window-buffer (selected-window) (current-buffer))
           (insert (make-string 2000 ?λ))
           (setq hook-first (selected-window))
+          ;; Like GNU window.el, stage OLD's remaining pixel width first.
+          (set-window-new-pixel hook-first (- (window-pixel-width hook-first) 40))
           (setq hook-second (split-window-internal hook-first 40 t nil))
           (make-local-variable 'window-configuration-change-hook)
           (make-local-variable 'window-state-change-functions)
