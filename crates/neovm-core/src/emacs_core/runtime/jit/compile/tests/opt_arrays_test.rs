@@ -25,6 +25,7 @@ struct Settings;
 impl Settings {
     fn enter() -> Self {
         force_opt_for_test(Some(OptMode::Opt), Some(OptAdmit::ALL));
+        force_opt_profit_for_test(Some(OptProfitMode::Off));
         force_opt_passes_for_test(Some(OptPasses {
             range: true,
             ..OptPasses::default()
@@ -45,6 +46,7 @@ impl Settings {
 impl Drop for Settings {
     fn drop(&mut self) {
         force_opt_for_test(None, None);
+        force_opt_profit_for_test(None);
         force_opt_passes_for_test(None);
         force_tier2_for_test(None);
         crate::emacs_core::jit::feedback::force_feedback_mode_for_test(None);
@@ -70,7 +72,11 @@ fn plan(f: &ByteCodeFunction) -> ir::Func {
     plan_prefix(f, 0)
 }
 fn plan_prefix(f: &ByteCodeFunction, prefix: usize) -> ir::Func {
-    let arity = f.params.required.len();
+    let arity = f
+        .params
+        .stack_shape()
+        .expect("fixture stack parameters")
+        .required();
     let cfg = analyze_cfg(
         f.executable_ops(),
         &f.constants,
@@ -103,7 +109,10 @@ fn lower(f: &ByteCodeFunction, ir: &ir::Func) -> CompiledLeaf {
     let leaf = lower_opt_ir_for_test(
         f.executable_ops(),
         &f.constants,
-        f.params.required.len(),
+        f.params
+            .stack_shape()
+            .expect("fixture stack parameters")
+            .required(),
         f.executable_gnu_byte_offset_map(),
         ir,
     )

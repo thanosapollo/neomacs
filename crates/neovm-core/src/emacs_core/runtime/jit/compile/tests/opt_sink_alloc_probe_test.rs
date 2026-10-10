@@ -33,6 +33,7 @@ struct Settings;
 impl Settings {
     fn enter(sink: bool) -> Self {
         force_opt_for_test(Some(OptMode::Opt), Some(OptAdmit::ALL));
+        force_opt_profit_for_test(Some(OptProfitMode::Off));
         force_opt_passes_for_test(Some(OptPasses {
             sink,
             ..OptPasses::ALL
@@ -60,6 +61,7 @@ impl Settings {
 impl Drop for Settings {
     fn drop(&mut self) {
         force_opt_for_test(None, None);
+        force_opt_profit_for_test(None);
         force_opt_passes_for_test(None);
         force_flonum_mode_for_test(None);
         force_tier2_for_test(None);
@@ -182,7 +184,7 @@ fn load_fixture(ctx: &mut Context, roots: &Roots) -> Fixture {
             .get_bytecode_data()
             .expect("real GNU byte-code object");
         assert_eq!(source.arglist, Value::make_int(spec.descriptor));
-        assert_eq!(source.max_stack, spec.max_stack);
+        assert_eq!(source.max_stack.get(), spec.max_stack as usize);
         assert_eq!(
             source.gnu_bytecode_bytes.as_ref().unwrap().as_slice(),
             spec.bytes

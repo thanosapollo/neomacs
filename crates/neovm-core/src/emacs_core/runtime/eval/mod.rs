@@ -725,8 +725,6 @@ pub(crate) enum InlineSubrKind {
     /// A fixed-arity subr of at most three arguments: the VM calls its
     /// function pointer straight from the operand stack.
     Direct,
-    /// `aset`/`fillarray`: keep the string write-back path.
-    Writeback,
     /// Pure reads of the current buffer, executed without any call.
     Point,
     PointMin,
@@ -752,7 +750,6 @@ impl InlineSubr {
             ("point-min", Some(SubrFn::A0(_))) => InlineSubrKind::PointMin,
             ("point-max", Some(SubrFn::A0(_))) => InlineSubrKind::PointMax,
             ("current-buffer", Some(SubrFn::A0(_))) => InlineSubrKind::CurrentBuffer,
-            ("aset" | "fillarray", _) => InlineSubrKind::Writeback,
             (_, Some(SubrFn::A0(_) | SubrFn::A1(_) | SubrFn::A2(_) | SubrFn::A3(_))) => {
                 InlineSubrKind::Direct
             }
@@ -1018,9 +1015,54 @@ impl SavedBufferId {
     }
 }
 
+/// GNU's `unwind_excursion.window` slot (editfns.c:783-786): the selected
+/// window at `save-excursion` capture time when it displayed the current
+/// buffer, `Qnil` otherwise. Window ids start at 1, so 0 is a sentinel that
+/// never names a window and the JIT-pinned `SpecBinding` payload width
+/// (`jit_layout.rs` `ENTRY_WORDS`) is unchanged.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExcursionWindow(u64);
+
+impl ExcursionWindow {
+    /// GNU's `Qnil`: no window was recorded at capture time.
+    pub(crate) const NONE: Self = Self(0);
+
+    /// GNU `save_excursion_save` (editfns.c:783-786): record the selected
+    /// window when it displays BUFFER, `NONE` otherwise. Read-only: unlike
+    /// `ensure_selected_frame_id_in_state` this never synthesizes a frame,
+    /// so a frameless batch context records no window, like a GNU that never
+    /// ran `window-init`.
+    #[inline]
+    pub(crate) fn capture(frames: &FrameManager, buffer: BufferId) -> Self {
+        frames
+            .selected_window()
+            .filter(|window| window.buffer_id() == Some(buffer))
+            .map_or(Self::NONE, |window| Self(window.id().0))
+    }
+
+    /// The recorded window, or `None` for GNU's `Qnil`.
+    #[inline]
+    pub(crate) fn window(self) -> Option<WindowId> {
+        (self.0 != 0).then_some(WindowId(self.0))
+    }
+}
+
+static_assertions::assert_eq_size!(ExcursionWindow, u64);
+static_assertions::assert_eq_align!(ExcursionWindow, u64);
+
+mod specbinding_layout;
+
+specbinding_layout::define! {
 /// A single entry on the specpdl (special binding stack).
 /// Matches GNU Emacs's `union specbinding` SPECPDL_LET / SPECPDL_LET_LOCAL.
-#[derive(Clone, Debug)]
+///
+/// `repr(u8)` fixes each variant as a C-layout record beginning with its tag.
+/// Small fields precede word fields, sharing the first word with the tag;
+/// this keeps every entry at four words on the JIT's 64-bit hosts. The macro
+/// emits the matching record types from this same field list for `offset_of!`.
+/// Entries belong to their owning, thread-confined Context; a JIT push writes
+/// all live fields before publishing the new specpdl length.
 pub(crate) enum SpecBinding {
     /// Plain dynamic let-binding: saves old obarray (global/default) value.
     Let {
@@ -1061,16 +1103,16 @@ pub(crate) enum SpecBinding {
     /// `(nil FUNC FORMS FLAGS)` for these (`backtrace_frame_apply`,
     /// eval.c:3993-3994).
     Backtrace {
+        debug_on_exit: bool,
         function: Value,
         args: BacktraceArgs,
-        debug_on_exit: bool,
     },
     /// Common evaluated one-argument call, stored directly in the specpdl
     /// entry so callback-heavy paths do not clone into the owned side stack.
     Backtrace1 {
+        debug_on_exit: bool,
         function: Value,
         arg: Value,
-        debug_on_exit: bool,
     },
     /// Common evaluated two-argument call. Omitting `debug_on_exit` is a type-
     /// level statement that this compact form is the ordinary non-debug frame;
@@ -1096,22 +1138,23 @@ pub(crate) enum SpecBinding {
     /// (`Context::detach_native_frames_into`). So the stop-the-world root
     /// snapshot and backtrace walks may always read through the pointer.
     BacktraceNative {
+        nargs: u32,
         function: Value,
         args_ptr: *const i64,
-        nargs: u32,
     },
     /// unwind-protect cleanup. Matches GNU SPECPDL_UNWIND.
     /// For interpreter: forms is a cons list, unbind_to calls sf_progn_value.
     /// For VM: forms is a callable (bytecode fn), unbind_to calls apply.
     UnwindProtect { forms: Value, lexenv: Value },
     /// save-excursion state. Matches GNU SPECPDL_UNWIND_EXCURSION.
-    /// The owning evaluator's mutator records the original IDs for diagnostics
-    /// and retains their payload slots to preserve the specpdl layout. Restore
-    /// follows the traced marker's live location (GNU editfns.c:792-803), since
-    /// buffer-swap-text can move it away from these recording-time identities.
+    /// The owning evaluator's mutator records the original buffer id for
+    /// diagnostics and retains the payload slot GNU gives to
+    /// `unwind_excursion.window`. Restore follows the traced marker's live
+    /// location (GNU editfns.c:792-803), since buffer-swap-text can move it
+    /// away from the recording-time buffer identity.
     SaveExcursion {
         _saved_buffer_id: crate::buffer::BufferId,
-        _saved_marker_id: u64,
+        saved_window: ExcursionWindow,
         marker: Value,
     },
     /// save-current-buffer state. Matches GNU record_unwind_current_buffer.
@@ -1137,6 +1180,8 @@ pub(crate) enum SpecBinding {
     NativeUnwind { action: NativeUnwindAction },
     /// Placeholder. Matches GNU SPECPDL_NOP.
     Nop,
+}
+
 }
 
 /// Cold, owned payload for a `save-restriction` unwind entry.
@@ -1208,6 +1253,9 @@ impl SpecBinding {
 /// an untyped callback whose captures the GC cannot see.
 #[derive(Clone, Debug)]
 pub(crate) enum NativeUnwindAction {
+    /// Scalar reserve state owned by this Context's mutator; restored on its
+    /// own specpdl, without sharing a limit or a reserve between Contexts.
+    RestoreEvalDepth { old_limit: i64 },
     RestoreWindowConfiguration {
         configuration: super::builtins::SavedWindowConfiguration,
         options: super::builtins::WindowConfigurationRestoreOptions,
@@ -1218,16 +1266,22 @@ pub(crate) enum NativeUnwindAction {
     MinibufferBuffer {
         state: Box<super::reader::MinibufferBufferUnwind>,
     },
+    /// GNU `record_unwind_protect_int (backtrace_eval_unrewind, -distance)`
+    /// (eval.c:4255): re-swap the specpdl suffix a `backtrace-eval` unbound,
+    /// restoring the frames' own bindings before their normal unwind.
+    BacktraceEvalRewind { distance: usize },
 }
 
 impl NativeUnwindAction {
     fn trace_roots(&self, visit: &mut dyn FnMut(Value)) {
         match self {
+            Self::RestoreEvalDepth { .. } => {}
             Self::RestoreWindowConfiguration { configuration, .. } => {
                 visit(configuration.trace_value())
             }
             Self::MinibufferSession { state } => state.trace_roots(visit),
             Self::MinibufferBuffer { .. } => {}
+            Self::BacktraceEvalRewind { .. } => {}
         }
     }
 
@@ -1237,6 +1291,10 @@ impl NativeUnwindAction {
         let root_scope = context.save_vm_roots();
         self.trace_roots(&mut |value| context.push_vm_frame_root(value));
         let result = match self {
+            Self::RestoreEvalDepth { old_limit } => {
+                context.restore_lisp_eval_depth_room(old_limit);
+                Ok(Value::NIL)
+            }
             Self::RestoreWindowConfiguration {
                 configuration,
                 options,
@@ -1247,6 +1305,9 @@ impl NativeUnwindAction {
             Self::MinibufferBuffer { state } => {
                 super::reader::unwind_minibuffer_buffer(context, *state)
             }
+            Self::BacktraceEvalRewind { distance } => context
+                .specpdl_swap_suffix_for_backtrace_eval(distance, false)
+                .map(|()| Value::NIL),
         };
         context.restore_vm_roots(root_scope);
         result
@@ -1592,7 +1653,8 @@ fn trivial_spec_binding_pop(binding: &SpecBinding) -> Option<TrivialSpecBindingP
 const _: () = assert!(!std::mem::needs_drop::<TrivialSpecBindingPop>());
 
 /// `pop_simple_specpdl_suffix` retires a `SpecBinding::Let`, `LetLocal`,
-/// `LetDefault` and `LexicalEnv` with `set_len` (GNU's `--specpdl_ptr`);
+/// `LetDefault`, `LexicalEnv`, `SaveCurrentBuffer` and a completed
+/// `SaveExcursion` with `set_len` (GNU's `--specpdl_ptr`);
 /// that is only sound while those variants' payloads own nothing.
 const _: () = assert!(
     !std::mem::needs_drop::<SymId>()
@@ -1600,6 +1662,7 @@ const _: () = assert!(
         && !std::mem::needs_drop::<Value>()
         && !std::mem::needs_drop::<crate::buffer::BufferId>()
         && !std::mem::needs_drop::<SavedBufferId>()
+        && !std::mem::needs_drop::<ExcursionWindow>()
 );
 
 #[derive(Clone, Debug, Default)]
@@ -1885,9 +1948,10 @@ cached_symbol_id!(closure_symbol, "closure");
 cached_symbol_id!(declare_symbol, "declare");
 cached_symbol_id!(macro_symbol, "macro");
 cached_symbol_id!(max_lisp_eval_depth_symbol, "max-lisp-eval-depth");
+// Symbol identity is global and immutable; values remain owned by each Context.
+cached_symbol_id!(lisp_eval_depth_reserve_symbol, "lisp-eval-depth-reserve");
 cached_symbol_id!(frame_alpha_lower_limit_symbol, "frame-alpha-lower-limit");
 cached_symbol_id!(byte_code_literal_symbol, "byte-code-literal");
-cached_symbol_id!(byte_code_symbol, "byte-code");
 cached_symbol_id!(input_decode_map_symbol, "input-decode-map");
 cached_symbol_id!(local_function_key_map_symbol, "local-function-key-map");
 cached_symbol_id!(post_gc_hook_symbol, "post-gc-hook");
@@ -2007,10 +2071,6 @@ fn install_core_eval_symbols(obarray: &mut Obarray, reset_runtime_values: bool) 
         symbols_with_pos_enabled_symbol,
         print_symbols_bare_symbol,
     }
-}
-
-fn is_runtime_dynamically_special(obarray: &Obarray, sym_id: SymId) -> bool {
-    obarray.is_special_id(sym_id) && !obarray.is_constant_id(sym_id)
 }
 
 /// The name `(let ((SYM VALUE)) ...)` must report as `(setting-constant SYM)`,
@@ -2731,6 +2791,11 @@ pub(crate) enum ResumeTarget {
     InterpreterCatch,
     InterpreterConditionCase {
         handler_index: usize,
+        condition_stack_base: usize,
+    },
+    /// GNU safe_funcall's Qt barrier. The index identifies a live handler
+    /// on its owning Context's mutator; it is never shared across Contexts.
+    SafeFuncall {
         condition_stack_base: usize,
     },
     VmCatch {
@@ -6354,155 +6419,6 @@ impl Context {
             _ => false,
         }
     }
-
-    #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
-    fn maybe_writeback_mutating_first_arg(
-        &mut self,
-        called_name: &str,
-        alias_target: Option<&str>,
-        call_args: &[Value],
-        result: &Value,
-    ) {
-        let mutates_fillarray =
-            called_name == "fillarray" || alias_target.is_some_and(|name| name == "fillarray");
-        let mutates_aset = called_name == "aset" || alias_target.is_some_and(|name| name == "aset");
-        if !mutates_fillarray && !mutates_aset {
-            return;
-        }
-        let Some(first_arg) = call_args.first() else {
-            return;
-        };
-        if !first_arg.is_string() {
-            return;
-        }
-
-        let replacement = if mutates_fillarray {
-            if !result.is_string() || eq_value(first_arg, result) {
-                return;
-            }
-            *result
-        } else {
-            if call_args.len() < 3 {
-                return;
-            }
-            let Ok(updated) =
-                super::builtins::aset_string_replacement(first_arg, &call_args[1], &call_args[2])
-            else {
-                return;
-            };
-            if eq_value(first_arg, &updated) {
-                return;
-            }
-            updated
-        };
-
-        if crate::emacs_core::value::equal_value(first_arg, &replacement, 0) {
-            return;
-        }
-
-        let mut visited = HashSet::new();
-        // Walk the lexenv cons alist and replace alias refs in binding values
-        {
-            let mut lexenv_val = self.lexenv;
-            Self::replace_alias_refs_in_value(
-                &mut lexenv_val,
-                first_arg,
-                &replacement,
-                &mut visited,
-            );
-            self.lexenv = lexenv_val;
-        }
-        // Dynamic bindings are now in the obarray (via specbind), so
-        // the obarray iteration below handles them.
-        if let Some(current_id) = self.buffers.current_buffer_id()
-            && let Some(buf) = self.buffers.get_mut(current_id)
-        {
-            for value in buf.bound_buffer_local_values_mut() {
-                Self::replace_alias_refs_in_value(value, first_arg, &replacement, &mut visited);
-            }
-        }
-
-        self.obarray.for_each_value_cell_mut(|value| {
-            Self::replace_alias_refs_in_value(value, first_arg, &replacement, &mut visited);
-        });
-    }
-
-    #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
-    fn replace_alias_refs_in_value(
-        value: &mut Value,
-        from: &Value,
-        to: &Value,
-        visited: &mut HashSet<usize>,
-    ) {
-        if eq_value(value, from) {
-            *value = *to;
-            return;
-        }
-
-        match value.kind() {
-            ValueKind::Cons => {
-                let key = value.bits() ^ 0x1;
-                if !visited.insert(key) {
-                    return;
-                }
-                let mut new_car = value.cons_car();
-                let mut new_cdr = value.cons_cdr();
-                Self::replace_alias_refs_in_value(&mut new_car, from, to, visited);
-                Self::replace_alias_refs_in_value(&mut new_cdr, from, to, visited);
-                value.set_car(new_car);
-                value.set_cdr(new_cdr);
-            }
-            ValueKind::Veclike(VecLikeType::Vector) => {
-                let key = value.bits() ^ 0x2;
-                if !visited.insert(key) {
-                    return;
-                }
-                let mut values = value.as_vector_data().unwrap().clone();
-                for item in values.iter_mut() {
-                    Self::replace_alias_refs_in_value(item, from, to, visited);
-                }
-                let _ = value.replace_vector_data(values);
-            }
-            ValueKind::Veclike(VecLikeType::Record) => {
-                let key = value.bits() ^ 0x2;
-                if !visited.insert(key) {
-                    return;
-                }
-                let mut values = value.as_record_data().unwrap().clone();
-                for item in values.iter_mut() {
-                    Self::replace_alias_refs_in_value(item, from, to, visited);
-                }
-                let _ = value.replace_record_data(values);
-            }
-            ValueKind::Veclike(VecLikeType::HashTable) => {
-                let key = value.bits() ^ 0x4;
-                if !visited.insert(key) {
-                    return;
-                }
-                let mut ht = value.as_hash_table().unwrap().clone();
-                let old_ptr = if from.is_string() {
-                    Some(from.bits())
-                } else {
-                    None
-                };
-                let new_ptr = if to.is_string() {
-                    Some(to.bits())
-                } else {
-                    None
-                };
-                if matches!(ht.test, HashTableTest::Eq | HashTableTest::Eql)
-                    && let (Some(old_ptr), Some(new_ptr)) = (old_ptr, new_ptr)
-                {
-                    ht.replace_pointer_key(old_ptr, new_ptr, *to);
-                }
-                for item in ht.data.values_mut() {
-                    Self::replace_alias_refs_in_value(item, from, to, visited);
-                }
-                let _ = value.replace_hash_table(ht);
-            }
-            _ => {}
-        }
-    }
 }
 
 fn default_toplevel_binding(specpdl: &[SpecBinding], sym_id: SymId) -> Option<&SpecBinding> {
@@ -7528,6 +7444,7 @@ mod pdump_reconstruct;
 mod macroexpand;
 
 mod specpdl;
+pub(crate) use specpdl::{CurrentBufferScope, ExcursionScope, RestrictionScope};
 
 mod builtin_vars;
 pub(crate) use builtin_vars::builtin_frontend_on;
@@ -7587,6 +7504,7 @@ pub use redisplay_hooks::{
 mod vm_shared;
 
 mod signal_dispatch;
+mod signal_room;
 
 mod construct;
 mod form_head_cache;
@@ -7597,6 +7515,10 @@ use form_head_cache::{FormHead, HeadClass};
 #[cfg(test)]
 #[path = "tests/eval_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/saved_state_scope_test.rs"]
+mod saved_state_scope_test;
 
 #[cfg(test)]
 #[path = "tests/gc_context_shutdown.rs"]

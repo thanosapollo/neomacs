@@ -103,7 +103,7 @@ fn install_noarg_hook_probe(
     body: Vec<Value>,
 ) {
     let lambda = Value::make_lambda(LambdaData {
-        params: LambdaParams::simple(vec![]),
+        params: LambdaParams::simple(vec![]).into(),
         body,
         env: None,
         docstring: None,
@@ -739,7 +739,7 @@ fn pure_dispatch_typed_vconcat_flattens_bool_vector_logical_bits() {
 fn pure_dispatch_typed_length_tracks_interpreted_closure_slot_count() {
     crate::test_utils::init_test_tracing();
     let bare = Value::make_lambda(LambdaData {
-        params: LambdaParams::simple(vec![intern("x")]),
+        params: LambdaParams::simple(vec![intern("x")]).into(),
         body: vec![Value::symbol("x")],
         env: Some(Value::NIL),
         docstring: None,
@@ -747,7 +747,7 @@ fn pure_dispatch_typed_length_tracks_interpreted_closure_slot_count() {
         interactive: None,
     });
     let with_doc = Value::make_lambda(LambdaData {
-        params: LambdaParams::simple(vec![intern("x")]),
+        params: LambdaParams::simple(vec![intern("x")]).into(),
         body: vec![Value::symbol("x")],
         env: Some(Value::NIL),
         docstring: Some(crate::heap_types::LispString::from_utf8("doc")),
@@ -856,7 +856,7 @@ fn malformed_interpreted_closure_arglists_signal_invalid_function_at_call_time()
 }
 
 #[test]
-fn compiled_literal_reifier_preserves_ordinary_vectors() {
+fn make_byte_code_preserves_ordinary_vectors() {
     crate::test_utils::init_test_tracing();
     let closure_vec = Value::vector(vec![
         Value::list(vec![Value::symbol("x")]),
@@ -868,7 +868,17 @@ fn compiled_literal_reifier_preserves_ordinary_vectors() {
         Value::NIL,
     ]);
 
-    let converted = super::symbols::try_convert_nested_compiled_literal(closure_vec).unwrap();
+    let function = make_byte_code_from_parts(
+        &Value::fixnum(0),
+        &Value::heap_string(crate::heap_types::LispString::from_unibyte(vec![192, 135])),
+        &Value::vector(vec![closure_vec]),
+        &Value::fixnum(1),
+        None,
+        None,
+    )
+    .unwrap();
+    let converted = function.get_bytecode_data().unwrap().constants[0];
+    assert_eq!(converted, closure_vec);
     assert!(
         converted.is_vector(),
         "ordinary vectors are not reader closures"
@@ -876,7 +886,7 @@ fn compiled_literal_reifier_preserves_ordinary_vectors() {
 }
 
 #[test]
-fn compiled_literal_reifier_preserves_cperl_key_vector_shape() {
+fn make_byte_code_preserves_cperl_key_vector_shape() {
     crate::test_utils::init_test_tracing();
     let key_vec = Value::vector(vec![
         Value::list(vec![Value::symbol("control"), Value::fixnum(99)]),
@@ -884,7 +894,17 @@ fn compiled_literal_reifier_preserves_cperl_key_vector_shape() {
         Value::fixnum(70),
     ]);
 
-    let converted = super::symbols::try_convert_nested_compiled_literal(key_vec).unwrap();
+    let function = make_byte_code_from_parts(
+        &Value::fixnum(0),
+        &Value::heap_string(crate::heap_types::LispString::from_unibyte(vec![192, 135])),
+        &Value::vector(vec![key_vec]),
+        &Value::fixnum(1),
+        None,
+        None,
+    )
+    .unwrap();
+    let converted = function.get_bytecode_data().unwrap().constants[0];
+    assert_eq!(converted, key_vec);
     assert!(
         converted.is_vector(),
         "key vectors must not become closures"
@@ -4377,7 +4397,7 @@ fn barf_bury_char_equal_cl_type_and_cancel_semantics() {
         Value::symbol("primitive-function")
     );
     let lambda = Value::make_lambda(LambdaData {
-        params: LambdaParams::simple(vec![intern("x")]),
+        params: LambdaParams::simple(vec![intern("x")]).into(),
         body: Vec::new(),
         env: None,
         docstring: None,
@@ -8349,15 +8369,12 @@ fn pure_dispatch_make_placeholder_cluster_matches_compat_contracts() {
     let bc = make_byte_code_with_hash
         .get_bytecode_data()
         .expect("make-byte-code should produce bytecode data");
-    if !bc.constants[0].is_hash_table() {
-        panic!("expected hash-table constant, got {:?}", bc.constants[0]);
-    };
-    let entry = {
-        let table = bc.constants[0].as_hash_table().unwrap();
-        let key = Value::symbol("foo").to_hash_key(&table.test);
-        table.data.get(&key).copied()
-    };
-    assert_eq!(entry, Some(Value::fixnum(42)));
+    // GNU Fmake_byte_code stores each supplied constant unchanged.
+    assert!(bc.constants[0].is_cons(), "the constant remains list data");
+    assert_eq!(
+        bc.constants[0], hash_literal,
+        "constant identity is preserved"
+    );
 
     let make_char_result = dispatch_builtin_pure("make-char", vec![Value::fixnum(1)])
         .expect("builtin make-char should resolve");
@@ -12993,7 +13010,7 @@ fn prin1_to_string_preserves_gensym_lambda_parameter_identity_like_gnu() {
     let mut eval = crate::emacs_core::eval::Context::new();
     let sym = crate::emacs_core::intern::intern_uninterned("stack");
     let lambda = Value::make_lambda(LambdaData {
-        params: LambdaParams::simple(vec![sym]),
+        params: LambdaParams::simple(vec![sym]).into(),
         body: vec![Value::from_sym_id(sym)],
         env: Some(Value::NIL),
         docstring: None,
@@ -19472,3 +19489,7 @@ fn a_user_defined_hash_table_test_answers_like_gnu_through_the_bucket_index() {
         )
     );
 }
+
+#[cfg(test)]
+#[path = "sequence_gnu_test.rs"]
+mod sequence_gnu;

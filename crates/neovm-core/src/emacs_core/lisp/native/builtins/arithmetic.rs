@@ -466,6 +466,18 @@ fn overflow_error() -> Flow {
     signal(LispCondition::OverflowError, vec![])
 }
 
+/// GNU src/bignum.c:92-100 admission for a fresh integer magnitude, also
+/// used by format conversions that GNU sends through double_to_integer.
+/// The active Context already owns the policy read by the constructors;
+/// use that same gate without a new lookup, activation or cached binding.
+pub(crate) fn validate_integer_bits(_ctx: &super::eval::Context, bits: u64) -> Result<(), Flow> {
+    if bignum_bits_overflow(bits) {
+        Err(overflow_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// GNU `make_integer_mpz` (`src/bignum.c:146`): a fixnum when `value` fits,
 /// otherwise a bignum, unless it is wider than `integer-width`, which
 /// signals `overflow-error`. The constructor for every arithmetic result
@@ -1366,15 +1378,15 @@ pub(crate) fn builtin_mod(_eval: &mut super::eval::Context, num: Value, den: Val
         // GNU `fmod_float` path — float-modulo. Existing behavior.
         let a = expect_number_or_marker_f64(&num)?;
         let b = expect_number_or_marker_f64(&den)?;
+        // GNU src/floatfns.c:570-582 uses fmod and preserves operand NaNs.
         let r = a % b;
-        let mut r = if r != 0.0 && (r < 0.0) != (b < 0.0) {
+        let r = if b < 0.0 {
+            if r > 0.0 { r + b } else { r }
+        } else if r < 0.0 {
             r + b
         } else {
             r
         };
-        if r.is_nan() {
-            r = f64::from_bits(f64::NAN.to_bits() | (1_u64 << 63));
-        }
         return Ok(Value::make_float(r));
     }
     integer_remainder(&num, &den, true)
@@ -1777,6 +1789,20 @@ pub(crate) fn builtin_ash_slice(args: &[Value]) -> EvalResult {
     expect_args("ash", args, 2)?;
     let value = &args[0];
     let count_val = &args[1];
+    // GNU src/data.c:3568-3569 validates VALUE before COUNT, including
+    // the bignum COUNT branches that can otherwise return or signal early.
+    // Retain the scalar classification validated before COUNT; do not inspect
+    // or borrow a bignum payload until the existing branch needs it.
+    let value_kind = value.kind();
+    if !matches!(
+        value_kind,
+        ValueKind::Fixnum(_) | ValueKind::Veclike(VecLikeType::Bignum)
+    ) {
+        return Err(signal(
+            LispCondition::WrongTypeArgument,
+            vec![Value::symbol("integerp"), *value],
+        ));
+    }
 
     // COUNT must be an integer (fixnum or bignum). If it's a bignum
     // and VALUE is anything but zero, GNU signals overflow-error for
@@ -1797,7 +1823,7 @@ pub(crate) fn builtin_ash_slice(args: &[Value]) -> EvalResult {
             }
             if *big < 0 {
                 // Negative count + nonzero value: result is 0 (or -1 for negative).
-                let sign_neg = match value.kind() {
+                let sign_neg = match value_kind {
                     ValueKind::Fixnum(n) => n < 0,
                     ValueKind::Veclike(VecLikeType::Bignum) => *value.as_bignum().unwrap() < 0,
                     _ => {
@@ -1822,7 +1848,7 @@ pub(crate) fn builtin_ash_slice(args: &[Value]) -> EvalResult {
     // Materialize VALUE as a Integer once. We could try to keep
     // small fixnum shifts on the i64 path, but ash is rare enough that
     // correctness over branchy fast-pathing is the right tradeoff.
-    let value_big = match value.kind() {
+    let value_big = match value_kind {
         ValueKind::Fixnum(n) => Integer::from(n),
         ValueKind::Veclike(VecLikeType::Bignum) => value.as_bignum().unwrap().clone(),
         _ => {
@@ -2574,6 +2600,9 @@ pub(crate) fn builtin_random(args: Vec<Value>) -> EvalResult {
                 }
                 return Ok(Value::fixnum(emacs_get_random_fixnum(lim)));
             }
+            ValueKind::Veclike(VecLikeType::Bignum) => {
+                return emacs_get_random_bignum(PositiveRandomLimit::try_from(limit)?);
+            }
             _ => {}
         }
     }
@@ -2581,6 +2610,96 @@ pub(crate) fn builtin_random(args: Vec<Value>) -> EvalResult {
     Ok(Value::from_fixnum(
         crate::tagged::value::Fixnum::from_payload_bits(emacs_get_random() as u64),
     ))
+}
+
+/// A positive bignum magnitude, validated before random generation. This
+/// borrow points into the creating mutator's Lisp heap and must remain on
+/// that mutator, even though Natural itself is Send/Sync. The process PRNG
+/// remains serialized by `emacs_random_lock`; its lock does not protect GC.
+/// No mutator-local cache is introduced.
+#[derive(Clone, Copy, Debug)]
+struct PositiveRandomLimit<'a>(&'a Natural, std::marker::PhantomData<*const ()>);
+
+impl<'a> TryFrom<&'a Value> for PositiveRandomLimit<'a> {
+    type Error = Flow;
+
+    fn try_from(value: &'a Value) -> Result<Self, Self::Error> {
+        let Some(integer) = value.as_bignum() else {
+            return Err(signal(
+                LispCondition::WrongTypeArgument,
+                vec![Value::symbol("integerp"), *value],
+            ));
+        };
+        if *integer <= 0 {
+            return Err(signal(LispCondition::ArgsOutOfRange, vec![*value]));
+        }
+        Ok(Self(integer.unsigned_abs_ref(), std::marker::PhantomData))
+    }
+}
+
+/// Local sampling state: a prefix above LIMIT is rejected immediately and
+/// cannot be carried into the next limb. No shared or mutator-specific state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RandomPrefix {
+    AtLimit,
+    BelowLimit,
+}
+
+static_assertions::assert_impl_all!(RandomPrefix: Send, Sync);
+
+fn emacs_random_limb_unlocked() -> u64 {
+    // GNU src/sysdep.c:2270-2276, get_random_ulong.
+    let mut word = 0u64;
+    for _ in 0..64u32.div_ceil(31) {
+        word = platform_random_word() ^ (word << 31) ^ (word >> 33);
+    }
+    word
+}
+
+fn emacs_get_random_bignum(limit: PositiveRandomLimit<'_>) -> EvalResult {
+    // GNU src/bignum.c:558-617 samples the high limb in a bounded interval,
+    // then rejects full candidates at or above LIMIT. Each allowed integer
+    // therefore has equal probability, including fixnum results.
+    let limbs = limit.0.as_limbs_asc();
+    let high_limit = limbs[limbs.len() - 1].wrapping_add(u64::from(limbs.len() > 1));
+    let _guard = emacs_random_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut candidate = vec![0; limbs.len()];
+    'sample: loop {
+        let high = loop {
+            let word = emacs_random_limb_unlocked();
+            if high_limit == 0 {
+                break word;
+            }
+            let remainder = word % high_limit;
+            if word - remainder <= high_limit.wrapping_neg() {
+                break remainder;
+            }
+        };
+        candidate[limbs.len() - 1] = high;
+        let mut prefix = if high == limbs[limbs.len() - 1] {
+            RandomPrefix::AtLimit
+        } else {
+            RandomPrefix::BelowLimit
+        };
+        for i in (0..limbs.len() - 1).rev() {
+            let word = emacs_random_limb_unlocked();
+            match prefix {
+                RandomPrefix::AtLimit => match word.cmp(&limbs[i]) {
+                    std::cmp::Ordering::Greater => continue 'sample,
+                    std::cmp::Ordering::Equal => {}
+                    std::cmp::Ordering::Less => prefix = RandomPrefix::BelowLimit,
+                },
+                RandomPrefix::BelowLimit => {}
+            }
+            candidate[i] = word;
+        }
+        if prefix == RandomPrefix::BelowLimit {
+            return integer_value(false, Natural::from_owned_limbs_asc(candidate))
+                .ok_or_else(overflow_error);
+        }
+    }
 }
 
 fn emacs_random_lock() -> &'static Mutex<()> {
@@ -2744,3 +2863,19 @@ mod arithmetic_rounding_capture_test;
 #[cfg(test)]
 #[path = "tests/arithmetic_integer_width_test.rs"]
 mod arithmetic_integer_width_test;
+
+#[cfg(test)]
+#[path = "tests/gdl_random_bignum_test.rs"]
+mod gdl_random_bignum;
+
+#[cfg(test)]
+#[path = "tests/gdl_ash_validation_test.rs"]
+mod gdl_ash_validation;
+
+#[cfg(test)]
+#[path = "tests/gdl_mod_nan_test.rs"]
+mod gdl_mod_nan;
+
+#[cfg(test)]
+#[path = "tests/gdl_integer_width_test.rs"]
+mod gdl_integer_width;

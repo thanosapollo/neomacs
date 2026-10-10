@@ -303,6 +303,56 @@ static_assertions::assert_impl_all!(BufferByteLen: Send, Sync);
 static_assertions::assert_impl_all!(RepeatCount: Send, Sync);
 static_assertions::assert_impl_all!(StringByteLen: Send, Sync);
 
+/// A constructor can reject Lisp arguments or exhaust its backing allocation.
+/// The latter must retain its identity until the evaluator selects its live
+/// `memory-signal-data` (GNU alloc.c:4140-4142). No state is shared between
+/// mutators; the context supplying the signal owns the Lisp payload.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AllocationFailure {
+    #[error("Lisp argument condition")]
+    Lisp(crate::emacs_core::error::Flow),
+    #[error("memory exhausted")]
+    MemoryExhausted(#[from] std::collections::TryReserveError),
+    /// The global allocator rejected a nonzero, validated storage request.
+    #[error("allocation returned null")]
+    NullAllocation,
+    /// A checked allocation layout could not represent the requested extent.
+    #[error("invalid allocation layout")]
+    InvalidLayout(#[from] std::alloc::LayoutError),
+}
+
+impl From<crate::emacs_core::error::Flow> for AllocationFailure {
+    fn from(flow: crate::emacs_core::error::Flow) -> Self {
+        Self::Lisp(flow)
+    }
+}
+
+impl AllocationFailure {
+    pub(crate) fn into_flow(self) -> crate::emacs_core::error::Flow {
+        match self {
+            Self::Lisp(flow) => flow,
+            Self::MemoryExhausted(_) | Self::NullAllocation | Self::InvalidLayout(_) => {
+                crate::emacs_core::error::memory_exhausted_error()
+            }
+        }
+    }
+
+    pub(crate) fn into_flow_in_context(
+        self,
+        context: &crate::emacs_core::eval::Context,
+    ) -> crate::emacs_core::error::Flow {
+        match self {
+            Self::Lisp(flow) => flow,
+            Self::MemoryExhausted(_) | Self::NullAllocation | Self::InvalidLayout(_) => context
+                .special_variable_value_by_id(crate::emacs_core::intern::intern(
+                    "memory-signal-data",
+                ))
+                .map(crate::emacs_core::error::memory_signal_from_binding_value)
+                .unwrap_or_else(crate::emacs_core::error::memory_exhausted_error),
+        }
+    }
+}
+
 /// Register bootstrap variables owned by the allocation / GC subsystem.
 pub fn register_bootstrap_vars(obarray: &mut Obarray) {
     obarray.define_int_variable("gc-cons-threshold", 800_000);

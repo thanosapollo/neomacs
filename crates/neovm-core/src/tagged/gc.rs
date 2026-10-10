@@ -1845,18 +1845,13 @@ impl TaggedHeap {
                     .owned_capacity()
                     .saturating_mul(size_of::<TaggedValue>()),
             )
-            .saturating_add(
-                data.params
+            .saturating_add(data.params.named().map_or(0, |params| {
+                params
                     .required
                     .capacity()
-                    .saturating_mul(size_of::<SymId>()),
-            )
-            .saturating_add(
-                data.params
-                    .optional
-                    .capacity()
-                    .saturating_mul(size_of::<SymId>()),
-            )
+                    .saturating_add(params.optional.capacity())
+                    .saturating_mul(size_of::<SymId>())
+            }))
             .saturating_add(
                 data.resident_gnu_byte_offset_map_capacity()
                     .saturating_mul(size_of::<GnuByteOffsetMapEntry>()),
@@ -2047,7 +2042,9 @@ impl TaggedHeap {
             owned: data.constants.owned_capacity() > 0,
             mapped: false,
         });
-        stats = stats.add(Self::lambda_params_payload_layout(&data.params));
+        if let Some(params) = data.params.named() {
+            stats = stats.add(Self::lambda_params_payload_layout(params));
+        }
         if let Some(offsets) = data.resident_gnu_byte_offset_map() {
             stats = stats.add(PayloadLayout {
                 logical_bytes: std::mem::size_of_val(offsets),
@@ -2490,9 +2487,10 @@ impl TaggedHeap {
 impl Drop for TaggedHeap {
     fn drop(&mut self) {
         // Explicit finish is the only blocking completion handoff. Drop
-        // cannot establish exclusive ownership while a marker is active, so
-        // its fallback retains every marker-readable allocation and returns.
-        if self.concurrent_mark_running {
+        // cannot establish exclusive ownership while a marker or facade
+        // reader obligation remains, so its fallback retains the backing
+        // allocations and returns without waiting for either kind of reader.
+        if self.concurrent_mark_running || self.facade_mark_is_excluded() {
             self.abandon_concurrent_mark();
             crate::tagged::gc::clear_tagged_heap_if_installed(self);
             return;
@@ -2715,9 +2713,15 @@ use chunk_map::{CHUNK_CLASS_COUNT, ChunkClass, ChunkEntry, ChunkMap, HeapChunkMa
 
 mod census;
 mod cold_gc;
+mod facade_mark;
 #[cfg(test)]
 use census::CensusRecord;
 use census::{CensusCycleKind, GenCensus, census_remset_probe_on};
+pub use facade_mark::{
+    CollectorQuiescenceError, ConcurrentMarkAdmissionError, ConcurrentMarkCapture,
+    ConcurrentMarkPermit, FacadeEpochRetention, FacadeMarkExclusion, FacadeMarkExclusionError,
+    QuiescentCollector,
+};
 
 mod alloc_region;
 #[cfg(test)]
@@ -2825,6 +2829,9 @@ mod generational_major_tests;
 #[path = "gc/tests/generational_pacing_test.rs"]
 mod generational_pacing_tests;
 
+#[cfg(test)]
+#[path = "gc/tests/bytecode_parameter_roots.rs"]
+mod bytecode_parameter_roots_tests;
 #[cfg(test)]
 #[path = "gc/tests/major_symbol_preimage_test.rs"]
 mod major_symbol_preimage_tests;

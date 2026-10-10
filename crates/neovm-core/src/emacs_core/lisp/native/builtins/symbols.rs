@@ -3520,11 +3520,42 @@ pub(crate) fn builtin_transpose_regions(
         current_id,
         changed_byte_span,
     )?;
+    let measured_at = crate::buffer::TextMeasurement::of(&eval.buffers, current_id);
     crate::emacs_core::editfns::signal_before_text_change(eval, change)?;
+    // GNU `Ftranspose_regions` runs `modify_text (start1, end2)` and then
+    // keeps using the positions it computed before (editfns.c), which reads
+    // stale bytes once a before-change function edited the buffer. Measure
+    // the same character positions in the live buffer instead, and reject
+    // them as `validate_region` would when they no longer fit.
+    let Some(target) = eval.buffers.current_buffer_id() else {
+        return Ok(Value::NIL);
+    };
+    let (transposition, change) =
+        if crate::buffer::TextMeasurement::of(&eval.buffers, target) == measured_at {
+            (transposition, change)
+        } else {
+            let Some(buf) = eval.buffers.get(target) else {
+                return Ok(Value::NIL);
+            };
+            if first.start() < buf.point_min_char_pos() || second.end() > buf.point_max_char_pos() {
+                return Err(signal(
+                    LispCondition::ArgsOutOfRange,
+                    vec![
+                        Value::fixnum(first.start().to_lisp().as_i64()),
+                        Value::fixnum(second.end().to_lisp().as_i64()),
+                    ],
+                ));
+            }
+            let transposition = buf.text_transposition_for_char_ranges(first, second);
+            let change = crate::buffer::TextChange::unchanged_extent(
+                buf.edit_range_for_char_range(transposition.char_span()),
+            );
+            (transposition, change)
+        };
     let leave_markers = args.get(4).is_some_and(|value| !value.is_nil());
     let _ = eval
         .buffers
-        .transpose_buffer_regions(current_id, transposition, leave_markers.into());
+        .transpose_buffer_regions(target, transposition, leave_markers.into());
     crate::emacs_core::editfns::signal_after_text_change(eval, change)?;
     Ok(Value::NIL)
 }
@@ -3791,65 +3822,100 @@ fn compare_lisp_strings(
     super::strings::string_ordering(lhs, rhs)
 }
 
+/// An integer decoded from a fixnum tag, hence strictly inside i64 range
+/// even after rounding to binary64. Only `ValueLtNumber::of` constructs it.
+/// This scalar has no Lisp state and can be shared between mutators.
+#[derive(Clone, Copy, Debug)]
+struct ValueLtFixnum(i64);
+
+static_assertions::assert_impl_all!(ValueLtFixnum: Send, Sync);
+
+/// Numeric operands decoded once for GNU's `value_cmp` (fns.c:3123-3132,
+/// 3263-3275). Borrowing ties bignums to their input values; comparing these
+/// operands never runs Lisp or reaches a GC safe point.
+/// Heap projections remain confined to the mutator owning the input values.
+#[derive(Clone, Copy, Debug)]
+enum ValueLtNumber<'value> {
+    Fixnum(ValueLtFixnum),
+    Float(f64),
+    Bignum(&'value Integer, std::marker::PhantomData<*const ()>),
+}
+
+impl<'value> ValueLtNumber<'value> {
+    #[inline]
+    fn of(value: &'value Value) -> Option<Self> {
+        if let Some(integer) = value.as_fixnum() {
+            Some(Self::Fixnum(ValueLtFixnum(integer)))
+        } else if let Some(float) = value.as_float() {
+            Some(Self::Float(float))
+        } else {
+            value
+                .as_bignum()
+                .map(|integer| Self::Bignum(integer, std::marker::PhantomData))
+        }
+    }
+
+    #[inline]
+    fn compare(self, other: Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::Fixnum(left), Self::Fixnum(right)) => left.0.cmp(&right.0),
+            (Self::Fixnum(integer), Self::Float(float)) => {
+                compare_fixnum_float_for_value_lt(integer, float)
+            }
+            (Self::Float(float), Self::Fixnum(integer)) => {
+                compare_fixnum_float_for_value_lt(integer, float).reverse()
+            }
+            (Self::Float(left), Self::Float(right)) => compare_floats_for_value_lt(left, right),
+            (Self::Bignum(left, _), Self::Bignum(right, _)) => left.cmp(right),
+            // A fixnum fits in Integer's inline single-limb representation;
+            // these total comparisons allocate and clone no bignum limbs.
+            (Self::Bignum(left, _), Self::Fixnum(right)) => left.cmp(&Integer::from(right.0)),
+            (Self::Fixnum(left), Self::Bignum(right, _)) => {
+                right.cmp(&Integer::from(left.0)).reverse()
+            }
+            (Self::Bignum(integer, _), Self::Float(float)) => {
+                integer.partial_cmp(&float).unwrap_or(Ordering::Equal)
+            }
+            (Self::Float(float), Self::Bignum(integer, _)) => integer
+                .partial_cmp(&float)
+                .unwrap_or(Ordering::Equal)
+                .reverse(),
+        }
+    }
+}
+
+/// GNU fns.c:3265-3267 makes NaN incomparable with every numeric operand.
+#[inline]
+fn compare_floats_for_value_lt(left: f64, right: f64) -> std::cmp::Ordering {
+    if left < right {
+        std::cmp::Ordering::Less
+    } else if left > right {
+        std::cmp::Ordering::Greater
+    } else {
+        std::cmp::Ordering::Equal
+    }
+}
+
+/// GNU fns.c:3089-3105 compares in the integer domain when conversion
+/// rounds a fixnum to the same double.
+#[inline]
+fn compare_fixnum_float_for_value_lt(integer: ValueLtFixnum, float: f64) -> std::cmp::Ordering {
+    let rounded = integer.0 as f64;
+    if rounded == float {
+        // Convert our own finite rounded fixnum, whose magnitude is at most
+        // 2^61 and therefore fits i64. Equality makes this the float's exact
+        // integral value, including either spelling of zero.
+        let exact = rounded as i64;
+        integer.0.cmp(&exact)
+    } else {
+        compare_floats_for_value_lt(rounded, float)
+    }
+}
+
+#[inline]
 fn compare_number_values_for_value_lt(lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
-    use std::cmp::Ordering;
-
-    if !lhs.is_number() || !rhs.is_number() {
-        return None;
-    }
-
-    if lhs.is_float() || rhs.is_float() {
-        if let Some(big) = lhs.as_bignum() {
-            let right = match rhs.kind() {
-                ValueKind::Fixnum(n) => n as f64,
-                ValueKind::Float => rhs.xfloat(),
-                _ => return None,
-            };
-            return Some(big.partial_cmp(&right).unwrap_or(Ordering::Equal));
-        }
-        if let Some(big) = rhs.as_bignum() {
-            let left = match lhs.kind() {
-                ValueKind::Fixnum(n) => n as f64,
-                ValueKind::Float => lhs.xfloat(),
-                _ => return None,
-            };
-            return Some(
-                big.partial_cmp(&left)
-                    .map(|ordering| ordering.reverse())
-                    .unwrap_or(Ordering::Equal),
-            );
-        }
-        let left = match lhs.kind() {
-            ValueKind::Fixnum(n) => n as f64,
-            ValueKind::Float => lhs.xfloat(),
-            _ => return None,
-        };
-        let right = match rhs.kind() {
-            ValueKind::Fixnum(n) => n as f64,
-            ValueKind::Float => rhs.xfloat(),
-            _ => return None,
-        };
-        return Some(left.partial_cmp(&right).unwrap_or(Ordering::Equal));
-    }
-
-    if !lhs.is_bignum() && !rhs.is_bignum() {
-        return match (lhs.kind(), rhs.kind()) {
-            (ValueKind::Fixnum(left), ValueKind::Fixnum(right)) => Some(left.cmp(&right)),
-            _ => None,
-        };
-    }
-
-    let left = match lhs.kind() {
-        ValueKind::Fixnum(n) => Integer::from(n),
-        ValueKind::Veclike(VecLikeType::Bignum) => lhs.as_bignum().expect("bignum").clone(),
-        _ => return None,
-    };
-    let right = match rhs.kind() {
-        ValueKind::Fixnum(n) => Integer::from(n),
-        ValueKind::Veclike(VecLikeType::Bignum) => rhs.as_bignum().expect("bignum").clone(),
-        _ => return None,
-    };
-    Some(left.cmp(&right))
+    Some(ValueLtNumber::of(lhs)?.compare(ValueLtNumber::of(rhs)?))
 }
 
 fn symbol_name_for_value_lt(
@@ -5847,6 +5913,21 @@ pub(crate) fn closure_from_reader_literal_slots(slots: &[Value]) -> EvalResult {
                 vec![Value::string("Invalid byte-code object")],
             ));
         }
+        use crate::emacs_core::bytecode::{BytecodeSlotOrigin, BytecodeString};
+        let code = BytecodeString::try_from(slots[1])
+            .map_err(|error| error.into_flow(BytecodeSlotOrigin::Reader))?
+            .into_unibyte(BytecodeSlotOrigin::Reader)?;
+        let normalized;
+        let slots = if code.value() != slots[1] {
+            normalized = {
+                let mut slots = slots.to_vec();
+                slots[1] = code.value();
+                slots
+            };
+            normalized.as_slice()
+        } else {
+            slots
+        };
         return make_byte_code_from_slots(slots).map_err(|_| {
             signal(
                 LispCondition::InvalidReadSyntax,
@@ -5901,6 +5982,44 @@ pub(crate) fn make_byte_code_from_parts(
     )
 }
 
+/// When a constructed GNU byte-code object turns its byte string into
+/// executable instructions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GnuDecodeTiming {
+    /// `make-byte-code` and the reader: check the string now and let the
+    /// process-wide eager/lazy policy decide when to decode it.
+    Deferred,
+    /// `byte-code` (GNU bytecode.c:298-320): the object runs once, at once.
+    /// Decode a single time, keep the instructions resident, and run them
+    /// on the checked driver instead of proving their stack effects first.
+    Immediate,
+}
+
+/// The function object GNU `Fbyte_code` builds through `Fmake_byte_code`
+/// with a nil arglist (bytecode.c:317), for immediate execution.
+///
+/// GNU hands that object straight to `exec_byte_code`; no Lisp frame or
+/// opcode can name it afterwards. It therefore stays an owned value here: its
+/// decoded instructions are released when the call returns, as GNU's only
+/// cost is the small vector, instead of staying resident until a collection.
+pub(crate) fn byte_code_for_immediate_call(
+    bytecode_str: &Value,
+    constants_vec: &Value,
+    maxdepth: &Value,
+) -> Result<crate::emacs_core::bytecode::ByteCodeFunction, Flow> {
+    build_byte_code_function(
+        &Value::NIL,
+        bytecode_str,
+        constants_vec,
+        maxdepth,
+        None,
+        None,
+        4,
+        &[],
+        GnuDecodeTiming::Immediate,
+    )
+}
+
 #[allow(clippy::too_many_arguments)] // preserves the observable GNU closure-slot layout
 fn make_byte_code_from_parts_with_slots(
     arglist: &Value,
@@ -5912,52 +6031,55 @@ fn make_byte_code_from_parts_with_slots(
     closure_slot_count: usize,
     extra_slots: &[Value],
 ) -> EvalResult {
+    build_byte_code_function(
+        arglist,
+        bytecode_str,
+        constants_vec,
+        maxdepth,
+        docstring,
+        interactive,
+        closure_slot_count,
+        extra_slots,
+        GnuDecodeTiming::Deferred,
+    )
+    .map(Value::make_bytecode)
+}
+
+#[allow(clippy::too_many_arguments)] // preserves the observable GNU closure-slot layout
+fn build_byte_code_function(
+    arglist: &Value,
+    bytecode_str: &Value,
+    constants_vec: &Value,
+    maxdepth: &Value,
+    docstring: Option<&Value>,
+    interactive: Option<&Value>,
+    closure_slot_count: usize,
+    extra_slots: &[Value],
+    timing: GnuDecodeTiming,
+) -> Result<crate::emacs_core::bytecode::ByteCodeFunction, Flow> {
     use crate::emacs_core::bytecode::ByteCodeFunction;
     use crate::emacs_core::bytecode::chunk::eager_gnu_bytecode;
     use crate::emacs_core::bytecode::decode::{
-        decode_gnu_bytecode_with_offset_map, parse_arglist_value, validate_gnu_bytecode,
+        decode_gnu_bytecode_with_offset_map, validate_gnu_bytecode,
     };
 
-    if !valid_closure_arglist(*arglist)
-        || !bytecode_str.is_string()
-        || bytecode_str.string_is_multibyte()
-        || !constants_vec.is_vector()
-        || !valid_bytecode_stack_depth(*maxdepth)
-    {
-        return Err(signal(
-            "error",
-            vec![Value::string("Invalid byte-code object")],
-        ));
-    }
-
-    // 1. Parse arglist
-    let params = parse_arglist_value(arglist);
+    use crate::emacs_core::bytecode::function_slots::{BytecodeSlotOrigin, CompiledSlots};
+    let slots = CompiledSlots::try_from([*arglist, *bytecode_str, *constants_vec, *maxdepth])
+        .map_err(|error| error.into_flow(BytecodeSlotOrigin::Constructor))?;
+    let params = slots.params;
 
     // 2. Copy the raw bytes out of the bytecode string, once.
     // Bytecode strings are unibyte and may contain arbitrary byte values
     // (including non-UTF-8), so we must access the raw bytes directly
     // rather than going through as_str() which requires valid UTF-8.
-    let raw_bytes = crate::tagged::header::LispByteVec::copy_from_slice(
-        bytecode_str
-            .as_lisp_string()
-            .expect("validated bytecode string")
-            .as_bytes(),
-    );
+    let raw_bytes = crate::tagged::header::LispByteVec::copy_from_slice(slots.code.as_bytes());
     let _ = bytecode_str.with_lisp_string_mut(|string| string.pin_immovable());
 
     // 3. Extract constants from vector
-    let mut constants: Vec<Value> = match constants_vec.kind() {
-        ValueKind::Veclike(VecLikeType::Vector) => constants_vec.as_vector_data().unwrap().clone(),
-        _ => Vec::new(),
-    };
+    let mut constants: Vec<Value> = slots.constants.as_slice().to_vec();
 
-    // 3b. Reify compiled literals embedded in the constants vector.
-    // GNU `.elc` constants may contain nested `#[...]` bytecode objects or
-    // `#s(hash-table ...)` literals. Convert them into real runtime objects
-    // before decoding/executing the bytecode.
-    for constant in &mut constants {
-        *constant = try_convert_nested_compiled_literal(*constant)?;
-    }
+    // Reader literals already carry their runtime types. Constants supplied
+    // here are literal data; their list/vector shapes never authorize decoding.
 
     // 4. Check the GNU bytecode. GNU's `Fmake_byte_code` never inspects
     // it; Neomacs executes decoded instructions, so it rejects bytecode it
@@ -5968,7 +6090,11 @@ fn make_byte_code_from_parts_with_slots(
     // no instructions built. The eager policy keeps them resident;
     // `NEOVM_MAKE_BYTE_CODE_VALIDATE_ONLY=off` decodes in full and lets
     // `defer_gnu_decode` drop the result, the former behavior (A/B).
-    let (ops, gnu_byte_offset_map) = if eager_gnu_bytecode() || !make_byte_code_validates_only() {
+    let decode_now = match timing {
+        GnuDecodeTiming::Immediate => true,
+        GnuDecodeTiming::Deferred => eager_gnu_bytecode() || !make_byte_code_validates_only(),
+    };
+    let (ops, gnu_byte_offset_map) = if decode_now {
         decode_gnu_bytecode_with_offset_map(&raw_bytes, &mut constants)
             .map(|(ops, offset_map)| (ops, Some(offset_map)))
     } else {
@@ -5981,11 +6107,8 @@ fn make_byte_code_from_parts_with_slots(
         )
     })?;
 
-    // 5. Extract maxdepth
-    let max_stack = match maxdepth.kind() {
-        ValueKind::Fixnum(n) => n as u16,
-        _ => 16, // fallback
-    };
+    // Preserve the full nonnegative fixnum depth in every runtime consumer.
+    let max_stack = slots.depth;
 
     // 6. Extract closure slot 4.
     // GNU byte-code objects use this slot for either a docstring or an
@@ -6041,14 +6164,22 @@ fn make_byte_code_from_parts_with_slots(
         runtime: Some(crate::emacs_core::jit::Runtime::new()),
         lazy_gnu_code: None,
     };
-    bc.defer_gnu_decode();
-    if !bc.ops.is_empty() {
-        // Eager decode policy kept the instructions resident; prove them now
-        // that every shape field is final. (The lazy path proves at decode.)
-        bc.refresh_stack_verification();
+    match timing {
+        GnuDecodeTiming::Deferred => {
+            bc.defer_gnu_decode();
+            if !bc.ops.is_empty() {
+                // Eager decode policy kept the instructions resident; prove
+                // them now that every shape field is final. (The lazy path
+                // proves at decode.)
+                bc.refresh_stack_verification();
+            }
+        }
+        // One run of straight-line GNU code costs less on the checked driver
+        // than a separate stack-effect proof pass would.
+        GnuDecodeTiming::Immediate => {}
     }
 
-    Ok(Value::make_bytecode(bc))
+    Ok(bc)
 }
 
 #[cfg(test)]
@@ -6158,152 +6289,6 @@ pub(crate) fn make_interpreted_closure_from_parts_unchecked(
     }
 
     Value::make_lambda_with_slots(slots)
-}
-
-/// Reify nested compiled literals embedded in `.elc` constant vectors.
-///
-/// The value reader already turns `#[...]` into closure objects, just as GNU's
-/// reader does.  Hash-table literals still arrive as
-/// `(make-hash-table-from-literal '(...))` forms, so this pass reifies those
-/// without guessing that ordinary vectors are closures.
-pub(crate) fn try_convert_nested_compiled_literal(val: Value) -> EvalResult {
-    Ok(try_convert_hash_table_literal(val)?.unwrap_or(val))
-}
-
-/// Literal options parsed on the current mutator. Lisp handles remain local
-/// through conversion; this temporary plan cannot cross threads.
-#[derive(Debug)]
-struct CompiledHashLiteral {
-    test: HashTableTest,
-    test_name: Option<SymId>,
-    weakness: Option<HashTableWeakness>,
-    rehash_size: f64,
-    rehash_threshold: f64,
-    data_value: Option<Value>,
-    _mutator: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-static_assertions::assert_not_impl_any!(CompiledHashLiteral: Send, Sync);
-
-fn parse_compiled_hash_literal(val: Value) -> Option<CompiledHashLiteral> {
-    // Every cons constant of every loaded function comes through here; only
-    // a `(make-hash-table-from-literal ...)` form can convert, so reject any
-    // other head before copying the list out.
-    if !(val.is_cons()
-        && val
-            .cons_car()
-            .is_symbol_named("make-hash-table-from-literal"))
-    {
-        return None;
-    }
-    let form = list_to_vec(&val)?;
-    if form.len() != 2 {
-        return None;
-    }
-    let head = form[0].as_symbol_name()?;
-    if head != "make-hash-table-from-literal" {
-        return None;
-    }
-
-    let payload = quote_payload_value(form[1])?;
-    let spec = list_to_vec(&payload)?;
-    if spec.first()?.as_symbol_name()? != "hash-table" {
-        return None;
-    }
-
-    let mut test = HashTableTest::Eql;
-    let mut test_name: Option<SymId> = None;
-    let mut weakness: Option<HashTableWeakness> = None;
-    let mut rehash_size = 1.5_f64;
-    let mut rehash_threshold = 0.8125_f64;
-    let mut data_value: Option<Value> = None;
-
-    let mut i = 1_usize;
-    while i + 1 < spec.len() {
-        let key = spec[i].as_symbol_name()?;
-        let value = spec[i + 1];
-        let Some(key) = HashTableLiteralKey::from_symbol_name(key) else {
-            i += 2;
-            continue;
-        };
-        match key {
-            HashTableLiteralKey::Size => {}
-            HashTableLiteralKey::Test => {
-                let name = value.as_symbol_name()?;
-                test = HashTableTest::from_symbol_name(name)?;
-                test_name = Some(intern(name));
-            }
-            HashTableLiteralKey::Weakness => {
-                weakness = match value.as_symbol_name() {
-                    Some("nil") | None => None,
-                    Some(name) => Some(HashTableWeakness::from_symbol_name(name)?),
-                };
-            }
-            HashTableLiteralKey::RehashSize => {
-                rehash_size = value.as_float().unwrap_or(value.as_int()? as f64);
-            }
-            HashTableLiteralKey::RehashThreshold => {
-                rehash_threshold = value.as_float().unwrap_or(value.as_int()? as f64);
-            }
-            HashTableLiteralKey::Data => data_value = Some(value),
-            HashTableLiteralKey::Purecopy => {}
-        }
-        i += 2;
-    }
-
-    Some(CompiledHashLiteral {
-        test,
-        test_name,
-        weakness,
-        rehash_size,
-        rehash_threshold,
-        data_value,
-        _mutator: std::marker::PhantomData,
-    })
-}
-
-fn try_convert_hash_table_literal(val: Value) -> Result<Option<Value>, Flow> {
-    let Some(literal) = parse_compiled_hash_literal(val) else {
-        return Ok(None);
-    };
-    // GNU lread.c:hash_table_from_plist ignores printed SIZE and requests only
-    // the already collected DATA pair count. Hash allocation is fallible, and
-    // every caller now propagates a failure rather than preserving the wrapper.
-    let mut data = literal
-        .data_value
-        .and_then(|value| list_to_vec(&value))
-        .unwrap_or_default();
-    let pairs =
-        i64::try_from(data.len() / 2).map_err(|_| crate::emacs_core::alloc::memory_exhausted())?;
-    let size = crate::emacs_core::alloc::HashTableSize::try_from(Value::make_int(pairs))?;
-    // Convert nested pairs before borrowing the new table. Recursive allocation
-    // errors propagate, and no conversion runs inside its mutable heap borrow.
-    for pair in data.chunks_exact_mut(2) {
-        pair[0] = try_convert_nested_compiled_literal(pair[0])?;
-        pair[1] = try_convert_nested_compiled_literal(pair[1])?;
-    }
-    let table_value = Value::try_hash_table_with_options(literal.test, size, literal.weakness)?;
-    let _ = table_value.with_hash_table_mut(|table| {
-        table.test_name = literal.test_name;
-        table.rehash_size = literal.rehash_size;
-        table.rehash_threshold = literal.rehash_threshold;
-        for pair in data.chunks_exact(2) {
-            let key = pair[0].to_hash_key(&table.test);
-            table.insert(key, pair[0], pair[1]);
-        }
-    });
-    Ok(Some(table_value))
-}
-
-fn quote_payload_value(value: Value) -> Option<Value> {
-    let items = list_to_vec(&value)?;
-    if items.len() != 2 {
-        return None;
-    }
-    match items[0].as_symbol_name() {
-        Some("quote") => Some(items[1]),
-        _ => None,
-    }
 }
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
