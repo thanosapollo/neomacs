@@ -6728,6 +6728,249 @@ fn accept_process_output_runs_gnu_timer_then_internal_timer_before_process_callb
     assert_eq!(format!("{}", events_after_second), after_sentinel);
 }
 
+/// Shared setup for the two deterministic neomacs#72 controls below: the
+/// two-timer stub of the test above (sorted `timer-list`, both already due,
+/// GNU's `timer-event-handler` replaced by a recorder), plus a filter and a
+/// sentinel that append to the same list.
+#[cfg(target_os = "linux")]
+fn apio_status_order_context() -> Context {
+    let mut ev = Context::new();
+    ev.eval_str(
+        r#"(progn
+             (setq apio-status-order nil)
+             (fset 'apio-status-order-gnu
+                   (lambda ()
+                     (setq apio-status-order
+                           (append apio-status-order '(gnu)))))
+             (fset 'apio-status-order-rust
+                   (lambda ()
+                     (setq apio-status-order
+                           (append apio-status-order '(rust)))))
+             (fset 'timer-event-handler
+                   (lambda (timer)
+                     (setq timer-list (delq timer timer-list))
+                     (funcall (aref timer 5))))
+             (fset 'apio-status-order-filter
+                   (lambda (_proc string)
+                     (setq apio-status-order
+                           (append apio-status-order
+                                   (list (list 'filter string))))))
+             (fset 'apio-status-order-sentinel
+                   (lambda (_proc msg)
+                     (setq apio-status-order
+                           (append apio-status-order
+                                   (list (list 'sentinel msg)))))))"#,
+    )
+    .expect("install status-order setup");
+    ev.set_variable(
+        "timer-list",
+        Value::list(vec![
+            gnu_timer_before(Duration::from_millis(2), "apio-status-order-gnu"),
+            gnu_timer_before(Duration::from_millis(1), "apio-status-order-rust"),
+        ]),
+    );
+    ev
+}
+
+#[cfg(target_os = "linux")]
+fn apio_status_order_spawn(ev: &mut Context, program: String, args: Vec<String>) -> ProcessId {
+    let pid = ev.processes.create_process(
+        "apio-status-order".into(),
+        Value::NIL,
+        program,
+        args,
+        crate::emacs_core::process::ProcessCodingSystems::gnu_make_process_initial(),
+    );
+    ev.processes
+        .spawn_child(pid, false)
+        .expect("spawn status-order process");
+    builtin_set_process_filter(
+        ev,
+        vec![
+            Value::make_process(pid),
+            Value::symbol("apio-status-order-filter"),
+        ],
+    )
+    .expect("install status-order filter");
+    builtin_set_process_sentinel(
+        ev,
+        vec![
+            Value::make_process(pid),
+            Value::symbol("apio-status-order-sentinel"),
+        ],
+    )
+    .expect("install status-order sentinel");
+    pid
+}
+
+/// Kernel barrier: wait until the child is exited and unreaped (state `Z`),
+/// the exact state GNU's SIGCHLD handler finds, and prove that nothing in
+/// this port has observed the exit yet.  The spin is a readiness barrier on
+/// kernel state, not a timing guess: it never decides the outcome, it only
+/// establishes the precondition the assertions below depend on.
+/// Linux-only: `pw187_is_zombie` reads `/proc/<pid>/stat`, so this barrier
+/// and the two controls using it are gated on procfs, not on all of Unix.
+#[cfg(target_os = "linux")]
+fn apio_status_order_await_unobserved_exit(ev: &Context, pid: ProcessId) {
+    let os_pid = ev
+        .processes
+        .get(pid)
+        .and_then(|proc| proc.os_pid)
+        .expect("a spawned child has an OS pid");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && !pw187_is_zombie(os_pid) {
+        std::thread::yield_now();
+    }
+    assert!(
+        pw187_is_zombie(os_pid),
+        "control: the child must be exited and unreaped before accept-process-output"
+    );
+    assert_eq!(
+        ProcessStatusSymbol::from_status_value(process_effective_status(
+            ev.processes.get(pid).expect("child is listed")
+        )),
+        Some(ProcessStatusSymbol::Run),
+        "control: nothing may have observed the exit before the wait"
+    );
+}
+
+/// neomacs#72, child already exited.  GNU `wait_reading_process_output`'s
+/// first pass runs `timer_check` (src/process.c:5512) before the
+/// `update_tick != process_tick` block's `status_notify (NULL, wait_proc)`
+/// (:5576), and the exited child's fd has already left the input mask
+/// (`delete_read_fd` in `handle_child_signal`, :7771), so `status_notify`
+/// both reads the remaining output (filter) and runs the sentinel -- after
+/// the timers, inside the first accept.  GNU 32.0.50: 200/200 runs of this
+/// exact shape, first `t (gnu rust (filter "out\n") (sentinel
+/// "finished\n"))`, second `nil` with the same list.
+#[cfg(target_os = "linux")]
+#[test]
+fn accept_process_output_runs_due_timers_before_exited_child_status_notify() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = apio_status_order_context();
+    let pid = apio_status_order_spawn(&mut ev, find_bin("echo"), vec!["out".into()]);
+    apio_status_order_await_unobserved_exit(&ev, pid);
+
+    let expected = r#"(gnu rust (filter "out
+") (sentinel "finished
+"))"#;
+    let first = builtin_accept_process_output(
+        &mut ev,
+        vec![Value::make_process(pid), Value::make_float(0.1)],
+    )
+    .expect("first accept-process-output");
+    let after_first = format!(
+        "{}",
+        ev.eval_symbol("apio-status-order")
+            .expect("status-order list after first wait")
+    );
+    assert_eq!(
+        after_first, expected,
+        "due timers must run before an exited child's filter and sentinel"
+    );
+    assert_eq!(first, Value::T);
+
+    let second = builtin_accept_process_output(
+        &mut ev,
+        vec![Value::make_process(pid), Value::make_float(0.1)],
+    )
+    .expect("second accept-process-output");
+    let after_second = format!(
+        "{}",
+        ev.eval_symbol("apio-status-order")
+            .expect("status-order list after second wait")
+    );
+    assert_eq!(second, Value::NIL);
+    assert_eq!(after_second, expected);
+}
+
+/// neomacs#72, child still alive.  The child has written its output and
+/// then blocks reading stdin, so the first wait sees readable output from a
+/// running process: timers, then the filter, and no sentinel.  After EOF the
+/// child exits (kernel barrier again) and the second wait runs only the
+/// sentinel.  GNU 32.0.50 `live-ready`: 200/200 runs, first `t (gnu rust
+/// (filter "out\n"))`, second `nil (gnu rust (filter "out\n") (sentinel
+/// "finished\n"))`.
+#[cfg(target_os = "linux")]
+#[test]
+fn accept_process_output_runs_due_timers_before_live_child_filter() {
+    crate::test_utils::init_test_tracing();
+    let marker = tmp_file("apio-status-order-live-ready");
+    assert!(
+        !std::path::Path::new(&marker).exists(),
+        "control: the ready marker must not exist before the child runs"
+    );
+    let mut ev = apio_status_order_context();
+    // `exec cat` keeps the same pid, so the later zombie barrier watches the
+    // process the port spawned.  The marker is created only after `echo`
+    // has written to the output pipe.
+    let pid = apio_status_order_spawn(
+        &mut ev,
+        find_bin("sh"),
+        vec![
+            "-c".into(),
+            r#"echo out; : > "$1"; exec cat >/dev/null"#.into(),
+            "sh".into(),
+            marker.clone(),
+        ],
+    );
+
+    // Readiness barrier on the child's own marker: once it exists, "out\n"
+    // is already in the pipe and the child is blocked in `cat`.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && !std::path::Path::new(&marker).exists() {
+        std::thread::yield_now();
+    }
+    let ready = std::path::Path::new(&marker).exists();
+    let _ = std::fs::remove_file(&marker);
+    assert!(ready, "control: the child must report its output written");
+    assert_eq!(
+        ProcessStatusSymbol::from_status_value(process_effective_status(
+            ev.processes.get(pid).expect("child is listed")
+        )),
+        Some(ProcessStatusSymbol::Run),
+        "control: the child must still be running at the first wait"
+    );
+
+    let first = builtin_accept_process_output(
+        &mut ev,
+        vec![Value::make_process(pid), Value::make_float(0.1)],
+    )
+    .expect("first accept-process-output");
+    let after_first = format!(
+        "{}",
+        ev.eval_symbol("apio-status-order")
+            .expect("status-order list after first wait")
+    );
+    assert_eq!(
+        after_first,
+        r#"(gnu rust (filter "out
+"))"#
+    );
+    assert_eq!(first, Value::T);
+
+    builtin_process_send_eof(&mut ev, vec![Value::make_process(pid)]).expect("process-send-eof");
+    apio_status_order_await_unobserved_exit(&ev, pid);
+
+    let second = builtin_accept_process_output(
+        &mut ev,
+        vec![Value::make_process(pid), Value::make_float(0.1)],
+    )
+    .expect("second accept-process-output");
+    let after_second = format!(
+        "{}",
+        ev.eval_symbol("apio-status-order")
+            .expect("status-order list after second wait")
+    );
+    assert_eq!(second, Value::NIL);
+    assert_eq!(
+        after_second,
+        r#"(gnu rust (filter "out
+") (sentinel "finished
+"))"#
+    );
+}
+
 #[test]
 fn accept_process_output_runs_default_process_filter() {
     crate::test_utils::init_test_tracing();
