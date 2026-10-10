@@ -41,9 +41,6 @@ note: required because it appears within the type `CharTableObj`
   = note: required because it appears within the type `&'static mut CharTableObj`
 note: required because it appears within the type `PhantomData<&'static mut CharTableObj>`
  --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
 note: required because it appears within the type `CharTableWrite<'static>`
  --> src/tagged/mutate/chartable.rs
   |
@@ -64,9 +61,6 @@ error[E0277]: `*const ()` cannot be sent between threads safely
   = help: within `CharTableWrite<'static>`, the trait `Send` is not implemented for `*const ()`
 note: required because it appears within the type `PhantomData<*const ()>`
  --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
 note: required because it appears within the type `TaggedValue`
  --> src/tagged/value.rs
   |
@@ -80,9 +74,6 @@ note: required because it appears within the type `CharTableObj`
   = note: required because it appears within the type `&'static mut CharTableObj`
 note: required because it appears within the type `PhantomData<&'static mut CharTableObj>`
  --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
 note: required because it appears within the type `CharTableWrite<'static>`
  --> src/tagged/mutate/chartable.rs
   |
@@ -119,9 +110,6 @@ note: required because it appears within the type `CharTableObj`
   = note: required because it appears within the type `&'static mut CharTableObj`
 note: required because it appears within the type `PhantomData<&'static mut CharTableObj>`
  --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
 note: required because it appears within the type `CharTableWrite<'static>`
  --> src/tagged/mutate/chartable.rs
   |
