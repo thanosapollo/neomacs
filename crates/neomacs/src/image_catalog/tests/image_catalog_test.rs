@@ -6,8 +6,8 @@ use neovm_core::emacs_core::Value;
 use neovm_core::emacs_core::image::image_load_identity;
 use neovm_core::emacs_core::image_catalog::ImageSizeLimit;
 use neovm_core::emacs_core::image_catalog::{
-    AxisSize, ImageColorContext, ImageDefaultScale, ImageScaleEnvironment, ImageScalePolicy,
-    ImageSizeSpec, ImageSpecIdentity,
+    AxisSize, ImageColorContext, ImageDataSource, ImageDefaultScale, ImageScaleEnvironment,
+    ImageScalePolicy, ImageSizeSpec, ImageSpecIdentity,
 };
 use neovm_core::emacs_core::value::list_to_vec;
 use std::sync::Arc;
@@ -648,36 +648,508 @@ fn a_refused_load_is_a_failed_lookup_carrying_gnus_diagnostic() {
 #[test]
 fn synchronous_wait_reports_a_new_decode_failure_and_each_cached_query() {
     let (cmd_tx, _cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
-    let metadata = Arc::new(ImageRenderState::default());
-    let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::clone(&metadata), None);
+    let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::new(ImageRenderState::default()), None);
     let request = file_request("/nonexistent/neomacs/synchronous-failure.png");
-    let ImageLookup::Pending(pending) = lookup(&catalog, request.clone()) else {
-        panic!("new request must be pending");
-    };
-    let publisher = Arc::clone(&metadata);
-    let worker = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(20));
-        publisher.publish_terminal(
-            pending.load(),
-            ImageDecodeTerminal::Failed(ImageDiagnostic::InvalidSize),
-        );
-    });
-    let first = catalog.resolve_sync(request.clone(), ImageSizeLimit::UNLIMITED);
-    worker.join().expect("terminal publisher");
-    assert_eq!(first, Err(ImageDiagnostic::InvalidSize.message()));
-    assert_eq!(
-        catalog.take_pending_diagnostics(),
-        vec![ImageDiagnostic::InvalidSize.message()],
-        "failure arriving during the semantic wait must reach diagnostics"
-    );
+    let error = catalog
+        .resolve_sync(request.clone(), ImageSizeLimit::UNLIMITED)
+        .unwrap_err();
+    assert!(error.contains("Cannot find image file"));
+    assert_eq!(catalog.take_pending_diagnostics(), vec![error.clone()]);
     assert_eq!(
         catalog.resolve_sync(request, ImageSizeLimit::UNLIMITED),
+        Err(error.clone())
+    );
+    assert_eq!(catalog.take_pending_diagnostics(), vec![error]);
+}
+
+#[test]
+fn semantic_rgba_retention_is_bounded_without_gpu_eviction() {
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(1);
+    let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::new(ImageRenderState::default()), None);
+    let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+    let mut first = None;
+    for index in 0..850 {
+        let mut request = file_request(&format!("retention-{index}.png"));
+        request.source =
+            ImageResolveSource::File(ImageFileName::from_utf8(fixture.to_str().unwrap()));
+        request.size = ImageSizeSpec::default();
+        let ready = catalog
+            .resolve_sync(request.clone(), ImageSizeLimit::UNLIMITED)
+            .unwrap()
+            .unwrap();
+        if index == 0 {
+            first = Some((request, ready));
+        }
+    }
+    let bytes = catalog.semantic_queries.cached_size_bytes();
+    println!("850 complete 100x200 RGBA realizations: retained CPU bytes={bytes}");
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "no GPU work or eviction enforces this budget"
+    );
+    assert!(
+        bytes <= 64 * 1024 * 1024,
+        "retained CPU RGBA exceeds independent budget: {bytes}"
+    );
+    let (request, ready) = first.unwrap();
+    assert_eq!(
+        catalog
+            .resolve_sync(request, ImageSizeLimit::from_axis_pixels(1))
+            .unwrap()
+            .unwrap(),
+        ready
+    );
+    assert!(catalog.invalidate(ImageInvalidation::All).changed());
+    assert_eq!(catalog.semantic_queries.cached_size_bytes(), 0);
+}
+
+#[test]
+fn semantic_rgba_fifo_preserves_answers_errors_and_encoded_fallback() {
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
+    let mut catalog =
+        AsyncImageCatalog::new(cmd_tx, None, Arc::new(ImageRenderState::default()), None);
+    catalog.semantic_queries = semantic_queries::SemanticQueries::with_pixel_budget(80_000);
+    let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+    let requests: Vec<_> = (0..3)
+        .map(|index| {
+            let mut request = file_request(&format!("fifo-{index}.png"));
+            request.source =
+                ImageResolveSource::File(ImageFileName::from_utf8(fixture.to_str().unwrap()));
+            request.size = ImageSizeSpec::default();
+            request
+        })
+        .collect();
+    let first = catalog
+        .resolve_sync(requests[0].clone(), ImageSizeLimit::UNLIMITED)
+        .unwrap()
+        .unwrap();
+    assert!(catalog.semantic_queries.pixels(&requests[0]).is_some());
+    let second = catalog
+        .resolve_sync(requests[1].clone(), ImageSizeLimit::UNLIMITED)
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog.semantic_queries.cached_size_bytes(), 80_000);
+    assert!(catalog.semantic_queries.pixels(&requests[0]).is_none());
+    assert!(catalog.semantic_queries.pixels(&requests[1]).is_some());
+    assert_eq!(
+        catalog
+            .resolve_sync(requests[0].clone(), ImageSizeLimit::from_axis_pixels(1))
+            .unwrap()
+            .unwrap(),
+        first
+    );
+    assert!(
+        catalog.semantic_queries.pixels(&requests[0]).is_none(),
+        "warm semantic answers do not re-decode evicted RGBA"
+    );
+    catalog.lookup(requests[0].clone(), ImageSizeLimit::from_axis_pixels(1));
+    assert!(
+        matches!(cmd_rx.try_recv().unwrap(), RenderCommand::Asset(AssetCommand::ImageLoadFile { limit, .. }) if limit == ImageSizeLimit::UNLIMITED)
+    );
+    // Complete but oversized pixels bypass retention without discarding the FIFO.
+    let mut oversized = requests[2].clone();
+    oversized.size = ImageSizeSpec::new(AxisSize::Exact(200), AxisSize::Exact(400));
+    assert!(
+        catalog
+            .resolve_sync(oversized.clone(), ImageSizeLimit::UNLIMITED)
+            .is_ok()
+    );
+    assert!(catalog.semantic_queries.pixels(&oversized).is_none());
+    assert!(catalog.semantic_queries.pixels(&requests[1]).is_some());
+    // Cache failures without allowing later bounds to re-admit them.
+    assert!(
+        catalog
+            .resolve_sync(requests[2].clone(), ImageSizeLimit::from_axis_pixels(1))
+            .is_err()
+    );
+    catalog.take_pending_diagnostics();
+    assert_eq!(
+        catalog.resolve_sync(requests[2].clone(), ImageSizeLimit::UNLIMITED),
         Err(ImageDiagnostic::InvalidSize.message())
     );
     assert_eq!(
         catalog.take_pending_diagnostics(),
-        vec![ImageDiagnostic::InvalidSize.message()],
-        "an explicit cached semantic query reports the same failure again"
+        vec![ImageDiagnostic::InvalidSize.message()]
+    );
+    catalog.invalidate_all();
+    assert_eq!(
+        catalog
+            .resolve_sync(requests[1].clone(), ImageSizeLimit::from_axis_pixels(1))
+            .unwrap()
+            .unwrap(),
+        second
+    );
+    assert_eq!(catalog.semantic_queries.cached_size_bytes(), 80_000);
+    assert!(
+        catalog
+            .invalidate(ImageInvalidation::Spec {
+                spec: requests[1].spec.clone()
+            })
+            .changed()
+    );
+    assert_eq!(catalog.semantic_queries.cached_size_bytes(), 0);
+}
+
+#[test]
+fn semantic_decode_completes_without_renderer_service_or_drawable_ready() {
+    let (cmd_tx, _cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(1);
+    let metadata = Arc::new(ImageRenderState::default());
+    let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::clone(&metadata), None);
+    let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+    let mut request = file_request(fixture.to_str().unwrap());
+    request.size = ImageSizeSpec::default();
+    let start = Instant::now();
+    let ready = catalog
+        .resolve_sync(request.clone(), ImageSizeLimit::UNLIMITED)
+        .expect("full CPU decode must not wait for renderer service")
+        .unwrap();
+    assert_eq!(ready.metadata.layout.dimensions(), (100, 200));
+    assert!(start.elapsed() < Duration::from_millis(900));
+    assert!(
+        matches!(lookup(&catalog, request), ImageLookup::Pending(_)),
+        "semantic completion must not publish drawable residency"
+    );
+    assert!(metadata.terminal(ready.load).is_none());
+}
+
+#[test]
+fn semantic_decode_cache_survives_gpu_reset_but_not_lisp_invalidation() {
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(1);
+    let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::new(ImageRenderState::default()), None);
+    let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+    let request = file_request(fixture.to_str().unwrap());
+    let first = catalog
+        .resolve_sync(request.clone(), ImageSizeLimit::UNLIMITED)
+        .unwrap()
+        .unwrap();
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "semantic admission must not send renderer commands"
+    );
+    catalog.invalidate_all();
+    let warm = catalog
+        .resolve_sync(request.clone(), ImageSizeLimit::from_axis_pixels(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first, warm,
+        "GPU reset and changed admission bounds do not erase decoded semantics"
+    );
+    assert!(
+        catalog
+            .invalidate(ImageInvalidation::Spec {
+                spec: request.spec.clone()
+            })
+            .changed()
+    );
+    assert_eq!(
+        catalog.resolve_sync(request.clone(), ImageSizeLimit::from_axis_pixels(1)),
+        Err(ImageDiagnostic::InvalidSize.message())
+    );
+    assert!(
+        catalog
+            .invalidate(ImageInvalidation::Dependency(request.source.clone()))
+            .changed()
+    );
+    let replacement = catalog
+        .resolve_sync(request, ImageSizeLimit::UNLIMITED)
+        .unwrap()
+        .unwrap();
+    assert_ne!(first.load, replacement.load);
+    assert_eq!(first.metadata, replacement.metadata);
+}
+
+#[test]
+fn semantic_decode_admission_is_shared_with_later_display_without_readiness() {
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
+    let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::new(ImageRenderState::default()), None);
+    let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+    let request = file_request(fixture.to_str().unwrap());
+    catalog
+        .resolve_sync(request.clone(), ImageSizeLimit::UNLIMITED)
+        .unwrap();
+    assert!(matches!(
+        catalog.lookup(request.clone(), ImageSizeLimit::from_axis_pixels(1)),
+        ImageLookup::Pending(_)
+    ));
+    assert!(
+        matches!(cmd_rx.try_recv().unwrap(), RenderCommand::Asset(AssetCommand::ImageLoadDecoded { decoded, .. }) if decoded.metadata().layout.dimensions() == (12, 24))
+    );
+    assert!(catalog.invalidate(ImageInvalidation::All).changed());
+    while cmd_rx.try_recv().is_ok() {}
+    assert!(
+        catalog
+            .resolve_sync(request.clone(), ImageSizeLimit::from_axis_pixels(1))
+            .is_err()
+    );
+    let ImageLookup::Failed(failed) = catalog.lookup(request, ImageSizeLimit::UNLIMITED) else {
+        panic!("negative admission must be shared too");
+    };
+    assert_eq!(failed.error, ImageDiagnostic::InvalidSize);
+    assert!(cmd_rx.try_recv().is_err());
+}
+
+#[test]
+fn semantic_decode_pending_display_uses_first_admission_in_both_bound_orders() {
+    for first in [
+        ImageSizeLimit::UNLIMITED,
+        ImageSizeLimit::from_axis_pixels(1),
+    ] {
+        let later = if first == ImageSizeLimit::UNLIMITED {
+            ImageSizeLimit::from_axis_pixels(1)
+        } else {
+            ImageSizeLimit::UNLIMITED
+        };
+        let (cmd_tx, _unserviced_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
+        let metadata = Arc::new(ImageRenderState::default());
+        let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::clone(&metadata), None);
+        let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+        let request = file_request(fixture.to_str().unwrap());
+        let ImageLookup::Pending(pending) = catalog.lookup(request.clone(), first) else {
+            panic!("display starts pending");
+        };
+        let before = catalog.resolve_sync(request.clone(), later);
+        if first == ImageSizeLimit::UNLIMITED {
+            let ready = before.as_ref().unwrap().as_ref().unwrap();
+            metadata.publish_terminal(
+                pending.load(),
+                ImageDecodeTerminal::Ready(ready.metadata.clone()),
+            );
+            assert!(matches!(
+                catalog.lookup(request.clone(), later),
+                ImageLookup::Ready(_)
+            ));
+        } else {
+            assert_eq!(before, Err(ImageDiagnostic::InvalidSize.message()));
+            metadata.publish_terminal(
+                pending.load(),
+                ImageDecodeTerminal::Failed(ImageDiagnostic::InvalidSize),
+            );
+            assert!(matches!(
+                catalog.lookup(request.clone(), later),
+                ImageLookup::Failed(_)
+            ));
+        }
+        assert_eq!(before, catalog.resolve_sync(request.clone(), later));
+        catalog.invalidate_all();
+        assert_eq!(before, catalog.resolve_sync(request, later));
+    }
+}
+
+#[test]
+fn semantic_decode_first_admission_survives_unobserved_completion_and_timeout() {
+    // Deterministically model the interval after a semantic wait returned None:
+    // first admission has been established, but no completion was observed and
+    // no prepared pixels/admissions have been adopted. No sleeps or renderer.
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
+    let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::new(ImageRenderState::default()), None);
+    let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+    let request = file_request(fixture.to_str().unwrap());
+    assert_eq!(
+        catalog.admission_limit(&request, ImageSizeLimit::UNLIMITED),
+        ImageSizeLimit::UNLIMITED
+    );
+    assert!(catalog.semantic_queries.pixels(&request).is_none());
+    assert!(catalog.semantic_queries.admission(&request).is_none());
+    catalog.lookup(request.clone(), ImageSizeLimit::from_axis_pixels(1));
+    assert!(
+        matches!(cmd_rx.try_recv().unwrap(), RenderCommand::Asset(AssetCommand::ImageLoadFile { limit, .. }) if limit == ImageSizeLimit::UNLIMITED)
+    );
+    assert!(
+        catalog
+            .resolve_sync(request.clone(), ImageSizeLimit::from_axis_pixels(1))
+            .is_ok()
+    );
+    assert!(catalog.invalidate(ImageInvalidation::All).changed());
+    assert_eq!(
+        catalog.admission_limit(&request, ImageSizeLimit::from_axis_pixels(1)),
+        ImageSizeLimit::from_axis_pixels(1)
+    );
+    // Semantic-only entries also retire their admission on explicit invalidation.
+    catalog
+        .resolve_sync(request.clone(), ImageSizeLimit::UNLIMITED)
+        .unwrap_err();
+    assert!(catalog.invalidate(ImageInvalidation::All).changed());
+    assert!(!catalog.admission_limits.borrow().contains_key(&request));
+}
+
+#[test]
+fn semantic_decode_trait_dispatch_preserves_cache_invalidation_and_reconciliation() {
+    let (cmd_tx, _cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
+    let metadata = Arc::new(ImageRenderState::default());
+    let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::clone(&metadata), None);
+    let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+    let request = file_request(fixture.to_str().unwrap());
+    let ready = catalog
+        .resolve_sync(request.clone(), ImageSizeLimit::UNLIMITED)
+        .unwrap()
+        .unwrap();
+    let boundary: &dyn ImageCatalog = &catalog;
+    assert!(boundary.cached_size_bytes() > 0);
+    let ImageLookup::Pending(pending) = boundary.lookup(request.clone(), ImageSizeLimit::UNLIMITED)
+    else {
+        panic!("no drawable residency");
+    };
+    metadata.publish_terminal(
+        pending.load(),
+        ImageDecodeTerminal::Ready(ready.metadata.clone()),
+    );
+    boundary.reconcile_renderer_state(ImageStateEvent::DecodeCompleted(pending.load()));
+    assert!(matches!(
+        catalog.entries.borrow().get(&request),
+        Some(CatalogEntry::Resident(_))
+    ));
+    assert!(
+        boundary
+            .invalidate_animation(ImageAnimationInvalidation::All)
+            .changed()
+    );
+    assert!(boundary.invalidate(ImageInvalidation::All).changed());
+    assert_eq!(boundary.cached_size_bytes(), 0);
+    let replacement = catalog
+        .resolve_sync(request, ImageSizeLimit::UNLIMITED)
+        .unwrap()
+        .unwrap();
+    assert_ne!(ready.load, replacement.load);
+}
+
+#[test]
+fn semantic_decode_production_queries_complete_pixel_and_animation_semantics() {
+    use neomacs_display_protocol::{ImageFrameIndex, ImageMaskKind};
+    let (cmd_tx, unserviced_rx) = neomacs_display_runtime::thread_comm::command_channel(64);
+    let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::new(ImageRenderState::default()), None);
+    // Actual encoded PNG streams: opaque, binary-transparent, continuous alpha.
+    let streams = [
+        (
+            vec![
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0,
+                2, 8, 6, 0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 17, 73, 68, 65, 84, 120, 156, 99, 16,
+                50, 9, 251, 15, 194, 12, 48, 6, 0, 52, 12, 6, 109, 214, 210, 193, 5, 0, 0, 0, 0,
+                73, 69, 78, 68, 174, 66, 96, 130,
+            ],
+            ImageMaskKind::None,
+            false,
+        ),
+        (
+            vec![
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0,
+                2, 8, 6, 0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 17, 73, 68, 65, 84, 120, 156, 99, 16,
+                50, 9, 99, 0, 97, 6, 24, 3, 0, 22, 42, 2, 113, 226, 237, 10, 156, 0, 0, 0, 0, 73,
+                69, 78, 68, 174, 66, 96, 130,
+            ],
+            ImageMaskKind::AlphaChannel,
+            true,
+        ),
+        (
+            vec![
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0,
+                2, 8, 6, 0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 17, 73, 68, 65, 84, 120, 156, 99, 16,
+                50, 9, 107, 0, 97, 6, 24, 3, 0, 37, 42, 4, 113, 236, 234, 27, 16, 0, 0, 0, 0, 73,
+                69, 78, 68, 174, 66, 96, 130,
+            ],
+            ImageMaskKind::AlphaChannel,
+            false,
+        ),
+    ];
+    for (index, (bytes, mask, transparent)) in streams.into_iter().enumerate() {
+        let mut request = file_request(&format!("data-pixel-{index}.png"));
+        request.source = ImageResolveSource::Data(ImageDataSource::Isolated(
+            neomacs_display_protocol::image::EncodedBytes::new(bytes),
+        ));
+        request.size = ImageSizeSpec::default();
+        let result = catalog
+            .resolve_sync(request, ImageSizeLimit::UNLIMITED)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.metadata.layout.dimensions(), (2, 2));
+        assert_eq!(result.metadata.background, 0x123456);
+        assert_eq!(result.metadata.mask, mask);
+        assert_eq!(result.metadata.background_transparent, transparent);
+    }
+    // Real two-frame 1x1 GIF, selected green frame delayed 40 milliseconds.
+    let mut request = file_request("data-animation.gif");
+    request.source = ImageResolveSource::Data(ImageDataSource::Isolated(
+        neomacs_display_protocol::image::EncodedBytes::new(vec![
+            71, 73, 70, 56, 57, 97, 1, 0, 1, 0, 128, 0, 0, 255, 0, 0, 0, 255, 0, 33, 249, 4, 0, 2,
+            0, 0, 0, 44, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 68, 1, 0, 33, 249, 4, 0, 4, 0, 0, 0, 44,
+            0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 76, 1, 0, 59,
+        ]),
+    ));
+    request.size = ImageSizeSpec::default();
+    request.frame = ImageFrameIndex::new(1);
+    let ready = catalog
+        .resolve_sync(request.clone(), ImageSizeLimit::UNLIMITED)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ready.metadata.background, 0x00ff00);
+    assert_eq!(ready.metadata.embedded.frame_count(), Some(2));
+    assert_eq!(
+        ready.metadata.embedded.frame_delay(),
+        Some(neomacs_display_protocol::ImageFrameDelay::milliseconds(40, 1).unwrap())
+    );
+    request.frame = ImageFrameIndex::new(2);
+    assert!(
+        catalog
+            .resolve_sync(request, ImageSizeLimit::UNLIMITED)
+            .is_err()
+    );
+    let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+    let mut malformed = file_request("data-truncated.png");
+    malformed.source = ImageResolveSource::Data(ImageDataSource::Isolated(
+        neomacs_display_protocol::image::EncodedBytes::new(
+            std::fs::read(fixture).unwrap()[..33].to_vec(),
+        ),
+    ));
+    assert!(
+        catalog
+            .resolve_sync(malformed, ImageSizeLimit::UNLIMITED)
+            .is_err(),
+        "complete IHDR must not count as semantic completion"
+    );
+    assert!(
+        unserviced_rx.try_recv().is_err(),
+        "queries require no renderer admission or service"
+    );
+}
+
+#[test]
+fn semantic_decode_does_not_require_even_a_connected_renderer() {
+    let (cmd_tx, cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(1);
+    drop(cmd_rx);
+    let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::new(ImageRenderState::default()), None);
+    let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+    assert!(
+        catalog
+            .resolve_sync(
+                file_request(fixture.to_str().unwrap()),
+                ImageSizeLimit::UNLIMITED
+            )
+            .is_ok()
+    );
+}
+
+#[test]
+fn semantic_decode_failure_without_renderer_service_reports_diagnostic() {
+    let (cmd_tx, _cmd_rx) = neomacs_display_runtime::thread_comm::command_channel(1);
+    let catalog = AsyncImageCatalog::new(cmd_tx, None, Arc::new(ImageRenderState::default()), None);
+    let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+    let request = file_request(fixture.to_str().unwrap());
+    assert_eq!(
+        catalog.resolve_sync(request.clone(), ImageSizeLimit::from_axis_pixels(1)),
+        Err(ImageDiagnostic::InvalidSize.message())
+    );
+    assert_eq!(
+        catalog.take_pending_diagnostics(),
+        vec![ImageDiagnostic::InvalidSize.message()]
+    );
+    assert_eq!(
+        catalog.resolve_sync(request, ImageSizeLimit::UNLIMITED),
+        Err(ImageDiagnostic::InvalidSize.message()),
+        "cached failures remain cached until flush"
+    );
+    assert_eq!(
+        catalog.take_pending_diagnostics(),
+        vec![ImageDiagnostic::InvalidSize.message()]
     );
 }
 
@@ -709,7 +1181,7 @@ fn profile_synchronous_metadata_with_unserviced_render_owner() {
         }
         let sched_before = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap();
         let start = Instant::now();
-        let result = catalog.resolve_sync(request, ImageSizeLimit::UNLIMITED);
+        let result = catalog.resolve_sync(request.clone(), ImageSizeLimit::UNLIMITED);
         let wall_ns = start.elapsed().as_nanos();
         let sched_after = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap();
         let parse = |text: &str| {
@@ -720,18 +1192,18 @@ fn profile_synchronous_metadata_with_unserviced_render_owner() {
         };
         let before = parse(&sched_before);
         let after = parse(&sched_after);
-        assert!(
-            result
-                .as_ref()
-                .unwrap_err()
-                .starts_with("Timed out waiting for image decode")
-        );
+        let ready = result.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(ready.metadata.layout.dimensions(), (50, 100));
+        let warm_start = Instant::now();
+        let warm = catalog.resolve_sync(request, ImageSizeLimit::UNLIMITED);
+        let warm_ns = warm_start.elapsed().as_nanos();
+        assert!(warm.is_ok());
         assert!(metadata.terminal(pending.load()).is_none());
         assert!(
             matches!(cmd_rx.try_recv(), Ok(RenderCommand::Asset(AssetCommand::ImageLoadFile { load, .. })) if load == pending.load())
         );
         println!(
-            "R020_METADATA_PROFILE rep={repetition} wall_ns={wall_ns} cpu_ns={} runnable_ns={} header=50x100 terminal=absent result={result:?}",
+            "R021_METADATA_PROFILE rep={repetition} cold_ns={wall_ns} warm_ns={warm_ns} cpu_ns={} runnable_ns={} header=50x100 residency=absent result={result:?}",
             after[0] - before[0],
             after[1] - before[1]
         );

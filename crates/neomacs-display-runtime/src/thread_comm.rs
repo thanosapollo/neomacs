@@ -525,6 +525,11 @@ pub enum AssetCommand {
         identity: neomacs_display_protocol::image_diagnostic::ImageLoadIdentity,
     },
     /// Load image from encoded data bytes (PNG, JPEG, SVG, etc.)
+    /// Already-completed CPU semantics; the renderer only establishes residency.
+    ImageLoadDecoded {
+        load: ImageLoadToken,
+        decoded: std::sync::Arc<neomacs_renderer_wgpu::image_cache::SemanticImageDecoded>,
+    },
     ImageLoadData {
         load: ImageLoadToken,
         data: neovm_core::emacs_core::image_catalog::ImageDataSource,
