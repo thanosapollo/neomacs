@@ -740,6 +740,7 @@ struct LiveWindowLayoutInputs {
     frame: FrameParams,
     window: WindowParams,
     source: WindowDisplaySource,
+    root_right_edge: f32,
     main_area_bottom: f32,
 }
 
@@ -774,7 +775,7 @@ fn collect_live_window_layout_inputs(
     // repeating a full-frame bridge walk would cost O(windows) per leaf. The
     // root window's canonical bounds supply the same main-area bottom as the
     // maximum of its partitioned leaves.
-    let (frame, mut window, main_area_bottom) = {
+    let (frame, mut window, root_right_edge, main_area_bottom) = {
         let (live_frame, live_window) = evaluator
             .frame_manager()
             .frame_and_window_at_path(frame_id, window_path)?;
@@ -837,6 +838,7 @@ fn collect_live_window_layout_inputs(
                 evaluator.obarray(),
             ),
             window,
+            root_bounds.x + root_bounds.width,
             root_bounds.y + root_bounds.height,
         )
     };
@@ -848,6 +850,7 @@ fn collect_live_window_layout_inputs(
         frame,
         window: resolved.params,
         source: resolved.source,
+        root_right_edge,
         main_area_bottom,
     })
 }
@@ -2138,6 +2141,12 @@ impl LayoutEngine {
                     mini_params.force_start = false;
                 }
             }
+            let root_bounds = evaluator
+                .frame_manager()
+                .get(frame_id)?
+                .root_window()
+                .bounds();
+            let root_right_edge = root_bounds.x + root_bounds.width;
             let main_area_bottom = query_main_area_bottom.unwrap_or_else(|| {
                 window_params_list
                     .iter()
@@ -2262,6 +2271,7 @@ impl LayoutEngine {
                         let geometry = WindowFrameGeometryRequest::new(
                             params,
                             &frame_params,
+                            root_right_edge,
                             main_area_bottom,
                         )
                         .resolve();
@@ -2563,6 +2573,7 @@ impl LayoutEngine {
                     frame: frame_params.clone(),
                     window: planned_params.clone(),
                     source: window_sources[window_index],
+                    root_right_edge,
                     main_area_bottom,
                 };
 
@@ -2627,6 +2638,7 @@ impl LayoutEngine {
                 let mut window_geometry = WindowFrameGeometryRequest::new(
                     &live_inputs.window,
                     &live_inputs.frame,
+                    live_inputs.root_right_edge,
                     live_inputs.main_area_bottom,
                 )
                 .resolve();
@@ -2772,6 +2784,7 @@ impl LayoutEngine {
                             window_geometry = WindowFrameGeometryRequest::new(
                                 &live_inputs.window,
                                 &live_inputs.frame,
+                                live_inputs.root_right_edge,
                                 live_inputs.main_area_bottom,
                             )
                             .resolve();
