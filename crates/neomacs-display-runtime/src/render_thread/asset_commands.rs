@@ -194,6 +194,14 @@ impl RenderApp {
                 }
                 self.publish_image_cache_usage();
             }
+            AssetCommand::ImageLoadDecoded { load, decoded } => {
+                clear_image_terminals(&self.image_metadata, load.image());
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let event = renderer.upload_semantic_image(load, &decoded);
+                    self.handle_image_event(event);
+                }
+                self.publish_image_cache_usage();
+            }
             AssetCommand::ImageLoadArgb32 {
                 load,
                 data,

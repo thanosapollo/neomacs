@@ -616,6 +616,161 @@ pub struct ImageMetadata {
     pub embedded: ImageEmbeddedMetadata,
 }
 
+/// CPU-only semantic decode source. No GPU or render-command capability.
+pub enum SemanticImageSource {
+    File(String),
+    Data {
+        data: EncodedBytes,
+        resources: crate::svg::SvgResourceContext,
+    },
+}
+
+/// Immutable inputs required for a complete semantic decode, not a header probe.
+pub struct SemanticImageRequest {
+    pub source: SemanticImageSource,
+    pub size: ImageSizeSpec,
+    pub rotation: ImageRotation,
+    pub realization: ImageRealization,
+    pub colors: ImageColorContext,
+    pub mask: ImageMaskPolicy,
+    pub animation: ImageAnimationPolicy,
+    pub frame: ImageFrameIndex,
+    pub sequence: ImageSequenceId,
+    pub limit: neomacs_display_protocol::ImageSizeLimit,
+    pub identity: ImageLoadIdentity,
+}
+
+/// Fully decoded immutable pixels, reusable for residency without re-reading
+/// sources or re-evaluating SVG resources after semantic admission.
+#[derive(Debug)]
+pub struct SemanticImageDecoded {
+    metadata: ImageMetadata,
+    geometry: ResolvedImageGeometry,
+    data: Vec<u8>,
+}
+
+impl SemanticImageDecoded {
+    pub fn metadata(&self) -> &ImageMetadata {
+        &self.metadata
+    }
+    pub fn size_bytes(&self) -> usize {
+        self.data.len()
+    }
+}
+
+/// Decoder-owned sequence state for synchronous semantic queries. Its lifetime
+/// and retirement are independent of renderer residency and GPU reset.
+pub struct SemanticImageDecoder {
+    sequences: Arc<ImageSequenceCache>,
+    sequence_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl Default for SemanticImageDecoder {
+    fn default() -> Self {
+        Self {
+            sequences: Arc::new(ImageSequenceCache::new()),
+            sequence_bytes: Default::default(),
+        }
+    }
+}
+
+/// Reservation made before submission, so retirement fences even queued jobs.
+pub struct SemanticImageSequenceReservation {
+    _reservation: crate::image_sequence::ImageSequenceReservation,
+}
+
+impl SemanticImageDecoder {
+    pub fn reserve_sequence(&self, sequence: ImageSequenceId) -> SemanticImageSequenceReservation {
+        SemanticImageSequenceReservation {
+            _reservation: self.sequences.reserve(sequence),
+        }
+    }
+
+    pub fn retire(&self, retirement: ImageSequenceRetirement) {
+        self.sequences.retire(retirement);
+        self.sequences.publish_size_snapshot(&self.sequence_bytes);
+    }
+
+    pub fn cached_size_bytes(&self) -> usize {
+        usize::try_from(self.sequence_bytes.load(Ordering::Acquire)).unwrap_or(usize::MAX)
+    }
+
+    /// Fully decode and realize pixels using the production decoder chain.
+    /// Admission and decoding use the same byte snapshot. Metadata is computed
+    /// only after the whole decode finishes; bands and headers are not answers.
+    pub fn decode(&self, request: SemanticImageRequest) -> Result<ImageMetadata, ImageDiagnostic> {
+        self.decode_pixels(request).map(|decoded| decoded.metadata)
+    }
+
+    pub fn decode_pixels(
+        &self,
+        request: SemanticImageRequest,
+    ) -> Result<SemanticImageDecoded, ImageDiagnostic> {
+        let SemanticImageRequest {
+            source,
+            size,
+            rotation,
+            realization,
+            colors,
+            mask,
+            animation,
+            frame,
+            sequence,
+            limit,
+            identity,
+        } = request;
+        let (failure, data, resources) = match source {
+            SemanticImageSource::File(path) => {
+                let failure = DecodeFailureSource::File { path: path.clone() };
+                let data = std::fs::read(&path)
+                    .map(EncodedBytes::new)
+                    .map_err(|_| failure.diagnostic(&identity))?;
+                (failure, data, crate::svg::SvgResourceContext::BaseUri(path))
+            }
+            SemanticImageSource::Data { data, resources } => (
+                DecodeFailureSource::Bytes { data: data.clone() },
+                data,
+                resources,
+            ),
+        };
+        if crate::image_probe::admit(crate::image_probe::ImageProbeSource::Data(&data), limit)
+            .is_err()
+        {
+            return Err(ImageDiagnostic::InvalidSize);
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            ImageCache::decode_data(
+                data,
+                size,
+                rotation,
+                colors,
+                realization,
+                mask,
+                animation,
+                frame,
+                resources,
+                &self.sequences,
+                sequence,
+                None,
+            )
+        }));
+        self.sequences.publish_size_snapshot(&self.sequence_bytes);
+        match result {
+            Ok(Some(pixels)) => Ok(SemanticImageDecoded {
+                metadata: ImageCache::metadata_from_rgba(
+                    pixels.geometry,
+                    &pixels.rgba,
+                    pixels.mask,
+                    pixels.embedded,
+                ),
+                geometry: pixels.geometry,
+                data: pixels.rgba,
+            }),
+            Ok(None) | Err(_) => Err(failure.diagnostic(&identity)),
+        }
+    }
+}
+
 /// Async image cache
 pub struct ImageCache {
     /// Budget accounting events since the last drain (texture create/free).
@@ -2430,6 +2585,31 @@ impl ImageCache {
         );
     }
 
+    /// Establish GPU residency from the complete CPU result, never a header or
+    /// band. Synchronous upload consumes the renderer load epoch exactly once.
+    pub fn upload_semantic_image(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        load: ImageLoadToken,
+        decoded: &SemanticImageDecoded,
+    ) -> ImageCacheEvent {
+        self.begin_load(load);
+        assert!(self.loads.accept(load));
+        self.upload_image_data(
+            device,
+            queue,
+            load,
+            decoded.geometry,
+            &decoded.data,
+            decoded.metadata.clone(),
+        );
+        ImageCacheEvent::Ready {
+            load,
+            metadata: decoded.metadata.clone(),
+        }
+    }
+
     /// Upload decoded image to GPU texture
     fn upload_texture(
         &mut self,
@@ -2437,8 +2617,27 @@ impl ImageCache {
         queue: &wgpu::Queue,
         decoded: DecodedImage,
     ) {
-        let image = decoded.load.image();
-        let raster = decoded.geometry.raster();
+        self.upload_image_data(
+            device,
+            queue,
+            decoded.load,
+            decoded.geometry,
+            &decoded.data,
+            decoded.metadata,
+        );
+    }
+
+    fn upload_image_data(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        load: ImageLoadToken,
+        geometry: ResolvedImageGeometry,
+        data: &[u8],
+        metadata: ImageMetadata,
+    ) {
+        let image = load.image();
+        let raster = geometry.raster();
         let (raster_width, raster_height) = raster.dimensions();
         // A banded decode may have already built this image's texture, at
         // exactly this raster (`realized_geometry` is the one place either side
@@ -2485,7 +2684,7 @@ impl ImageCache {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &decoded.data,
+            data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(raster_width * 4),
@@ -2498,7 +2697,7 @@ impl ImageCache {
             },
         );
 
-        let layout = decoded.metadata.layout;
+        let layout = metadata.layout;
 
         self.textures.insert(
             image,
@@ -2510,7 +2709,7 @@ impl ImageCache {
                 // The write above covered the whole texture, whether or not a
                 // banded decode had got part of the way through it.
                 filled: FilledRows::complete(raster),
-                metadata: Some(decoded.metadata),
+                metadata: Some(metadata),
                 memory_size,
                 last_access: Cell::new(self.next_access_stamp()),
             },

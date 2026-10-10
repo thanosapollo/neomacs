@@ -311,7 +311,36 @@ pub(crate) struct ImageSequenceCache {
     state: Mutex<ImageSequenceCacheState>,
 }
 
+/// Holds sequence retirement validity across queueing and source I/O, before
+/// the decoder's own lease exists. A queued retired job may finish its private
+/// pixels, but can never repopulate the sequence cache.
+pub(crate) struct ImageSequenceReservation {
+    cache: Arc<ImageSequenceCache>,
+    sequence: ImageSequenceId,
+}
+
+impl Drop for ImageSequenceReservation {
+    fn drop(&mut self) {
+        self.cache
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish_decode(self.sequence);
+    }
+}
+
 impl ImageSequenceCache {
+    pub(crate) fn reserve(self: &Arc<Self>, sequence: ImageSequenceId) -> ImageSequenceReservation {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin_decode(sequence);
+        ImageSequenceReservation {
+            cache: Arc::clone(self),
+            sequence,
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self::with_max_bytes(DEFAULT_SEQUENCE_CACHE_BYTES)
     }
@@ -499,6 +528,14 @@ impl ImageSequenceCache {
             hits: state.hits,
             misses: state.misses,
         }
+    }
+
+    pub(crate) fn publish_size_snapshot(&self, snapshot: &std::sync::atomic::AtomicU64) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        snapshot.store(
+            state.total_bytes as u64,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     pub(crate) fn resident_bytes(&self) -> usize {
