@@ -738,6 +738,183 @@ fn native_metrics_are_probed_only_for_the_cached_winner() {
 }
 
 #[test]
+fn font_info_metrics_reuse_preserves_size_and_clear_invalidation() {
+    // Initialize the evaluator before native observations, as in production;
+    // Context startup resets the process fontset registry to its defaults.
+    let mut eval = neovm_core::emacs_core::Context::new();
+    let probes = Arc::new(AtomicUsize::new(0));
+    let path = std::env::temp_dir().join(format!("font-info-reuse-{}", std::process::id()));
+    std::fs::write(&path, b"backend-owned metrics fixture").unwrap();
+    let mut selected = candidate("Fixture", 400, FontSlant::Normal, 100);
+    replace_file_identity(
+        &mut selected,
+        ResolvedFontIdentity::from_file(path.to_str().unwrap(), 0, None),
+    );
+    selected.matched.metadata.design_metrics = None;
+    let mut resolver = FontResolver::new(Box::new(MetricBackend {
+        candidates: vec![selected],
+        probes: Arc::clone(&probes),
+    }));
+    let query = FontEntityQuery::new(Some(FontFamilyName::new("Fixture").unwrap()));
+    let first = resolver.open_entity(&query, 20).unwrap();
+    assert_eq!(resolver.open_entity(&query, 20).unwrap(), first);
+    assert_eq!(
+        probes.load(Ordering::Relaxed),
+        1,
+        "unchanged font-info must reuse metrics"
+    );
+    assert_ne!(
+        resolver.open_entity(&query, 30).unwrap().metrics,
+        first.metrics
+    );
+    assert_eq!(probes.load(Ordering::Relaxed), 2);
+    resolver.clear_caches();
+    assert_eq!(resolver.open_entity(&query, 20).unwrap(), first);
+    assert_eq!(probes.load(Ordering::Relaxed), 3);
+    std::fs::write(&path, b"changed backend asset").unwrap();
+    resolver.open_entity(&query, 20).unwrap();
+    assert_eq!(
+        probes.load(Ordering::Relaxed),
+        4,
+        "changed file must reprobe"
+    );
+    let generation = fontset_generation();
+    eval.eval_str("(set-fontset-font t #x3042 '(\"Fixture\" . \"iso10646-1\"))")
+        .unwrap();
+    assert_ne!(fontset_generation(), generation);
+    resolver.open_entity(&query, 20).unwrap();
+    assert_eq!(
+        probes.load(Ordering::Relaxed),
+        5,
+        "fontset mutation must retire the observation"
+    );
+    eval.eval_str("(set-fontset-font t #x3042 nil)").unwrap();
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn font_info_metrics_reuse_is_bounded_and_does_not_cache_missing_files() {
+    let probes = Arc::new(AtomicUsize::new(0));
+    let path = std::env::temp_dir().join(format!("font-info-bound-{}", std::process::id()));
+    std::fs::write(&path, b"backend metrics").unwrap();
+    let mut selected = candidate("Fixture", 400, FontSlant::Normal, 100);
+    replace_file_identity(
+        &mut selected,
+        ResolvedFontIdentity::from_file(path.to_str().unwrap(), 0, None),
+    );
+    selected.matched.metadata.design_metrics = None;
+    let resolver = FontResolver::new(Box::new(MetricBackend {
+        candidates: vec![selected],
+        probes: Arc::clone(&probes),
+    }));
+    let query = FontEntityQuery::new(Some(FontFamilyName::new("Fixture").unwrap()));
+    for size in 1..=128 {
+        resolver.open_entity(&query, size).unwrap();
+    }
+    assert_eq!(probes.load(Ordering::Relaxed), 128);
+    resolver.open_entity(&query, 1).unwrap();
+    assert_eq!(
+        probes.load(Ordering::Relaxed),
+        128,
+        "warm bounded entry must hit"
+    );
+    resolver.open_entity(&query, 129).unwrap();
+    resolver.open_entity(&query, 1).unwrap();
+    assert_eq!(
+        probes.load(Ordering::Relaxed),
+        130,
+        "overflow retires prior entries"
+    );
+    std::fs::remove_file(&path).unwrap();
+    resolver.open_entity(&query, 1).unwrap();
+    resolver.open_entity(&query, 1).unwrap();
+    assert_eq!(
+        probes.load(Ordering::Relaxed),
+        132,
+        "missing metadata is not a reusable success"
+    );
+}
+
+#[test]
+fn font_info_metrics_reuse_keeps_style_and_collection_identity_distinct() {
+    let probes = Arc::new(AtomicUsize::new(0));
+    let path = std::env::temp_dir().join(format!("font-info-collection-{}", std::process::id()));
+    std::fs::write(&path, b"backend collection metrics").unwrap();
+    let candidates = [400, 700]
+        .into_iter()
+        .enumerate()
+        .map(|(index, weight)| {
+            let mut selected = candidate("Fixture", weight, FontSlant::Normal, 100);
+            replace_file_identity(
+                &mut selected,
+                ResolvedFontIdentity::from_file(path.to_str().unwrap(), index as u32, None),
+            );
+            selected.matched.metadata.design_metrics = None;
+            selected
+        })
+        .collect();
+    let resolver = FontResolver::new(Box::new(MetricBackend {
+        candidates,
+        probes: Arc::clone(&probes),
+    }));
+    let query = FontEntityQuery::new(Some(FontFamilyName::new("Fixture").unwrap()));
+    let regular = resolver
+        .open_entity(&query.clone().with_weight(400), 20)
+        .unwrap();
+    let bold = resolver
+        .open_entity(&query.clone().with_weight(700), 20)
+        .unwrap();
+    assert_ne!(
+        regular.entity.matched.identity,
+        bold.entity.matched.identity
+    );
+    assert_eq!(
+        resolver
+            .open_entity(&query.clone().with_weight(400), 20)
+            .unwrap(),
+        regular
+    );
+    assert_eq!(
+        resolver.open_entity(&query.with_weight(700), 20).unwrap(),
+        bold
+    );
+    assert_eq!(
+        probes.load(Ordering::Relaxed),
+        2,
+        "full requests have independent warm entries"
+    );
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn font_info_metrics_reuse_honors_lisp_clear_font_cache() {
+    let mut eval = neovm_core::emacs_core::Context::new();
+    let probes = Arc::new(AtomicUsize::new(0));
+    let path = std::env::temp_dir().join(format!("font-info-clear-{}", std::process::id()));
+    std::fs::write(&path, b"backend metrics").unwrap();
+    let mut selected = candidate("Fixture", 400, FontSlant::Normal, 100);
+    replace_file_identity(
+        &mut selected,
+        ResolvedFontIdentity::from_file(path.to_str().unwrap(), 0, None),
+    );
+    selected.matched.metadata.design_metrics = None;
+    let resolver = FontResolver::new(Box::new(MetricBackend {
+        candidates: vec![selected],
+        probes: Arc::clone(&probes),
+    }));
+    let query = FontEntityQuery::new(Some(FontFamilyName::new("Fixture").unwrap()));
+    resolver.open_entity(&query, 20).unwrap();
+    eval.eval_str("(clear-font-cache)").unwrap();
+    resolver.open_entity(&query, 20).unwrap();
+    assert_eq!(
+        probes.load(Ordering::Relaxed),
+        2,
+        "Lisp clear-font-cache must retire native metrics"
+    );
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
 fn native_entity_open_is_completed_with_backend_metrics() {
     let probes = Arc::new(AtomicUsize::new(0));
     let mut candidate = candidate("Fixture", 400, FontSlant::Normal, 100);

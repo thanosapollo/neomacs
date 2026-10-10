@@ -142,8 +142,21 @@ impl FontEntityMatchPolicy {
     }
 }
 
+const OPENED_ENTITY_CACHE_CAP: usize = 128;
+
+/// No Lisp values or whole-file allocations: the original caller still
+/// constructs fresh font-info vectors and retains its font-object identity.
+struct OpenedEntityObservation {
+    query: FontEntityQuery,
+    pixel_size: u32,
+    fontset_generation: u64,
+    file: crate::font::probe::FontFileObservation,
+    opened: OpenedFontEntity,
+}
+
 /// Platform-neutral owner of fontset policy and candidate scoring.
 pub struct FontResolver {
+    opened_entity_cache: Mutex<Vec<OpenedEntityObservation>>,
     worker_policy: Option<worker_policy::WorkerPolicy>,
     backend: Box<dyn FontBackend>,
     materializer: Option<neomacs_font_materializer::FontMaterializer>,
@@ -164,6 +177,7 @@ pub struct FontResolver {
 impl FontResolver {
     pub fn new(backend: Box<dyn FontBackend>) -> Self {
         Self {
+            opened_entity_cache: Mutex::new(Vec::new()),
             backend,
             worker_policy: None,
             materializer: neomacs_font_materializer::FontMaterializer::new().ok(),
@@ -298,9 +312,41 @@ impl FontResolver {
         query: &FontEntityQuery,
         pixel_size: u32,
     ) -> Option<OpenedFontEntity> {
-        let mut entity = self.resolve_entity(query)?;
-        entity.matched = self.with_native_metrics(entity.matched);
         let pixel_size = pixel_size.max(1);
+        let generation = fontset_generation();
+        {
+            let mut cache = self
+                .opened_entity_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(index) = cache.iter().position(|entry| {
+                entry.query == *query
+                    && entry.pixel_size == pixel_size
+                    && entry.fontset_generation == generation
+            }) {
+                let entry = &cache[index];
+                if entry
+                    .opened
+                    .entity
+                    .matched
+                    .file_path()
+                    .and_then(crate::font::probe::FontFileObservation::for_file)
+                    .as_ref()
+                    == Some(&entry.file)
+                {
+                    return Some(entry.opened.clone());
+                }
+                // Missing/replaced/changed files must never serve an earlier
+                // successful opening. Errors remain immediately retryable.
+                cache.swap_remove(index);
+            }
+        }
+        let mut entity = self.resolve_entity(query)?;
+        let before = entity
+            .matched
+            .file_path()
+            .and_then(crate::font::probe::FontFileObservation::for_file);
+        entity.matched = self.with_native_metrics(entity.matched);
         let metrics = entity
             .matched
             .pixel_metrics(pixel_size as f32)
@@ -320,7 +366,34 @@ impl FontResolver {
                     explicit_weight,
                 )
             })?;
-        Some(OpenedFontEntity { entity, metrics })
+        let opened = OpenedFontEntity { entity, metrics };
+        // Native-only/memory assets, unsupported metadata and changing files
+        // retain the original uncached opening path. Never cache failures.
+        if let Some(file) = before
+            && opened
+                .entity
+                .matched
+                .file_path()
+                .and_then(crate::font::probe::FontFileObservation::for_file)
+                .as_ref()
+                == Some(&file)
+        {
+            let mut cache = self
+                .opened_entity_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if cache.len() >= OPENED_ENTITY_CACHE_CAP {
+                cache.clear();
+            }
+            cache.push(OpenedEntityObservation {
+                query: query.clone(),
+                pixel_size,
+                fontset_generation: generation,
+                file,
+                opened: opened.clone(),
+            });
+        }
+        Some(opened)
     }
 
     /// Resolve a primary face from candidates in one concrete family.
@@ -600,6 +673,10 @@ impl FontResolver {
     }
 
     pub(crate) fn clear_caches(&mut self) {
+        self.opened_entity_cache
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         if let Some(policy) = &mut self.worker_policy {
             policy.admitted_queries.clear();
         }

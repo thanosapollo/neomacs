@@ -2424,6 +2424,9 @@ fn match_font_spec_request(
 pub(crate) fn clear_font_cache(args: Vec<Value>) -> EvalResult {
     expect_max_args("clear-font-cache", &args, 0)?;
     clear_font_cache_state();
+    // Native font observations share this revision with fontset policy.
+    // Retire successful openings too, without removing any fontset rules.
+    super::fontset::invalidate_font_selection_policy();
     Ok(Value::NIL)
 }
 
@@ -2725,8 +2728,7 @@ fn apply_face_layers_with_remapping(
                 // Named text faces contribute their explicit inheritance,
                 // not another default baseline. The first list entry wins.
                 for name in names.iter().rev() {
-                    let contribution =
-                        face_table.resolve_text_face_with_remapping(name, remapping);
+                    let contribution = face_table.resolve_text_face_with_remapping(name, remapping);
                     face = face.merge(&contribution);
                 }
             }
