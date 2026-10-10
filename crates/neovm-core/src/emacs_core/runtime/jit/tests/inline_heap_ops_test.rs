@@ -817,7 +817,7 @@ fn function_cell_writes_do_not_regate_inline_aset() {
     eval.eval_str("(fset 'aset aset-orig)").expect("restore");
 }
 
-/// Tenured owners (a partitioned heap after its first cycle): an owner the
+/// Explicit permanent owners in the legacy emitter fixture: an owner the
 /// remembered set lacks goes to the shim once, whose barrier remembers it;
 /// from then on its stores are inline. An image vector (in the window, and
 /// mapped storage a store must copy) always goes to the shim.
@@ -826,10 +826,11 @@ fn tenured_owners_store_inline_once_remembered() {
     let mut eval = legacy_context();
     let ctx_ptr = &mut eval as *mut Context as *mut u8;
     let leaf = compile_bytecode_function(&aset_fn()).expect("aset compiles");
-    // The owners exist (and are reachable) before a fake image turns the
-    // dump partition on, so whichever collection runs the partition's first
-    // cycle — the explicit one below, or under GC stress an earlier safe
-    // point — tenures them. The image vector's slots are mapped storage.
+    // The legacy emitter needs permanent owners to exercise its one-time
+    // remembered barrier. First-partition collection no longer makes session
+    // survivors permanent: that would retain released buffers indefinitely.
+    // Collect the rooted owners, then explicitly establish this test-only
+    // permanent world. The image vector's slots are mapped storage.
     eval.eval_str("(setq aset-old-a (vector 1 2 3) aset-old-b (record 'r 1 2))")
         .expect("owners");
     let image = crate::tagged::gc::fake_image::FakeImage::leak(true);
@@ -837,6 +838,7 @@ fn tenured_owners_store_inline_once_remembered() {
     let image_vector = image.register_vector(&mut eval.tagged_heap);
     eval.eval_str("(garbage-collect)")
         .expect("first partition cycle");
+    eval.tagged_heap.make_survivors_permanent_for_test();
     let a = eval.eval_str("aset-old-a").expect("a");
     let b = eval.eval_str("aset-old-b").expect("b");
     assert!(eval.tagged_heap.is_tenured_for_test(a));

@@ -10,7 +10,7 @@ impl TaggedHeap {
     /// (the allocation-region closure test). Ordinary session-lifetime tests
     /// must not use this helper. The test owns the only mutator; assert that
     /// no worker, mark, deferred sweep, or old sweep cursor can race the walk.
-    pub(super) fn make_survivors_permanent_for_test(&mut self) {
+    pub(crate) fn make_survivors_permanent_for_test(&mut self) {
         #[cfg(debug_assertions)]
         crate::tagged::mutate::debug_assert_no_heap_mut_closure();
         assert!(!self.concurrent_mark_running());
