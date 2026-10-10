@@ -452,6 +452,7 @@ pub(crate) use types::*;
 // primitive bodies (`builtin_point_0`, `builtin_char_after`, ...) by name
 // instead of reimplementing them (matches the sibling `navigation`/`editfns`/
 // `search` modules, already crate-visible).
+mod byte_code;
 mod file_notify;
 pub(crate) mod fringe_bitmap;
 pub(crate) mod fringe_standard_bitmaps;
@@ -463,6 +464,8 @@ mod lcms;
 pub(crate) mod misc_eval;
 pub(crate) mod search;
 mod stubs;
+pub(crate) use byte_code::builtin_byte_code;
+
 mod subrs;
 pub(crate) mod symbols;
 mod treesit;
@@ -666,6 +669,9 @@ mod make_byte_code_literals_test;
 #[cfg(test)]
 #[path = "tests/make_closure_instance_test.rs"]
 mod make_closure_instance_test;
+#[cfg(test)]
+#[path = "tests/tsb_literal_size.rs"]
+mod tsb_literal_size_test;
 
 #[cfg(test)]
 #[path = "tests/obarray_growth_test.rs"]
@@ -1095,3 +1101,7 @@ fn neovm_internal_panic(_eval: &mut super::eval::Context, args: Vec<Value>) -> E
         .unwrap_or_else(|| "neovm--internal-panic".to_string());
     panic!("{message}");
 }
+
+#[cfg(test)]
+#[path = "tests/gdl_format_test.rs"]
+mod gdl_format;
