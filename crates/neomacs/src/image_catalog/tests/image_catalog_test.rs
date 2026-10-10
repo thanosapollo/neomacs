@@ -19,7 +19,7 @@ thread_local! {
 
 use neomacs_display_protocol::ImageAnimationPolicy;
 
-fn file_request(path: &str) -> ImageResolveRequest {
+pub(super) fn file_request(path: &str) -> ImageResolveRequest {
     let spec = IMAGE_SPEC_TEST_CONTEXT.with(|_| {
         Value::list(vec![
             Value::symbol("image"),

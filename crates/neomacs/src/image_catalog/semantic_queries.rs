@@ -136,9 +136,23 @@ impl Completion {
     }
 }
 
+#[derive(Clone)]
+struct SemanticEntry {
+    pending: PendingImage,
+    // Only complete successes are copied into evaluator-owned storage. This
+    // holds metadata, never prepared RGBA, and dies with the existing entry.
+    ready: Option<ReadyImage>,
+}
+
+impl SemanticEntry {
+    fn load(&self) -> ImageLoadToken {
+        self.pending.load()
+    }
+}
+
 #[derive(Default)]
 pub(super) struct SemanticQueries {
-    entries: RefCell<HashMap<ImageResolveRequest, PendingImage>>,
+    entries: RefCell<HashMap<ImageResolveRequest, SemanticEntry>>,
     limits: RefCell<HashMap<ImageResolveRequest, ImageSizeLimit>>,
     admissions: RefCell<HashMap<ImageResolveRequest, Result<ImageSizeLimit, ImageDiagnostic>>>,
     completion: Arc<Completion>,
@@ -161,6 +175,14 @@ impl SemanticQueries {
         limit: ImageSizeLimit,
     ) -> Result<Option<ReadyImage>, String> {
         let (request, resolution) = catalog.classify_request(request);
+        if let Some(ready) = self
+            .entries
+            .borrow()
+            .get(&request)
+            .and_then(|entry| entry.ready.clone())
+        {
+            return Ok(Some(ready));
+        }
         // Admission belongs to the first realization attempt, even while its
         // renderer terminal is unserviced. A query must not re-admit that same
         // identity under a later dynamically changed max-image-size.
@@ -200,7 +222,10 @@ impl SemanticQueries {
                                 .insert(request.clone(), ImageSizeLimit::UNLIMITED);
                         }
                         self.completion.publish(load, result);
-                        return pending;
+                        return SemanticEntry {
+                            pending,
+                            ready: None,
+                        };
                     }
                     let sequence = catalog.sequence_id(&request.source);
                     let reservation = self.decoder.reserve_sequence(sequence);
@@ -218,8 +243,12 @@ impl SemanticQueries {
                         self.completion
                             .publish(load, Err(ImageDiagnostic::NotDrawable));
                     }
-                    pending
+                    SemanticEntry {
+                        pending,
+                        ready: None,
+                    }
                 })
+                .pending
                 .clone()
         };
         let Some(result) = self.completion.wait(pending.load(), Duration::from_secs(1)) else {
@@ -236,10 +265,18 @@ impl SemanticQueries {
             .borrow_mut()
             .insert(request.clone(), admission);
         match result {
-            Ok((metadata, _)) => Ok(Some(ReadyImage {
-                load: pending.load(),
-                metadata,
-            })),
+            Ok((metadata, _)) => {
+                let ready = ReadyImage {
+                    load: pending.load(),
+                    metadata,
+                };
+                self.entries
+                    .borrow_mut()
+                    .get_mut(&request)
+                    .expect("semantic entry survives synchronous completion")
+                    .ready = Some(ready.clone());
+                Ok(Some(ready))
+            }
             Err(error) => {
                 let failed = pending.failed(error);
                 catalog.record_failure_always(&failed);
@@ -390,6 +427,129 @@ fn run(job: Job) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn warm_semantics_do_not_reenter_admission_or_worker_state() {
+        let (tx, _rx) = neomacs_display_runtime::thread_comm::command_channel(1);
+        let catalog = AsyncImageCatalog::new(
+            tx,
+            None,
+            Arc::new(neomacs_display_runtime::render_thread::ImageRenderState::default()),
+            None,
+        );
+        let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+        let request = super::super::tests::file_request(fixture.to_str().unwrap());
+        let expected = catalog
+            .resolve_sync(request.clone(), ImageSizeLimit::UNLIMITED)
+            .unwrap();
+        // A completed success is evaluator-owned. Dynamic admission and decoder
+        // publication cannot affect that answer until explicit invalidation.
+        let _admission = catalog.admission_limits.borrow_mut();
+        let _limits = catalog.semantic_queries.limits.borrow_mut();
+        let _admissions = catalog.semantic_queries.admissions.borrow_mut();
+        let _worker = catalog.semantic_queries.completion.loads.lock().unwrap();
+        assert_eq!(
+            catalog
+                .resolve_sync(request, ImageSizeLimit::from_axis_pixels(1))
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit warm catalog component timing"]
+    fn profile_warm_catalog_components() {
+        use std::hint::black_box;
+        let (tx, _rx) = neomacs_display_runtime::thread_comm::command_channel(1);
+        let catalog = AsyncImageCatalog::new(
+            tx,
+            None,
+            Arc::new(neomacs_display_runtime::render_thread::ImageRenderState::default()),
+            None,
+        );
+        let fixture = neomacs_infra::workspace_root().join("test/data/image/blank-100x200.png");
+        let request = super::super::tests::file_request(fixture.to_str().unwrap());
+        let ready = catalog
+            .resolve_sync(request.clone(), ImageSizeLimit::UNLIMITED)
+            .unwrap()
+            .unwrap();
+        for block in 0..7 {
+            let n = 20000;
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                black_box(catalog.classify_request(black_box(request.clone())));
+            }
+            println!(
+                "R025_NATIVE block={block} component=classify n={n} ns={}",
+                start.elapsed().as_nanos()
+            );
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                black_box(
+                    catalog
+                        .semantic_queries
+                        .completion
+                        .wait(ready.load, Duration::from_secs(1)),
+                );
+            }
+            println!(
+                "R025_NATIVE block={block} component=completion n={n} ns={}",
+                start.elapsed().as_nanos()
+            );
+            let (classified, _) = catalog.classify_request(request.clone());
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                black_box(
+                    catalog.admission_limit(black_box(&classified), ImageSizeLimit::UNLIMITED),
+                );
+            }
+            println!(
+                "R025_NATIVE block={block} component=admission n={n} ns={}",
+                start.elapsed().as_nanos()
+            );
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                black_box(
+                    catalog
+                        .semantic_queries
+                        .entries
+                        .borrow()
+                        .get(black_box(&classified))
+                        .cloned(),
+                );
+            }
+            println!(
+                "R025_NATIVE block={block} component=entry n={n} ns={}",
+                start.elapsed().as_nanos()
+            );
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                black_box(
+                    catalog
+                        .semantic_queries
+                        .admissions
+                        .borrow_mut()
+                        .insert(classified.clone(), Ok(ImageSizeLimit::UNLIMITED)),
+                );
+            }
+            println!(
+                "R025_NATIVE block={block} component=admission_write n={n} ns={}",
+                start.elapsed().as_nanos()
+            );
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                black_box(
+                    catalog
+                        .resolve_sync(black_box(request.clone()), ImageSizeLimit::UNLIMITED)
+                        .unwrap(),
+                );
+            }
+            println!(
+                "R025_NATIVE block={block} component=resolve n={n} ns={}",
+                start.elapsed().as_nanos()
+            );
+        }
+    }
+
     #[test]
     fn prepared_pixels_do_not_wait_for_worker_mutex() {
         let completion = Arc::new(Completion::default());
