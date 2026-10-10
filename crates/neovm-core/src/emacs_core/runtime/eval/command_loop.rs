@@ -1862,6 +1862,10 @@ impl Context {
         // `Window::Leaf.hscroll` here makes both the layout render and
         // `(window-hscroll)` reflect the new value (no post-layout write-back).
         crate::emacs_core::hscroll::update_auto_hscroll_before_redisplay(self);
+        // Record the state consumed by the paint, not mutations made by
+        // callbacks during layout or by the post-paint window hooks. Those
+        // changes still require another redisplay.
+        let painted_signature = self.redisplay_signature();
         let has_fn = self.redisplay_fn.is_some();
         tracing::debug!("redisplay called (has_fn={})", has_fn);
         if let Some(mut f) = self.redisplay_fn.take() {
@@ -1885,7 +1889,11 @@ impl Context {
             self.echo_area_resize_exact_pending = false;
             let _ = super::super::builtins::run_redisplay_window_change_hooks(self);
         }
-        self.last_redisplay_signature = Some(self.redisplay_signature());
+        // Cache only a still-current paint. A changed signature schedules a
+        // catch-up paint, without retaining pre-callback Lisp message values.
+        let current_signature = self.redisplay_signature();
+        self.last_redisplay_signature =
+            (current_signature == painted_signature).then_some(current_signature);
         Ok(())
     }
 

@@ -978,6 +978,8 @@ impl RedisplayTransaction<'_> {
         crate::emacs_core::hscroll::update_auto_hscroll_before_redisplay(self.eval);
         self.eval.gnu_distribute_text_marks();
         let accepted_before = self.eval.gnu_redisplay_hooks.accepted_serial;
+        // Callback mutations must not be acknowledged as already painted.
+        let painted_signature = self.eval.redisplay_signature();
         self.callback = self.eval.redisplay_fn.take();
         if let Some(callback) = self.callback.as_mut() {
             callback(self.eval);
@@ -995,7 +997,11 @@ impl RedisplayTransaction<'_> {
             self.eval.echo_area_resize_exact_pending = false;
             self.eval.gnu_redisplay_hooks.windows = PendingScope::None;
             self.eval.gnu_redisplay_hooks.mode_lines = PendingScope::None;
-            self.eval.last_redisplay_signature = Some(self.eval.redisplay_signature());
+            // Invalidate instead of retaining an old message's Lisp values
+            // across callback execution; only the live snapshot is cached.
+            let current_signature = self.eval.redisplay_signature();
+            self.eval.last_redisplay_signature =
+                (current_signature == painted_signature).then_some(current_signature);
         }
         Ok(Value::NIL)
     }

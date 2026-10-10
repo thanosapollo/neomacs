@@ -26461,6 +26461,28 @@ fn native_backtrace_push_preserves_values_across_growth_and_gc() {
 
 #[test]
 fn a_buffer_change_during_redisplay_is_not_recorded_as_already_displayed() {
+    assert_buffer_change_during_redisplay_is_not_recorded_as_displayed(false, false);
+}
+
+#[test]
+fn a_buffer_change_during_gnu_redisplay_is_not_recorded_as_already_displayed() {
+    assert_buffer_change_during_redisplay_is_not_recorded_as_displayed(true, false);
+}
+
+#[test]
+fn a_buffer_change_during_gnu_redisplay_with_unchanged_point_is_not_acknowledged() {
+    assert_buffer_change_during_redisplay_is_not_recorded_as_displayed(true, true);
+}
+
+fn assert_buffer_change_during_redisplay_is_not_recorded_as_displayed(
+    gnu: bool,
+    preserve_point: bool,
+) {
+    let _policy = if gnu {
+        RedisplayHookPolicyGuard::gnu()
+    } else {
+        RedisplayHookPolicyGuard::legacy()
+    };
     // Found driving vterm in the GUI: after a burst of terminal output the
     // buffer held the complete text while the window kept showing the previous
     // frame, and every later redisplay logged "skipped: visible state
@@ -26491,16 +26513,43 @@ fn a_buffer_change_during_redisplay_is_not_recorded_as_already_displayed() {
         painted_in_cb
             .borrow_mut()
             .push(ev.buffers.get(current).expect("buffer").buffer_string());
+        if gnu {
+            // Accept exactly the state just consumed by this mock paint.
+            crate::test_utils::mock_redisplay::accept_all_frames(ev);
+        }
         // Output arrives mid-paint: it is NOT part of the frame just drawn.
-        ev.buffers.insert_lisp_string_into_buffer(
-            current,
-            &crate::heap_types::LispString::from_utf8("late output\n"),
-        );
+        // Only the first paint receives new output; once caught up the third
+        // redisplay should be skipped again.
+        if painted_in_cb.borrow().len() == 1 {
+            let original_point = ev
+                .buffers
+                .get(current)
+                .expect("buffer")
+                .point_emacs_byte_pos();
+            ev.buffers.insert_lisp_string_into_buffer(
+                current,
+                &crate::heap_types::LispString::from_utf8("late output\n"),
+            );
+            if preserve_point {
+                // Do not let point synchronization accidentally request paint.
+                ev.buffers
+                    .get_mut(current)
+                    .expect("buffer")
+                    .goto_emacs_byte_pos(original_point);
+            }
+        }
     }));
 
     ev.redisplay().expect("redisplay");
     let after_first = painted.borrow().len();
     assert_eq!(after_first, 1, "first redisplay should paint");
+    if preserve_point {
+        assert_ne!(
+            ev.last_redisplay_signature,
+            Some(ev.redisplay_signature()),
+            "unpainted output must not be acknowledged"
+        );
+    }
 
     // The text inserted during the paint was never on screen, so the next
     // redisplay must run rather than conclude nothing changed.
@@ -26516,6 +26565,8 @@ fn a_buffer_change_during_redisplay_is_not_recorded_as_already_displayed() {
         "the second paint should see the text inserted during the first: {:?}",
         painted.borrow()[1]
     );
+    ev.redisplay().expect("idle redisplay");
+    assert_eq!(painted.borrow().len(), 2, "caught-up state should skip");
 }
 
 #[test]
