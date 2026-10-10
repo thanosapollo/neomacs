@@ -237,6 +237,22 @@ impl Context {
         }
         group("profiler");
         self.trace_profiler_roots(visit);
+        // These Rust-owned payloads clone interval tables but share their Lisp
+        // plists. The echo buffer's copied plists do not retain the message's
+        // own copies. GNU roots echo buffers and Vloads_in_progress instead.
+        group("string_payloads");
+        for text in self
+            .current_message
+            .iter()
+            .chain(self.loads_in_progress.iter())
+            .chain(
+                self.last_redisplay_signature
+                    .iter()
+                    .flat_map(|signature| signature.current_message.iter()),
+            )
+        {
+            text.trace_roots_with(visit);
+        }
         group("misc");
         visit(self.lexenv);
         visit(self.quit_flag);
@@ -304,7 +320,7 @@ impl Context {
         // Values that any thread holds through this heap's `SharedRoot`s.
         group("shared_roots");
         crate::tagged::transport::collect_shared_root_gc_roots(
-            self.tagged_heap.heap_identity(),
+            &self.tagged_heap,
             &mut registry_roots,
         );
         for root in registry_roots.drain(..) {
@@ -545,8 +561,7 @@ impl Context {
         }
         self.gc_runtime_settings_cache.gc_cons_threshold_bytes = self
             .obarray
-            .symbol_value_id(syms.threshold())
-            .copied()
+            .symbol_value_id_copied(syms.threshold())
             .and_then(|value| {
                 value.as_fixnum().or_else(|| {
                     // GNU's gc-cons-threshold watcher accepts integers fitting
@@ -645,8 +660,7 @@ impl Context {
 
         let old_elapsed = self
             .obarray
-            .symbol_value_id(gc_elapsed_symbol())
-            .copied()
+            .symbol_value_id_copied(gc_elapsed_symbol())
             .and_then(|value| value.as_number_f64())
             .unwrap_or(0.0);
         self.obarray.set_symbol_value_id(

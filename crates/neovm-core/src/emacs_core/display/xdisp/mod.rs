@@ -145,11 +145,7 @@ impl super::eval::Context {
         self.buffers
             .get(buffer_id)
             .and_then(|buffer| buffer.buffer_local_value("window-scroll-functions"))
-            .or_else(|| {
-                self.obarray
-                    .symbol_value("window-scroll-functions")
-                    .copied()
-            })
+            .or_else(|| self.obarray.symbol_value_copied("window-scroll-functions"))
             .is_some_and(|hook| !hook.is_nil())
     }
 
@@ -2429,7 +2425,7 @@ fn mode_line_symbol_value_in_state(
         return Some(value);
     }
 
-    obarray.symbol_value(name).copied()
+    obarray.symbol_value_copied(name)
 }
 
 fn mode_line_human_readable_size(mut quotient: usize) -> String {
@@ -2738,10 +2734,10 @@ fn build_mode_line_percent_context(
             )
         } else {
             let term_cs = obarray
-                .symbol_value("terminal-coding-system")
+                .symbol_value_copied("terminal-coding-system")
                 .and_then(|v| v.as_symbol_id());
             let kbd_cs = obarray
-                .symbol_value("keyboard-coding-system")
+                .symbol_value_copied("keyboard-coding-system")
                 .and_then(|v| v.as_symbol_id());
             (
                 kbd_cs
@@ -2860,8 +2856,7 @@ fn coding_system_eol_indicator_value(
         "eol-mnemonic-undecided"
     };
     obarray
-        .symbol_value(var_name)
-        .copied()
+        .symbol_value_copied(var_name)
         .filter(|value| value.is_string() || value.as_char().is_some())
 }
 
@@ -6566,10 +6561,7 @@ fn bidi_buffer_var(ctx: &super::eval::Context, buf_id: BufferId, name: &str) -> 
             return value;
         }
     }
-    ctx.obarray
-        .symbol_value(name)
-        .copied()
-        .unwrap_or(Value::NIL)
+    ctx.obarray.symbol_value_copied(name).unwrap_or(Value::NIL)
 }
 
 pub(crate) fn builtin_current_bidi_paragraph_direction(
@@ -9649,10 +9641,11 @@ pub fn register_bootstrap_vars(obarray: &mut crate::emacs_core::symbol::Obarray)
     obarray.define_special_variable("auto-fill-chars", auto_fill);
 
     // char-width-table: a char-table for character display widths.
-    // Official Emacs (character.c) creates it with default 1.
+    // GNU character.c:1112-1119 seeds default 1 plus C1/raw-byte width 4.
+    // Include characters.el Unicode ranges for contexts before Lisp bootstrap.
     obarray.set_symbol_value(
         "char-width-table",
-        make_char_table_value(Value::symbol("char-width-table"), Value::fixnum(1)),
+        crate::encoding::default_char_width_table(),
     );
 
     // translation-table-vector: vector recording all translation tables.

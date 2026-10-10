@@ -684,9 +684,9 @@ pub struct Obarray {
     members_epoch: u64,
     /// Memoized GNU-bucket-order symbol list for completion over the
     /// global obarray: try-completion/all-completions re-derive the same
-    /// ~30k-symbol hash+sort per call (a bootstrap hotspot). Mutex, not
-    /// RefCell — `&Obarray` is shared with the concurrent GC scan thread
-    /// (uncontended in practice: completion runs on the Lisp thread).
+    /// ~30k-symbol hash+sort per call (a bootstrap hotspot). Completion owns
+    /// this cache on the mutator. The concurrent marker receives a leased
+    /// symbol snapshot and never accesses the cache or `&Obarray`.
     completion_order_cache: std::sync::Mutex<Option<CompletionOrderCache>>,
     /// Heap-allocated BLVs for `SYMBOL_LOCALIZED` symbols. Each entry
     /// is a `Box::into_raw` pointer; freed in [`Obarray::drop`]. The
@@ -735,6 +735,12 @@ pub struct Obarray {
     /// walk (`jit::cache::sync_cache_to_obarray`).
     generation: u64,
 }
+
+// The owner contains thread-local Values and mutable BLV records. Atomic
+// symbol words do not admit sharing their containing owner; the marker moves
+// only an admitted ObarrayScanSnapshot with retained chunk storage.
+static_assertions::assert_impl_all!(Obarray: Clone, std::fmt::Debug);
+static_assertions::assert_not_impl_any!(Obarray: Send, Sync);
 
 /// The next [`Obarray::generation`]: one process-global counter, so no two
 /// obarrays alive at once (or ever) share a generation.
@@ -816,8 +822,8 @@ struct SymbolChunks {
     /// — kept equal to `chunks.as_ptr()` by every operation that can move it
     /// (construction, clone, growth). Compiled code reads it at a fixed offset
     /// to reach a symbol's cell without a call (see
-    /// [`OBARRAY_JIT_SPINE_OFFSET`]). A plain integer, not a raw pointer, so
-    /// the store stays `Send`/`Sync`.
+    /// [`OBARRAY_JIT_SPINE_OFFSET`]). This integer preserves the JIT layout;
+    /// it does not make the containing thread-local symbol store Send/Sync.
     spine_addr: usize,
 }
 
@@ -1160,10 +1166,12 @@ static_assertions::const_assert_eq!(
 // SAFETY: construction requires the heap-identified serialized-writer admission.
 // Every raw chunk/side pointer has a storage lease: owner destruction retains
 // the allocations until the marker has finished reading. The one owning marker
-// uses atomic presence/slot loads and the admitted writer's seqlock protocol.
+// uses the Acquire presence gate and the admitted writer's seqlock protocol
+// for the redirect/payload pair. Function and plist are independent atomic
+// words. It never accesses BLVs, descriptor interiors or the completion cache.
 unsafe impl Send for ObarrayScanSnapshot {}
 static_assertions::assert_impl_all!(ObarrayScanSnapshot: Send, std::fmt::Debug);
-static_assertions::assert_not_impl_any!(ObarrayScanSnapshot: Sync);
+static_assertions::assert_not_impl_any!(ObarrayScanSnapshot: Sync, Copy, Clone);
 
 impl std::fmt::Debug for ObarrayScanSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1364,13 +1372,6 @@ impl Clone for Obarray {
         }
     }
 }
-
-// Safety: Obarray contains raw pointers to its own heap allocations.
-// They're owned by the obarray, so sending the obarray across threads
-// (via Send) or sharing it via &Obarray (via Sync) is safe — the
-// pointers don't escape and don't carry interior mutability.
-unsafe impl Send for Obarray {}
-unsafe impl Sync for Obarray {}
 
 impl Default for Obarray {
     fn default() -> Self {
@@ -1878,14 +1879,17 @@ impl Obarray {
         self.slot_mut(id)
     }
 
-    /// Get the value cell of a symbol.
+    /// Copy the global value of a symbol.
     ///
     /// **This is not GNU's `Vfoo`.** For a symbol some buffer has localised it
     /// answers the BLV *defcell*, and for a `DEFVAR_PER_BUFFER` name it
     /// answers `None`; see [`BufferlessValue`] for why, and
     /// [`Self::value_in_buffer`] for the reader that does mirror GNU's C.
-    pub fn symbol_value(&self, name: &str) -> Option<&Value> {
-        self.symbol_value_id(intern(name))
+    ///
+    /// The returned word does not borrow the mutable symbol or descriptor slot.
+    #[inline]
+    pub fn symbol_value_copied(&self, name: &str) -> Option<Value> {
+        self.symbol_value_id_copied(intern(name))
     }
 
     /// GNU's `Vfoo` / `foo` / `BVAR (current_buffer, foo)` -- the one spelling
@@ -1923,7 +1927,7 @@ impl Obarray {
     /// symbol no buffer has ever localised can have no alist entry (every
     /// insertion path marks it `Localized` first), so the walk would only ever
     /// answer `None`. That keeps this reader roughly the cost of
-    /// [`Self::symbol_value`] on the overwhelmingly common global path, which
+    /// [`Self::symbol_value_copied`] on the overwhelmingly common global path, which
     /// matters where a caller reads a dozen names at once -- the `print-*`
     /// family, for one.
     pub fn value_in_buffer_id(
@@ -2058,62 +2062,14 @@ impl Obarray {
 
     /// Get a symbol's value by identity, returning nil when unbound.
     ///
-    /// This is the copied-value equivalent of the common
-    /// `symbol_value_id(...).copied().unwrap_or(Value::NIL)` pattern.
     /// GNU's `find_symbol_value` returns a `Lisp_Object` directly; keeping
-    /// hot evaluator reads in this shape avoids an extra borrowed Option path.
+    /// hot evaluator reads in this shape avoids an extra Option path.
     #[inline(always)]
     pub fn symbol_value_id_or_nil(&self, id: SymId) -> Value {
         match self.symbol_value_id_copied(id) {
             Some(value) => value,
             None => Value::NIL,
         }
-    }
-
-    pub fn symbol_value_id(&self, id: SymId) -> Option<&Value> {
-        let mut current = id;
-        for _ in 0..50 {
-            let sym = match self.symbols.get(Self::slot_index(current)) {
-                Some(sym) => sym,
-                _ => return None,
-            };
-            match sym.value_cell() {
-                ValueCell::Plain(_) => {
-                    // UNBOUND sentinel = unbound.
-                    return sym.plain_value_ref().filter(|v| !v.is_unbound());
-                }
-                ValueCell::Alias(target) => {
-                    current = target;
-                }
-                ValueCell::Localized(_) => {
-                    // Return the BLV defcell default (global) value.
-                    // The defcell is a heap-allocated cons (sym . default);
-                    // its cdr field lives in the GC heap, which is owned
-                    // by `self` for the lifetime of `&self`.
-                    // UNBOUND cdr means the symbol has no global default.
-                    return self.blv(current).and_then(|blv| {
-                        // Safety: defcell is a valid heap cons (allocated
-                        // by Value::cons in make_symbol_localized and kept
-                        // alive by the GC root in blv.defcell). The cdr
-                        // field lives in the ConsCell in the GC heap and
-                        // is valid for the lifetime of `&self`.
-                        let cdr_ref = unsafe {
-                            let cons_ptr = blv.defcell.xcons_ptr();
-                            &(*cons_ptr).cdr_or_next.cdr
-                        };
-                        if cdr_ref.is_unbound() {
-                            None
-                        } else {
-                            Some(cdr_ref)
-                        }
-                    });
-                }
-                ValueCell::Forwarded(fwd) => {
-                    return fwd.load_ref();
-                }
-            }
-        }
-        None // alias cycle
     }
 
     /// Set the value cell of a symbol. Interns if needed.
@@ -4230,46 +4186,25 @@ impl Obarray {
         Ok(())
     }
 
-    /// Get the default value of a symbol, following aliases.
-    /// For `Plainval` this is the direct value; for `Localized` it's the
-    /// BLV defcell default; for `Varalias` it follows the chain; for
-    /// `Forwarded` BUFFER_OBJFWD it returns the forwarder's static default.
+    /// Copy the global default, including a per-buffer forwarder's default.
     ///
-    /// Phase F: reads from the redirect union (`val`) rather than the
-    /// legacy `value` enum field.
-    pub fn default_value_id(&self, id: SymId) -> Option<&Value> {
+    /// Aliases and localized variables retain the same resolution rules as a
+    /// global read. No returned value borrows a symbol, BLV or descriptor slot.
+    pub fn default_value_id_copied(&self, id: SymId) -> Option<Value> {
         let mut current = id;
         for _ in 0..50 {
             let sym = self.slot(current)?;
             match sym.value_cell() {
-                ValueCell::Plain(_) => {
-                    return sym.plain_value_ref().filter(|v| !v.is_unbound());
-                }
-                ValueCell::Alias(target) => {
-                    current = target;
-                }
+                ValueCell::Plain(value) => return (!value.is_unbound()).then_some(value),
+                ValueCell::Alias(target) => current = target,
                 ValueCell::Localized(_) => {
-                    // Return a reference to the BLV defcell cdr (the default).
-                    return self.blv(current).and_then(|blv| {
-                        // Safety: same as symbol_value_id's Localized arm.
-                        let cdr_ref = unsafe {
-                            let cons_ptr = blv.defcell.xcons_ptr();
-                            &(*cons_ptr).cdr_or_next.cdr
-                        };
-                        if cdr_ref.is_unbound() {
-                            None
-                        } else {
-                            Some(cdr_ref)
-                        }
-                    });
+                    let value = self.blv(current)?.defcell.cons_cdr();
+                    return (!value.is_unbound()).then_some(value);
                 }
                 ValueCell::Forwarded(fwd) => {
-                    if let Some(value) = fwd.load_ref() {
-                        return Some(value);
-                    }
-                    // `load_ref` answers for every family but the per-buffer
-                    // slot, whose registration default is immutable.
-                    return fwd.as_buffer_obj_fwd().map(|buf_fwd| &buf_fwd.default);
+                    return fwd
+                        .load()
+                        .or_else(|| fwd.as_buffer_obj_fwd().map(|buf_fwd| buf_fwd.default));
                 }
             }
         }
@@ -4645,3 +4580,7 @@ mod fn_stamps_tests;
 #[cfg(test)]
 #[path = "tests/buffer_local_global_read_test.rs"]
 mod buffer_local_global_read_tests;
+
+#[cfg(test)]
+#[path = "tests/copied_value_test.rs"]
+mod copied_value_tests;

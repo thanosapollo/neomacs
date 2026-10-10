@@ -1695,18 +1695,16 @@ pub(crate) fn is_global_obarray_proxy(eval: &super::eval::Context, value: &Value
         *SYMBOL.get_or_init(|| crate::emacs_core::intern::intern("neovm--obarray-object"))
     }
     eval.obarray()
-        .symbol_value_id(neovm_obarray_object_sym())
-        .is_some_and(|proxy| *proxy == *value)
+        .symbol_value_id_copied(neovm_obarray_object_sym())
+        .is_some_and(|proxy| proxy == *value)
 }
 
 fn current_lisp_obarray_value(eval: &super::eval::Context) -> Value {
     eval.obarray()
-        .symbol_value("obarray")
-        .copied()
+        .symbol_value_copied("obarray")
         .unwrap_or_else(|| {
             eval.obarray()
-                .symbol_value("neovm--obarray-object")
-                .copied()
+                .symbol_value_copied("neovm--obarray-object")
                 .unwrap_or(Value::NIL)
         })
 }
@@ -1897,12 +1895,10 @@ pub(crate) fn intern_soft_impl(eval: &super::eval::Context, args: &[Value]) -> E
 
 pub(crate) fn builtin_obarray_make(args: Vec<Value>) -> EvalResult {
     expect_args_range("obarray-make", &args, 0, 1)?;
-    let size = if args.is_empty() || args[0].is_nil() {
-        1511usize
-    } else {
-        expect_wholenump(&args[0])? as usize
-    };
-    Ok(Value::obarray(size))
+    let size = crate::emacs_core::alloc::ObarrayBits::try_from(
+        args.first().copied().unwrap_or(Value::NIL),
+    )?;
+    Value::try_obarray(size)
 }
 
 fn is_legacy_obarray_vector(value: Value) -> bool {
@@ -2331,13 +2327,11 @@ fn check_record_slots(count: usize) -> Result<(), Flow> {
 
 pub(crate) fn builtin_make_record(args: Vec<Value>) -> EvalResult {
     expect_args("make-record", &args, 3)?;
-    let length = expect_wholenump(&args[1])? as usize;
-    check_record_slots(length + 1)?;
-    let mut items = Vec::with_capacity(length + 1);
-    items.push(args[0]); // type tag
-    for _ in 0..length {
-        items.push(args[2]); // init value
-    }
+    use crate::emacs_core::alloc::{AllocLen, RecordLen, reserved_values};
+    let length = RecordLen::try_from(args[1])?;
+    let mut items = reserved_values(length)?;
+    items.resize(length.capacity(), args[2]);
+    items[0] = args[0];
     Ok(Value::make_record(items))
 }
 
@@ -2443,8 +2437,7 @@ pub(crate) fn menu_bar_top_level_items_for_frame(
     } else {
         let obey_overriding_local_maps = eval
             .obarray
-            .symbol_value("overriding-local-map-menu-flag")
-            .copied()
+            .symbol_value_copied("overriding-local-map-menu-flag")
             .is_some_and(|value| value.is_truthy());
         let mut maps = crate::emacs_core::keymap::current_active_maps_for_position_read_only(
             eval,
@@ -2463,7 +2456,7 @@ pub(crate) fn menu_bar_top_level_items_for_frame(
 }
 
 fn move_menu_bar_final_items(eval: &super::eval::Context, items: &mut Vec<(Value, String)>) {
-    let Some(mut final_items) = eval.obarray().symbol_value("menu-bar-final-items").copied() else {
+    let Some(mut final_items) = eval.obarray().symbol_value_copied("menu-bar-final-items") else {
         return;
     };
     while final_items.is_cons() {
@@ -2529,8 +2522,7 @@ fn selected_frame_value(eval: &mut super::eval::Context) -> Value {
 fn maybe_transform_mouse_position(eval: &mut super::eval::Context, value: Value) -> EvalResult {
     let transform = eval
         .obarray
-        .symbol_value("mouse-position-function")
-        .copied()
+        .symbol_value_copied("mouse-position-function")
         .unwrap_or(Value::NIL);
     if transform.is_truthy() {
         eval.apply(transform, vec![value])
@@ -2613,7 +2605,7 @@ fn dynamic_or_global_symbol_value_in_state(
     _dynamic: &[OrderedRuntimeBindingMap],
     name: &str,
 ) -> Option<Value> {
-    obarray.symbol_value(name).copied()
+    obarray.symbol_value_copied(name)
 }
 
 pub(crate) fn builtin_new_fontset(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
@@ -5340,13 +5332,11 @@ pub(crate) fn builtin_dump_emacs_portable(
     }
     let saved_post_gc_hook = ctx
         .obarray()
-        .symbol_value("post-gc-hook")
-        .copied()
+        .symbol_value_copied("post-gc-hook")
         .unwrap_or(Value::NIL);
     let saved_command_line_processed = ctx
         .obarray()
-        .symbol_value("command-line-processed")
-        .copied()
+        .symbol_value_copied("command-line-processed")
         .unwrap_or(Value::NIL);
     // `process-environment` is a `DEFVAR_LISP` (`src/callproc.c:2144`) that
     // `lisp/eshell/esh-var.el` and `lisp/progmodes/compile.el` localise, so it
@@ -5868,6 +5858,21 @@ pub(crate) fn closure_from_reader_literal_slots(slots: &[Value]) -> EvalResult {
                 vec![Value::string("Invalid byte-code object")],
             ));
         }
+        use crate::emacs_core::bytecode::{BytecodeSlotOrigin, BytecodeString};
+        let code = BytecodeString::try_from(slots[1])
+            .map_err(|error| error.into_flow(BytecodeSlotOrigin::Reader))?
+            .into_unibyte(BytecodeSlotOrigin::Reader)?;
+        let normalized;
+        let slots = if code.value() != slots[1] {
+            normalized = {
+                let mut slots = slots.to_vec();
+                slots[1] = code.value();
+                slots
+            };
+            normalized.as_slice()
+        } else {
+            slots
+        };
         return make_byte_code_from_slots(slots).map_err(|_| {
             signal(
                 LispCondition::InvalidReadSyntax,
@@ -5922,6 +5927,44 @@ pub(crate) fn make_byte_code_from_parts(
     )
 }
 
+/// When a constructed GNU byte-code object turns its byte string into
+/// executable instructions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GnuDecodeTiming {
+    /// `make-byte-code` and the reader: check the string now and let the
+    /// process-wide eager/lazy policy decide when to decode it.
+    Deferred,
+    /// `byte-code` (GNU bytecode.c:298-320): the object runs once, at once.
+    /// Decode a single time, keep the instructions resident, and run them
+    /// on the checked driver instead of proving their stack effects first.
+    Immediate,
+}
+
+/// The function object GNU `Fbyte_code` builds through `Fmake_byte_code`
+/// with a nil arglist (bytecode.c:317), for immediate execution.
+///
+/// GNU hands that object straight to `exec_byte_code`; no Lisp frame or
+/// opcode can name it afterwards. It therefore stays an owned value here: its
+/// decoded instructions are released when the call returns, as GNU's only
+/// cost is the small vector, instead of staying resident until a collection.
+pub(crate) fn byte_code_for_immediate_call(
+    bytecode_str: &Value,
+    constants_vec: &Value,
+    maxdepth: &Value,
+) -> Result<crate::emacs_core::bytecode::ByteCodeFunction, Flow> {
+    build_byte_code_function(
+        &Value::NIL,
+        bytecode_str,
+        constants_vec,
+        maxdepth,
+        None,
+        None,
+        4,
+        &[],
+        GnuDecodeTiming::Immediate,
+    )
+}
+
 #[allow(clippy::too_many_arguments)] // preserves the observable GNU closure-slot layout
 fn make_byte_code_from_parts_with_slots(
     arglist: &Value,
@@ -5933,52 +5976,55 @@ fn make_byte_code_from_parts_with_slots(
     closure_slot_count: usize,
     extra_slots: &[Value],
 ) -> EvalResult {
+    build_byte_code_function(
+        arglist,
+        bytecode_str,
+        constants_vec,
+        maxdepth,
+        docstring,
+        interactive,
+        closure_slot_count,
+        extra_slots,
+        GnuDecodeTiming::Deferred,
+    )
+    .map(Value::make_bytecode)
+}
+
+#[allow(clippy::too_many_arguments)] // preserves the observable GNU closure-slot layout
+fn build_byte_code_function(
+    arglist: &Value,
+    bytecode_str: &Value,
+    constants_vec: &Value,
+    maxdepth: &Value,
+    docstring: Option<&Value>,
+    interactive: Option<&Value>,
+    closure_slot_count: usize,
+    extra_slots: &[Value],
+    timing: GnuDecodeTiming,
+) -> Result<crate::emacs_core::bytecode::ByteCodeFunction, Flow> {
     use crate::emacs_core::bytecode::ByteCodeFunction;
     use crate::emacs_core::bytecode::chunk::eager_gnu_bytecode;
     use crate::emacs_core::bytecode::decode::{
-        decode_gnu_bytecode_with_offset_map, parse_arglist_value, validate_gnu_bytecode,
+        decode_gnu_bytecode_with_offset_map, validate_gnu_bytecode,
     };
 
-    if !valid_closure_arglist(*arglist)
-        || !bytecode_str.is_string()
-        || bytecode_str.string_is_multibyte()
-        || !constants_vec.is_vector()
-        || !valid_bytecode_stack_depth(*maxdepth)
-    {
-        return Err(signal(
-            "error",
-            vec![Value::string("Invalid byte-code object")],
-        ));
-    }
-
-    // 1. Parse arglist
-    let params = parse_arglist_value(arglist);
+    use crate::emacs_core::bytecode::function_slots::{BytecodeSlotOrigin, CompiledSlots};
+    let slots = CompiledSlots::try_from([*arglist, *bytecode_str, *constants_vec, *maxdepth])
+        .map_err(|error| error.into_flow(BytecodeSlotOrigin::Constructor))?;
+    let params = slots.params;
 
     // 2. Copy the raw bytes out of the bytecode string, once.
     // Bytecode strings are unibyte and may contain arbitrary byte values
     // (including non-UTF-8), so we must access the raw bytes directly
     // rather than going through as_str() which requires valid UTF-8.
-    let raw_bytes = crate::tagged::header::LispByteVec::copy_from_slice(
-        bytecode_str
-            .as_lisp_string()
-            .expect("validated bytecode string")
-            .as_bytes(),
-    );
+    let raw_bytes = crate::tagged::header::LispByteVec::copy_from_slice(slots.code.as_bytes());
     let _ = bytecode_str.with_lisp_string_mut(|string| string.pin_immovable());
 
     // 3. Extract constants from vector
-    let mut constants: Vec<Value> = match constants_vec.kind() {
-        ValueKind::Veclike(VecLikeType::Vector) => constants_vec.as_vector_data().unwrap().clone(),
-        _ => Vec::new(),
-    };
+    let mut constants: Vec<Value> = slots.constants.as_slice().to_vec();
 
-    // 3b. Reify compiled literals embedded in the constants vector.
-    // GNU `.elc` constants may contain nested `#[...]` bytecode objects or
-    // `#s(hash-table ...)` literals. Convert them into real runtime objects
-    // before decoding/executing the bytecode.
-    for constant in &mut constants {
-        *constant = try_convert_nested_compiled_literal(*constant);
-    }
+    // Reader literals already carry their runtime types. Constants supplied
+    // here are literal data; their list/vector shapes never authorize decoding.
 
     // 4. Check the GNU bytecode. GNU's `Fmake_byte_code` never inspects
     // it; Neomacs executes decoded instructions, so it rejects bytecode it
@@ -5989,7 +6035,11 @@ fn make_byte_code_from_parts_with_slots(
     // no instructions built. The eager policy keeps them resident;
     // `NEOVM_MAKE_BYTE_CODE_VALIDATE_ONLY=off` decodes in full and lets
     // `defer_gnu_decode` drop the result, the former behavior (A/B).
-    let (ops, gnu_byte_offset_map) = if eager_gnu_bytecode() || !make_byte_code_validates_only() {
+    let decode_now = match timing {
+        GnuDecodeTiming::Immediate => true,
+        GnuDecodeTiming::Deferred => eager_gnu_bytecode() || !make_byte_code_validates_only(),
+    };
+    let (ops, gnu_byte_offset_map) = if decode_now {
         decode_gnu_bytecode_with_offset_map(&raw_bytes, &mut constants)
             .map(|(ops, offset_map)| (ops, Some(offset_map)))
     } else {
@@ -6002,11 +6052,8 @@ fn make_byte_code_from_parts_with_slots(
         )
     })?;
 
-    // 5. Extract maxdepth
-    let max_stack = match maxdepth.kind() {
-        ValueKind::Fixnum(n) => n as u16,
-        _ => 16, // fallback
-    };
+    // Preserve the full nonnegative fixnum depth in every runtime consumer.
+    let max_stack = slots.depth;
 
     // 6. Extract closure slot 4.
     // GNU byte-code objects use this slot for either a docstring or an
@@ -6062,14 +6109,22 @@ fn make_byte_code_from_parts_with_slots(
         runtime: Some(crate::emacs_core::jit::Runtime::new()),
         lazy_gnu_code: None,
     };
-    bc.defer_gnu_decode();
-    if !bc.ops.is_empty() {
-        // Eager decode policy kept the instructions resident; prove them now
-        // that every shape field is final. (The lazy path proves at decode.)
-        bc.refresh_stack_verification();
+    match timing {
+        GnuDecodeTiming::Deferred => {
+            bc.defer_gnu_decode();
+            if !bc.ops.is_empty() {
+                // Eager decode policy kept the instructions resident; prove
+                // them now that every shape field is final. (The lazy path
+                // proves at decode.)
+                bc.refresh_stack_verification();
+            }
+        }
+        // One run of straight-line GNU code costs less on the checked driver
+        // than a separate stack-effect proof pass would.
+        GnuDecodeTiming::Immediate => {}
     }
 
-    Ok(Value::make_bytecode(bc))
+    Ok(bc)
 }
 
 #[cfg(test)]

@@ -112,4 +112,7 @@ mod r022_callback_buffer;
 #[path = "case68_native/r022_raw_identity.rs"]
 mod r022_raw_identity;
 
+#[path = "case68_native/r023_contraction.rs"]
+mod r023_contraction;
+
 pub use neovm_core::case68_test_support::dispatch_builtin_without_eval_state;

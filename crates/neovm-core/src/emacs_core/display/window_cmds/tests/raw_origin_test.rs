@@ -272,10 +272,38 @@ fn child_effective_border_precedence_fallback_and_clamping() {
 }
 
 #[test]
+fn raw_origin_split_fixture_requires_gnu_staged_extent() {
+    for (side, extent) in [("t", "window-pixel-width"), ("nil", "window-pixel-height")] {
+        let (mut ev, _, _) = context(8, true);
+        let form = format!(
+            "(let ((before (list (window-list) (window-pixel-left) (window-pixel-top)
+                                   (window-pixel-width) (window-pixel-height))))
+               (list
+                 (condition-case err
+                     (split-window-internal (selected-window) 300 {side} nil)
+                   (error err))
+                 (equal before (list (window-list) (window-pixel-left) (window-pixel-top)
+                                   (window-pixel-width) (window-pixel-height)))
+                 (progn
+                   (set-window-new-pixel nil (- ({extent}) 300))
+                   (window-live-p (split-window-internal (selected-window) 300 {side} nil)))))"
+        );
+        assert_eq!(
+            crate::emacs_core::print::print_value(&ev.eval_str(&form).unwrap()),
+            "((error \"Resizing old window failed\") t t)"
+        );
+    }
+}
+
+#[test]
 fn split_leaf_internal_and_selected_origins_retain_relative_offsets() {
     let (mut ev, fid, _) = context(8, true);
     let new = ev
-        .eval_str("(split-window-internal (selected-window) 300 t nil)")
+        .eval_str(
+            "(progn
+               (set-window-new-pixel nil (- (window-pixel-width) 300))
+               (split-window-internal (selected-window) 300 t nil))",
+        )
         .expect("horizontal split");
     let root = ev.eval_str("(frame-root-window)").unwrap();
     assert_eq!(
@@ -343,7 +371,11 @@ fn raw_origin_errors_keep_valid_window_predicate_and_arity() {
         );
     }
     let deleted = ev
-        .eval_str("(split-window-internal (selected-window) 300 nil nil)")
+        .eval_str(
+            "(progn
+               (set-window-new-pixel nil (- (window-pixel-height) 300))
+               (split-window-internal (selected-window) 300 nil nil))",
+        )
         .unwrap();
     ev.set_variable("raw-origin-deleted-window", deleted);
     ev.eval_str("(delete-window-internal raw-origin-deleted-window)")

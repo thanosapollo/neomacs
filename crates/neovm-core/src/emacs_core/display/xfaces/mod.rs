@@ -9,6 +9,8 @@
 //! `Face` value type, merge core, `FaceTable` derived cache) lives in
 //! `crate::face`; font.c matching stays in `super::font`.
 
+pub(crate) mod height;
+
 use crate::emacs_core::error::EvalResult;
 use crate::emacs_core::error::{expect_args, expect_max_args, expect_min_args};
 use crate::emacs_core::heap_registry::{HeapRegistryHandle, HeapRegistrySlot};
@@ -41,8 +43,7 @@ pub fn register_bootstrap_vars(obarray: &mut Obarray) {
 pub(crate) fn ensure_startup_compat_variables(eval: &mut crate::emacs_core::eval::Context) {
     match eval
         .obarray()
-        .symbol_value("face--new-frame-defaults")
-        .copied()
+        .symbol_value_copied("face--new-frame-defaults")
     {
         Some(table) if table.is_hash_table() => seed_face_new_frame_defaults_table(table),
         _ => eval.set_variable(
@@ -67,7 +68,7 @@ pub(crate) fn ensure_startup_compat_variables(eval: &mut crate::emacs_core::eval
         ("face-font-lax-matched-attributes", Value::T),
     ];
     for (name, value) in defaults {
-        if eval.obarray().symbol_value(name).is_none() {
+        if eval.obarray().symbol_value_copied(name).is_none() {
             eval.set_variable(name, value);
         }
     }
@@ -195,8 +196,7 @@ pub(crate) fn ensure_face_new_frame_defaults_entry(
 ) -> Option<Value> {
     let table = eval
         .obarray()
-        .symbol_value("face--new-frame-defaults")
-        .copied()?;
+        .symbol_value_copied("face--new-frame-defaults")?;
     // The table is fully seeded once at bootstrap (`register_bootstrap_vars`)
     // and again at startup (`ensure_startup_compat_variables`). Re-seeding here
     // -- on every ensure/lookup -- rebuilt every face's cons + lface vector only
@@ -243,8 +243,7 @@ pub(crate) fn remove_face_new_frame_defaults_entry(
 ) {
     let Some(table) = eval
         .obarray()
-        .symbol_value("face--new-frame-defaults")
-        .copied()
+        .symbol_value_copied("face--new-frame-defaults")
     else {
         return;
     };
@@ -282,8 +281,7 @@ pub(crate) fn lookup_face_new_frame_defaults_vector(
 ) -> Option<Value> {
     let table = eval
         .obarray()
-        .symbol_value("face--new-frame-defaults")
-        .copied()?;
+        .symbol_value_copied("face--new-frame-defaults")?;
     let entry = lookup_frame_face_hash_entry(table, key)?;
     if entry.is_cons() {
         Some(entry.cons_cdr())
@@ -2700,7 +2698,9 @@ fn merge_face_height_value(
     match from.kind() {
         ValueKind::Fixnum(_) => from,
         ValueKind::Float => match to.kind() {
-            ValueKind::Fixnum(height) => Value::fixnum((from.xfloat() * height as f64) as i64),
+            ValueKind::Fixnum(height) => Value::from_fixnum(height::gnu_height_merge_fixnum(
+                from.xfloat() * height as f64,
+            )),
             ValueKind::Float => Value::make_float(from.xfloat() * to.xfloat()),
             _ if is_reset_like_face_attr_value(&to) => from,
             _ => invalid,
@@ -2763,43 +2763,35 @@ fn normalize_face_attr_for_set_with_eval(
         }
         ":height" => {
             if !is_reset_like {
-                if face_name == "default" {
-                    match normalized.kind() {
-                        ValueKind::Fixnum(n) if n > 0 => {}
-                        _ => {
-                            return Err(signal(
-                                "error",
-                                vec![
-                                    Value::string("Default face height not absolute and positive"),
-                                    normalized,
-                                ],
-                            ));
-                        }
+                let valid = match height::NumericFaceHeight::try_from(normalized) {
+                    Ok(height::NumericFaceHeight::Absolute(_)) => true,
+                    Ok(height::NumericFaceHeight::Relative(_)) => face_name != "default",
+                    Err(height::FaceHeightError::InvalidNumericHeight)
+                        if face_name == "default" || normalized.is_number() =>
+                    {
+                        false
                     }
-                } else {
-                    match normalized.kind() {
-                        ValueKind::Fixnum(n) if n > 0 => {}
-                        ValueKind::Float if normalized.xfloat() > 0.0 => {}
-                        _ => {
-                            let test = merge_face_height_value(
-                                eval,
-                                normalized,
-                                Value::fixnum(10),
-                                Value::NIL,
-                            );
-                            if test.as_int().is_none_or(|n| n <= 0) {
-                                return Err(signal(
-                                    "error",
-                                    vec![
-                                        Value::string(
-                                            "Face height does not produce a positive integer",
-                                        ),
-                                        normalized,
-                                    ],
-                                ));
-                            }
-                        }
+                    Err(height::FaceHeightError::InvalidNumericHeight) => {
+                        let test = merge_face_height_value(
+                            eval,
+                            normalized,
+                            Value::fixnum(10),
+                            Value::NIL,
+                        );
+                        test.as_int().is_some_and(|height| height > 0)
                     }
+                    Err(height::FaceHeightError::BackendRange) => false,
+                };
+                if !valid {
+                    let message = if face_name == "default" {
+                        "Default face height not absolute and positive"
+                    } else {
+                        "Face height does not produce a positive integer"
+                    };
+                    return Err(signal(
+                        LispCondition::Error,
+                        vec![Value::string(message), normalized],
+                    ));
                 }
             }
         }
@@ -3385,8 +3377,8 @@ fn lisp_value_to_face_attr_resolved(
     resolver: FaceColorResolver<'_>,
 ) -> Option<crate::face::FaceAttrValue> {
     use crate::face::{
-        BoxBorder, BoxStyle, FaceAttrValue, FaceHeight, FontSlant, FontWeight, FontWidth,
-        SpecifiedColor, Underline, UnderlinePosition, UnderlineStyle,
+        BoxBorder, BoxStyle, FaceAttrValue, FontSlant, FontWeight, FontWidth, SpecifiedColor,
+        Underline, UnderlinePosition, UnderlineStyle,
     };
 
     // "unspecified" symbol = reset the attribute
@@ -3420,10 +3412,10 @@ fn lisp_value_to_face_attr_resolved(
             let name = value.as_symbol_name()?;
             Some(FaceAttrValue::Width(FontWidth::from_symbol(name)?))
         }
-        LFaceAttr::Height => match value.kind() {
-            ValueKind::Fixnum(n) => Some(FaceAttrValue::Height(FaceHeight::Absolute(n as i32))),
-            ValueKind::Float => Some(FaceAttrValue::Height(FaceHeight::Relative(value.xfloat()))),
-            _ => None,
+        LFaceAttr::Height => match height::BackendFaceHeight::try_from(value) {
+            Ok(height) => Some(FaceAttrValue::Height(height.into())),
+            Err(height::FaceHeightError::InvalidNumericHeight) => None,
+            Err(height::FaceHeightError::BackendRange) => None,
         },
         LFaceAttr::Family | LFaceAttr::Foundry => {
             if value.is_string() {

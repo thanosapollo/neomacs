@@ -32,6 +32,8 @@ pub enum SearchTarget {
 ///
 /// Offsets are mapped into `0..=text.len()` rather than rejected, so arbitrary
 /// inputs exercise the beginning, middle, and end of every generated text.
+/// Multibyte offsets are rounded down to decoded character boundaries, as
+/// GNU Lisp points and search bounds cannot split a character.
 #[derive(Clone, Copy, Debug)]
 pub struct RegexCase<'a> {
     pattern: &'a str,
@@ -67,11 +69,33 @@ impl<'a> RegexCase<'a> {
     }
 
     fn start(self) -> usize {
-        offset_in_text(self.start, self.text.len())
+        self.offset(self.start)
     }
 
     fn point(self) -> usize {
-        offset_in_text(self.point, self.text.len())
+        self.offset(self.point)
+    }
+
+    // GNU Lisp points and search bounds cannot split an internal multibyte
+    // character. Keep every generated case, but map interior byte offsets
+    // to the preceding decoded boundary, like byte-to-position. Unibyte
+    // targets retain every byte position. Decode from the beginning rather
+    // than testing continuation bytes: fuzz inputs can be malformed and
+    // Emacs raw-byte characters are not Rust UTF-8.
+    fn offset(self, offset: usize) -> usize {
+        let offset = offset_in_text(offset, self.text.len());
+        if self.target == SearchTarget::Unibyte {
+            return offset;
+        }
+        let mut pos = 0;
+        while pos < offset {
+            let next = pos + emacs_char::string_char(&self.text[pos..]).1;
+            if next > offset {
+                break;
+            }
+            pos = next;
+        }
+        pos
     }
 }
 
@@ -496,5 +520,33 @@ impl SyntaxLookup for PropertyRunSyntax {
         (pos..self.classes.len())
             .find(|&at| self.classes[at].is_some())
             .unwrap_or(usize::MAX)
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+
+    #[test]
+    fn multibyte_offsets_follow_gnu_byte_to_position_boundaries() {
+        let text = "café ééé".as_bytes();
+        let expected = [0, 1, 2, 3, 3, 5, 6, 6, 8, 8, 10, 10, 12];
+        for (offset, boundary) in expected.into_iter().enumerate() {
+            let case = RegexCase::new("é+", text, false, offset, offset);
+            assert_eq!(case.start(), boundary);
+            assert_eq!(case.point(), boundary);
+            assert_eq!(case.with_target(SearchTarget::Unibyte).start(), offset);
+        }
+        for offset in [1, 2] {
+            let case = RegexCase::new(".*", "中".as_bytes(), true, offset, offset);
+            assert_eq!(case.start(), 0);
+            assert_eq!(case.point(), 0);
+        }
+        // The robust internal decoder, not a UTF-8 API or continuation-bit
+        // filter, defines boundaries for raw-byte and malformed fuzz text.
+        let raw = RegexCase::new(".*", &[0xc0, 0x80], false, 1, 1);
+        assert_eq!(raw.start(), 0);
+        let truncated = RegexCase::new(".*", &[0xe4], false, 1, 1);
+        assert_eq!(truncated.start(), 1);
     }
 }

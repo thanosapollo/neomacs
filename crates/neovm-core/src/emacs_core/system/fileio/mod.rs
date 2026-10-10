@@ -5,6 +5,7 @@
 
 use crate::emacs_core::error::LispCondition;
 use crate::emacs_core::error::{expect_args, expect_fixnum, expect_max_args, expect_min_args};
+use crate::emacs_core::timefns::{TimestampError, UnixTimestamp};
 use std::collections::{HashMap, VecDeque};
 #[cfg(unix)]
 use std::ffi::{CStr, CString};
@@ -2302,65 +2303,14 @@ fn expect_temp_prefix(value: &Value) -> Result<crate::heap_types::LispString, Fl
     }
 }
 
-fn normalize_secs_nanos(mut secs: i64, mut nanos: i64) -> (i64, i64) {
-    if nanos >= 1_000_000_000 {
-        secs += nanos / 1_000_000_000;
-        nanos %= 1_000_000_000;
-    } else if nanos < 0 {
-        let borrow = ((-nanos) + 999_999_999) / 1_000_000_000;
-        secs -= borrow;
-        nanos += borrow * 1_000_000_000;
-    }
-    (secs, nanos)
+fn parse_timestamp_arg(value: &Value) -> Result<UnixTimestamp, Flow> {
+    UnixTimestamp::try_from(value)
 }
 
-fn parse_timestamp_arg(value: &Value) -> Result<(i64, i64), Flow> {
-    match value.kind() {
-        ValueKind::Fixnum(n) => Ok((n, 0)),
-        ValueKind::Float => {
-            let f = value.as_float().unwrap();
-            let secs = f.floor() as i64;
-            let nanos = ((f - f.floor()) * 1_000_000_000.0).round() as i64;
-            Ok(normalize_secs_nanos(secs, nanos))
-        }
-        ValueKind::Cons => {
-            let items = list_to_vec(value).ok_or_else(|| {
-                signal(
-                    LispCondition::WrongTypeArgument,
-                    vec![Value::symbol("listp"), *value],
-                )
-            })?;
-            if items.len() < 2 {
-                return Err(signal(
-                    LispCondition::WrongTypeArgument,
-                    vec![Value::symbol("listp"), *value],
-                ));
-            }
-            let high = items[0].as_int().ok_or_else(|| {
-                signal(
-                    LispCondition::WrongTypeArgument,
-                    vec![Value::symbol("integerp"), items[0]],
-                )
-            })?;
-            let low = items[1].as_int().ok_or_else(|| {
-                signal(
-                    LispCondition::WrongTypeArgument,
-                    vec![Value::symbol("integerp"), items[1]],
-                )
-            })?;
-            let usec = if items.len() > 2 {
-                items[2].as_int().unwrap_or(0)
-            } else {
-                0
-            };
-            let secs = high * 65_536 + low;
-            let nanos = usec * 1_000;
-            Ok(normalize_secs_nanos(secs, nanos))
-        }
-        _other => Err(signal(
-            LispCondition::WrongTypeArgument,
-            vec![Value::symbol("numberp"), *value],
-        )),
+fn representable_file_timestamp(time: std::time::SystemTime) -> Option<UnixTimestamp> {
+    match UnixTimestamp::try_from(time) {
+        Ok(timestamp) => Some(timestamp),
+        Err(TimestampError::OutOfRange) => None,
     }
 }
 
@@ -2391,7 +2341,9 @@ fn validate_file_truename_counter(counter: &Value) -> Result<(), Flow> {
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
 fn temporary_file_directory_for_eval(eval: &Context) -> Option<crate::heap_types::LispString> {
-    let val = eval.obarray.symbol_value("temporary-file-directory")?;
+    let val = eval
+        .obarray
+        .symbol_value_copied("temporary-file-directory")?;
     val.as_lisp_string().cloned()
 }
 
@@ -3080,7 +3032,7 @@ fn raw_default_directory_value_for_eval(eval: &Context) -> Option<Value> {
 }
 
 fn invocation_directory_absolute_value_for_eval(eval: &Context) -> Option<Value> {
-    let value = eval.obarray.symbol_value("invocation-directory").copied()?;
+    let value = eval.obarray.symbol_value_copied("invocation-directory")?;
     let filename = value.as_lisp_string()?;
     if lisp_file_name_absolute_system_p(filename) {
         Some(value)
@@ -3587,21 +3539,43 @@ fn set_file_modes_path(path: &Path, mode: i64, nofollow: bool) -> std::io::Resul
     }
 }
 
-fn build_file_times(timestamp: Option<(i64, i64)>) -> std::fs::FileTimes {
-    let mut times = std::fs::FileTimes::new();
-    let t = if let Some((secs, nanos)) = timestamp {
-        std::time::UNIX_EPOCH + std::time::Duration::new(secs as u64, nanos as u32)
-    } else {
-        std::time::SystemTime::now()
+#[cfg(not(unix))]
+fn build_file_times(timestamp: Option<UnixTimestamp>) -> std::io::Result<std::fs::FileTimes> {
+    let t = match timestamp {
+        Some(timestamp) => std::time::SystemTime::try_from(timestamp)
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?,
+        None => std::time::SystemTime::now(),
     };
-    times = times.set_accessed(t).set_modified(t);
-    times
+    Ok(std::fs::FileTimes::new().set_accessed(t).set_modified(t))
+}
+
+/// Whether timestamp updates follow a symbolic link or update the link itself.
+///
+/// This immutable policy contains no Lisp values, handles, or mutator state.
+/// It can be copied between threads and shared by concurrent callers; the
+/// filesystem operation itself retains the platform's existing semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileTimeSymlinks {
+    Follow,
+    NoFollow,
+}
+
+static_assertions::assert_impl_all!(FileTimeSymlinks: Send, Sync);
+
+impl From<Value> for FileTimeSymlinks {
+    fn from(flag: Value) -> Self {
+        if flag.is_nil() {
+            Self::Follow
+        } else {
+            Self::NoFollow
+        }
+    }
 }
 
 fn set_file_times_path(
     path: &Path,
-    timestamp: Option<(i64, i64)>,
-    nofollow: bool,
+    timestamp: Option<UnixTimestamp>,
+    symlinks: FileTimeSymlinks,
 ) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -3616,71 +3590,77 @@ fn set_file_times_path(
         // `set-file-times' work on a read-only file without racing another
         // observer by temporarily changing its attributes.  OpenOptionsExt is
         // a safe wrapper around the same CreateFileW contract.
-        let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
-        if nofollow {
-            flags |= FILE_FLAG_OPEN_REPARSE_POINT;
-        }
+        let flags = match symlinks {
+            FileTimeSymlinks::Follow => FILE_FLAG_BACKUP_SEMANTICS,
+            FileTimeSymlinks::NoFollow => FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        };
         let file = fs::OpenOptions::new()
             .access_mode(FILE_WRITE_ATTRIBUTES)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(flags)
             .open(path)?;
-        return file.set_times(build_file_times(timestamp));
+        return file.set_times(build_file_times(timestamp)?);
     }
 
-    #[cfg(not(windows))]
-    if nofollow {
-        #[cfg(unix)]
-        {
-            let c_path = path_to_cstring(path).map_err(|_| {
-                std::io::Error::new(ErrorKind::InvalidInput, "embedded NUL in file name")
-            })?;
+    #[cfg(unix)]
+    {
+        let c_path = path_to_cstring(path).map_err(|_| {
+            std::io::Error::new(ErrorKind::InvalidInput, "embedded NUL in file name")
+        })?;
 
-            let mut ts = [
-                libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                },
-                libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                },
-            ];
-            if let Some((secs, nanos)) = timestamp {
-                ts[0].tv_sec = secs as libc::time_t;
-                ts[1].tv_sec = secs as libc::time_t;
-                ts[0].tv_nsec = nanos as libc::c_long;
-                ts[1].tv_nsec = nanos as libc::c_long;
-            } else {
-                ts[0].tv_nsec = libc::UTIME_NOW as libc::c_long;
-                ts[1].tv_nsec = libc::UTIME_NOW as libc::c_long;
-            }
-            let result = unsafe {
-                libc::utimensat(
-                    libc::AT_FDCWD,
-                    c_path.as_ptr(),
-                    ts.as_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if result == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
+        let mut ts = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+        ];
+        if let Some(timestamp) = timestamp {
+            let secs = timestamp.seconds();
+            let nanos = timestamp.nanoseconds();
+            ts[0].tv_sec = libc::time_t::try_from(secs)
+                .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?;
+            ts[1].tv_sec = ts[0].tv_sec;
+            ts[0].tv_nsec = nanos as libc::c_long;
+            ts[1].tv_nsec = nanos as libc::c_long;
+        } else {
+            ts[0].tv_nsec = libc::UTIME_NOW as libc::c_long;
+            ts[1].tv_nsec = libc::UTIME_NOW as libc::c_long;
         }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = (path, timestamp);
-            Err(std::io::Error::new(
+        // SAFETY: c_path is NUL-terminated, ts has two initialized entries,
+        // and both borrowed arrays remain alive through the syscall.
+        let result = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                ts.as_ptr(),
+                match symlinks {
+                    FileTimeSymlinks::Follow => 0,
+                    FileTimeSymlinks::NoFollow => libc::AT_SYMLINK_NOFOLLOW,
+                },
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        match symlinks {
+            FileTimeSymlinks::Follow => {
+                let file = fs::OpenOptions::new().write(true).open(path)?;
+                file.set_times(build_file_times(timestamp)?)
+            }
+            FileTimeSymlinks::NoFollow => Err(std::io::Error::new(
                 ErrorKind::Unsupported,
                 "nofollow set-file-times is unsupported on this platform",
-            ))
+            )),
         }
-    } else {
-        let file = fs::OpenOptions::new().write(true).open(path)?;
-        let times = build_file_times(timestamp);
-        file.set_times(times)
     }
 }
 
@@ -4062,7 +4042,7 @@ pub(crate) fn builtin_set_file_times(eval: &mut Context, args: Vec<Value>) -> Ev
             ],
         ));
     }
-    let nofollow = args.get(2).is_some_and(|flag| !flag.is_nil());
+    let symlinks = FileTimeSymlinks::from(args.get(2).copied().unwrap_or(Value::NIL));
     let timestamp_arg = args.get(1).copied().unwrap_or(Value::NIL);
     let flag_arg = args.get(2).copied().unwrap_or(Value::NIL);
     let timestamp = if !timestamp_arg.is_nil() {
@@ -4086,7 +4066,7 @@ pub(crate) fn builtin_set_file_times(eval: &mut Context, args: Vec<Value>) -> Ev
     )? {
         return Ok(result);
     }
-    set_file_times_path(&lisp_file_name_to_path_buf(&filename), timestamp, nofollow).map_err(
+    set_file_times_path(&lisp_file_name_to_path_buf(&filename), timestamp, symlinks).map_err(
         |err| {
             signal_file_action_error_value(err, "Setting file times", Value::heap_string(filename))
         },
@@ -4208,15 +4188,13 @@ pub(crate) fn builtin_verify_visited_file_modtime(
     let (disk_modtime, disk_size) = match std::fs::metadata(&path) {
         Ok(meta) => {
             let modtime = match meta.modified() {
-                Ok(mtime) => {
-                    let dur = mtime
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default();
-                    VisitedFileModtime::Known {
-                        sec: dur.as_secs() as i64,
-                        nsec: dur.subsec_nanos() as i32,
-                    }
-                }
+                Ok(mtime) => match UnixTimestamp::try_from(mtime) {
+                    Ok(timestamp) => VisitedFileModtime::Known {
+                        sec: timestamp.seconds(),
+                        nsec: timestamp.nanoseconds() as i32,
+                    },
+                    Err(TimestampError::OutOfRange) => VisitedFileModtime::Unknown,
+                },
                 Err(_) => VisitedFileModtime::Unknown,
             };
             (modtime, Some(meta.len() as i64))
@@ -4334,13 +4312,12 @@ pub(crate) fn builtin_set_visited_file_modtime(eval: &mut Context, args: Vec<Val
             .buffers
             .current_buffer_mut()
             .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
-        if let Ok(mtime) = meta.modified() {
-            let dur = mtime
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
+        if let Ok(mtime) = meta.modified()
+            && let Some(timestamp) = representable_file_timestamp(mtime)
+        {
             buf.set_visited_file_modtime(VisitedFileModtime::Known {
-                sec: dur.as_secs() as i64,
-                nsec: dur.subsec_nanos() as i32,
+                sec: timestamp.seconds(),
+                nsec: timestamp.nanoseconds() as i32,
             });
             buf.modtime_size = Some(meta.len() as i64);
         }
@@ -4640,7 +4617,9 @@ impl CopyTimestampPolicy {
                     Self::Preserve => Ok(()),
                     // GNU w32_copy_file explicitly counters CopyFileW's default
                     // when KEEP-TIME is nil (src/w32.c:6982-7029).
-                    Self::Refresh => set_file_times_path(destination, None, false),
+                    Self::Refresh => {
+                        set_file_times_path(destination, None, FileTimeSymlinks::Follow)
+                    }
                 }
             }
             _ => {
@@ -5973,8 +5952,8 @@ fn prepare_write_region(
                     .buffers
                     .get(buffer_after)
                     .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
-                callback_start = Value::fixnum(buf.point_min_lisp_char_pos().as_i64());
-                callback_end = Value::fixnum(buf.point_max_lisp_char_pos().as_i64());
+                callback_start = Value::from_fixnum(buf.point_min_position().into());
+                callback_end = Value::from_fixnum(buf.point_max_position().into());
                 annotations.clear();
             }
             annotations.merge_callback_result(result)?;
@@ -6586,14 +6565,12 @@ pub(crate) fn builtin_insert_file_contents(
         // current_buffer->modtime = mtime; current_buffer->modtime_size = st_size).
         if let Ok(meta) = std::fs::metadata(lisp_file_name_to_path_buf(&resolved))
             && let Ok(mtime) = meta.modified()
+            && let Some(timestamp) = representable_file_timestamp(mtime)
         {
-            let dur = mtime
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
             if let Some(buf) = eval.buffers.get_mut(current_id) {
                 buf.set_visited_file_modtime(VisitedFileModtime::Known {
-                    sec: dur.as_secs() as i64,
-                    nsec: dur.subsec_nanos() as i32,
+                    sec: timestamp.seconds(),
+                    nsec: timestamp.nanoseconds() as i32,
                 });
                 buf.modtime_size = Some(meta.len() as i64);
             }
@@ -6960,12 +6937,13 @@ pub(crate) fn builtin_write_region(
                     Value::heap_string(resolved.clone()),
                 )
             })?;
-            let dur = mtime
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
+            let timestamp =
+                UnixTimestamp::try_from(mtime).map_err(|TimestampError::OutOfRange| {
+                    crate::emacs_core::timefns::time_error_overflow()
+                })?;
             Some((
-                dur.as_secs() as i64,
-                dur.subsec_nanos() as i32,
+                timestamp.seconds(),
+                timestamp.nanoseconds() as i32,
                 meta.len() as i64,
             ))
         } else {
@@ -7151,7 +7129,7 @@ pub(crate) fn builtin_do_auto_save(
 
     let auto_save_visited = eval
         .obarray
-        .symbol_value("auto-save-visited-file-name")
+        .symbol_value_copied("auto-save-visited-file-name")
         .is_some_and(|v| v.is_truthy());
 
     // Collect buffer ids to process

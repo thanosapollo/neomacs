@@ -376,6 +376,14 @@ fn substring_impl(name: &str, args: &[Value], preserve_props: bool) -> EvalResul
 #[path = "tests/strings_test.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "tests/width_policy.rs"]
+mod width_policy_tests;
+
+#[cfg(test)]
+#[path = "tests/gdh_format_width_scan_test.rs"]
+mod gdh_format_width_scan_tests;
+
 pub(crate) fn builtin_substring(args: Vec<Value>) -> EvalResult {
     builtin_substring_slice(&args)
 }
@@ -818,9 +826,8 @@ pub(crate) fn builtin_number_to_string(
             super::print::format_float_with_output_format(
                 args[0].xfloat(),
                 ctx.obarray
-                    .symbol_value("float-output-format")
-                    .filter(|v| v.is_string())
-                    .copied(),
+                    .symbol_value_copied("float-output-format")
+                    .filter(|v| v.is_string()),
             ),
         )),
         ValueKind::Veclike(VecLikeType::Bignum) => {
@@ -852,12 +859,19 @@ pub(crate) fn builtin_upcase_in_state_1(
 ) -> EvalResult {
     let args: [Value; 1] = [obj];
     let casetab = super::super::casetab::CaseTableOverride::for_current_buffer(eval)?;
-    upcase_with_override(&args, casetab)
+    upcase_with_override(
+        &args,
+        casetab,
+        super::super::casefiddle::CaseEncoding::for_current_buffer(eval),
+        super::super::casefiddle::upcase_word_predicate(eval, &casetab),
+    )
 }
 
 fn upcase_with_override(
     args: &[Value],
     casetab: super::super::casetab::CaseTableOverride,
+    encoding: super::super::casefiddle::CaseEncoding,
+    is_word: impl Fn(u32) -> bool,
 ) -> EvalResult {
     expect_args("upcase", args, 1)?;
     match args[0].kind() {
@@ -867,25 +881,29 @@ fn upcase_with_override(
             let source_props = (!string.is_multibyte())
                 .then(|| get_string_text_properties_table_for_value(source))
                 .flatten();
-            let result =
-                Value::heap_string(transform_string_case(string, true, |_| false, &casetab, None));
+            let result = Value::heap_string(super::super::casefiddle::casify_lisp_string(
+                string,
+                super::super::casefiddle::CaseAction::Up,
+                is_word,
+                &casetab,
+            ));
             if let Some(table) = source_props {
                 set_string_text_properties_table_for_value(result, table);
             }
             Ok(result)
         }
-        ValueKind::Fixnum(c) if (0..=0x3F_FFFF).contains(&c) => {
-            // GNU `upcase` consults the per-buffer upcase table first
-            // (`buffer.h:1656-1663`); only fall through to the hardwired
-            // Unicode mapping when the table has no explicit entry.
-            let mapped = casetab
-                .map(super::super::casetab::CaseMap::Up, c)
-                .unwrap_or_else(|| upcase_char_code_emacs_compat(c));
-            if let Some(ch) = u32::try_from(mapped).ok().and_then(char::from_u32) {
-                Ok(Value::fixnum(ch as i64))
-            } else {
-                Ok(Value::fixnum(c))
-            }
+        ValueKind::Fixnum(c) if c >= 0 => {
+            let code = super::super::casefiddle::CaseNatnum::try_from(c).map_err(|_| {
+                signal(
+                    LispCondition::WrongTypeArgument,
+                    vec![Value::symbol("char-or-string-p"), args[0]],
+                )
+            })?;
+            Ok(Value::fixnum(code.casify(
+                super::super::casefiddle::CaseAction::Up,
+                encoding,
+                &casetab,
+            )))
         }
         ValueKind::Fixnum(_) => Err(signal(
             LispCondition::WrongTypeArgument,
@@ -959,72 +977,22 @@ fn transform_string_case(
     casetab: &super::super::casetab::CaseTableOverride,
     special_lowercase: Option<Value>,
 ) -> crate::heap_types::LispString {
-    use super::super::casetab::CaseMap;
-    if !s.is_multibyte() {
-        let which = if upcase { CaseMap::Up } else { CaseMap::Down };
-        return crate::emacs_core::casefiddle::casify_unibyte_string(
+    if upcase {
+        crate::emacs_core::casefiddle::casify_lisp_string(
             s,
-            which,
+            crate::emacs_core::casefiddle::CaseAction::Up,
+            is_word,
+            casetab,
+        )
+    } else {
+        crate::emacs_core::casefiddle::downcase_lisp_string_emacs_compat(
+            s,
+            is_word,
+            |_| false,
             casetab,
             crate::emacs_core::casefiddle::CaseTarget::String,
-        );
-    }
-    if !upcase {
-        return crate::emacs_core::casefiddle::downcase_lisp_string_emacs_compat(
-            s, is_word, |_| false, casetab,
-            crate::emacs_core::casefiddle::CaseTarget::String, special_lowercase,
-        );
-    }
-
-    let bytes = s.as_bytes();
-    let multibyte = s.is_multibyte();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let push = |out: &mut Vec<u8>, code: u32| {
-        if multibyte {
-            let mut buf = [0u8; crate::emacs_core::emacs_char::MAX_MULTIBYTE_LENGTH];
-            let n = crate::emacs_core::emacs_char::char_string(code, &mut buf);
-            out.extend_from_slice(&buf[..n]);
-        } else {
-            out.push(code as u8);
-        }
-    };
-    let mut pos = 0;
-    while pos < bytes.len() {
-        let (code, len) = if multibyte {
-            crate::emacs_core::emacs_char::string_char(&bytes[pos..])
-        } else {
-            (bytes[pos] as u32, 1)
-        };
-        pos += len;
-        // GNU `case_character_impl` checks special-uppercase before the
-        // one-to-one Up table. Character and unibyte conversion do not expand.
-        if let Some(expansion) = crate::emacs_core::casefiddle::special_upcase_expansion(code) {
-            for upper in expansion {
-                push(&mut out, upper as u32);
-            }
-            continue;
-        }
-        if let Some(mapped) = casetab.map(CaseMap::Up, code as i64) {
-            push(&mut out, mapped as u32);
-            continue;
-        }
-        match char::from_u32(code).filter(|_| multibyte || code < 0x80) {
-            Some(ch) => {
-                if ch == '\u{0131}' || preserve_emacs_upcase_string_payload(code as i64) {
-                    push(&mut out, code);
-                } else {
-                    for up in ch.to_uppercase() {
-                        push(&mut out, up as u32);
-                    }
-                }
-            }
-            None => push(&mut out, code),
-        }
-    }
-    if multibyte {
-        crate::heap_types::LispString::from_emacs_bytes(out)
-    } else {
-        crate::heap_types::LispString::from_unibyte(out)
+            special_lowercase,
+        )
     }
 }
 
@@ -1044,22 +1012,6 @@ pub(crate) fn upcase_char_code_emacs_compat(code: i64) -> i64 {
             }
         }
     }
-}
-
-fn preserve_emacs_upcase_string_payload(code: i64) -> bool {
-    matches!(
-        code,
-        411
-            | 612
-            | 7306
-            | 42957
-            | 42959
-            | 42963
-            | 42965
-            | 42971
-            | 68976..=68997
-            | 93883..=93907
-    )
 }
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
@@ -1130,6 +1082,7 @@ fn downcase_with_word_pred(
     is_word: impl Fn(u32) -> bool,
     casetab: super::super::casetab::CaseTableOverride,
     special_lowercase: Option<Value>,
+    encoding: super::super::casefiddle::CaseEncoding,
 ) -> EvalResult {
     expect_args("downcase", args, 1)?;
     match args[0].kind() {
@@ -1139,25 +1092,30 @@ fn downcase_with_word_pred(
             let source_props = (!string.is_multibyte())
                 .then(|| get_string_text_properties_table_for_value(source))
                 .flatten();
-            let result =
-                Value::heap_string(transform_string_case(string, false, is_word, &casetab, special_lowercase));
+            let result = Value::heap_string(transform_string_case(
+                string,
+                false,
+                is_word,
+                &casetab,
+                special_lowercase,
+            ));
             if let Some(table) = source_props {
                 set_string_text_properties_table_for_value(result, table);
             }
             Ok(result)
         }
-        ValueKind::Fixnum(c) if (0..=0x3F_FFFF).contains(&c) => {
-            // GNU `downcase` consults the per-buffer downcase table first
-            // (`buffer.h:1648-1655`); fall through to the hardwired Unicode
-            // mapping only when there is no explicit entry.
-            let mapped = casetab
-                .map(super::super::casetab::CaseMap::Down, c)
-                .unwrap_or_else(|| downcase_char_code_emacs_compat(c));
-            if let Some(ch) = u32::try_from(mapped).ok().and_then(char::from_u32) {
-                Ok(Value::fixnum(ch as i64))
-            } else {
-                Ok(Value::fixnum(c))
-            }
+        ValueKind::Fixnum(c) if c >= 0 => {
+            let code = super::super::casefiddle::CaseNatnum::try_from(c).map_err(|_| {
+                signal(
+                    LispCondition::WrongTypeArgument,
+                    vec![Value::symbol("char-or-string-p"), args[0]],
+                )
+            })?;
+            Ok(Value::fixnum(code.casify(
+                super::super::casefiddle::CaseAction::Down,
+                encoding,
+                &casetab,
+            )))
         }
         ValueKind::Fixnum(_) => Err(signal(
             LispCondition::WrongTypeArgument,
@@ -1178,6 +1136,7 @@ pub(crate) fn builtin_downcase(args: Vec<Value>) -> EvalResult {
         |_| false,
         super::super::casetab::CaseTableOverride::none(),
         None,
+        super::super::casefiddle::CaseEncoding::Multibyte,
     )
 }
 
@@ -1199,11 +1158,27 @@ pub(crate) fn builtin_downcase_in_state_1(
     eval: &mut crate::emacs_core::eval::Context,
     obj: Value,
 ) -> EvalResult {
+    if !obj.is_string() {
+        let casetab = super::super::casetab::CaseTableOverride::for_current_buffer(eval)?;
+        return downcase_with_word_pred(
+            &[obj],
+            casing_word_predicate(eval),
+            casetab,
+            None,
+            super::super::casefiddle::CaseEncoding::for_current_buffer(eval),
+        );
+    }
     eval.with_specpdl_roots(&[obj], |eval| {
         crate::emacs_core::casefiddle::with_text_downcase_table(eval, false, |eval, lower| {
             let is_word = casing_word_predicate(eval);
             let casetab = super::super::casetab::CaseTableOverride::for_current_buffer(eval)?;
-            downcase_with_word_pred(&[obj], is_word, casetab, Some(lower))
+            downcase_with_word_pred(
+                &[obj],
+                is_word,
+                casetab,
+                Some(lower),
+                super::super::casefiddle::CaseEncoding::for_current_buffer(eval),
+            )
         })
     })
 }
@@ -1972,20 +1947,38 @@ fn format_float_spec(f: f64, spec: &FormatSpec) -> FormatField {
 /// `info[i].end` tracking in GNU's `styled_format` (editfns.c:3651-3806).
 ///
 /// Issue #131: `data` is the argument's Emacs internal-encoding bytes, measured
-/// with its own `is_multibyte` flag (a unibyte raw byte is one column, a
-/// multibyte eight-bit char is four, matching GNU). The returned content is
-/// canonical multibyte (unibyte content promoted), so the caller can splice it
+/// with its own `is_multibyte` flag. Unibyte C1 bytes and multibyte eight-bit
+/// characters occupy four columns; unibyte bytes 0xA0..0xFF occupy one.
+/// The returned content is canonical multibyte (unibyte content promoted), so the caller can splice it
 /// into the byte result; padding is always ASCII spaces.
-fn format_string_spec(data: &[u8], is_multibyte: bool, spec: &FormatSpec) -> FormatField {
+fn format_string_spec(
+    data: &[u8],
+    is_multibyte: bool,
+    spec: &FormatSpec,
+    ctx: &super::eval::Context,
+) -> FormatField {
     let mut content_width = 0usize;
     let mut truncated_end = data.len();
     let mut saw_limit = spec.precision.is_none();
     if spec.precision.is_some() || spec.width.is_some() {
+        let policy = crate::encoding::CharacterWidthPolicy::from_context(ctx);
         truncated_end = 0;
         let mut pos = 0usize;
+        let width_only_limit = if spec.precision.is_none() {
+            spec.width
+        } else {
+            None
+        };
         while pos < data.len() {
+            if width_only_limit.is_some_and(|minimum| content_width >= minimum) {
+                // Without precision GNU copies all source bytes; width only
+                // decides padding (editfns.c:3751-3752,3764-3765). Nonnegative
+                // widths cannot require padding after the minimum is reached.
+                truncated_end = data.len();
+                break;
+            }
             let (code, len) = next_format_unit(data, pos, is_multibyte);
-            let display_width = format_unit_display_width(code, is_multibyte);
+            let display_width = policy.width(code);
             if let Some(prec) = spec.precision
                 && content_width + display_width > prec
             {
@@ -2158,26 +2151,6 @@ fn next_format_unit(data: &[u8], pos: usize, is_multibyte: bool) -> (u32, usize)
     }
 }
 
-/// Display width of one character unit, mirroring [`display_width_emacs`].
-fn format_unit_display_width(code: u32, is_multibyte: bool) -> usize {
-    use crate::emacs_core::emacs_char;
-    if is_multibyte {
-        if emacs_char::char_byte8_p(code) {
-            4
-        } else if let Some(ch) = char::from_u32(code) {
-            crate::encoding::char_width(ch)
-        } else {
-            1
-        }
-    } else if code < 0x80 {
-        char::from_u32(code)
-            .map(crate::encoding::char_width)
-            .unwrap_or(1)
-    } else {
-        1
-    }
-}
-
 /// Push a single Emacs character `code` to `out` as canonical internal-encoding
 /// bytes (eight-bit / non-Unicode codes become their disjoint extended sequence,
 /// so a real Private-Use glyph survives instead of being mistaken for a raw byte).
@@ -2237,6 +2210,7 @@ fn do_format(
     princ_fn: &dyn Fn(&Value) -> Result<Vec<u8>, Flow>,
     prin1_fn: &dyn Fn(&Value) -> Vec<u8>,
     quoting_style: FormatMessageQuotingStyle,
+    ctx: &super::eval::Context,
 ) -> Result<
     (
         Vec<u8>,
@@ -2441,7 +2415,7 @@ fn do_format(
                 } else {
                     (princ_fn(&arg)?, true)
                 };
-                let field = format_string_spec(&s, src_multibyte, &spec);
+                let field = format_string_spec(&s, src_multibyte, &spec, ctx);
                 if track_props && arg_is_string && !field.mid.is_empty() {
                     let formatted_chars = field.chars();
                     let content_char_start_in_formatted = field.leading_spaces;
@@ -2471,7 +2445,7 @@ fn do_format(
             }
             'S' => {
                 let s = prin1_fn(&args[this_arg_idx]);
-                format_string_spec(&s, true, &spec)
+                format_string_spec(&s, true, &spec, ctx)
             }
             'd' | 'i' | 'b' | 'B' | 'o' | 'x' | 'X' => {
                 // Plain `%d` on a fixnum with no property tracking: render the
@@ -2522,7 +2496,7 @@ fn do_format(
                 let formatted_char = format_char_argument(n)?;
                 force_multibyte_result |= formatted_char.force_multibyte_result;
                 if formatted_char.force_multibyte_result {
-                    format_string_spec(&formatted_char.rendered, true, &spec)
+                    format_string_spec(&formatted_char.rendered, true, &spec, ctx)
                 } else {
                     // GNU `styled_format` formats an ASCII character as one
                     // byte, none for precision 0, padded by that byte count
@@ -2671,6 +2645,7 @@ pub(crate) fn builtin_format_wrapper_strict_slice(
             &|v| format_percent_s_in_state(ctx, v),
             &|v| super::error::print_value_bytes_escaped_with_eval(ctx, v),
             FormatMessageQuotingStyle::None,
+            ctx,
         )?;
         // GNU `styled_format`: `if (! new_result) { val = args[0]; goto return_val; }`
         // (editfns.c:4289). Nothing was formatted, so GNU builds no new string and
@@ -2844,6 +2819,7 @@ pub(crate) fn builtin_format_message_slice(
             &|v| format_percent_s_in_state(ctx, v),
             &|v| super::error::print_value_bytes_escaped_with_eval(ctx, v),
             quoting_style,
+            ctx,
         )?;
         // GNU `styled_format`: `if (! new_result) { val = args[0]; goto return_val; }`
         // (editfns.c:4289). Nothing was formatted, so GNU builds no new string and
@@ -3049,19 +3025,16 @@ pub(crate) fn builtin_string_width(ctx: &mut super::eval::Context, args: Vec<Val
     })?;
     let data = ls.as_bytes();
     let is_multibyte = ls.is_multibyte();
-    let display_table = crate::encoding::active_display_table(ctx);
-    // GNU `lisp_string_width' measures each character with `char_width', which
-    // bottoms out in `CHARACTER_WIDTH' returning `SANE_TAB_WIDTH(current_buffer)'
-    // for a TAB -- i.e. the dynamically-bound `tab-width', not a hardcoded 8.
-    let tab_width = crate::emacs_core::indent::current_buffer_tab_width(ctx);
-    let unit_width = |code: u32, width: usize| -> usize {
-        if display_table.is_some() {
-            crate::encoding::char_width_for_code_with_display_table(code as i64, display_table)
-        } else if code == 0x09 {
-            tab_width
-        } else {
-            width
+    let policy = crate::encoding::CharacterWidthPolicy::from_context(ctx);
+    let string_width = |data: &[u8]| {
+        let mut width = 0usize;
+        let mut position = 0usize;
+        while position < data.len() {
+            let (code, bytes) = next_format_unit(data, position, is_multibyte);
+            width += policy.width(code);
+            position += bytes;
         }
+        width
     };
     if args.len() <= 1
         || (args.len() == 2 && args[1] == Value::NIL)
@@ -3070,11 +3043,7 @@ pub(crate) fn builtin_string_width(ctx: &mut super::eval::Context, args: Vec<Val
             && (args.len() < 3 || args[2] == Value::NIL))
     {
         // Fast path: full string width
-        let units = super::super::string_escape::decode_units_emacs(data, is_multibyte);
-        let width = units
-            .iter()
-            .map(|(code, width)| unit_width(*code, *width))
-            .sum::<usize>();
+        let width = string_width(data);
         return Ok(Value::fixnum(width as i64));
     }
     // Substring range specified: sum the widths of [from, to) only.  GNU
@@ -3121,10 +3090,6 @@ pub(crate) fn builtin_string_width(ctx: &mut super::eval::Context, args: Vec<Val
         ));
     }
     let range = &data[ls.char_to_byte_pos(from)..ls.char_to_byte_pos(to)];
-    let units = super::super::string_escape::decode_units_emacs(range, is_multibyte);
-    let width: usize = units
-        .iter()
-        .map(|(code, width)| unit_width(*code, *width))
-        .sum();
+    let width = string_width(range);
     Ok(Value::fixnum(width as i64))
 }

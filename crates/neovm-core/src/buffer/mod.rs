@@ -3,6 +3,7 @@
 pub mod buffer;
 pub(crate) mod buffer_text;
 mod edit_transaction;
+pub(crate) use edit_transaction::{CasifyExpansion, CasifyStorageShape};
 pub(crate) mod gap_buffer;
 mod marker_data;
 pub mod overlay;
@@ -25,6 +26,7 @@ pub use buffer::{
 pub(crate) use buffer_text::BufferText;
 pub use edit_transaction::TranspositionAnchorPolicy;
 pub use overlay::{Overlay, OverlayList};
+pub(crate) use position::BufferLispPos;
 pub use position::{
     AccessibleCharRange, AccessibleEmacsByteRange, CharLen, CharPos0, CharRange, DisplayColumn,
     EmacsByteLen, EmacsBytePos, EmacsByteRange, FullBufferLispCharRange, LispBytePos1,

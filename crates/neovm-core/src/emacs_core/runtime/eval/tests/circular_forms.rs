@@ -110,8 +110,8 @@ fn circular_form_macroexpand_all_signals_circular_list() {
 }
 
 /// Special forms: the up-front `list_length` in `eval_sub` signals before
-/// the form runs, reporting the argument list for a cycle through it and
-/// the looping cons for a prefixed cycle.
+/// the form runs, reporting the cons found by the pinned GNU Brent schedule.
+/// For a three-cons cycle this need not be the argument-list head.
 #[test]
 fn circular_form_special_form_args_signal_circular_list() {
     let gnu = "(circular-list t)";
@@ -123,7 +123,7 @@ fn circular_form_special_form_args_signal_circular_list() {
         ),
         (
             "(let ((c (list 'progn 1 2 3))) (setcdr (nthcdr 3 c) (cdr c))
-               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) (cdr c))))))",
+               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) (nthcdr 3 c))))))",
             gnu,
         ),
         (
@@ -150,7 +150,7 @@ fn circular_form_special_form_args_signal_circular_list() {
         ),
         (
             "(let ((c (list 'setq 'x 1))) (setcdr (nthcdr 2 c) c)
-               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) (cdr c))))))",
+               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) c)))))",
             gnu,
         ),
         (
@@ -314,7 +314,7 @@ fn circular_form_call_and_macro_args_signal_circular_list() {
         ),
         (
             "(let ((c (list 'when t 1))) (setcdr (nthcdr 2 c) c)
-               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) (cdr c))))))",
+               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) c)))))",
             gnu,
         ),
     ]);
@@ -335,7 +335,7 @@ fn circular_form_macroexpand_args_signal_circular_list() {
         (
             "(let ((c (list 'when t 1))) (setcdr (nthcdr 2 c) c)
                (condition-case e (macroexpand c)
-                 (error (list (car e) (eq (cadr e) (cdr c))))))",
+                 (error (list (car e) (eq (cadr e) c)))))",
             gnu,
         ),
         (
@@ -379,7 +379,7 @@ fn assert_tier_i_cases(cases: &[(&'static str, &'static str)]) {
                         Ok(value) => print_value(&value),
                         Err(err) => format!("ERR {err:?}"),
                     };
-                    let datum = eval.obarray.symbol_value("fix15-datum").copied();
+                    let datum = eval.obarray.symbol_value_copied("fix15-datum");
                     if let Some(datum) = datum.filter(|datum| datum.is_cons()) {
                         let live = eval.tagged_heap.owns_heap_value_for_test(datum);
                         printed.push_str(if live { " live" } else { " FREED" });
@@ -647,7 +647,7 @@ fn improper_let_star_keeps_original_datum_after_moving_roots_advance() {
                         print_value(&eval.eval_str("(fix15-original-datum)").unwrap()),
                         "3"
                     );
-                    let original_bits = eval.obarray.symbol_value("fix15-c").unwrap().bits();
+                    let original_bits = eval.obarray.symbol_value_copied("fix15-c").unwrap().bits();
                     eval.eval_str("(setq fix15-gc t fix15-n 0)").unwrap();
                     let runs_before = eval.tier_i.stats().count(TierIEvent::Run);
                     let condition = eval
@@ -658,7 +658,7 @@ fn improper_let_star_keeps_original_datum_after_moving_roots_advance() {
                         )
                         .unwrap();
                     assert_eq!(print_value(&condition), "(wrong-type-argument listp)");
-                    let datum = *eval.obarray.symbol_value("fix15-datum").unwrap();
+                    let datum = eval.obarray.symbol_value_copied("fix15-datum").unwrap();
                     assert_eq!(datum.bits(), original_bits, "{mode:?}, lexical={lex}");
                     // Check ownership before dereferencing/printing the cons.
                     assert!(eval.tagged_heap.owns_heap_value_for_test(datum));
@@ -677,7 +677,10 @@ fn improper_let_star_keeps_original_datum_after_moving_roots_advance() {
             }
         })
         .expect("spawn improper-let-star-datum thread");
-    assert_eq!(rx.recv_timeout(STARTUP_TIMEOUT).expect("runtime startup"), "");
+    assert_eq!(
+        rx.recv_timeout(STARTUP_TIMEOUT).expect("runtime startup"),
+        ""
+    );
     for mode in MODES {
         for lex in ["nil", "t"] {
             assert_eq!(
