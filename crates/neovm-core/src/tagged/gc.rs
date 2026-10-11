@@ -2789,9 +2789,10 @@ mod cons_block_trailer;
 use cons_block_trailer::*;
 mod collection_observed;
 pub(crate) use collection_observed::{
-    advance_collection_observation_epoch, clear_noncons_collection_observed_metadata,
-    collection_observation_epoch, collection_observed, collection_observed_metadata,
-    cons_collection_observed_word, has_collection_observations, mark_collection_observed,
+    CollectionObservedWord, advance_collection_observation_epoch,
+    clear_noncons_collection_observed_metadata, collection_observation_epoch, collection_observed,
+    collection_observed_word, cons_collection_observed_word, has_collection_observations,
+    mark_collection_observed,
 };
 use collection_observed::{
     clear_cons_observed_block, clear_cons_observed_dead, has_noncons_collection_observations,
