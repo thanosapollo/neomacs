@@ -10247,8 +10247,9 @@ fn format_padding_child_under_address_limit() {
 }
 
 /// User-sized formatting must either succeed or signal a catchable error,
-/// never abort. Neomacs can fit width padding into one result buffer; GNU
-/// 31 and 32 instead signal memory-full for these 256 MiB cases with only
+/// never abort. Neomacs can fit width padding into one result buffer in
+/// some build profiles, but success at that limit is allocator-dependent;
+/// GNU 31 and 32 signal memory-full for these 256 MiB cases with only
 /// 384 MiB spare address space. Numeric precision uses intermediate storage
 /// in both GNU and the upstream formatter: verify successful 64 MiB controls
 /// and catchable exhaustion at 256 MiB. Each form gets its own limited child.
@@ -10261,11 +10262,31 @@ fn format_padding_is_written_into_the_reserved_result() {
     );
     let mut failures = Vec::new();
     for (src, expected) in [
-        ("(length (format \"%268435456f\" 1.0))", "268435456"),
-        ("(length (format \"%-268435456f\" 1.0))", "268435456"),
-        ("(length (format \"%0268435456f\" -1.0))", "268435456"),
-        ("(length (format \"%268435456d\" 1))", "268435456"),
-        ("(length (format \"%268435456s\" \"a\"))", "268435456"),
+        (
+            "(condition-case e (length (format \"%268435456f\" 1.0)) (error (substring (car (cdr e)) 0 16)))",
+            "268435456",
+        ),
+        (
+            "(condition-case e (length (format \"%-268435456f\" 1.0)) (error (substring (car (cdr e)) 0 16)))",
+            "268435456",
+        ),
+        (
+            "(condition-case e (length (format \"%0268435456f\" -1.0)) (error (substring (car (cdr e)) 0 16)))",
+            "268435456",
+        ),
+        (
+            "(condition-case e (length (format \"%268435456d\" 1)) (error (substring (car (cdr e)) 0 16)))",
+            "268435456",
+        ),
+        (
+            "(condition-case e (length (format \"%268435456s\" \"a\")) (error (substring (car (cdr e)) 0 16)))",
+            "268435456",
+        ),
+        ("(length (format \"%67108864f\" 1.0))", "67108864"),
+        ("(length (format \"%-67108864f\" 1.0))", "67108864"),
+        ("(length (format \"%067108864f\" -1.0))", "67108864"),
+        ("(length (format \"%67108864d\" 1))", "67108864"),
+        ("(length (format \"%67108864s\" \"a\"))", "67108864"),
         ("(length (format \"%.67108864d\" 1))", "67108864"),
         ("(length (format \"%.67108864f\" 1.0))", "67108866"),
         (
@@ -10334,8 +10355,14 @@ fn format_padding_is_written_into_the_reserved_result() {
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
             ));
-        } else if !stdout.contains(&format!("RESULT={expected}\n")) {
-            failures.push(format!("{src}: expected {expected}\n{stdout}"));
+        } else if !stdout.contains(&format!("RESULT={expected}\n"))
+            && !(src.starts_with("(condition-case")
+                && expected == "268435456"
+                && stdout.contains("RESULT=\"Memory exhausted\"\n"))
+        {
+            failures.push(format!(
+                "{src}: expected {expected} or GNU memory exhaustion for a large field\n{stdout}"
+            ));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
