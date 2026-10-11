@@ -9964,20 +9964,42 @@ fn oversized_requests_signal_or_succeed_like_gnu() {
         let value = ev.eval_str(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
         crate::emacs_core::print_value_with_eval(&ev, &value)
     };
-    for size in [
-        "(make-string most-positive-fixnum ?a)",
-        "(make-string most-positive-fixnum ?\u{e9})",
-        "(make-string (/ most-positive-fixnum 2) ?\u{e9})",
-        "(make-vector most-positive-fixnum nil)",
-        "(make-list most-positive-fixnum nil)",
-        "(make-hash-table :size most-positive-fixnum)",
-        "(make-bool-vector most-positive-fixnum nil)",
+    for (size, expected) in [
+        (
+            "(make-string most-positive-fixnum ?a)",
+            "\"Memory exhausted\"",
+        ),
+        // GNU 31 and 32 reject the multibyte byte extent before allocation.
+        (
+            "(make-string most-positive-fixnum ?\u{e9})",
+            "\"Maximum string s\"",
+        ),
+        (
+            "(make-string (/ most-positive-fixnum 2) ?\u{e9})",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(make-vector most-positive-fixnum nil)",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(make-list most-positive-fixnum nil)",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(make-hash-table :size most-positive-fixnum)",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(make-bool-vector most-positive-fixnum nil)",
+            "\"Memory exhausted\"",
+        ),
     ] {
         assert_eq!(
             eval(&format!(
                 "(condition-case e {size} (error (substring (car (cdr e)) 0 16)))"
             )),
-            "\"Memory exhausted\"",
+            expected,
             "{size}"
         );
     }
@@ -10224,14 +10246,12 @@ fn format_padding_child_under_address_limit() {
     );
 }
 
-/// Padding and excess-precision zeros are sized by the user, so GNU
-/// `styled_format` writes them straight into its one result buffer and
-/// signals memory-full when that cannot grow.  Building them in a separate
-/// string aborted the process once the result had room for the field but
-/// the heap had none for a second copy.  Every later growth must signal
-/// the same way: the text after a field, and the final copy into a string.
-/// Each form runs in a child process limited to 384 MiB more address space:
-/// a 256 MiB field fits once, not twice, and a 1 GiB field never fits.
+/// User-sized formatting must either succeed or signal a catchable error,
+/// never abort. Neomacs can fit width padding into one result buffer; GNU
+/// 31 and 32 instead signal memory-full for these 256 MiB cases with only
+/// 384 MiB spare address space. Numeric precision uses intermediate storage
+/// in both GNU and the upstream formatter: verify successful 64 MiB controls
+/// and catchable exhaustion at 256 MiB. Each form gets its own limited child.
 #[test]
 fn format_padding_is_written_into_the_reserved_result() {
     crate::test_utils::init_test_tracing();
@@ -10246,8 +10266,16 @@ fn format_padding_is_written_into_the_reserved_result() {
         ("(length (format \"%0268435456f\" -1.0))", "268435456"),
         ("(length (format \"%268435456d\" 1))", "268435456"),
         ("(length (format \"%268435456s\" \"a\"))", "268435456"),
-        ("(length (format \"%.268435456d\" 1))", "268435456"),
-        ("(length (format \"%.268435456f\" 1.0))", "268435458"),
+        ("(length (format \"%.67108864d\" 1))", "67108864"),
+        ("(length (format \"%.67108864f\" 1.0))", "67108866"),
+        (
+            "(condition-case e (format \"%.268435456d\" 1) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
+        (
+            "(condition-case e (format \"%.268435456f\" 1.0) (error (substring (car (cdr e)) 0 16)))",
+            "\"Memory exhausted\"",
+        ),
         (
             "(condition-case e (format \"%1073741824f\" 1.0) (error (substring (car (cdr e)) 0 16)))",
             "\"Memory exhausted\"",
