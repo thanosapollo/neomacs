@@ -2099,6 +2099,9 @@ pub(crate) struct ModeLineNumberAnchor {
     pub(crate) accessible_start: EmacsBytePos,
     pub(crate) line_start: EmacsBytePos,
     pub(crate) line_number: usize,
+    /// Text revision at which the coordinate was counted. Unlike the dirty
+    /// region, this survives a redisplay acknowledgement before the next use.
+    pub(crate) chars_modified_tick: i64,
 }
 
 impl AccessibleBufferRegionSnapshot {
@@ -2295,8 +2298,8 @@ pub struct Buffer {
     /// xdisp.c:29486-29620, held per BUFFER here): the accessible-region
     /// origin plus a recently displayed line start, so `%l` counts newlines
     /// only from the anchor instead of from BUF_BEGV. Validity is checked
-    /// against both the restriction and the unchanged-region accumulator (the
-    /// BEG_UNCHANGED analog) at each use.
+    /// against the restriction and text revision at each use, independently
+    /// of redisplay's resettable unchanged-region accumulator.
     pub(crate) line_number_anchor: std::cell::Cell<Option<ModeLineNumberAnchor>>,
     /// Unique identifier.
     pub(crate) id: BufferId,
@@ -2476,6 +2479,10 @@ impl Buffer {
     }
 
     fn swap_owned_text_state_with(&mut self, other: &mut Self) {
+        // These buffer-local counts belonged to the outgoing text. Incoming
+        // character ticks can collide with their cached revisions.
+        self.line_number_anchor.set(None);
+        other.line_number_anchor.set(None);
         mem::swap(&mut self.text, &mut other.text);
         mem::swap(&mut self.point, &mut other.point);
         mem::swap(&mut self.accessible_start, &mut other.accessible_start);
@@ -7502,6 +7509,13 @@ impl BufferManager {
         let root_id = self.modified_state_root_id(id)?;
         let buf = self.storage_mut().buffers.get_mut(&root_id)?;
         buf.text.set_modified_tick(tick);
+        // MODIFF is explicitly settable: a later character edit can reuse a
+        // cached CHARS_MODIFF. Invalidate every view of this shared text now.
+        for buf in self.storage_mut().buffers.values_mut() {
+            if buf.base_buffer.unwrap_or(buf.id) == root_id {
+                buf.line_number_anchor.set(None);
+            }
+        }
         Some(())
     }
 
