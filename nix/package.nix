@@ -97,61 +97,6 @@ let
           ":"
           "${wpeWebkit}/libexec/wpe-webkit-2.0"
         ];
-  # makeWrapper arguments, as shell words interpolated into postInstall.
-  # They configure the editor process itself: its private library path,
-  # runtime root, drivers and plugins.
-  wrapArgs = [
-    "--prefix"
-    "LD_LIBRARY_PATH"
-    ":"
-    "\"${pkgs.lib.makeLibraryPath runtimeLibs}\""
-    "--set-default"
-    "RUST_LOG"
-    "info"
-    "--set-default"
-    "NEOMACS_RUNTIME_ROOT"
-    "\"$out/share/neomacs\""
-  ]
-  ++ linuxWrapArgs;
-  # Every variable those arguments change.
-  wrappedEnvironmentNames = lib.unique (
-    lib.concatLists (
-      lib.imap0 (
-        index: arg:
-        lib.optional (builtins.elem arg [
-          "--set"
-          "--set-default"
-          "--unset"
-          "--prefix"
-          "--suffix"
-          "--prefix-each"
-          "--suffix-each"
-          "--prefix-contents"
-          "--suffix-contents"
-        ]) (builtins.elemAt wrapArgs (index + 1))
-      ) wrapArgs
-    )
-  );
-  # Before changing anything, record what the user's environment held:
-  # NEOMACS_WRAPPER_ENV lists the changed names and
-  # NEOMACS_WRAPPER_ORIGINAL_<NAME> holds each one that was set.  Neomacs
-  # starts `initial-environment' and `process-environment' from that record,
-  # so subprocesses inherit the user's environment rather than the editor's
-  # private Nix library path.  A name already recorded by an enclosing
-  # wrapped launch keeps its first, original value.
-  recordOriginalEnvironment = lib.concatMapStrings (name: ''
-    case ":''${NEOMACS_WRAPPER_ENV-}:" in
-      *:${name}:*) ;;
-      *)
-        if [ -n "''${${name}+x}" ]; then
-          export NEOMACS_WRAPPER_ORIGINAL_${name}="''${${name}}"
-        else
-          unset NEOMACS_WRAPPER_ORIGINAL_${name}
-        fi
-        export NEOMACS_WRAPPER_ENV="''${NEOMACS_WRAPPER_ENV:+''${NEOMACS_WRAPPER_ENV}:}${name}"
-        ;;
-    esac
-  '') wrappedEnvironmentNames;
 in
 craneLib.buildPackage (
   commonArgs
@@ -213,8 +158,19 @@ craneLib.buildPackage (
       ln -s neomacsclient "$out/bin/emacsclient"
 
       wrapProgram "$out/bin/neomacs" \
-        --run ${lib.escapeShellArg recordOriginalEnvironment} \
-        ${lib.concatStringsSep " \\\n        " wrapArgs}
+        --set-default RUST_LOG info \
+        --set-default NEOMACS_RUNTIME_ROOT "$out/share/neomacs" \
+        ${lib.concatStringsSep " \\\n        " linuxWrapArgs}
+    '';
+
+    # Neomacs opens some runtime libraries with dlopen (Vulkan, Wayland,
+    # xkbcommon, X11, GL), so they are not in its DT_NEEDED list.  Record
+    # their directories in the executable's RUNPATH rather than in a wrapper
+    # LD_LIBRARY_PATH, which every program started from Neomacs would
+    # inherit.  This runs after fixup has shrunk the RUNPATH to linked
+    # libraries, so the dlopen-only directories are kept.
+    postFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+      patchelf --add-rpath "${lib.makeLibraryPath runtimeLibs}" "$out/bin/.neomacs-wrapped"
     '';
 
     passthru = {

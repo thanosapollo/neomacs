@@ -67,8 +67,10 @@ let
         test -f ${checkedPackage}/bin/neomacs.pdump
         test ! -e ${checkedPackage}/bin/libneomacs_video_gstreamer.so
 
-        readelf --dynamic ${checkedPackage}/bin/neomacs \
-          | grep -Eq 'Shared library: \[libgstreamer-1[.]0[.]so'
+        ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+          readelf --dynamic ${checkedPackage}/bin/.neomacs-wrapped \
+            | grep -Eq 'Shared library: \[libgstreamer-1[.]0[.]so'
+        ''}
 
         fingerprint="$(${checkedPackage}/bin/neomacs --fingerprint | tr -d '[:space:]')"
         if ! [[ "$fingerprint" =~ ^[[:xdigit:]]{64}$ ]]; then
@@ -91,27 +93,36 @@ let
           marker = "nix installed-package contract ok";
         }}
 
-        # The wrapper's private library path, runtime root and plugin paths
-        # configure Neomacs itself; a subprocess gets the launching
-        # environment back, unset variables included.
-        cat > child-environment.sh <<'EOF'
-        for v in LD_LIBRARY_PATH NEOMACS_RUNTIME_ROOT RUST_LOG NEOMACS_WRAPPER_ENV; do
-          eval "if [ -n \"\''${$v+x}\" ]; then echo \"$v=\$$v\"; else echo $v!; fi"
-        done
-        EOF
-        child_environment_form="(progn (call-process \"${pkgs.runtimeShell}\" nil t nil \"$PWD/child-environment.sh\") (princ (buffer-string)))"
-        test "$(env -u LD_LIBRARY_PATH -u NEOMACS_RUNTIME_ROOT -u RUST_LOG \
-                  ${checkedPackage}/bin/neomacs --batch --eval "$child_environment_form")" \
-          = "$(printf '%s\n' LD_LIBRARY_PATH! NEOMACS_RUNTIME_ROOT! RUST_LOG! NEOMACS_WRAPPER_ENV!)"
-        test "$(env -u NEOMACS_RUNTIME_ROOT LD_LIBRARY_PATH=/user/lib RUST_LOG=warn \
-                  ${checkedPackage}/bin/neomacs --batch --eval "$child_environment_form")" \
-          = "$(printf '%s\n' LD_LIBRARY_PATH=/user/lib NEOMACS_RUNTIME_ROOT! RUST_LOG=warn NEOMACS_WRAPPER_ENV!)"
-        # A stale saved value without its list does not bring back a
-        # variable the user had unset.
-        test "$(env -u LD_LIBRARY_PATH -u NEOMACS_RUNTIME_ROOT -u RUST_LOG \
-                  NEOMACS_WRAPPER_ORIGINAL_LD_LIBRARY_PATH=/stale/lib \
-                  ${checkedPackage}/bin/neomacs --batch --eval "$child_environment_form")" \
-          = "$(printf '%s\n' LD_LIBRARY_PATH! NEOMACS_RUNTIME_ROOT! RUST_LOG! NEOMACS_WRAPPER_ENV!)"
+        ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+          # Runtime libraries are found through the executable's RUNPATH,
+          # including ones it only opens with dlopen, not through a wrapper
+          # LD_LIBRARY_PATH that subprocesses would inherit.
+          if grep -q LD_LIBRARY_PATH ${checkedPackage}/bin/neomacs; then
+            echo "the neomacs wrapper sets LD_LIBRARY_PATH" >&2
+            exit 1
+          fi
+          runpath="$(readelf --dynamic ${checkedPackage}/bin/.neomacs-wrapped | grep -F '(RUNPATH)')"
+          for dir in ${lib.getLib pkgs.vulkan-loader}/lib ${lib.getLib pkgs.libxkbcommon}/lib; do
+            grep -Fq "$dir" <<<"$runpath"
+          done
+
+          # A subprocess sees the LD_LIBRARY_PATH Neomacs was started with:
+          # none, or the user's own value unchanged.
+          cat > child-ld-library-path.sh <<'EOF'
+          if [ -n "''${LD_LIBRARY_PATH+x}" ]; then
+            echo "child LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+          else
+            echo "child LD_LIBRARY_PATH unset"
+          fi
+          EOF
+          child_form="(princ (with-temp-buffer (call-process \"${pkgs.runtimeShell}\" nil t nil \"$PWD/child-ld-library-path.sh\") (buffer-string)))"
+          output="$(env -u LD_LIBRARY_PATH ${checkedPackage}/bin/neomacs --batch --eval "$child_form")"
+          grep -Fqx "child LD_LIBRARY_PATH unset" <<<"$output"
+          output="$(env LD_LIBRARY_PATH=/user/lib ${checkedPackage}/bin/neomacs --batch --eval "$child_form")"
+          grep -Fqx "child LD_LIBRARY_PATH=/user/lib" <<<"$output"
+          output="$(env LD_LIBRARY_PATH= ${checkedPackage}/bin/neomacs --batch --eval "$child_form")"
+          grep -Fqx "child LD_LIBRARY_PATH=" <<<"$output"
+        ''}
 
         touch "$out"
       '';

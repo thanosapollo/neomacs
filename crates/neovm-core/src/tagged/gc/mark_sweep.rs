@@ -60,6 +60,10 @@ impl TaggedHeap {
     /// (`begin_stw_collection`) called it: only that entry pre-marks the
     /// image for a first partition cycle (`premark_mapped_image`).
     pub(super) fn begin_collection_with(&mut self, stw_entry: bool) {
+        assert!(
+            !self.concurrent_mark_running,
+            "collection requires an explicit successful marker finish"
+        );
         #[cfg(debug_assertions)]
         crate::tagged::mutate::debug_assert_no_heap_mut_closure();
         if stw_entry {
@@ -219,12 +223,24 @@ impl TaggedHeap {
                 // for the GC thread (`launch_concurrent_mark` moves them
                 // into the job).
                 self.seed_mapped_string_children();
-                self.staged_mapped_veclikes = Some(
-                    self.mapped_veclike_objects
-                        .iter()
-                        .map(|o| o.header as usize)
-                        .collect(),
-                );
+                let mapped_veclikes = {
+                    // SAFETY: this stopped start owns the heap's only writer,
+                    // including its TLS aliases. No Lisp callback or safepoint
+                    // intervenes before launch; the cycle retains captured
+                    // mappings, fixed char-table spans and retired vectors.
+                    let world = unsafe { scan_contract::SingleMutatorWorld::from_heap(self) };
+                    // SAFETY: this heap's mapped registry supplies live headers
+                    // and immutable mappings. Owned vector buffers retire before
+                    // replacement; char-table writers preserve fixed lengths.
+                    // Mutable owned record buffers are deferred by capture.
+                    unsafe {
+                        MappedVeclikeScanSnapshot::capture(
+                            &world,
+                            world.heap().mapped_veclike_objects.iter().map(|o| o.header),
+                        )
+                    }
+                };
+                self.staged_mapped_veclikes = Some(mapped_veclikes);
                 self.staged_mapped_cons_scan = Some(
                     self.mapped_cons_ranges
                         .iter()
@@ -767,7 +783,7 @@ impl TaggedHeap {
         // owner inserted meanwhile would be merged back.
         let owners = std::mem::take(&mut self.mapped_remembered);
         for &bits in &owners {
-            self.push_value_children_to_gray(TaggedValue(bits), "remembered-dump-child");
+            self.push_value_children_to_gray(TaggedValue::from_bits(bits), "remembered-dump-child");
         }
         let inserted = std::mem::replace(&mut self.mapped_remembered, owners);
         self.mapped_remembered.extend(inserted);
@@ -1445,6 +1461,9 @@ impl TaggedHeap {
                         return;
                     }
                     sink.child(data.arglist);
+                    if let Some(child) = data.params.heap_child() {
+                        sink.child(child);
+                    }
                     sink.children(data.constants.iter().copied());
                     if let Some(env) = data.env {
                         sink.child(env);
@@ -1586,6 +1605,10 @@ impl TaggedHeap {
     }
 
     pub(crate) fn complete_collection(&mut self) {
+        assert!(
+            !self.concurrent_mark_running,
+            "sweeping requires an explicit successful marker finish"
+        );
         // Collector code never sees an open allocation region
         // (`alloc_region.rs`, invariant I2).
         self.close_alloc_regions();
