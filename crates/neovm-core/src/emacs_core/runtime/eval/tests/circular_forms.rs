@@ -6,9 +6,8 @@
 //! datum is the cons where the walk met its tortoise.
 //!
 //! Each case evaluates to `(CONDITION DATUM-IS-EXPECTED-CONS ...)`; the
-//! expected strings are GNU's output for the same forms on the emacs-31.1
-//! `FOR_EACH_TAIL` Brent schedule (checked with GNU 30.2, whose lisp.h walk
-//! and `let`/`let*` are unchanged in 31.1).  The cases run on a worker
+//! list_length cases follow GNU Emacs 32; callback-sensitive FOR_EACH_TAIL
+//! cases retain the emacs-31.1 schedule. The cases run on a worker
 //! thread so a regression fails here instead of hanging.
 
 use crate::emacs_core::eval::{TierIEvent, TierIMode};
@@ -110,8 +109,8 @@ fn circular_form_macroexpand_all_signals_circular_list() {
 }
 
 /// Special forms: the up-front `list_length` in `eval_sub` signals before
-/// the form runs, reporting the cons found by the pinned GNU Brent schedule.
-/// For a three-cons cycle this need not be the argument-list head.
+/// the form runs, reporting the cons found by GNU Emacs 32 list_length.
+/// A short cycle reports the argument-list head.
 #[test]
 fn circular_form_special_form_args_signal_circular_list() {
     let gnu = "(circular-list t)";
@@ -123,7 +122,7 @@ fn circular_form_special_form_args_signal_circular_list() {
         ),
         (
             "(let ((c (list 'progn 1 2 3))) (setcdr (nthcdr 3 c) (cdr c))
-               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) (nthcdr 3 c))))))",
+               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) (cdr c))))))",
             gnu,
         ),
         (
@@ -150,7 +149,7 @@ fn circular_form_special_form_args_signal_circular_list() {
         ),
         (
             "(let ((c (list 'setq 'x 1))) (setcdr (nthcdr 2 c) c)
-               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) c)))))",
+               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) (cdr c))))))",
             gnu,
         ),
         (
@@ -314,7 +313,7 @@ fn circular_form_call_and_macro_args_signal_circular_list() {
         ),
         (
             "(let ((c (list 'when t 1))) (setcdr (nthcdr 2 c) c)
-               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) c)))))",
+               (condition-case e (eval c t) (error (list (car e) (eq (cadr e) (cdr c))))))",
             gnu,
         ),
     ]);
@@ -335,7 +334,7 @@ fn circular_form_macroexpand_args_signal_circular_list() {
         (
             "(let ((c (list 'when t 1))) (setcdr (nthcdr 2 c) c)
                (condition-case e (macroexpand c)
-                 (error (list (car e) (eq (cadr e) c)))))",
+                 (error (list (car e) (eq (cadr e) (cdr c))))))",
             gnu,
         ),
         (
