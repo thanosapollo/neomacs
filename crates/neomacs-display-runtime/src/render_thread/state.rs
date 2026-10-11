@@ -1210,4 +1210,5 @@ impl RenderApp {
 }
 
 #[cfg(test)]
+#[path = "state/tests/state_test.rs"]
 mod tests;

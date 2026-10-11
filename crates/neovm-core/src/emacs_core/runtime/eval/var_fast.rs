@@ -26,7 +26,7 @@
 //! `neovm--vm-profile-dump` prints them.
 
 use super::*;
-use crate::emacs_core::forward::{ForwardStore, LispBufferObjFwd, LispFwd, LispFwdType};
+use crate::emacs_core::forward::{ForwardStore, LispFwd, LispFwdType};
 use crate::emacs_core::symbol::{
     BlvCacheHit, LispSymbol, SYMCELL_INLINE_WRITE_MASK, SymbolRedirect, symcell_inline_write_value,
 };
@@ -345,11 +345,8 @@ impl Context {
             return Some(value);
         }
         // `load` answers `None` for exactly the per-buffer slot.
-        debug_assert_eq!(fwd.ty, LispFwdType::BufferObj);
+        let buf_fwd = fwd.as_buffer_obj_fwd()?;
         let buf = self.buffers.current_buffer()?;
-        // SAFETY: a `BufferObj` descriptor is a `LispBufferObjFwd`, whose
-        // first field is the shared header (`#[repr(C)]`).
-        let buf_fwd = unsafe { &*(fwd as *const LispFwd as *const LispBufferObjFwd) };
         let value = buf_fwd.value_in(
             Some(&buf.slots[..]),
             buf.local_flags,
@@ -393,10 +390,42 @@ impl Context {
 
     #[inline(always)]
     fn try_set_var_cached_impl<const COMPILED: bool>(&mut self, id: SymId, value: Value) -> bool {
+        self.try_set_var_cached_in_obarray::<COMPILED>(&self.obarray, id, value)
+    }
+
+    /// The uncompiled cached-set tier under a short, noncalling Obarray read.
+    /// The manager root has already been chosen by this owner's live operand
+    /// phase. Plain cells remain the exclusive CellWrite phase's responsibility;
+    /// these unchanged commits touch only the admitted BLV cons or forwarder.
+    ///
+    /// # Safety
+    /// `obarray` must be this Context owner's current manager, loaned from its
+    /// still-live unpublished cursor. No manager/interior reference escapes,
+    /// and neither the closure nor this method may call Lisp, collect or
+    /// replace owner/manager storage. The caller must select this method only
+    /// for uncompiled stores; compiled observation policy uses the existing
+    /// const-generic wrappers instead.
+    #[inline(never)]
+    pub(crate) unsafe fn try_set_var_cached_in_uncompiled_read_phase(
+        &self,
+        obarray: &crate::emacs_core::symbol::Obarray,
+        id: SymId,
+        value: Value,
+    ) -> bool {
+        self.try_set_var_cached_in_obarray::<false>(obarray, id, value)
+    }
+
+    #[inline(always)]
+    fn try_set_var_cached_in_obarray<const COMPILED: bool>(
+        &self,
+        obarray: &crate::emacs_core::symbol::Obarray,
+        id: SymId,
+        value: Value,
+    ) -> bool {
         if !var_cache_tier_on(VarCacheTier::Set) {
             return false;
         }
-        let Some(sym) = self.obarray.get_by_id(id) else {
+        let Some(sym) = obarray.get_by_id(id) else {
             return false;
         };
         let window = sym.write_window() & SYMCELL_INLINE_WRITE_MASK;
@@ -459,7 +488,7 @@ impl Context {
         };
         // A per-buffer slot has local-flag and default-propagation rules;
         // `store_runtime_binding` writes a slot-named symbol's buffer slot.
-        if fwd.ty == LispFwdType::BufferObj
+        if fwd.ty() == LispFwdType::BufferObj
             || crate::buffer::buffer::lookup_buffer_slot_by_sym_id(id).is_some()
         {
             return false;
@@ -578,7 +607,7 @@ impl Context {
     ) -> bool {
         // A per-buffer slot binds `LetLocal`/`LetDefault` by its local flag;
         // a keyboard variable is GNU's `where.kbd` binding.
-        if matches!(fwd.ty, LispFwdType::BufferObj | LispFwdType::KboardObj) {
+        if matches!(fwd.ty(), LispFwdType::BufferObj | LispFwdType::KboardObj) {
             return false;
         }
         let Some(old) = fwd.load().filter(|old| !old.is_unbound()) else {
@@ -642,7 +671,8 @@ impl Context {
         }
         let popped = match (sym.forwarded_descriptor(), old.get()) {
             (Some(fwd), Some(old))
-                if fwd.ty != LispFwdType::BufferObj && !self.runtime_binding_has_projection(id) =>
+                if fwd.ty() != LispFwdType::BufferObj
+                    && !self.runtime_binding_has_projection(id) =>
             {
                 match fwd.store(old) {
                     Ok(store) => {
@@ -810,7 +840,7 @@ fn read_cached_binding_old<const COMPILED: bool>(cell: Value) -> Value {
 fn forward_rule(fwd: Option<&'static LispFwd>, value: Value) -> Option<Value> {
     match fwd {
         None => Some(value),
-        Some(fwd) if fwd.ty == LispFwdType::BufferObj => None,
+        Some(fwd) if fwd.ty() == LispFwdType::BufferObj => None,
         Some(fwd) => fwd.store(value).ok().map(ForwardStore::canonical_value),
     }
 }

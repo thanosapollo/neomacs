@@ -63,6 +63,11 @@ pub(super) fn is_eligible(
         && std::env::var_os("NEOMACS_DISABLE_RETAINED_STATIC").is_none()
 }
 
+pub(super) fn is_valid(render: &GuiFrameRenderState, size: SnapshotSize) -> bool {
+    matches!(&render.compositor.retained_static,
+        Some(rs) if rs.generation == render.compositor.current_scene_generation && rs.texture.size() == size)
+}
+
 /// Compose one frame from the retained cursorless scene: blit it, draw the
 /// cursor over it, and redraw each filled-box cell.
 ///
@@ -86,13 +91,13 @@ pub(super) fn draw(
     inputs: &FrameDrawInputs<'_>,
     cursor_visible: bool,
     hovered_scroll_bar: Option<neomacs_display_protocol::ScrollBarIdentity>,
-) -> ModelPicture {
+) -> Result<ModelPicture, super::surface::FrameRenderFailure> {
     let Some(native_size) = SnapshotSize::new(native.content_size().0, native.content_size().1)
     else {
         // wgpu rejects a zero extent, so there is no scene to retain and
         // nothing to composite from. Reaching this would mean the window was
         // asked to draw at a size `resize` already refuses to configure.
-        return ModelPicture::new();
+        return Ok(ModelPicture::new());
     };
     let generation = render.compositor.current_scene_generation;
     let retained_valid = matches!(
@@ -102,6 +107,7 @@ pub(super) fn draw(
             (generation, native_size, inputs.models),
         )
     );
+
     if !retained_valid {
         ensure_retained_static_texture(renderer, render, native_size);
         let retained_view = render
@@ -127,7 +133,7 @@ pub(super) fn draw(
             inputs,
             false,
             true,
-        );
+        )?;
         let cells = build_filled_box_cursor_cells(
             frame,
             native.scale_factor as f32,
@@ -177,14 +183,14 @@ pub(super) fn draw(
         );
     }
     frame_stats::count(&frame_stats::COMPOSITE_ONLY_FRAMES);
-    retained_frame_picture(
+    Ok(retained_frame_picture(
         render
             .compositor
             .retained_static
             .as_ref()
             .map(|rs| &rs.models.picture),
         picture_of(renderer.take_drawn_surfaces(), inputs.models),
-    )
+    ))
 }
 
 /// What a retained-static frame pictures of the models: the retained
@@ -258,6 +264,7 @@ pub(in crate::render_thread) fn retained_scene_is_current(
             .depends_on
             .iter()
             .all(|(id, snapshot)| now.2.get(id) == snapshot.as_ref())
+
 }
 
 /// Build a single-glyph mini-frame for each filled-box cursor in the frame
@@ -397,7 +404,7 @@ pub(super) fn pointer_appearance_allowed(pointer_appearance: &PointerAppearanceS
 ///
 /// [`UnpooledTexture::RetainedStaticScene`]:
 ///     neomacs_renderer_wgpu::UnpooledTexture::RetainedStaticScene
-fn ensure_retained_static_texture(
+pub(super) fn ensure_retained_static_texture(
     renderer: &WgpuRenderer,
     render: &mut GuiFrameRenderState,
     size: SnapshotSize,
@@ -422,4 +429,5 @@ fn ensure_retained_static_texture(
 }
 
 #[cfg(test)]
+#[path = "retained_static/tests/retained_static_test.rs"]
 mod tests;

@@ -778,6 +778,67 @@ pub(crate) enum TtyInputDecoding {
     KeyboardCodingSystem,
 }
 
+/// GNU `read_char` changes the idle epoch only when it has no end time.
+/// A timed read inside an idle callback belongs to the existing idle episode.
+#[derive(Clone, Copy, Debug)]
+enum ReadCharWaitMode {
+    Unbounded,
+    Timed { deadline: std::time::Instant },
+}
+
+impl ReadCharWaitMode {
+    fn from_timeout(timeout: Option<std::time::Duration>) -> Self {
+        match timeout {
+            None => Self::Unbounded,
+            Some(timeout) => Self::Timed {
+                deadline: std::time::Instant::now() + timeout,
+            },
+        }
+    }
+
+    fn deadline(self) -> Option<std::time::Instant> {
+        match self {
+            Self::Unbounded => None,
+            Self::Timed { deadline } => Some(deadline),
+        }
+    }
+
+    fn idle_policy(self) -> IdleTransitionPolicy {
+        match self {
+            Self::Unbounded => IdleTransitionPolicy::Manage,
+            Self::Timed { .. } => IdleTransitionPolicy::Preserve,
+        }
+    }
+}
+
+/// Whether input servicing owns the current idle episode. Timed Lisp reads
+/// leave it unchanged, including while servicing events in the unified wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IdleTransitionPolicy {
+    Manage,
+    Preserve,
+}
+
+impl IdleTransitionPolicy {
+    pub(crate) fn start_idle(self, eval: &mut crate::emacs_core::Context) {
+        if matches!(self, Self::Manage) {
+            eval.timer_start_idle();
+        }
+    }
+
+    pub(crate) fn stop_idle(self, eval: &mut crate::emacs_core::Context) {
+        if matches!(self, Self::Manage) {
+            eval.timer_stop_idle();
+        }
+    }
+
+    pub(crate) fn resume_idle(self, eval: &mut crate::emacs_core::Context) {
+        if matches!(self, Self::Manage) {
+            eval.timer_resume_idle();
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum CommandKeyRecording {
     Append,
@@ -1594,6 +1655,23 @@ enum KeyEchoState {
     },
 }
 
+impl crate::gc_trace::GcTrace for KeyEchoState {
+    fn trace_roots(&self, roots: &mut Vec<Value>) {
+        self.trace_roots_with(&mut |root| roots.push(root));
+    }
+
+    fn trace_roots_with(&self, visit: &mut dyn FnMut(Value)) {
+        match self {
+            Self::Inactive => {}
+            Self::Immediate { prompt } => {
+                if let Some(text) = prompt {
+                    text.trace_roots_with(visit);
+                }
+            }
+        }
+    }
+}
+
 /// Semantic pieces of a keyboard-owned echo message.
 ///
 /// Keeping key names distinct from prose makes it impossible to change the
@@ -2059,6 +2137,9 @@ impl Default for KBoard {
 
 impl crate::gc_trace::GcTrace for KBoard {
     fn trace_roots(&self, roots: &mut Vec<Value>) {
+        // GNU marks echo_prompt for every keyboard, including parked ones
+        // (keyboard.c:14638); the Context echo message is only the active copy.
+        self.key_echo_state.trace_roots(roots);
         if let Some(event) = self.unread_selection_event {
             roots.push(event);
         }
@@ -3261,7 +3342,7 @@ impl crate::emacs_core::eval::Context {
     }
 
     pub(crate) fn special_event_binding(&self, event: &Value) -> Option<Value> {
-        let special_event_map = self.obarray.symbol_value("special-event-map").copied()?;
+        let special_event_map = self.obarray.symbol_value_copied("special-event-map")?;
         // GNU `read_char` calls `access_keymap` on the event head, so a
         // full lispy event like `(focus-in FRAME)` must match a keymap entry
         // stored under just `focus-in`.
@@ -3994,6 +4075,7 @@ impl crate::emacs_core::eval::Context {
     fn take_next_wait_request_special_input_event(
         &mut self,
         internal_effects: &mut crate::frontend_events::InternalEventEffects,
+        idle_policy: IdleTransitionPolicy,
     ) -> Result<Option<InputEvent>, crate::emacs_core::error::Flow> {
         *internal_effects =
             (*internal_effects).merge(self.service_leading_internal_frontend_events());
@@ -4009,7 +4091,7 @@ impl crate::emacs_core::eval::Context {
                     .keyboard
                     .pending_input_events
                     .pop_visible_front();
-                self.timer_stop_idle();
+                idle_policy.stop_idle(self);
                 return Ok(Some(event));
             }
             return Ok(None);
@@ -4030,7 +4112,7 @@ impl crate::emacs_core::eval::Context {
                     .keyboard
                     .pending_input_events
                     .pop_visible_front();
-                self.timer_stop_idle();
+                idle_policy.stop_idle(self);
                 return Ok(Some(event));
             }
             return Ok(None);
@@ -4142,8 +4224,18 @@ impl crate::emacs_core::eval::Context {
         Ok(self.has_frontend_input(query))
     }
 
+    #[cfg(test)]
     pub(crate) fn service_wait_request_special_input_events(
         &mut self,
+    ) -> Result<SpecialInputServiceOutcome, crate::emacs_core::error::Flow> {
+        self.service_wait_request_special_input_events_with_idle_policy(
+            IdleTransitionPolicy::Manage,
+        )
+    }
+
+    pub(crate) fn service_wait_request_special_input_events_with_idle_policy(
+        &mut self,
+        idle_policy: IdleTransitionPolicy,
     ) -> Result<SpecialInputServiceOutcome, crate::emacs_core::error::Flow> {
         let mut outcome = SpecialInputServiceOutcome::default();
         let mut internal_effects = crate::frontend_events::InternalEventEffects::default();
@@ -4160,7 +4252,7 @@ impl crate::emacs_core::eval::Context {
         }
 
         while let Some(event) =
-            self.take_next_wait_request_special_input_event(&mut internal_effects)?
+            self.take_next_wait_request_special_input_event(&mut internal_effects, idle_policy)?
         {
             if crate::frontend_events::interrupts(&event)
                 && self.interrupt_for_input_event_if_requested(event.clone())?
@@ -4212,11 +4304,11 @@ impl crate::emacs_core::eval::Context {
                 } => {
                     outcome = outcome.merge(SpecialInputServiceOutcome::any_activity());
                     self.note_mouse_move_input_event(x, y, target_frame_id);
-                    self.timer_resume_idle();
+                    idle_policy.resume_idle(self);
                 }
                 InputEvent::WindowClose { emacs_frame_id } => {
                     outcome = outcome.merge(SpecialInputServiceOutcome::any_activity());
-                    self.handle_window_close_input_event(emacs_frame_id)?;
+                    self.handle_window_close_input_event(emacs_frame_id, idle_policy)?;
                 }
                 InputEvent::DisplayReset => {
                     // Like Resize: apply here, let the outcome trigger the
@@ -4399,8 +4491,9 @@ impl crate::emacs_core::eval::Context {
     fn handle_window_close_input_event(
         &mut self,
         emacs_frame_id: u64,
+        idle_policy: IdleTransitionPolicy,
     ) -> Result<(), crate::emacs_core::error::Flow> {
-        self.timer_resume_idle();
+        idle_policy.resume_idle(self);
         if let Some(event) = self.make_lispy_delete_frame_event(emacs_frame_id)
             && self.execute_special_event_if_bound(event)?
         {
@@ -5019,7 +5112,10 @@ impl crate::emacs_core::eval::Context {
     /// Mirrors GNU Emacs `read_char()` (keyboard.c:2489).
     /// This is THE blocking point in the command loop.
     /// Before blocking, triggers redisplay.
-    fn drain_ready_input_event_for_read_char(&mut self) -> Option<InputEvent> {
+    fn drain_ready_input_event_for_read_char(
+        &mut self,
+        idle_policy: IdleTransitionPolicy,
+    ) -> Option<InputEvent> {
         loop {
             self.service_leading_internal_frontend_events();
             if let Some(event) = self
@@ -5028,7 +5124,7 @@ impl crate::emacs_core::eval::Context {
                 .pending_input_events
                 .pop_visible_front()
             {
-                self.timer_stop_idle();
+                idle_policy.stop_idle(self);
                 return Some(event);
             }
 
@@ -5078,6 +5174,7 @@ impl crate::emacs_core::eval::Context {
 
     fn pop_queued_read_char_event(
         &mut self,
+        idle_policy: IdleTransitionPolicy,
     ) -> Result<QueuedReadCharEvent, crate::emacs_core::error::Flow> {
         if let Some(event) = self.pop_unread_post_input_method_event_unrecorded() {
             return Ok(QueuedReadCharEvent::Event(
@@ -5101,7 +5198,7 @@ impl crate::emacs_core::eval::Context {
         }
 
         if let Some(event) = self.command_loop.keyboard.pop_unread_event() {
-            if self.handle_help_echo_event(event)? {
+            if self.handle_help_echo_event(event, idle_policy)? {
                 return Ok(QueuedReadCharEvent::HandledInternally);
             }
             if self.execute_special_event_if_bound(event)? {
@@ -5182,10 +5279,24 @@ impl crate::emacs_core::eval::Context {
         }
     }
 
+    #[cfg(test)]
     fn handle_read_char_input_event(
         &mut self,
         event: InputEvent,
         tty_input_decoding: TtyInputDecoding,
+    ) -> Result<Option<Value>, crate::emacs_core::error::Flow> {
+        self.handle_read_char_input_event_with_idle_policy(
+            event,
+            tty_input_decoding,
+            IdleTransitionPolicy::Manage,
+        )
+    }
+
+    fn handle_read_char_input_event_with_idle_policy(
+        &mut self,
+        event: InputEvent,
+        tty_input_decoding: TtyInputDecoding,
+        idle_policy: IdleTransitionPolicy,
     ) -> Result<Option<Value>, crate::emacs_core::error::Flow> {
         if crate::frontend_events::interrupts(&event)
             && self.interrupt_for_input_event_if_requested(event.clone())?
@@ -5196,11 +5307,19 @@ impl crate::emacs_core::eval::Context {
         match event {
             InputEvent::Tracked { receipt, event } => {
                 self.input_progress.consumed(receipt);
-                self.handle_read_char_input_event(*event, tty_input_decoding)
+                self.handle_read_char_input_event_with_idle_policy(
+                    *event,
+                    tty_input_decoding,
+                    idle_policy,
+                )
             }
             InputEvent::Observed { token, event } => {
                 neomacs_display_protocol::input_latency::consumed(token);
-                self.handle_read_char_input_event(*event, tty_input_decoding)
+                self.handle_read_char_input_event_with_idle_policy(
+                    *event,
+                    tty_input_decoding,
+                    idle_policy,
+                )
             }
             InputEvent::RawTtyBytes { bytes, target } => {
                 self.route_tty_keyboard_input(target);
@@ -5268,7 +5387,7 @@ impl crate::emacs_core::eval::Context {
                 Ok(Some(emacs_event))
             }
             InputEvent::WindowClose { emacs_frame_id } => {
-                self.handle_window_close_input_event(emacs_frame_id)?;
+                self.handle_window_close_input_event(emacs_frame_id, idle_policy)?;
                 Ok(None)
             }
             InputEvent::Resize {
@@ -5281,7 +5400,7 @@ impl crate::emacs_core::eval::Context {
                 if !crate::emacs_core::eval::gnu_redisplay_hooks_enabled() {
                     self.redisplay()?;
                 }
-                self.timer_resume_idle();
+                idle_policy.resume_idle(self);
                 Ok(None)
             }
             InputEvent::DisplayReset => {
@@ -5290,7 +5409,7 @@ impl crate::emacs_core::eval::Context {
                 // itself since no buffer/geometry state changed.
                 self.handle_display_reset_input_event();
                 self.redisplay()?;
-                self.timer_resume_idle();
+                idle_policy.resume_idle(self);
                 Ok(None)
             }
             InputEvent::WebView(event) => {
@@ -5337,7 +5456,7 @@ impl crate::emacs_core::eval::Context {
                     // motion for the rest of the session.
                     self.window_edge_drag.abandoned();
                 }
-                self.timer_resume_idle();
+                idle_policy.resume_idle(self);
                 if let Some(event) = self.make_lispy_focus_event(focused, emacs_frame_id) {
                     if self.execute_special_event_if_bound(event)? {
                         return Ok(None);
@@ -5359,7 +5478,7 @@ impl crate::emacs_core::eval::Context {
                 Ok(None)
             }
             InputEvent::MonitorsChanged { monitors } => {
-                self.timer_resume_idle();
+                idle_policy.resume_idle(self);
                 crate::emacs_core::builtins::set_neomacs_monitor_info(monitors);
                 let hook_sym = crate::emacs_core::hook_runtime::hook_symbol_by_name(
                     self,
@@ -5377,7 +5496,7 @@ impl crate::emacs_core::eval::Context {
                 Ok(None)
             }
             InputEvent::SelectWindow { window_id } => {
-                self.timer_resume_idle();
+                idle_policy.resume_idle(self);
                 Ok(self.make_lispy_select_window_event(window_id))
             }
             InputEvent::KeyPress {
@@ -5708,7 +5827,7 @@ impl crate::emacs_core::eval::Context {
                 target_frame_id,
             } => {
                 self.note_mouse_move_input_event(x, y, target_frame_id);
-                self.timer_resume_idle();
+                idle_policy.resume_idle(self);
                 if !self.track_mouse_enabled() {
                     return Ok(None);
                 }
@@ -5740,7 +5859,9 @@ impl crate::emacs_core::eval::Context {
         command_input: bool,
         tty_input_decoding: TtyInputDecoding,
     ) -> Result<Option<ReadCharEvent>, crate::emacs_core::error::Flow> {
-        let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
+        let wait_mode = ReadCharWaitMode::from_timeout(timeout);
+        let deadline = wait_mode.deadline();
+        let idle_policy = wait_mode.idle_policy();
         let mut idle_auto_save_deadline = None;
         let mut key_echo_deadline = self.delayed_key_echo_deadline(timeout);
 
@@ -5754,7 +5875,7 @@ impl crate::emacs_core::eval::Context {
             crate::emacs_core::dbusbind::drain_events(self)?;
             // Model events a throw out of a callback left queued.
             crate::emacs_core::model::drain_model_events(self)?;
-            match self.pop_queued_read_char_event()? {
+            match self.pop_queued_read_char_event(idle_policy)? {
                 QueuedReadCharEvent::Event(event) => return Ok(Some(event)),
                 QueuedReadCharEvent::HandledInternally => continue,
                 QueuedReadCharEvent::None => {}
@@ -5763,8 +5884,12 @@ impl crate::emacs_core::eval::Context {
             if self.sync_pending_resize_events() {
                 self.redisplay()?;
             }
-            if let Some(event) = self.drain_ready_input_event_for_read_char() {
-                if let Some(value) = self.handle_read_char_input_event(event, tty_input_decoding)? {
+            if let Some(event) = self.drain_ready_input_event_for_read_char(idle_policy) {
+                if let Some(value) = self.handle_read_char_input_event_with_idle_policy(
+                    event,
+                    tty_input_decoding,
+                    idle_policy,
+                )? {
                     return Ok(Some(ReadCharEvent::fresh_input_method_candidate(value)));
                 }
                 continue;
@@ -5777,18 +5902,18 @@ impl crate::emacs_core::eval::Context {
             }
 
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                self.timer_stop_idle();
+                idle_policy.stop_idle(self);
                 return Ok(None);
             }
 
             self.redisplay_for_input_wait()?;
-            self.service_input_wait_with_redisplay()?;
+            self.service_input_wait_with_redisplay(idle_policy)?;
 
             // GNU read_char re-checks Vunread_command_events after idle
             // timers/sit-for/read-event can requeue input, before consulting
             // the terminal queue.  Keep that priority so `M-x` replay from
             // sit-for cannot be overtaken by the next host byte.
-            match self.pop_queued_read_char_event()? {
+            match self.pop_queued_read_char_event(idle_policy)? {
                 QueuedReadCharEvent::Event(event) => return Ok(Some(event)),
                 QueuedReadCharEvent::HandledInternally => continue,
                 QueuedReadCharEvent::None => {}
@@ -5803,8 +5928,12 @@ impl crate::emacs_core::eval::Context {
                 self.redisplay()?;
             }
 
-            if let Some(event) = self.drain_ready_input_event_for_read_char() {
-                if let Some(value) = self.handle_read_char_input_event(event, tty_input_decoding)? {
+            if let Some(event) = self.drain_ready_input_event_for_read_char(idle_policy) {
+                if let Some(value) = self.handle_read_char_input_event_with_idle_policy(
+                    event,
+                    tty_input_decoding,
+                    idle_policy,
+                )? {
                     return Ok(Some(ReadCharEvent::fresh_input_method_candidate(value)));
                 }
                 continue;
@@ -5841,9 +5970,7 @@ impl crate::emacs_core::eval::Context {
                 // update flag from a zero-delay idle timer, so a read that
                 // reported EOF here without servicing idle timers stalled the
                 // whole helm session.
-                if timeout.is_none() {
-                    self.timer_start_idle();
-                }
+                idle_policy.start_idle(self);
                 let next_timer_timeout = [
                     self.next_ordinary_gnu_timer_timeout_before(None),
                     self.next_idle_gnu_timer_timeout(),
@@ -5858,16 +5985,14 @@ impl crate::emacs_core::eval::Context {
                     self.service_timers_without_redisplay()?;
                     continue;
                 }
-                self.timer_stop_idle();
+                idle_policy.stop_idle(self);
                 return Ok(None);
             }
 
             // GNU starts the idle epoch only for an unbounded read. A timed
             // Lisp `read-char` must not recursively activate idle timers, but
             // the command loop's unbounded read does (`keyboard.c:2869-2875`).
-            if timeout.is_none() {
-                self.timer_start_idle();
-            }
+            idle_policy.start_idle(self);
 
             // `auto-save-timeout` is not a Lisp idle timer. GNU computes it
             // inside `read_char`, then folds the resulting `sit_for` deadline
@@ -5890,17 +6015,18 @@ impl crate::emacs_core::eval::Context {
             .into_iter()
             .flatten()
             .min();
-            let wait_result = self.wait_for_command_input(wait_deadline);
+            let wait_result =
+                self.wait_for_command_input_with_idle_policy(wait_deadline, idle_policy);
 
             match wait_result? {
                 CommandInputWaitOutcome::InputPending => {
-                    self.timer_stop_idle();
+                    idle_policy.stop_idle(self);
                     continue;
                 }
                 CommandInputWaitOutcome::DeadlineElapsed => {
                     let now = std::time::Instant::now();
                     if deadline.is_some_and(|deadline| now >= deadline) {
-                        self.timer_stop_idle();
+                        idle_policy.stop_idle(self);
                         return Ok(None);
                     }
                     if key_echo_deadline.is_some_and(|deadline| now >= deadline) {
@@ -5930,7 +6056,7 @@ impl crate::emacs_core::eval::Context {
                     // handlers preserve the idle epoch; do not start a fresh
                     // epoch (and re-arm repeating idle timers) merely because
                     // the unified wait was interrupted.
-                    self.timer_resume_idle();
+                    idle_policy.resume_idle(self);
                     continue;
                 }
             }
@@ -6233,6 +6359,7 @@ impl crate::emacs_core::eval::Context {
     fn handle_help_echo_event(
         &mut self,
         event: Value,
+        idle_policy: IdleTransitionPolicy,
     ) -> Result<bool, crate::emacs_core::error::Flow> {
         let Some(parts) = crate::emacs_core::value::list_to_vec(&event) else {
             return Ok(false);
@@ -6245,7 +6372,7 @@ impl crate::emacs_core::eval::Context {
             return Ok(false);
         }
 
-        self.show_help_echo(parts[2], parts[3], parts[4], parts[5])?;
+        self.show_help_echo_with_idle_policy(parts[2], parts[3], parts[4], parts[5], idle_policy)?;
         Ok(true)
     }
 
@@ -6253,10 +6380,27 @@ impl crate::emacs_core::eval::Context {
     /// native menus through one path.
     pub(crate) fn show_help_echo(
         &mut self,
+        help: Value,
+        window: Value,
+        object: Value,
+        pos: Value,
+    ) -> Result<(), crate::emacs_core::error::Flow> {
+        self.show_help_echo_with_idle_policy(
+            help,
+            window,
+            object,
+            pos,
+            IdleTransitionPolicy::Manage,
+        )
+    }
+
+    fn show_help_echo_with_idle_policy(
+        &mut self,
         mut help: Value,
         window: Value,
         object: Value,
         pos: Value,
+        idle_policy: IdleTransitionPolicy,
     ) -> Result<(), crate::emacs_core::error::Flow> {
         // User help callbacks may run while the GUI invalidates this intent.
         // Preserve the starting context, not the callback-completion context.
@@ -6307,8 +6451,7 @@ impl crate::emacs_core::eval::Context {
 
         let show_help_function = self
             .obarray
-            .symbol_value("show-help-function")
-            .copied()
+            .symbol_value_copied("show-help-function")
             .unwrap_or(Value::NIL);
         if self.function_value_is_callable(&show_help_function) {
             let _ = self.funcall_general(show_help_function, vec![help])?;
@@ -6319,7 +6462,7 @@ impl crate::emacs_core::eval::Context {
             self.clear_current_message();
         }
 
-        self.timer_resume_idle();
+        idle_policy.resume_idle(self);
         Ok(())
     }
 
@@ -6350,17 +6493,24 @@ impl crate::emacs_core::eval::Context {
             return Ok(help);
         }
 
-        let inhibit = crate::emacs_core::textprop::builtin_get_text_property_in_state(
-            &self.obarray,
-            &self.buffers,
-            &[
-                Value::fixnum(1),
-                Value::symbol("help-echo-inhibit-substitution"),
-                help,
-            ],
-        )?;
-        if inhibit.is_truthy() {
-            return Ok(help);
+        // GNU keyboard.c:2221-2226 inspects only the first character,
+        // and skips the property lookup for an empty help string.
+        if help
+            .as_lisp_string()
+            .is_some_and(|string| string.schars() > 0)
+        {
+            let inhibit = crate::emacs_core::textprop::builtin_get_text_property_in_state(
+                &self.obarray,
+                &self.buffers,
+                &[
+                    Value::fixnum(0),
+                    Value::symbol("help-echo-inhibit-substitution"),
+                    help,
+                ],
+            )?;
+            if inhibit.is_truthy() {
+                return Ok(help);
+            }
         }
 
         match self.obarray.symbol_function("substitute-command-keys") {
@@ -6797,8 +6947,7 @@ impl crate::emacs_core::eval::Context {
 
     fn default_tool_bar_map(&self) -> Value {
         self.obarray()
-            .default_value_id(intern("tool-bar-map"))
-            .copied()
+            .default_value_id_copied(intern("tool-bar-map"))
             .unwrap_or(Value::NIL)
     }
 
@@ -7317,7 +7466,8 @@ impl crate::emacs_core::eval::Context {
             y: (y - coordinate_origin.y().get()).round() as i64,
             metrics,
         });
-        let Some(posn_string) = Self::presented_string_position_value(frame, window_id, hit) else {
+        let Some(posn_string) = Self::presented_string_position_value(eval, frame, window_id, hit)
+        else {
             return Some(position);
         };
         let Some(mut parts) = crate::emacs_core::value::list_to_vec(&position) else {
@@ -7328,6 +7478,7 @@ impl crate::emacs_core::eval::Context {
     }
 
     fn presented_string_position_value(
+        eval: &Self,
         frame: &crate::window::Frame,
         window: crate::window::WindowId,
         hit: neomacs_display_protocol::PresentedHit,
@@ -7339,8 +7490,9 @@ impl crate::emacs_core::eval::Context {
             .chrome_strings
             .iter()
             .find(|source| source.area() == area && source.string_id() == position.string())?;
+        let object = eval.materialize(source.object()).ok()?.value();
         Some(Value::cons(
-            source.value(),
+            object,
             Value::fixnum(position.char_index().min(i64::MAX as u64) as i64),
         ))
     }
@@ -7790,4 +7942,5 @@ fn key_sequence_translation_events(translation: Value) -> Option<Vec<Value>> {
 // ===========================================================================
 
 #[cfg(test)]
+#[path = "keyboard/tests/keyboard_test.rs"]
 mod tests;
