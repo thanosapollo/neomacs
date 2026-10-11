@@ -1913,6 +1913,11 @@ fn font_name_projection_matches_opened_font_properties() {
             glyph_code: Some(17),
         };
         let name = font_name_from_resolved_match(&requested, &matched);
+        let projected = font_name_from_host_projection(
+            &requested,
+            &crate::emacs_core::display_host::ResolvedFontName::from_match(&matched),
+        );
+        assert_eq!(projected.as_utf8_str(), name.as_utf8_str());
         let object = opened_font_from_resolved_match(&requested, &matched);
         assert_eq!(
             name.as_utf8_str(),

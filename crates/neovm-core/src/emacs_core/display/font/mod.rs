@@ -2779,8 +2779,7 @@ fn apply_face_layers_with_remapping(
                 // Named text faces contribute their explicit inheritance,
                 // not another default baseline. The first list entry wins.
                 for name in names.iter().rev() {
-                    let contribution =
-                        face_table.resolve_text_face_with_remapping(name, remapping);
+                    let contribution = face_table.resolve_text_face_with_remapping(name, remapping);
                     face = face.merge(&contribution);
                 }
             }
@@ -3071,20 +3070,28 @@ fn resolved_font_property_fields(
     face: &RuntimeFace,
     matched: &super::eval::ResolvedFontMatch,
 ) -> Vec<Value> {
-    let opened = &matched.font;
-    let canonical = &opened.resolved;
+    resolved_font_name_property_fields(
+        face,
+        &super::display_host::ResolvedFontName::from_match(matched),
+    )
+}
+
+fn resolved_font_name_property_fields(
+    face: &RuntimeFace,
+    matched: &super::display_host::ResolvedFontName,
+) -> Vec<Value> {
     let mut selected = face.clone();
-    selected.family = Some(Value::from_sym_id(intern(&canonical.family)));
-    selected.foundry = opened
+    selected.family = Some(Value::from_sym_id(intern(&matched.family)));
+    selected.foundry = matched
         .foundry
         .as_ref()
         .map(|foundry| Value::from_sym_id(intern(foundry.as_utf8_str().unwrap_or_default())));
-    selected.weight = Some(FontWeight::from_css_weight(canonical.weight));
-    selected.slant = Some(opened.slant);
-    selected.width = Some(opened.width());
+    selected.weight = Some(FontWeight::from_css_weight(matched.weight));
+    selected.slant = Some(matched.slant);
+    selected.width = Some(matched.width);
     let mut fields =
-        font_object_property_fields(&selected, Some(i64::from(opened.metrics.pixel_size.max(1))));
-    if let Some(postscript_name) = &canonical.postscript_name {
+        font_object_property_fields(&selected, Some(i64::from(matched.pixel_size.max(1))));
+    if let Some(postscript_name) = &matched.postscript_name {
         fields.push(Value::keyword("postscript-name"));
         fields.push(Value::string(postscript_name.clone()));
     }
@@ -3092,11 +3099,19 @@ fn resolved_font_property_fields(
 }
 
 /// Project the opened name without materializing discarded font metadata.
+#[cfg(test)]
 pub(crate) fn font_name_from_resolved_match(
     face: &RuntimeFace,
     matched: &super::eval::ResolvedFontMatch,
 ) -> Value {
     font_name_from_property_fields(resolved_font_property_fields(face, matched))
+}
+
+pub(crate) fn font_name_from_host_projection(
+    face: &RuntimeFace,
+    matched: &super::display_host::ResolvedFontName,
+) -> Value {
+    font_name_from_property_fields(resolved_font_name_property_fields(face, matched))
 }
 
 /// Materialize the core's opaque opened-font object from one host resolution.

@@ -351,13 +351,12 @@ use super::error::{Flow, LispCondition, signal};
 use super::font::alternative_font_registry_alist;
 use super::font::{
     FrameFontRealization, alternative_font_family_alist, default_face_font_attr_affects_frame_font,
-    face_remapping_for_current_buffer, font_name_from_resolved_match, font_string_text,
+    face_remapping_for_current_buffer, font_name_from_host_projection, font_string_text,
     font_value_fields, font_value_text, font_vector_get_flexible, frame_device_designator_p,
     frame_id_from_designator, frame_parameter_for_face_attribute, is_font, is_font_entity,
     is_font_spec, live_frame_designator_in_state, live_frame_font_attribute_fallback,
     publish_face_attribute_to_frame_parameter, replace_alternative_font_registry_alist,
-    resolve_font_match, resolve_live_frame_font_request, sync_live_default_face_font_state,
-    sync_live_frame_font_state,
+    resolve_live_frame_font_request, sync_live_default_face_font_state, sync_live_frame_font_state,
 };
 
 use super::intern::intern;
@@ -4538,8 +4537,19 @@ pub(crate) fn builtin_face_font(eval: &mut super::eval::Context, args: Vec<Value
         // an XLFD pixel size; fabricating a name corrupts window-font-*.
         crate::emacs_core::emacs_char::EmacsChar::from_char('M')
     };
-    Ok(resolve_font_match(eval, frame_id, character, &face)
-        .map(|matched| font_name_from_resolved_match(&face, &matched))
+    Ok(eval
+        .display_host
+        .as_mut()
+        .and_then(|host| {
+            host.resolve_font_name_for_char(super::display_host::FontResolveRequest {
+                frame_id,
+                character,
+                face: face.clone(),
+            })
+            .ok()
+            .flatten()
+        })
+        .map(|matched| font_name_from_host_projection(&face, &matched))
         .unwrap_or(Value::NIL))
 }
 
