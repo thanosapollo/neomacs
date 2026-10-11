@@ -721,6 +721,9 @@ pub struct ScrollReplay {
     /// The start was chosen for point motion, so phase B must revalidate it
     /// and the assembled rows must still satisfy the full viewport policy.
     pub(crate) point_driven: bool,
+    /// The point-driven decision came from retained measured rows, not the
+    /// source resolver; phase B must reproduce both decisions independently.
+    pub(crate) point_measured: bool,
     /// An edit replay (window-start kept), as opposed to a scroll.
     pub(crate) edit: bool,
     /// Sealed frame-face generation that owns every ID in `reused_rows`.
@@ -1599,6 +1602,7 @@ impl RetainedWindowMatrix {
                 one_line_contract: None,
                 sync: Some(plan),
                 point_driven: false,
+                point_measured: false,
                 edit: false,
                 face_generation: self.face_generation,
             });
@@ -1684,6 +1688,7 @@ impl RetainedWindowMatrix {
             one_line_contract: None,
             sync: None,
             point_driven: false,
+            point_measured: false,
             edit: false,
             face_generation: self.face_generation,
         })
@@ -1973,6 +1978,7 @@ impl RetainedWindowMatrix {
                 one_line_contract: None,
                 sync: Some(plan),
                 point_driven: false,
+                point_measured: false,
                 edit: true,
                 face_generation: self.face_generation,
             });
@@ -2195,6 +2201,7 @@ impl RetainedWindowMatrix {
                     one_line_contract: None,
                     sync: None,
                     point_driven: false,
+                    point_measured: false,
                     edit: true,
                     face_generation: self.face_generation,
                 });
@@ -2225,6 +2232,7 @@ impl RetainedWindowMatrix {
             one_line_contract: None,
             sync: None,
             point_driven: false,
+            point_measured: false,
             edit: true,
             face_generation: self.face_generation,
         })

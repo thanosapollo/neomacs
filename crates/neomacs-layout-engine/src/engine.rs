@@ -2428,6 +2428,21 @@ impl LayoutEngine {
                                         replay
                                     });
                             }
+                        } else if let Some(measured_start) =
+                            self.retained_measured_forward_start(params, *layout_box, evaluator)
+                        {
+                            let mut resolved_params = params.clone();
+                            resolved_params.window_start = measured_start;
+                            scroll = self
+                                .build_scroll_replay(&resolved_params, *layout_box, evaluator)
+                                // Integer snapshots and point rows cannot be
+                                // translated through a fractional rounding phase.
+                                .filter(|replay| replay.dvpos.fract() == 0.0)
+                                .map(|mut replay| {
+                                    replay.point_driven = true;
+                                    replay.point_measured = true;
+                                    replay
+                                });
                         }
                     }
                     // A cached page supplies content, not a new viewport
@@ -4274,6 +4289,135 @@ impl LayoutEngine {
         Some(replay)
     }
 
+    /// Source-line placement can keep a start whose last measured row is
+    /// clipped. Only the canonical measured retry may choose its replacement.
+    /// Re-run this against live inputs in phase B; retention supplies evidence,
+    /// never authority to bypass a changed policy or source.
+    fn retained_measured_forward_start(
+        &self,
+        params: &WindowParams,
+        layout_box: WindowLayoutBox,
+        evaluator: &neovm_core::emacs_core::Context,
+    ) -> Option<i64> {
+        if !params.selected
+            || params.force_start
+            || params.is_minibuffer()
+            || params.vscroll != 0
+            || params.display_line_numbers != crate::types::DisplayLineNumbersMode::Off
+        {
+            return None;
+        }
+        let previous = self
+            .retained_window_matrices
+            .get(&DisplayWindowId::new(params.window_id))?;
+        let key = RetainedWindowKey::from_params(params, layout_box, evaluator);
+        if previous.validity != MatrixValidity::Valid
+            || previous.key.point == key.point
+            || !RetainedWindowKey::cursor_only_eligible(&previous.key, &key)
+        {
+            return None;
+        }
+        let mut rows: Vec<_> = previous
+            .display_snapshot
+            .rows
+            .iter()
+            .filter(|row| {
+                previous
+                    .matrix
+                    .rows
+                    .get(row.row as usize)
+                    .is_some_and(|matrix_row| {
+                        matrix_row.enabled
+                            && matrix_row.role
+                                == neomacs_display_protocol::frame_glyphs::GlyphRowRole::Text
+                            && matrix_row.displays_text
+                            && !matrix_row.ends_at_zv
+                    })
+            })
+            .cloned()
+            .collect();
+        // Do not silently omit filler, EOB, or unanchored body rows from the
+        // canonical evidence: a subset is not the measured viewport.
+        if rows.len()
+            != previous
+                .matrix
+                .rows
+                .iter()
+                .filter(|row| row.enabled && !RetainedWindowMatrix::is_chrome_role(row.role))
+                .count()
+        {
+            return None;
+        }
+        rows.sort_by_key(|row| row.row);
+        let body = layout_box.body();
+        let top = (body.y - params.bounds.y).round() as i64;
+        let bottom = (body.bottom() - params.bounds.y).round() as i64;
+        let last = rows.last()?;
+        // Cursor replay rounds row height, whereas a fresh space-glyph
+        // cursor can keep its integral font height. Leave fractional cursor
+        // rows to the canonical walk rather than changing that contract here.
+        if previous
+            .matrix
+            .rows
+            .get(last.row as usize)?
+            .height_px
+            .fract()
+            != 0.0
+        {
+            return None;
+        }
+        let point = crate::coords::layout_i64_char_pos_to_lisp_char_pos(params.point);
+        // Admit just a clipped bottom text row, with point actually measured
+        // on it. No extrapolation, top clipping, fillers, or missing anchors.
+        if rows.len() < 2
+            || last.y >= bottom
+            || last.y.saturating_add(last.height) <= bottom
+            || !last
+                .start_buffer_pos
+                .zip(last.end_buffer_pos)
+                .is_some_and(|(start, end)| start <= point && point <= end)
+            || rows.iter().enumerate().any(|(index, row)| {
+                row.height <= 0
+                    || row.y < top
+                    || row.start_buffer_pos.is_none()
+                    || row.end_buffer_pos.is_none()
+                    || (index + 1 < rows.len() && row.y.saturating_add(row.height) > bottom)
+            })
+        {
+            return None;
+        }
+        let buffer = evaluator
+            .buffer_manager()
+            .get(neovm_core::buffer::BufferId(params.buffer_id))?;
+        let access = crate::neovm_bridge::RustBufferAccess::new(buffer);
+        let retry =
+            crate::display_text_window_row_lifecycle::TextWindowVisibilityRetryRequest::new(
+                &rows,
+                params.window_start,
+                params.buffer_begv,
+                params.buffer_size,
+                params.point,
+                crate::coords::lisp_char_pos_to_layout_i64(last.end_buffer_pos?),
+                false,
+                top,
+                bottom,
+                crate::scroll_policy::ScrollPolicy::from_window_params(params),
+                params.scroll_margin,
+                None,
+                &access,
+            )
+            .decide();
+        if !matches!(
+            retry.viewport_decision(),
+            ViewportDecision::Keep | ViewportDecision::Commit { .. }
+        ) {
+            return None;
+        }
+        retry
+            .retry_window_start()
+            .filter(|start| *start > params.window_start)
+    }
+
     /// Phase 2: if this window's previous-frame matrix can be reused after a
     /// whole-row scroll (overlapping rows shifted, only newly-exposed rows
     /// walked), return the scroll replay; else `None`. Selected window only, for
@@ -4767,8 +4911,24 @@ impl LayoutEngine {
         };
         // Sibling Lisp can change the scroll policy after phase A. A point
         // replay is only valid for the start phase B independently chooses.
+        let mut resolved_window_start = resolved_window_start;
         let scroll_replay = scroll_replay.filter(|replay| {
-            !replay.point_driven || replay.new_window_start == resolved_window_start.get()
+            if !replay.point_driven {
+                return true;
+            }
+            if !replay.point_measured {
+                return replay.new_window_start == resolved_window_start.get();
+            }
+            if matches!(viewport_resolution, ViewportResolutionPhase::Resolve)
+                && resolved_window_start.get() == params.window_start
+                && self.retained_measured_forward_start(params, *layout_box, evaluator)
+                    == Some(replay.new_window_start)
+            {
+                resolved_window_start =
+                    ResolvedWindowStart::from_layout_charpos(replay.new_window_start);
+                return true;
+            }
+            false
         });
         let resolved_params;
         let params = if resolved_window_start.get() == params.window_start {

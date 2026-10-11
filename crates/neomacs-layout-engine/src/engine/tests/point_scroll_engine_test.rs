@@ -134,6 +134,115 @@ fn point_scroll_reuses_overlap_and_publishes_its_new_start() {
 }
 
 #[test]
+fn point_scroll_measured_clipped_bottom_reuses_repeated_next_lines() {
+    let (mut eval, frame, buffer, window, mut engine) = fixture(245, 0);
+    let (mut control, control_frame, control_buffer, _, mut full) = fixture(245, 0);
+    for (context, owner) in [(&mut eval, buffer), (&mut control, control_buffer)] {
+        let buffer = context.buffer_manager_mut().get_mut(owner).unwrap();
+        buffer.set_buffer_local("scroll-conservatively", Value::fixnum(0));
+        // Display-space height preserves subpixel geometry, unlike face
+        // sizes which the native font backend quantizes to device pixels.
+        for line in (2..200).step_by(4) {
+            assert!(buffer.put_text_property(
+                line * LINE.len(),
+                line * LINE.len() + 1,
+                Value::symbol("display"),
+                Value::list(vec![
+                    Value::symbol("space"),
+                    Value::keyword("relative-height"),
+                    Value::make_float(1.025)
+                ])
+            ));
+        }
+    }
+    engine.layout_frame_rust(&mut eval, frame);
+    full.layout_frame_rust(&mut control, control_frame);
+    activate_last_engine_presentation(&mut eval, &engine, frame);
+    activate_last_engine_presentation(&mut control, &full, control_frame);
+    let heights: Vec<_> = engine.retained_window_matrices[&DisplayWindowId::new(window.0 as i64)]
+        .matrix
+        .rows
+        .iter()
+        .filter(|row| row.enabled && row.role == GlyphRowRole::Text)
+        .map(|row| row.height_px)
+        .collect();
+    println!("measured body heights: {heights:?}");
+    assert!(
+        heights.iter().any(|height| height.fract() != 0.0),
+        "fixture must measure fractional body heights"
+    );
+    let mut scrolls = 0;
+    let mut measured_proposals = 0;
+    for line in 1..45 {
+        let target = line * LINE.len();
+        let retained = &engine.retained_window_matrices[&DisplayWindowId::new(window.0 as i64)];
+        let body = retained.key.partition.text_body();
+        let clipped = retained.matrix.rows.iter().any(|row| {
+            row.enabled
+                && row.role == GlyphRowRole::Text
+                && row.displays_text
+                && row.pixel_y + retained.display_snapshot.regions.outer.y + row.height_px
+                    > body.y + body.height
+        });
+        move_point(&mut eval, buffer, target);
+        move_point(&mut control, control_buffer, target);
+        let (params, frame_params, layout_box) = measured_inputs(&mut eval, frame, &engine);
+        if engine
+            .retained_measured_forward_start(&params, layout_box, &eval)
+            .is_some()
+        {
+            assert_eq!(
+                resolve_leaf_window_start(
+                    &eval,
+                    &params,
+                    &frame_params,
+                    &layout_box,
+                    WindowPositionPublication::Redisplay,
+                    false
+                )
+                .get(),
+                params.window_start
+            );
+            measured_proposals += 1;
+        }
+        full.retained_window_matrices.clear();
+        full.prepared_viewports = PreparedViewports::default();
+        engine.layout_frame_rust(&mut eval, frame);
+        full.layout_frame_rust(&mut control, control_frame);
+        let actual = selected_window_layout_trace(&eval, &engine, frame);
+        let expected = selected_window_layout_trace(&control, &full, control_frame);
+        assert_eq!(
+            actual,
+            expected,
+            "next line {line}, stats={:?}",
+            engine.last_layout_stats()
+        );
+        let stats = engine.last_layout_stats();
+        if stats.scroll_windows > 0 {
+            assert!(
+                clipped,
+                "reuse must originate from a clipped measured viewport"
+            );
+            assert!(stats.reused_shifted_rows > 0, "{stats:?}");
+            scrolls += 1;
+        }
+        activate_last_engine_presentation(&mut eval, &engine, frame);
+        activate_last_engine_presentation(&mut control, &full, control_frame);
+    }
+    assert!(
+        measured_proposals >= 3,
+        "got {measured_proposals} measured proposals"
+    );
+    println!(
+        "measured next-line: {scrolls} scroll reuses / {measured_proposals} measured proposals / 44 exact full traces"
+    );
+    assert!(
+        scrolls >= 3,
+        "repeated next-line must reuse measured scrolls, got {scrolls}"
+    );
+}
+
+#[test]
 fn point_scroll_respects_measured_margins_and_partial_rows() {
     for (height, margin) in [(240, 2), (245, 0), (245, 2)] {
         let (mut eval, frame, buffer, _, mut engine) = fixture(height, margin);
@@ -367,6 +476,129 @@ fn policy_interleaving_fixture(
     engine.layout_frame_rust(&mut eval, frame);
     activate_last_engine_presentation(&mut eval, &engine, frame);
     (eval, frame, buffer, earlier_buffer, engine)
+}
+
+fn measured_inputs(
+    eval: &mut Context,
+    frame: neovm_core::window::FrameId,
+    engine: &LayoutEngine,
+) -> (WindowParams, FrameParams, WindowLayoutBox) {
+    let target = eval.frame_manager().get(frame).unwrap().selected_window;
+    let path = eval
+        .frame_manager()
+        .leaf_window_paths(frame)
+        .unwrap()
+        .into_iter()
+        .find(|(id, _)| *id == target)
+        .unwrap()
+        .1;
+    let inputs = collect_live_window_layout_inputs(
+        eval,
+        frame,
+        target,
+        &path,
+        None,
+        engine.font_sizing,
+        &engine.retained_window_chrome_metrics,
+        WindowLayoutWalkPurpose::Redisplay,
+    )
+    .unwrap();
+    let geometry = WindowFrameGeometryRequest::new(
+        &inputs.window,
+        &inputs.frame,
+        inputs.root_right_edge,
+        inputs.main_area_bottom,
+    )
+    .resolve();
+    let layout_box = WindowLayoutBox::resolve(
+        &inputs.window,
+        WindowChromeMetrics::from_params(&inputs.window),
+        WindowDividerLayout::resolve(&inputs.window, &inputs.frame, geometry),
+    );
+    (inputs.window, inputs.frame, layout_box)
+}
+
+#[test]
+fn point_scroll_measured_plan_revalidates_sibling_policy_change() {
+    let (mut eval, frame, buffer, earlier, mut engine) = policy_interleaving_fixture(245);
+    let (mut control, control_frame, control_buffer, control_earlier, mut full) =
+        policy_interleaving_fixture(245);
+    engine.layout_frame_rust(&mut eval, frame);
+    activate_last_engine_presentation(&mut eval, &engine, frame);
+    let trace = selected_window_layout_trace(&eval, &engine, frame);
+    let target = trace
+        .matrix_rows
+        .iter()
+        .rev()
+        .find(|row| row.role == GlyphRowRole::Text && row.displays_text)
+        .unwrap()
+        .start_charpos;
+    move_point(&mut eval, buffer, target);
+    move_point(&mut control, control_buffer, target);
+    let (params, frame_params, layout_box) = measured_inputs(&mut eval, frame, &engine);
+    let proposal = engine
+        .retained_measured_forward_start(&params, layout_box, &eval)
+        .expect("clipped bottom must admit measured plan");
+    assert_eq!(
+        resolve_leaf_window_start(
+            &eval,
+            &params,
+            &frame_params,
+            &layout_box,
+            WindowPositionPublication::Redisplay,
+            false
+        )
+        .get(),
+        params.window_start
+    );
+    let mut proposed = params.clone();
+    proposed.window_start = proposal;
+    assert!(
+        engine
+            .build_scroll_replay(&proposed, layout_box, &eval)
+            .is_some()
+    );
+    for (context, sibling) in [(&mut eval, earlier), (&mut control, control_earlier)] {
+        let mode_line = context
+            .eval_str(
+                "'((:eval (progn
+            (if point-scroll-policy-armed (progn
+              (setq point-scroll-policy-armed nil)
+              (setq point-scroll-policy-mutations (1+ point-scroll-policy-mutations))
+              (save-current-buffer (set-buffer point-scroll-policy-target)
+                (set (make-local-variable 'scroll-margin) 3)))) \"EARLIER\")))",
+            )
+            .unwrap();
+        context
+            .buffer_manager_mut()
+            .get_mut(sibling)
+            .unwrap()
+            .set_buffer_local("mode-line-format", mode_line);
+        context.set_variable("point-scroll-policy-armed", Value::T);
+        context
+            .buffer_manager_mut()
+            .get_mut(sibling)
+            .unwrap()
+            .insert("x");
+    }
+    full.retained_window_matrices.clear();
+    full.prepared_viewports = PreparedViewports::default();
+    engine.layout_frame_rust(&mut eval, frame);
+    full.layout_frame_rust(&mut control, control_frame);
+    for context in [&mut eval, &mut control] {
+        assert_eq!(
+            context
+                .eval_str("point-scroll-policy-mutations")
+                .unwrap()
+                .as_fixnum(),
+            Some(1)
+        );
+    }
+    assert_eq!(engine.last_layout_stats().scroll_windows, 0);
+    assert_eq!(
+        selected_window_layout_trace(&eval, &engine, frame),
+        selected_window_layout_trace(&control, &full, control_frame)
+    );
 }
 
 fn proposed_forward_scroll(
