@@ -2415,7 +2415,7 @@ impl LayoutEngine {
                                 prepared_faces = Some(faces);
                             }
                             if cursor_only.is_none()
-                                && resolved_start.get() > params.window_start
+                                && resolved_start.get() != params.window_start
                                 && params.display_line_numbers
                                     == crate::types::DisplayLineNumbersMode::Off
                             {
@@ -4199,6 +4199,23 @@ impl LayoutEngine {
         let curr_key = RetainedWindowKey::from_params(params, layout_box, evaluator);
         let mut replay = match prev.cursor_only_replay(&curr_key) {
             Ok(replay) => replay,
+            Err(
+                crate::incremental_layout::CursorOnlyDecline::PointMoveMayScrollDown
+                | crate::incremental_layout::CursorOnlyDecline::PointMoveMayScrollUp,
+            ) => {
+                // Matrix indices alone cannot decide scrolling. The alternate
+                // admission only removes that veto for a fully visible row;
+                // canonical source + measured Keep proof below still owns it.
+                let replay = prev
+                    .cursor_only_replay_with_forced_start(&curr_key, true)
+                    .ok()?;
+                // Widen only cross-row edge motion. Same-row motion keeps the
+                // original retained-matrix admission, including its declines.
+                if replay.retained_cursor_row_index == Some(replay.new_cursor_row_index) {
+                    return None;
+                }
+                replay
+            }
             Err(reason) => {
                 // The edit path reports why it declined; without the same
                 // report here a window that silently full-rebuilds every frame
@@ -4214,68 +4231,17 @@ impl LayoutEngine {
                 return None;
             }
         };
-        if params.scroll_margin > 0 && prev.key.point != params.point {
-            // GNU try_cursor_movement can keep the measured body only when
-            // the ordinary viewport policy would keep its start. Use both
-            // canonical decisions: source resolution owns the top margin;
-            // the measured-row retry owns the bottom margin and clipping.
-            // In particular, do not invent a char-height * margin bound for
-            // wrapped rows, tall glyphs, or measured header/tab-line heights.
-            let body = layout_box.body();
-            let top = (body.y - params.bounds.y).round() as i64;
-            let bottom = (body.bottom() - params.bounds.y).round() as i64;
-            let rows = &replay.body_row_snapshots;
-            if rows.is_empty()
-                || rows.iter().any(|row| {
-                    row.height <= 0 || row.y < top || row.y.saturating_add(row.height) > bottom
-                })
-            {
-                return None;
-            }
-            let buffer = evaluator
-                .buffer_manager()
-                .get(neovm_core::buffer::BufferId(params.buffer_id))?;
-            let access = crate::neovm_bridge::RustBufferAccess::new(buffer);
-            // A forced start suppresses source scrolling, but the canonical
-            // measured retry can still move point into the kept viewport.
-            // Fall back for that decision rather than dropping the point move.
-            if !params.force_start
-                && resolve_leaf_window_start(
-                    evaluator,
-                    params,
-                    frame_params,
-                    &layout_box,
-                    WindowPositionPublication::Redisplay,
-                    false,
-                )
-                .get()
-                    != params.window_start
-            {
-                return None;
-            }
-            let visible_end = rows.iter().rev().find_map(|row| row.end_buffer_pos)?;
-            let retry =
-                crate::display_text_window_row_lifecycle::TextWindowVisibilityRetryRequest::new(
-                    rows,
-                    params.window_start,
-                    params.buffer_begv,
-                    params.buffer_size,
-                    params.point,
-                    crate::coords::lisp_char_pos_to_layout_i64(visible_end),
-                    false,
-                    top,
-                    bottom,
-                    crate::scroll_policy::ScrollPolicy::from_window_params(params),
-                    params.scroll_margin,
-                    None,
-                    &access,
-                )
-                .decide();
-            if !matches!(retry.viewport_decision(), ViewportDecision::Keep)
-                || retry.retry_window_start().is_some()
-            {
-                return None;
-            }
+        if prev.key.point != params.point
+            && (params.scroll_margin > 0 || Self::cursor_replay_widens_edge(&replay, params))
+            && !Self::cursor_replay_keeps_viewport(
+                &replay,
+                params,
+                layout_box,
+                frame_params,
+                evaluator,
+            )
+        {
+            return None;
         }
         if prev.chrome_reusable_after_cursor_move(&replay, chrome_reuse_context(params, evaluator))
             && let Some(chrome) = prev.retained_chrome()
@@ -4287,6 +4253,133 @@ impl LayoutEngine {
             replay.chrome_memo = prev.chrome_memo();
         }
         Some(replay)
+    }
+
+    /// Only newly admitted cross-row motion needs the additional edge proof.
+    /// Preserve the original admission at pinned buffer edges and within the
+    /// same display row, whose glyph geometry may have fractional heights.
+    fn cursor_replay_widens_edge(replay: &CursorOnlyReplay, params: &WindowParams) -> bool {
+        replay.retained_cursor_row_index != Some(replay.new_cursor_row_index)
+            && (replay.body_rows.last().is_some_and(|(index, row)| {
+                *index == replay.new_cursor_row_index && !row.ends_at_zv
+            }) || replay.body_rows.first().is_some_and(|(index, _)| {
+                *index == replay.new_cursor_row_index
+                    && params.window_start > params.buffer_begv + 1
+            }))
+    }
+
+    /// Retained rows are evidence, not a viewport decision. Check both
+    /// canonical policies for margin-sensitive motion and newly widened edges.
+    fn cursor_replay_keeps_viewport(
+        replay: &CursorOnlyReplay,
+        params: &WindowParams,
+        layout_box: WindowLayoutBox,
+        frame_params: &FrameParams,
+        evaluator: &neovm_core::emacs_core::Context,
+    ) -> bool {
+        let body = layout_box.body();
+        let Some((_, matrix_row)) = replay
+            .body_rows
+            .iter()
+            .find(|(index, _)| *index == replay.new_cursor_row_index)
+        else {
+            return false;
+        };
+        // Integer snapshots cannot prove subpixel cursor reconstruction.
+        let cursor_top = matrix_row.pixel_y + params.bounds.y;
+        if matrix_row.height_px.fract() != 0.0
+            || (!matrix_row.ends_at_zv
+                && params.point == matrix_row.end_charpos as i64
+                && replay
+                    .body_rows
+                    .last()
+                    .is_some_and(|(index, _)| *index == replay.new_cursor_row_index))
+            || cursor_top < body.y
+            || cursor_top + matrix_row.height_px > body.bottom()
+        {
+            return false;
+        }
+        let top = (body.y - params.bounds.y).round() as i64;
+        let bottom = (body.bottom() - params.bounds.y).round() as i64;
+        let rows = &replay.body_row_snapshots;
+        let Some(cursor_row) = rows
+            .iter()
+            .find(|row| row.row == replay.new_cursor_row_index as i64)
+        else {
+            return false;
+        };
+        if cursor_row.y < top || cursor_row.y.saturating_add(cursor_row.height) > bottom {
+            return false;
+        }
+        if rows.is_empty()
+            || rows.len() != replay.body_rows.len()
+            || replay.body_rows.iter().any(|(index, row)| {
+                rows.iter()
+                    .filter(|snapshot| snapshot.row == *index as i64)
+                    .count()
+                    != 1
+                    || row.role != neomacs_display_protocol::frame_glyphs::GlyphRowRole::Text
+            })
+            || rows.iter().any(|row| {
+                row.height <= 0
+                    || row.y < top
+                    || row.start_buffer_pos.is_none()
+                    || row.end_buffer_pos.is_none()
+                    || (params.scroll_margin > 0 && row.y.saturating_add(row.height) > bottom)
+            })
+        {
+            return false;
+        }
+        let Some(buffer) = evaluator
+            .buffer_manager()
+            .get(neovm_core::buffer::BufferId(params.buffer_id))
+        else {
+            return false;
+        };
+        let access = crate::neovm_bridge::RustBufferAccess::new(buffer);
+        // A forced start suppresses source scrolling, but the canonical
+        // measured retry can still move point into the kept viewport.
+        // Fall back for that decision rather than dropping the point move.
+        if !params.force_start
+            && resolve_leaf_window_start(
+                evaluator,
+                params,
+                frame_params,
+                &layout_box,
+                WindowPositionPublication::Redisplay,
+                false,
+            )
+            .get()
+                != params.window_start
+        {
+            return false;
+        }
+        let Some(visible_end) = rows.iter().rev().find_map(|row| row.end_buffer_pos) else {
+            return false;
+        };
+        let retry =
+            crate::display_text_window_row_lifecycle::TextWindowVisibilityRetryRequest::new(
+                rows,
+                params.window_start,
+                params.buffer_begv,
+                params.buffer_size,
+                params.point,
+                crate::coords::lisp_char_pos_to_layout_i64(visible_end),
+                false,
+                top,
+                bottom,
+                crate::scroll_policy::ScrollPolicy::from_window_params(params),
+                params.scroll_margin,
+                None,
+                &access,
+            )
+            .decide();
+        if !matches!(retry.viewport_decision(), ViewportDecision::Keep)
+            || retry.retry_window_start().is_some()
+        {
+            return false;
+        }
+        true
     }
 
     /// Source-line placement can keep a start whose last measured row is
@@ -4942,6 +5035,42 @@ impl LayoutEngine {
             };
             &resolved_params
         };
+        let cursor_only_replay = cursor_only_replay.filter(|replay| {
+            // Prepared pages are validated against their own key, not the
+            // last displayed matrix. A first visit changes window_start and
+            // cannot satisfy that matrix's cursor-only eligibility predicate.
+            // Keep their existing Phase B validation and viewport resolution;
+            // the edge-motion proof below belongs only to current-matrix reuse.
+            if self
+                .prepared_window_ids
+                .contains(&DisplayWindowId::new(params.window_id))
+            {
+                return true;
+            }
+            let Some(previous) = self
+                .retained_window_matrices
+                .get(&DisplayWindowId::new(params.window_id))
+            else {
+                // Historical pages keep their own existing validation path.
+                return true;
+            };
+            if previous.key.point == params.point
+                || (params.scroll_margin <= 0 && !Self::cursor_replay_widens_edge(replay, params))
+            {
+                return true;
+            }
+            let current = RetainedWindowKey::from_params(params, *layout_box, evaluator);
+            // Revalidate the policy after sibling Lisp, never accept Phase A's
+            // Keep as authority for an edge cursor in Phase B.
+            RetainedWindowKey::cursor_only_eligible(&previous.key, &current)
+                && Self::cursor_replay_keeps_viewport(
+                    replay,
+                    params,
+                    *layout_box,
+                    frame_params,
+                    evaluator,
+                )
+        });
         let scroll_hook_site = WindowScrollHookSite::new(window_id, resolved_window_start);
         let site_publication = if params.is_minibuffer()
             && matches!(position_publication, WindowPositionPublication::Redisplay)

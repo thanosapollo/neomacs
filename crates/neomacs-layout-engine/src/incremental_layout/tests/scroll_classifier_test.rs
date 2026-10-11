@@ -183,6 +183,56 @@ fn forced_start_reuse_still_rejects_a_point_move_into_a_clipped_bottom_row() {
 }
 
 #[test]
+fn scroll_replay_blank_anchor_rejects_even_matching_measured_geometry() {
+    use neovm_core::buffer::LispCharPos1;
+    use neovm_core::window::DisplayRowSnapshot;
+
+    let mut retained = synthetic_matrix(0, 5);
+    let blank = MatrixRow::make_mut(&mut retained.matrix.rows[2]);
+    blank.displays_text = false;
+    blank.end_charpos = blank.start_charpos;
+    std::sync::Arc::make_mut(&mut retained.display_snapshot)
+        .rows
+        .push(DisplayRowSnapshot {
+            row: 2,
+            y: 32,
+            height: 16,
+            start_buffer_pos: Some(LispCharPos1::new(21)),
+            end_buffer_pos: Some(LispCharPos1::new(21)),
+            ..DisplayRowSnapshot::default()
+        });
+    let current = synthetic_key(20, 25);
+    // These agree exactly, but they still do not describe how the canonical
+    // source walk consumes the newline. Geometry agreement must not admit it.
+    assert!(retained.scroll_replay(&current).is_none());
+
+    for invalid in 0..8 {
+        let mut bad = retained.clone();
+        let row = MatrixRow::make_mut(&mut bad.matrix.rows[2]);
+        match invalid {
+            0 => row.ends_at_zv = true,
+            1 => row.role = GlyphRowRole::Minibuffer,
+            2 => row.end_charpos += 1,
+            3 => row.height_px = 0.0,
+            4 => row.enabled = false,
+            5 => {
+                std::sync::Arc::make_mut(&mut bad.display_snapshot).rows[0].start_buffer_pos = None
+            }
+            6 => {
+                std::sync::Arc::make_mut(&mut bad.display_snapshot).rows[0].end_buffer_pos =
+                    Some(LispCharPos1::new(22))
+            }
+            7 => std::sync::Arc::make_mut(&mut bad.display_snapshot).rows[0].y += 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            bad.scroll_replay(&current).is_none(),
+            "invalid certificate {invalid}"
+        );
+    }
+}
+
+#[test]
 fn scroll_replay_detects_whole_row_scroll_down() {
     let m = synthetic_matrix(0, 5); // rows start at 0,10,20,30,40
     let curr = synthetic_key(20, 25); // scrolled to row 2, point followed

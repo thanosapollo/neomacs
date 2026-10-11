@@ -3710,12 +3710,18 @@ fn cursor_only_fast_path_places_cursor_on_the_row_glyph_advances() {
         .expect("reference cursor")
         .clone();
 
-    // Move away and back: both redisplays reuse the retained body rows.
+    // Move away and back within the same first display row: its fractional
+    // face metrics must not enter the newly widened cross-row edge proof.
     eval.buffer_manager_mut()
         .get_mut(buf_id)
         .expect("buffer")
         .goto_emacs_byte_pos(EmacsBytePos::new(0));
     engine.layout_frame_rust(&mut eval, frame_id);
+    assert_eq!(
+        engine.last_layout_stats().cursor_only_windows,
+        1,
+        "same-row motion away from the wide glyphs must retain its original admission"
+    );
     eval.buffer_manager_mut()
         .get_mut(buf_id)
         .expect("buffer")

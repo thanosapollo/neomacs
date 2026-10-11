@@ -1588,13 +1588,11 @@ impl RetainedWindowMatrix {
         if projected_y.is_some() && curr.window_start < body[0].1.start_charpos as i64 {
             return None;
         }
-        // Whole-row scroll distance: the body row whose start matches the new
-        // window_start. `None` (no match) → partial-row scroll or scroll-up → bail.
-        // Match only rows that DISPLAY buffer text: an empty line or the EOB
-        // placeholder now also carries a real buffer position, but window_start
-        // is always the position of a line that shows text, so gating on
-        // `displays_text` keeps a positionless-but-real empty row from being
-        // taken as the new top (GNU only starts a window at a text row).
+        // Only a displayed-text row certifies this replay's resume origin.
+        // Equal blank matrix/snapshot anchors describe retained geometry, not
+        // the canonical source walk: a full walk can consume that newline and
+        // resume on the next text row. Keep blank-origin scrolling on the full
+        // path until that source transition has its own certificate.
         // P3.5 G3: the start moved BACK. Walk the newly exposed rows from the
         // new start and synchronize with the old first row below them.
         if curr.window_start < body[0].1.start_charpos as i64 && edit_sync::scroll_back_enabled() {

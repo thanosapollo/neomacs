@@ -265,6 +265,23 @@ fn first_visit_page_command_reuses_worker_rows_with_point_at_page_start() {
     first_visit_at(None, "ordinary offscreen text\n", None, 0, 0);
 }
 
+#[test]
+fn first_visit_worker_page_top_row_reuses_rows_after_previous_point_moves() {
+    // Distinct prior cursor rows must not turn prepared-page admission into
+    // current-matrix cursor-only admission. Keep the helper's reuse and fresh
+    // trace assertions unchanged.
+    for previous_row in [1, 5] {
+        first_visit_with_setup(
+            None,
+            "ordinary offscreen text\n",
+            None,
+            0,
+            0,
+            Some(&format!("(goto-char {})", previous_row * 24 + 1)),
+        );
+    }
+}
+
 fn first_visit_at(
     face: Option<&str>,
     line: &str,

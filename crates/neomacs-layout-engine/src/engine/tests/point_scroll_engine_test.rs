@@ -88,6 +88,289 @@ fn move_point(eval: &mut Context, buffer: BufferId, target: usize) {
 }
 
 #[test]
+fn point_scroll_forward_blank_top_falls_back_with_exact_trace() {
+    let text = format!("{LINE}\n").repeat(200);
+    let (mut eval, frame, buffer, window, mut engine) = fixture_with_text(&text, 256, 0);
+    let (mut control, control_frame, control_buffer, control_window, mut full) =
+        fixture_with_text(&text, 256, 0);
+    engine.layout_frame_rust(&mut eval, frame);
+    activate_last_engine_presentation(&mut eval, &engine, frame);
+    scroll_window_to(
+        &mut eval,
+        frame,
+        window,
+        buffer,
+        LINE.len() as i64 + 1,
+        LINE.len() + 2,
+    );
+    scroll_window_to(
+        &mut control,
+        control_frame,
+        control_window,
+        control_buffer,
+        LINE.len() as i64 + 1,
+        LINE.len() + 2,
+    );
+    full.retained_window_matrices.clear();
+    full.prepared_viewports = PreparedViewports::default();
+    engine.layout_frame_rust(&mut eval, frame);
+    full.layout_frame_rust(&mut control, control_frame);
+    assert_eq!(
+        selected_window_layout_trace(&eval, &engine, frame),
+        selected_window_layout_trace(&control, &full, control_frame)
+    );
+    let stats = engine.last_layout_stats();
+    assert_eq!(stats.scroll_windows, 0, "{stats:?}");
+    assert_eq!(stats.full_windows, 1, "{stats:?}");
+    let retained = &engine.retained_window_matrices[&DisplayWindowId::new(window.0 as i64)];
+    let first = retained
+        .matrix
+        .rows
+        .iter()
+        .find(|row| row.enabled && row.role == GlyphRowRole::Text)
+        .unwrap();
+    assert!(
+        !first.displays_text,
+        "new top must be the blank logical line"
+    );
+}
+
+#[test]
+fn point_scroll_upward_overlap_reuses_with_exact_trace() {
+    let (mut eval, frame, buffer, window, mut engine) = fixture(256, 0);
+    let (mut control, control_frame, control_buffer, control_window, mut full) = fixture(256, 0);
+    for (context, frame_id, owner, leaf) in [
+        (&mut eval, frame, buffer, window),
+        (&mut control, control_frame, control_buffer, control_window),
+    ] {
+        scroll_window_to(
+            context,
+            frame_id,
+            leaf,
+            owner,
+            (20 * LINE.len()) as i64 + 1,
+            24 * LINE.len(),
+        );
+    }
+    engine.layout_frame_rust(&mut eval, frame);
+    full.layout_frame_rust(&mut control, control_frame);
+    activate_last_engine_presentation(&mut eval, &engine, frame);
+    activate_last_engine_presentation(&mut control, &full, control_frame);
+    let before = selected_window_layout_trace(&eval, &engine, frame).window_start;
+    let old_start = before.as_i64() - 1;
+    assert_eq!(old_start % LINE.len() as i64, 0);
+    assert!(old_start >= LINE.len() as i64);
+    // Initial source placement can advance the explicitly requested line 20
+    // using the already-presented viewport's end. Pick the predecessor of the
+    // ACCEPTED start, not of that stale request: this is exactly one row back.
+    let expected_start = old_start - LINE.len() as i64;
+    let target = usize::try_from(expected_start + 1).unwrap();
+    move_point(&mut eval, buffer, target);
+    move_point(&mut control, control_buffer, target);
+    let (frame_params, windows) = crate::neovm_bridge::collect_layout_params_with_font_sizing(
+        &eval,
+        frame,
+        None,
+        engine.font_sizing,
+    )
+    .unwrap();
+    let params = windows.iter().find(|window| window.selected).unwrap();
+    assert_eq!(params.window_start, old_start);
+    let geometry = WindowFrameGeometryRequest::new(
+        params,
+        &frame_params,
+        frame_params.width as f32,
+        frame_params.height as f32,
+    )
+    .resolve();
+    let layout_box = WindowLayoutBox::resolve(
+        params,
+        WindowChromeMetrics::from_params(params),
+        WindowDividerLayout::resolve(params, &frame_params, geometry),
+    );
+    let resolved_start = resolve_leaf_window_start(
+        &eval,
+        params,
+        &frame_params,
+        &layout_box,
+        WindowPositionPublication::Redisplay,
+        false,
+    );
+    assert_eq!(resolved_start.get(), expected_start);
+    let mut resolved_params = params.clone();
+    resolved_params.window_start = resolved_start.get();
+    let key = RetainedWindowKey::from_params(&resolved_params, layout_box, &eval);
+    let retained = &engine.retained_window_matrices[&DisplayWindowId::new(window.0 as i64)];
+    assert!(LayoutEngine::small_backward_scroll(retained, &key, &eval));
+    let replay = engine
+        .build_scroll_replay(&resolved_params, layout_box, &eval)
+        .expect("one-row canonical backward start must admit the bounded synchronization route");
+    assert!(replay.sync.is_some());
+    assert_eq!(replay.walk_start.get(), expected_start);
+    full.retained_window_matrices.clear();
+    full.prepared_viewports = PreparedViewports::default();
+    engine.layout_frame_rust(&mut eval, frame);
+    full.layout_frame_rust(&mut control, control_frame);
+    let trace = selected_window_layout_trace(&eval, &engine, frame);
+    assert_eq!(
+        trace,
+        selected_window_layout_trace(&control, &full, control_frame)
+    );
+    assert!(trace.window_start < before);
+    assert_eq!(trace.window_start.as_i64() - 1, expected_start);
+    let stats = engine.last_layout_stats();
+    assert_eq!(stats.scroll_windows, 1, "{stats:?}");
+    assert!(stats.reused_shifted_rows > 0, "{stats:?}");
+    assert_eq!(stats.full_windows, 0, "{stats:?}");
+    assert_eq!(stats.prepared_windows, 0, "{stats:?}");
+}
+
+#[test]
+fn point_cursor_fully_visible_edges_keep_canonical_start_and_reuse() {
+    for bottom in [false, true] {
+        let (mut eval, frame, buffer, window, mut engine) = fixture(256, 0);
+        let (mut control, control_frame, control_buffer, control_window, mut full) =
+            fixture(256, 0);
+        for (context, frame_id, owner, leaf) in [
+            (&mut eval, frame, buffer, window),
+            (&mut control, control_frame, control_buffer, control_window),
+        ] {
+            scroll_window_to(
+                context,
+                frame_id,
+                leaf,
+                owner,
+                (20 * LINE.len()) as i64 + 1,
+                24 * LINE.len(),
+            );
+        }
+        engine.layout_frame_rust(&mut eval, frame);
+        full.layout_frame_rust(&mut control, control_frame);
+        activate_last_engine_presentation(&mut eval, &engine, frame);
+        activate_last_engine_presentation(&mut control, &full, control_frame);
+        let before = selected_window_layout_trace(&eval, &engine, frame);
+        let rows: Vec<_> = before
+            .matrix_rows
+            .iter()
+            .filter(|row| row.role == GlyphRowRole::Text)
+            .collect();
+        let row = if bottom {
+            rows.last().unwrap()
+        } else {
+            rows.first().unwrap()
+        };
+        let target = row.start_charpos + 1;
+        move_point(&mut eval, buffer, target);
+        move_point(&mut control, control_buffer, target);
+        full.retained_window_matrices.clear();
+        full.prepared_viewports = PreparedViewports::default();
+        engine.layout_frame_rust(&mut eval, frame);
+        full.layout_frame_rust(&mut control, control_frame);
+        let trace = selected_window_layout_trace(&eval, &engine, frame);
+        assert_eq!(
+            trace,
+            selected_window_layout_trace(&control, &full, control_frame),
+            "bottom={bottom}"
+        );
+        assert_eq!(trace.window_start, before.window_start);
+        let stats = engine.last_layout_stats();
+        assert_eq!(stats.cursor_only_windows, 1, "bottom={bottom}: {stats:?}");
+        assert!(stats.reused_rows > 0, "{stats:?}");
+    }
+}
+
+#[test]
+fn point_cursor_edge_certification_rejects_margin_fractional_and_missing_anchors() {
+    let (mut eval, frame, buffer, window, mut engine) = fixture(256, 0);
+    scroll_window_to(
+        &mut eval,
+        frame,
+        window,
+        buffer,
+        (20 * LINE.len()) as i64 + 1,
+        24 * LINE.len(),
+    );
+    engine.layout_frame_rust(&mut eval, frame);
+    activate_last_engine_presentation(&mut eval, &engine, frame);
+    let trace = selected_window_layout_trace(&eval, &engine, frame);
+    let target = trace
+        .matrix_rows
+        .iter()
+        .find(|row| row.role == GlyphRowRole::Text)
+        .unwrap()
+        .start_charpos
+        + 1;
+    move_point(&mut eval, buffer, target);
+    let (frame_params, windows) = crate::neovm_bridge::collect_layout_params_with_font_sizing(
+        &eval,
+        frame,
+        None,
+        engine.font_sizing,
+    )
+    .unwrap();
+    let params = windows.iter().find(|window| window.selected).unwrap();
+    let geometry = WindowFrameGeometryRequest::new(
+        params,
+        &frame_params,
+        frame_params.width as f32,
+        frame_params.height as f32,
+    )
+    .resolve();
+    let layout_box = WindowLayoutBox::resolve(
+        params,
+        WindowChromeMetrics::from_params(params),
+        WindowDividerLayout::resolve(params, &frame_params, geometry),
+    );
+    let replay = engine
+        .build_cursor_only_replay(params, layout_box, &frame_params, &eval)
+        .expect("fully visible top edge must be admitted");
+    assert!(LayoutEngine::cursor_replay_keeps_viewport(
+        &replay,
+        params,
+        layout_box,
+        &frame_params,
+        &eval
+    ));
+    let mut with_margin = params.clone();
+    with_margin.scroll_margin = 3;
+    assert!(!LayoutEngine::cursor_replay_keeps_viewport(
+        &replay,
+        &with_margin,
+        layout_box,
+        &frame_params,
+        &eval
+    ));
+    let mut fractional = replay.clone();
+    let (_, row) = fractional
+        .body_rows
+        .iter_mut()
+        .find(|(index, _)| *index == fractional.new_cursor_row_index)
+        .unwrap();
+    neomacs_display_protocol::MatrixRow::make_mut(row).height_px += 0.25;
+    assert!(!LayoutEngine::cursor_replay_keeps_viewport(
+        &fractional,
+        params,
+        layout_box,
+        &frame_params,
+        &eval
+    ));
+    let mut unanchored = replay.clone();
+    unanchored
+        .body_row_snapshots
+        .iter_mut()
+        .find(|row| row.row == unanchored.new_cursor_row_index as i64)
+        .unwrap()
+        .start_buffer_pos = None;
+    assert!(!LayoutEngine::cursor_replay_keeps_viewport(
+        &unanchored,
+        params,
+        layout_box,
+        &frame_params,
+        &eval
+    ));
+}
+
+#[test]
 fn point_scroll_reuses_overlap_and_publishes_its_new_start() {
     // This frame leaves a whole number of body rows; the partial-row cases
     // below intentionally exercise rejection instead of successful reuse.
@@ -1183,7 +1466,18 @@ fn point_cursor_margin_interior_reuses_retained_rows() {
 
 #[test]
 fn point_cursor_margin_revalidates_policy_changed_by_an_earlier_sibling() {
-    fn interleaving_fixture() -> (
+    cursor_policy_interleaving_trace(2, 2);
+}
+
+#[test]
+fn point_cursor_zero_margin_edge_revalidates_sibling_policy_change() {
+    cursor_policy_interleaving_trace(0, 0);
+}
+
+fn cursor_policy_interleaving_trace(initial_margin: i64, target_row: usize) {
+    fn interleaving_fixture(
+        initial_margin: i64,
+    ) -> (
         Context,
         neovm_core::window::FrameId,
         BufferId,
@@ -1197,7 +1491,7 @@ fn point_cursor_margin_revalidates_policy_changed_by_an_earlier_sibling() {
             policy_interleaving_fixture(496);
         {
             let buffer = eval.buffer_manager_mut().get_mut(buffer).unwrap();
-            buffer.set_buffer_local("scroll-margin", Value::fixnum(2));
+            buffer.set_buffer_local("scroll-margin", Value::fixnum(initial_margin));
             buffer.set_buffer_local("scroll-conservatively", Value::fixnum(101));
         }
         let mode_line = eval
@@ -1231,9 +1525,10 @@ fn point_cursor_margin_revalidates_policy_changed_by_an_earlier_sibling() {
         (eval, frame, buffer, earlier_buffer, engine)
     }
 
-    let (mut eval, frame, buffer, earlier_buffer, mut engine) = interleaving_fixture();
+    let (mut eval, frame, buffer, earlier_buffer, mut engine) =
+        interleaving_fixture(initial_margin);
     let (mut control, control_frame, control_buffer, control_earlier, mut full) =
-        interleaving_fixture();
+        interleaving_fixture(initial_margin);
     // Constructing the control Context advances the process-wide character
     // table revision. Refresh both matrices after both contexts exist so
     // phase A is testing a point-only change, not unrelated key invalidation.
@@ -1265,10 +1560,10 @@ fn point_cursor_margin_revalidates_policy_changed_by_an_earlier_sibling() {
         .iter()
         .filter(|row| row.role == GlyphRowRole::Text && row.displays_text)
         .collect();
-    // Row two is usable with margin two, but inside the raised top margin.
-    // It is not an edge row, so the older first/last-row guard cannot mask
-    // this phase-A/phase-B policy race.
-    let target = rows[2].start_charpos;
+    // Margin two admits row two before the sibling raises its policy. The
+    // zero-margin variant admits the fully visible first row instead; both
+    // must discard Phase A's Keep when the sibling changes the live margin.
+    let target = rows[target_row].start_charpos + usize::from(initial_margin == 0);
     move_point(&mut eval, buffer, target);
     move_point(&mut control, control_buffer, target);
     let window = eval.frame_manager().get(frame).unwrap().selected_window;
@@ -1303,7 +1598,7 @@ fn point_cursor_margin_revalidates_policy_changed_by_an_earlier_sibling() {
         WindowChromeMetrics::from_params(&inputs.window),
         WindowDividerLayout::resolve(&inputs.window, &inputs.frame, geometry),
     );
-    assert_eq!(inputs.window.scroll_margin, 2);
+    assert_eq!(inputs.window.scroll_margin, initial_margin);
     assert!(
         engine
             .build_cursor_only_replay(&inputs.window, layout_box, &inputs.frame, &eval)
