@@ -84,6 +84,34 @@ not replaced.  This fixture is not a PTY/parser/renderer substitute."
         (should-not eshell-foreground-command)
         (should (equal default-directory before-directory))))))
 
+(ert-deftest neo-term-exec-prepends-terminal-identity-to-empty-environment ()
+  (neo-term-eshell-test--with-shell
+    (neo-term-exec "/bin/printf" nil "/" nil)
+    (should (= (length admissions) 1))
+    (should (equal (nth 5 (car admissions))
+                   '("TERM=xterm-256color" "COLORTERM=truecolor")))))
+
+(ert-deftest neo-term-exec-prepends-terminal-identity-without-mutating-environment ()
+  (neo-term-eshell-test--with-shell
+    (let* ((environment (list "TERM" "COLORTERM=caller-color" "TERM=caller-term"
+                              "COLORTERM" "SHELL=/bin/sh" "CUSTOM=space λ"
+                              "CUSTOM" "CUSTOM=later"))
+           (before (copy-tree environment))
+           (process-before (copy-tree process-environment))
+           (process-original process-environment))
+      (neo-term-exec "/bin/printf" nil "/" environment)
+      (should (= (length admissions) 1))
+      (let ((received (nth 5 (car admissions))))
+        (should (equal received
+                       (append '("TERM=xterm-256color" "COLORTERM=truecolor")
+                               before)))
+        ;; Preserve all caller entries, including duplicates and bare unsets.
+        (should (eq (cddr received) environment)))
+      (should (equal environment before))
+      (with-current-buffer parent
+        (should (eq process-environment process-original))
+        (should (equal process-environment process-before))))))
+
 (ert-deftest neo-term-eshell-context-refuses-pipe-background-subcommand-and-input ()
   (neo-term-eshell-test--with-shell
     (let ((eshell-current-handles (eshell-create-handles t 'insert)))

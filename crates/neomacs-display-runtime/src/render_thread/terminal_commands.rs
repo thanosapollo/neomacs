@@ -8,6 +8,36 @@ use crate::thread_comm::TerminalCommand;
 
 #[cfg(feature = "neo-term")]
 impl RenderApp {
+    fn terminal_query_palette(
+        &self,
+        frame: neomacs_display_protocol::types::DisplayFrameId,
+    ) -> neomacs_display_protocol::neo_term_palette::NeoTermPalette {
+        self.terminal_manager
+            .palettes
+            .get(&frame)
+            .copied()
+            .unwrap_or_else(|| {
+                let frame = self
+                    .frame_windows
+                    .get(frame.get())
+                    .and_then(|state| state.render.compositor.current_frame.as_ref());
+                frame.map_or_else(
+                    || {
+                        neomacs_display_protocol::neo_term_palette::NeoTermPalette::fallback(
+                            crate::core::types::Color::WHITE,
+                            crate::core::types::Color::BLACK,
+                        )
+                    },
+                    |frame| {
+                        neomacs_display_protocol::neo_term_palette::NeoTermPalette::fallback(
+                            frame.resolved_face(crate::core::types::FaceId::new(0)).fg,
+                            frame.background,
+                        )
+                    },
+                )
+            })
+    }
+
     /// Schedule one render-preparation pass for renderer-owned terminal state.
     ///
     /// PTY wakeups normally provide this demand through `has_terminal_activity`,
@@ -36,6 +66,12 @@ impl RenderApp {
                     None => self.terminal_manager.palettes.remove(&frame).is_some(),
                 };
                 if changed {
+                    let palette = self.terminal_query_palette(frame);
+                    for view in self.terminal_manager.terminals.values() {
+                        if view.frame == Some(frame) {
+                            view.event_proxy.set_palette(palette);
+                        }
+                    }
                     // Reproject cached semantic cells; do not reread/reparse PTY
                     // output or rebuild the grid just because a theme changed.
                     self.invalidate_terminal_scene();
@@ -43,6 +79,7 @@ impl RenderApp {
             }
             TerminalCommand::TerminalCreate {
                 id,
+                frame,
                 size,
                 target,
                 shell,
@@ -54,6 +91,8 @@ impl RenderApp {
                 shell.as_deref(),
                 invocation.as_ref(),
                 waker,
+                Some(frame),
+                self.terminal_query_palette(frame),
             ) {
                 Ok(view) => {
                     if let Err(error) = self.shared_terminals.mark_live(id, view.term.clone()) {

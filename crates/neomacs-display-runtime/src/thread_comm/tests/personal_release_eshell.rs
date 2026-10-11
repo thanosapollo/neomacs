@@ -25,6 +25,7 @@ fn eshell_exact_invocation_survives_cancelled_gui_and_opacity_startup_extraction
         .cmd_tx
         .try_send(RenderCommand::Terminal(TerminalCommand::TerminalCreate {
             id,
+            frame: neomacs_display_protocol::types::DisplayFrameId::new(7),
             size: crate::terminal::TerminalGridSize::new(80, 24).unwrap(),
             target: crate::terminal::TerminalDisplayTarget::Floating,
             shell: None,

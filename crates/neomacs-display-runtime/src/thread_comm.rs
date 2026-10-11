@@ -640,6 +640,7 @@ pub enum TerminalCommand {
     /// Create a terminal
     TerminalCreate {
         id: crate::terminal::TerminalId,
+        frame: neomacs_display_protocol::types::DisplayFrameId,
         size: crate::terminal::TerminalGridSize,
         target: crate::terminal::TerminalDisplayTarget,
         shell: Option<String>,

@@ -4163,8 +4163,8 @@ fn cbsym_classifier_selects_shipset_by_name() {
 }
 
 #[test]
-fn cbsym_shipset_excludes_special_and_reentrant_names() {
-    // The `dispatch_vm_builtin_unrooted` special names and reentrant names
+fn cbsym_shipset_excludes_special_and_writeback_names() {
+    // The `dispatch_vm_builtin_unrooted` special, reentrant and array mutation names
     // must NEVER classify: the fast shim funnels through `funcall_general`,
     // a different dispatch than the special-name arm. Allowlist construction makes
     // this automatic; assert it functionally (a collision would classify one).
@@ -4174,7 +4174,7 @@ fn cbsym_shipset_excludes_special_and_reentrant_names() {
     for name in CBSYM_SPECIAL_NAMES
         .iter()
         .copied()
-        .chain(["funcall", "apply", "eval"])
+        .chain(["funcall", "apply", "eval", "aset", "fillarray"])
     {
         assert!(
             cbsym_spec_kind(intern(name), 0).is_none(),

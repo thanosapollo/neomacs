@@ -7080,6 +7080,7 @@ fn primary_display_host_routes_typed_terminal_requests_to_the_renderer() {
     let id = neovm_core::emacs_core::DisplayHost::create_terminal(
         &host,
         TerminalCreateRequest {
+            frame: neovm_core::window::FrameId(7),
             size: TerminalGridSize {
                 cols: std::num::NonZeroU16::new(96).unwrap(),
                 rows: std::num::NonZeroU16::new(31).unwrap(),
@@ -7137,11 +7138,13 @@ fn primary_display_host_routes_typed_terminal_requests_to_the_renderer() {
         &commands[0],
         RenderCommand::Terminal(TerminalCommand::TerminalCreate {
             id: command_id,
+            frame,
             size,
             target: TerminalDisplayTarget::Floating,
             shell: Some(shell),
             invocation: None,
         }) if *command_id == id
+            && frame.get() == 7
             && *size == TerminalGridSize::new(96, 31).unwrap()
             && shell == "/bin/sh"
     ));
@@ -7181,6 +7184,7 @@ fn primary_display_host_routes_typed_terminal_requests_to_the_renderer() {
     let exact_id = neovm_core::emacs_core::DisplayHost::create_terminal(
         &host,
         TerminalCreateRequest {
+            frame: neovm_core::window::FrameId(7),
             size: TerminalGridSize::new(80, 24).unwrap(),
             target: CoreTerminalDisplayTarget::Floating,
             shell: None,
