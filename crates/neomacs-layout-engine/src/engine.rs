@@ -2333,7 +2333,12 @@ impl LayoutEngine {
                     if params.is_minibuffer() {
                         let cursor_only = if crate::incremental_layout::mini_window_still_enabled()
                         {
-                            self.build_cursor_only_replay(params, *layout_box, evaluator)
+                            self.build_cursor_only_replay(
+                                params,
+                                *layout_box,
+                                &frame_params,
+                                evaluator,
+                            )
                         } else {
                             None
                         };
@@ -2344,8 +2349,12 @@ impl LayoutEngine {
                             is_edit: false,
                         };
                     }
-                    let mut cursor_only =
-                        self.build_cursor_only_replay(params, *layout_box, evaluator);
+                    let mut cursor_only = self.build_cursor_only_replay(
+                        params,
+                        *layout_box,
+                        &frame_params,
+                        evaluator,
+                    );
                     let mut prepared_faces = None;
                     // Historical cursor replays likewise cannot decide margins.
                     if cursor_only.is_none() && params.scroll_margin <= 0 {
@@ -4153,6 +4162,7 @@ impl LayoutEngine {
         &self,
         params: &WindowParams,
         layout_box: WindowLayoutBox,
+        frame_params: &FrameParams,
         evaluator: &neovm_core::emacs_core::Context,
     ) -> Option<CursorOnlyReplay> {
         // The cursor-only fast path applies to ANY window. The render cursor branch
@@ -4171,11 +4181,6 @@ impl LayoutEngine {
             );
             return None;
         };
-        // Retained cursor placement has no measured margin decision. Let the
-        // canonical walk decide when point moves with a nonzero scroll margin.
-        if params.scroll_margin > 0 && prev.key.point != params.point {
-            return None;
-        }
         let curr_key = RetainedWindowKey::from_params(params, layout_box, evaluator);
         let mut replay = match prev.cursor_only_replay(&curr_key) {
             Ok(replay) => replay,
@@ -4194,6 +4199,69 @@ impl LayoutEngine {
                 return None;
             }
         };
+        if params.scroll_margin > 0 && prev.key.point != params.point {
+            // GNU try_cursor_movement can keep the measured body only when
+            // the ordinary viewport policy would keep its start. Use both
+            // canonical decisions: source resolution owns the top margin;
+            // the measured-row retry owns the bottom margin and clipping.
+            // In particular, do not invent a char-height * margin bound for
+            // wrapped rows, tall glyphs, or measured header/tab-line heights.
+            let body = layout_box.body();
+            let top = (body.y - params.bounds.y).round() as i64;
+            let bottom = (body.bottom() - params.bounds.y).round() as i64;
+            let rows = &replay.body_row_snapshots;
+            if rows.is_empty()
+                || rows.iter().any(|row| {
+                    row.height <= 0 || row.y < top || row.y.saturating_add(row.height) > bottom
+                })
+            {
+                return None;
+            }
+            let buffer = evaluator
+                .buffer_manager()
+                .get(neovm_core::buffer::BufferId(params.buffer_id))?;
+            let access = crate::neovm_bridge::RustBufferAccess::new(buffer);
+            // A forced start suppresses source scrolling, but the canonical
+            // measured retry can still move point into the kept viewport.
+            // Fall back for that decision rather than dropping the point move.
+            if !params.force_start
+                && resolve_leaf_window_start(
+                    evaluator,
+                    params,
+                    frame_params,
+                    &layout_box,
+                    WindowPositionPublication::Redisplay,
+                    false,
+                )
+                .get()
+                    != params.window_start
+            {
+                return None;
+            }
+            let visible_end = rows.iter().rev().find_map(|row| row.end_buffer_pos)?;
+            let retry =
+                crate::display_text_window_row_lifecycle::TextWindowVisibilityRetryRequest::new(
+                    rows,
+                    params.window_start,
+                    params.buffer_begv,
+                    params.buffer_size,
+                    params.point,
+                    crate::coords::lisp_char_pos_to_layout_i64(visible_end),
+                    false,
+                    top,
+                    bottom,
+                    crate::scroll_policy::ScrollPolicy::from_window_params(params),
+                    params.scroll_margin,
+                    None,
+                    &access,
+                )
+                .decide();
+            if !matches!(retry.viewport_decision(), ViewportDecision::Keep)
+                || retry.retry_window_start().is_some()
+            {
+                return None;
+            }
+        }
         if prev.chrome_reusable_after_cursor_move(&replay, chrome_reuse_context(params, evaluator))
             && let Some(chrome) = prev.retained_chrome()
         {

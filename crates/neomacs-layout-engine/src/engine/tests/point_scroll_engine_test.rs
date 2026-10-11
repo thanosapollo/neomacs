@@ -309,14 +309,16 @@ fn point_scroll_across_org_folds_and_replacements_matches_full_layout() {
     }
 }
 
-fn policy_interleaving_fixture() -> (
+fn policy_interleaving_fixture(
+    height: u32,
+) -> (
     Context,
     neovm_core::window::FrameId,
     BufferId,
     BufferId,
     LayoutEngine,
 ) {
-    let (mut eval, frame, buffer, target, mut engine) = fixture(480, 0);
+    let (mut eval, frame, buffer, target, mut engine) = fixture(height, 0);
     eval.buffer_manager_mut()
         .get_mut(buffer)
         .unwrap()
@@ -423,9 +425,9 @@ fn proposed_forward_scroll(
 
 #[test]
 fn point_scroll_revalidates_policy_changed_by_an_earlier_sibling() {
-    let (mut eval, frame, buffer, earlier_buffer, mut engine) = policy_interleaving_fixture();
+    let (mut eval, frame, buffer, earlier_buffer, mut engine) = policy_interleaving_fixture(480);
     let (mut control, control_frame, control_buffer, control_earlier, mut full) =
-        policy_interleaving_fixture();
+        policy_interleaving_fixture(480);
     engine.layout_frame_rust(&mut eval, frame);
     activate_last_engine_presentation(&mut eval, &engine, frame);
     let target = first_line_beyond_previous_viewport(&eval, &engine, frame);
@@ -716,4 +718,357 @@ fn point_scroll_margin_cannot_reuse_an_old_page_cursor() {
         assert_eq!(actual, selected_window_layout_trace(&eval, &full, frame));
         activate_last_engine_presentation(&mut eval, &engine, frame);
     }
+}
+
+fn margin_cursor_fixture(
+    height: u32,
+) -> (
+    Context,
+    neovm_core::window::FrameId,
+    BufferId,
+    neovm_core::window::WindowId,
+    LayoutEngine,
+) {
+    let (mut eval, frame, buffer, window, mut engine) = fixture(height, 2);
+    scroll_window_to(
+        &mut eval,
+        frame,
+        window,
+        buffer,
+        (20 * LINE.len()) as i64 + 1,
+        24 * LINE.len(),
+    );
+    engine.layout_frame_rust(&mut eval, frame);
+    activate_last_engine_presentation(&mut eval, &engine, frame);
+    (eval, frame, buffer, window, engine)
+}
+
+#[test]
+fn point_cursor_margin_interior_reuses_retained_rows() {
+    // Include an oversized margin: the canonical cap, not its raw value,
+    // determines the usable rows.
+    for margin in [2, 100] {
+        let (mut eval, frame, buffer, window, mut engine) = margin_cursor_fixture(256);
+        eval.buffer_manager_mut()
+            .get_mut(buffer)
+            .unwrap()
+            .set_buffer_local("scroll-margin", Value::fixnum(margin));
+        engine.layout_frame_rust(&mut eval, frame);
+        activate_last_engine_presentation(&mut eval, &engine, frame);
+        let before = selected_window_layout_trace(&eval, &engine, frame).window_start;
+        for line in [25, 24, 25] {
+            move_point(&mut eval, buffer, line * LINE.len());
+            engine.layout_frame_rust(&mut eval, frame);
+            let actual = selected_window_layout_trace(&eval, &engine, frame);
+            assert_eq!(actual.window_start, before);
+            assert_eq!(engine.last_layout_stats().cursor_only_windows, 1);
+            assert_eq!(engine.last_layout_stats().prepared_windows, 0);
+            let mut full = LayoutEngine::new();
+            full.layout_frame_rust(&mut eval, frame);
+            assert_eq!(actual, selected_window_layout_trace(&eval, &full, frame));
+            assert_eq!(
+                engine.retained_window_matrices[&DisplayWindowId::new(window.0 as i64)]
+                    .key
+                    .window_start,
+                before.as_i64() - 1
+            );
+            activate_last_engine_presentation(&mut eval, &engine, frame);
+        }
+    }
+}
+
+#[test]
+fn point_cursor_margin_revalidates_policy_changed_by_an_earlier_sibling() {
+    fn interleaving_fixture() -> (
+        Context,
+        neovm_core::window::FrameId,
+        BufferId,
+        BufferId,
+        LayoutEngine,
+    ) {
+        // A 496px frame leaves whole 20px body rows and enough rows that
+        // margins two and three remain distinct after the canonical cap.
+        // The 480px scroll fixture clips its last row, preventing admission.
+        let (mut eval, frame, buffer, earlier_buffer, mut engine) =
+            policy_interleaving_fixture(496);
+        {
+            let buffer = eval.buffer_manager_mut().get_mut(buffer).unwrap();
+            buffer.set_buffer_local("scroll-margin", Value::fixnum(2));
+            buffer.set_buffer_local("scroll-conservatively", Value::fixnum(101));
+        }
+        let mode_line = eval
+            .eval_str(
+                "'((:eval (progn
+                 (if point-scroll-policy-armed
+                   (progn
+                     (setq point-scroll-policy-armed nil)
+                     (setq point-scroll-policy-mutations (1+ point-scroll-policy-mutations))
+                     (save-current-buffer
+                       (set-buffer point-scroll-policy-target)
+                       (set (make-local-variable 'scroll-margin) 3))))
+                 \"EARLIER\")))",
+            )
+            .unwrap();
+        eval.buffer_manager_mut()
+            .get_mut(earlier_buffer)
+            .unwrap()
+            .set_buffer_local("mode-line-format", mode_line);
+        let window = eval.frame_manager().get(frame).unwrap().selected_window;
+        scroll_window_to(
+            &mut eval,
+            frame,
+            window,
+            buffer,
+            (20 * LINE.len()) as i64 + 1,
+            24 * LINE.len(),
+        );
+        engine.layout_frame_rust(&mut eval, frame);
+        activate_last_engine_presentation(&mut eval, &engine, frame);
+        (eval, frame, buffer, earlier_buffer, engine)
+    }
+
+    let (mut eval, frame, buffer, earlier_buffer, mut engine) = interleaving_fixture();
+    let (mut control, control_frame, control_buffer, control_earlier, mut full) =
+        interleaving_fixture();
+    // Constructing the control Context advances the process-wide character
+    // table revision. Refresh both matrices after both contexts exist so
+    // phase A is testing a point-only change, not unrelated key invalidation.
+    for (context, frame_id, buffer_id) in [
+        (&mut eval, frame, buffer),
+        (&mut control, control_frame, control_buffer),
+    ] {
+        let window = context
+            .frame_manager()
+            .get(frame_id)
+            .unwrap()
+            .selected_window;
+        scroll_window_to(
+            context,
+            frame_id,
+            window,
+            buffer_id,
+            (20 * LINE.len()) as i64 + 1,
+            24 * LINE.len(),
+        );
+    }
+    engine.layout_frame_rust(&mut eval, frame);
+    activate_last_engine_presentation(&mut eval, &engine, frame);
+    full.layout_frame_rust(&mut control, control_frame);
+    activate_last_engine_presentation(&mut control, &full, control_frame);
+    let initial = selected_window_layout_trace(&eval, &engine, frame);
+    let rows: Vec<_> = initial
+        .matrix_rows
+        .iter()
+        .filter(|row| row.role == GlyphRowRole::Text && row.displays_text)
+        .collect();
+    // Row two is usable with margin two, but inside the raised top margin.
+    // It is not an edge row, so the older first/last-row guard cannot mask
+    // this phase-A/phase-B policy race.
+    let target = rows[2].start_charpos;
+    move_point(&mut eval, buffer, target);
+    move_point(&mut control, control_buffer, target);
+    let window = eval.frame_manager().get(frame).unwrap().selected_window;
+    let path = eval
+        .frame_manager()
+        .leaf_window_paths(frame)
+        .unwrap()
+        .into_iter()
+        .find(|(id, _)| *id == window)
+        .unwrap()
+        .1;
+    let inputs = collect_live_window_layout_inputs(
+        &mut eval,
+        frame,
+        window,
+        &path,
+        None,
+        engine.font_sizing,
+        &engine.retained_window_chrome_metrics,
+        WindowLayoutWalkPurpose::Redisplay,
+    )
+    .unwrap();
+    let geometry = WindowFrameGeometryRequest::new(
+        &inputs.window,
+        &inputs.frame,
+        inputs.root_right_edge,
+        inputs.main_area_bottom,
+    )
+    .resolve();
+    let layout_box = WindowLayoutBox::resolve(
+        &inputs.window,
+        WindowChromeMetrics::from_params(&inputs.window),
+        WindowDividerLayout::resolve(&inputs.window, &inputs.frame, geometry),
+    );
+    assert_eq!(inputs.window.scroll_margin, 2);
+    assert!(
+        engine
+            .build_cursor_only_replay(&inputs.window, layout_box, &inputs.frame, &eval)
+            .is_some(),
+        "the target must admit a cursor plan before the sibling raises its margin"
+    );
+    for (context, earlier) in [(&mut eval, earlier_buffer), (&mut control, control_earlier)] {
+        context.set_variable("point-scroll-policy-armed", Value::T);
+        // Changing the earlier buffer's modified star forces its :eval to run
+        // after phase A and before the selected target consumes its plan.
+        context
+            .buffer_manager_mut()
+            .get_mut(earlier)
+            .unwrap()
+            .insert("x");
+    }
+    full.retained_window_matrices.clear();
+    full.prepared_viewports = PreparedViewports::default();
+    let display_revision = eval.display_var_change_count;
+    engine.layout_frame_rust(&mut eval, frame);
+    full.layout_frame_rust(&mut control, control_frame);
+    assert_eq!(
+        eval.display_var_change_count, display_revision,
+        "margin revalidation must not depend on generic display invalidation"
+    );
+    for context in [&mut eval, &mut control] {
+        assert_eq!(
+            context
+                .eval_str("point-scroll-policy-mutations")
+                .unwrap()
+                .as_fixnum(),
+            Some(1),
+            "the earlier sibling must raise the margin exactly once"
+        );
+    }
+    let stats = engine.last_layout_stats();
+    assert_eq!(stats.cursor_only_windows, 0, "{stats:?}");
+    assert_eq!(stats.prepared_windows, 0, "{stats:?}");
+    assert_eq!(stats.scroll_windows, 0, "{stats:?}");
+    let actual = selected_window_layout_trace(&eval, &engine, frame);
+    let expected = selected_window_layout_trace(&control, &full, control_frame);
+    assert_ne!(actual.window_start, initial.window_start);
+    assert_eq!(actual.window_start, expected.window_start);
+    assert_eq!(actual, expected);
+    assert_eq!(
+        engine.retained_window_matrices[&DisplayWindowId::new(window.0 as i64)]
+            .key
+            .scroll_margin,
+        3,
+        "the accepted matrix must retain the policy used at consumption"
+    );
+}
+
+#[test]
+fn point_cursor_top_and_bottom_margin_fall_back() {
+    for top in [true, false] {
+        let (mut eval, frame, buffer, _, mut engine) = margin_cursor_fixture(256);
+        let (mut control, control_frame, control_buffer, _, mut full) = margin_cursor_fixture(256);
+        let initial = selected_window_layout_trace(&eval, &engine, frame);
+        let rows: Vec<_> = initial
+            .matrix_rows
+            .iter()
+            .filter(|row| row.role == GlyphRowRole::Text && row.displays_text)
+            .collect();
+        // Neither target is an edge row: these must reject because of the
+        // effective margin, not the older first/last-row recenter guard.
+        let target = rows[if top { 1 } else { rows.len() - 2 }].start_charpos;
+        move_point(&mut eval, buffer, target);
+        move_point(&mut control, control_buffer, target);
+        full.retained_window_matrices.clear();
+        full.prepared_viewports = PreparedViewports::default();
+        engine.layout_frame_rust(&mut eval, frame);
+        full.layout_frame_rust(&mut control, control_frame);
+        let actual = selected_window_layout_trace(&eval, &engine, frame);
+        assert_eq!(engine.last_layout_stats().cursor_only_windows, 0);
+        assert_eq!(engine.last_layout_stats().prepared_windows, 0);
+        assert_ne!(actual.window_start, initial.window_start);
+        assert_eq!(
+            actual,
+            selected_window_layout_trace(&control, &full, control_frame)
+        );
+    }
+}
+
+#[test]
+fn point_cursor_margin_forced_start_preserves_start_and_point_policy() {
+    for top in [true, false] {
+        let (mut eval, frame, buffer, window, mut engine) = margin_cursor_fixture(256);
+        let (mut control, control_frame, control_buffer, control_window, mut full) =
+            margin_cursor_fixture(256);
+        let initial = selected_window_layout_trace(&eval, &engine, frame);
+        let rows: Vec<_> = initial
+            .matrix_rows
+            .iter()
+            .filter(|row| row.role == GlyphRowRole::Text && row.displays_text)
+            .collect();
+        let target = rows[if top { 0 } else { rows.len() - 1 }].start_charpos;
+        for (context, frame_id, buffer_id, window_id) in [
+            (&mut eval, frame, buffer, window),
+            (&mut control, control_frame, control_buffer, control_window),
+        ] {
+            move_point(context, buffer_id, target);
+            let leaf = context
+                .frame_manager_mut()
+                .get_mut(frame_id)
+                .unwrap()
+                .find_window_mut(window_id)
+                .unwrap();
+            if let neovm_core::window::Window::Leaf { force_start, .. } = leaf {
+                *force_start = true;
+            } else {
+                panic!("fixture must be a leaf");
+            }
+        }
+        full.retained_window_matrices.clear();
+        full.prepared_viewports = PreparedViewports::default();
+        engine.layout_frame_rust(&mut eval, frame);
+        full.layout_frame_rust(&mut control, control_frame);
+        let actual = selected_window_layout_trace(&eval, &engine, frame);
+        assert_eq!(actual.window_start, initial.window_start);
+        // Forced starts remain conservative: the canonical walk owns any
+        // point relocation needed at the measured bottom margin.
+        assert_eq!(engine.last_layout_stats().cursor_only_windows, 0);
+        assert_eq!(
+            actual,
+            selected_window_layout_trace(&control, &full, control_frame)
+        );
+        assert_eq!(
+            eval.buffer_manager()
+                .get(buffer)
+                .unwrap()
+                .point_emacs_byte_pos(),
+            control
+                .buffer_manager()
+                .get(control_buffer)
+                .unwrap()
+                .point_emacs_byte_pos()
+        );
+        if top {
+            assert_eq!(
+                eval.buffer_manager()
+                    .get(buffer)
+                    .unwrap()
+                    .point_emacs_byte_pos(),
+                EmacsBytePos::new(target)
+            );
+        }
+    }
+}
+
+#[test]
+fn point_cursor_margin_clipped_viewport_falls_back() {
+    let (mut eval, frame, buffer, window, mut engine) = margin_cursor_fixture(245);
+    let retained = &engine.retained_window_matrices[&DisplayWindowId::new(window.0 as i64)];
+    let body = retained.key.partition.text_body();
+    assert!(
+        retained.matrix.rows.iter().any(|row| {
+            row.enabled
+                && row.role == GlyphRowRole::Text
+                && row.pixel_y + retained.display_snapshot.regions.outer.y + row.height_px
+                    > body.y + body.height
+        }),
+        "fixture must contain a clipped body row"
+    );
+    move_point(&mut eval, buffer, 25 * LINE.len());
+    engine.layout_frame_rust(&mut eval, frame);
+    assert_eq!(engine.last_layout_stats().cursor_only_windows, 0);
+    let actual = selected_window_layout_trace(&eval, &engine, frame);
+    let mut full = LayoutEngine::new();
+    full.layout_frame_rust(&mut eval, frame);
+    assert_eq!(actual, selected_window_layout_trace(&eval, &full, frame));
 }

@@ -186,6 +186,10 @@ pub struct RetainedWindowKey {
     pub buffer_id: u64,
     pub window_start: i64,
     pub point: i64,
+    /// Viewport cursor-margin policy. Lisp in an earlier sibling can change
+    /// this after cursor-only admission without bumping a display tick; phase
+    /// B must then discard the plan admitted under the previous margin.
+    pub scroll_margin: i64,
     /// Effective line-number semantics baked into the retained left margin.
     /// Unlike a generic display-variable generation, this typed value also
     /// declares how bare point motion invalidates body glyphs.
@@ -329,6 +333,7 @@ impl RetainedWindowKey {
             buffer_id: p.buffer_id,
             window_start: p.window_start,
             point: p.point,
+            scroll_margin: p.scroll_margin,
             display_line_numbers: p.display_line_numbers,
             buffer_begv: p.buffer_begv,
             buffer_size,
@@ -451,6 +456,7 @@ impl RetainedWindowKey {
             buffer_id,
             window_start,
             point,
+            scroll_margin,
             display_line_numbers,
             buffer_begv,
             buffer_size,

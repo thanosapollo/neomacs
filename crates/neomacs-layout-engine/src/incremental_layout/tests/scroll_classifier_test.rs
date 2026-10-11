@@ -16,6 +16,7 @@ fn synthetic_key(window_start: i64, point: i64) -> RetainedWindowKey {
         buffer_id: 1,
         window_start,
         point,
+        scroll_margin: 0,
         display_line_numbers: DisplayLineNumbersMode::Off,
         buffer_begv: 0,
         buffer_size: 1000,
@@ -283,6 +284,7 @@ fn fast_paths_bail_when_a_non_tick_layout_param_changes() {
     ));
 
     let mutations: &[KeyMutation] = &[
+        ("scroll_margin", |k| k.scroll_margin = 3),
         ("display_line_numbers", |k| {
             k.display_line_numbers = DisplayLineNumbersMode::Relative
         }),
@@ -344,6 +346,22 @@ fn fast_paths_bail_when_a_non_tick_layout_param_changes() {
             "{name} change must block the edit fast path"
         );
     }
+}
+
+#[test]
+fn scroll_margin_change_is_a_policy_invalidator() {
+    let mut previous = synthetic_key(0, 0);
+    previous.scroll_margin = 2;
+    let mut current = previous.clone();
+    current.scroll_margin = 3;
+    assert_eq!(previous.differing_fields(&current), vec!["scroll_margin"]);
+    let delta = WindowDelta::between(&previous, &current);
+    assert!(delta.other_changed);
+    assert!(!delta.is_still());
+    assert!(!delta.only_point_moved_at_most());
+    assert!(!RetainedWindowKey::row_content_eligible(
+        &previous, &current
+    ));
 }
 
 /// Phase 3 below-reuse classifier: a simple insert into a monospace edited
