@@ -135,8 +135,33 @@ fn point_scroll_reuses_overlap_and_publishes_its_new_start() {
 
 #[test]
 fn point_scroll_measured_clipped_bottom_reuses_repeated_next_lines() {
-    let (mut eval, frame, buffer, window, mut engine) = fixture(245, 0);
-    let (mut control, control_frame, control_buffer, _, mut full) = fixture(245, 0);
+    measured_next_line_trace(false, false);
+}
+
+#[test]
+fn point_scroll_measured_blank_org_lines_reuse_and_reject_uncertified_rows() {
+    measured_next_line_trace(true, false);
+}
+
+#[test]
+fn point_scroll_measured_blank_org_fringe_falls_back_with_exact_traces() {
+    measured_next_line_trace(true, true);
+}
+
+fn measured_next_line_trace(rich_org: bool, fringe: bool) {
+    let mut text = String::new();
+    let mut starts = Vec::new();
+    for line in 0..200 {
+        starts.push(text.len());
+        text.push_str(if rich_org && line % 4 == 0 {
+            "\n"
+        } else {
+            LINE
+        });
+    }
+    let (mut eval, frame, buffer, window, mut engine) = fixture_with_text(&text, 245, 0);
+    let (mut control, control_frame, control_buffer, _, mut full) =
+        fixture_with_text(&text, 245, 0);
     for (context, owner) in [(&mut eval, buffer), (&mut control, control_buffer)] {
         let buffer = context.buffer_manager_mut().get_mut(owner).unwrap();
         buffer.set_buffer_local("scroll-conservatively", Value::fixnum(0));
@@ -144,8 +169,8 @@ fn point_scroll_measured_clipped_bottom_reuses_repeated_next_lines() {
         // sizes which the native font backend quantizes to device pixels.
         for line in (2..200).step_by(4) {
             assert!(buffer.put_text_property(
-                line * LINE.len(),
-                line * LINE.len() + 1,
+                starts[line],
+                starts[line] + 1,
                 Value::symbol("display"),
                 Value::list(vec![
                     Value::symbol("space"),
@@ -153,6 +178,40 @@ fn point_scroll_measured_clipped_bottom_reuses_repeated_next_lines() {
                     Value::make_float(1.025)
                 ])
             ));
+        }
+        if rich_org {
+            // Leave the newline-only rows undecorated: real Org's empty Text
+            // rows have no glyphs, displays_text=false, and start=end anchors.
+            for line in (1..200).step_by(4) {
+                assert!(buffer.put_text_property(
+                    starts[line],
+                    starts[line] + LINE.len() - 1,
+                    Value::symbol("face"),
+                    Value::list(vec![Value::keyword("foreground"), Value::string("#426789")]),
+                ));
+                if fringe {
+                    // Buffer-dependent text fringes deliberately veto scroll
+                    // replay; removing the blank-row gate must not weaken it.
+                    assert!(buffer.put_text_property(
+                        starts[line],
+                        starts[line] + 1,
+                        Value::symbol("display"),
+                        Value::list(vec![
+                            Value::symbol("left-fringe"),
+                            Value::symbol("right-triangle"),
+                            Value::symbol("default")
+                        ]),
+                    ));
+                }
+            }
+            for line in (3..200).step_by(4) {
+                assert!(buffer.put_text_property(
+                    starts[line],
+                    starts[line] + 1,
+                    Value::symbol("display"),
+                    Value::string("* Org heading "),
+                ));
+            }
         }
     }
     engine.layout_frame_rust(&mut eval, frame);
@@ -166,6 +225,23 @@ fn point_scroll_measured_clipped_bottom_reuses_repeated_next_lines() {
         .filter(|row| row.enabled && row.role == GlyphRowRole::Text)
         .map(|row| row.height_px)
         .collect();
+    if rich_org {
+        let retained = &engine.retained_window_matrices[&DisplayWindowId::new(window.0 as i64)];
+        assert_eq!(
+            retained.matrix.rows.iter().any(|row| row.enabled
+                && row.role == GlyphRowRole::Text
+                && row.displays_text
+                && row.left_fringe_bitmap.is_some()),
+            fringe,
+            "fixture must realize the requested text fringe, not only set a property"
+        );
+        assert!(
+            trace_text_rows(&selected_window_layout_trace(&eval, &engine, frame))
+                .iter()
+                .any(|row| row.contains("Org heading")),
+            "fixture must realize the display replacement"
+        );
+    }
     println!("measured body heights: {heights:?}");
     assert!(
         heights.iter().any(|height| height.fract() != 0.0),
@@ -173,8 +249,9 @@ fn point_scroll_measured_clipped_bottom_reuses_repeated_next_lines() {
     );
     let mut scrolls = 0;
     let mut measured_proposals = 0;
+    let mut blank_proposals = 0;
     for line in 1..45 {
-        let target = line * LINE.len();
+        let target = starts[line];
         let retained = &engine.retained_window_matrices[&DisplayWindowId::new(window.0 as i64)];
         let body = retained.key.partition.text_body();
         let clipped = retained.matrix.rows.iter().any(|row| {
@@ -204,6 +281,72 @@ fn point_scroll_measured_clipped_bottom_reuses_repeated_next_lines() {
                 params.window_start
             );
             measured_proposals += 1;
+            if rich_org {
+                let id = DisplayWindowId::new(window.0 as i64);
+                let original = engine.retained_window_matrices[&id].clone();
+                let blank = original
+                    .display_snapshot
+                    .rows
+                    .iter()
+                    .find(|row| {
+                        let matrix = &original.matrix.rows[row.row as usize];
+                        matrix.enabled
+                            && matrix.role == GlyphRowRole::Text
+                            && !matrix.displays_text
+                            && !matrix.ends_at_zv
+                            && row.start_buffer_pos.is_some()
+                            && row.start_buffer_pos == row.end_buffer_pos
+                    })
+                    .expect("rich viewport must retain an anchored empty logical row");
+                blank_proposals += 1;
+                // Change only the admitted blank row's certification. None of
+                // these invalid rows may be silently omitted or extrapolated.
+                for invalid in ["eob", "missing-start", "missing-end", "non-text", "filler"] {
+                    let mut mutant = original.clone();
+                    let row_index = blank.row as usize;
+                    match invalid {
+                        "eob" => {
+                            neomacs_display_protocol::MatrixRow::make_mut(
+                                &mut mutant.matrix.rows[row_index],
+                            )
+                            .ends_at_zv = true
+                        }
+                        "non-text" => {
+                            neomacs_display_protocol::MatrixRow::make_mut(
+                                &mut mutant.matrix.rows[row_index],
+                            )
+                            .role = GlyphRowRole::Minibuffer
+                        }
+                        _ => {
+                            let snapshot = std::sync::Arc::make_mut(&mut mutant.display_snapshot);
+                            let row = snapshot
+                                .rows
+                                .iter_mut()
+                                .find(|row| row.row == blank.row)
+                                .unwrap();
+                            if invalid != "missing-end" {
+                                row.start_buffer_pos = None;
+                            }
+                            if invalid != "missing-start" {
+                                row.end_buffer_pos = None;
+                            }
+                        }
+                    }
+                    engine.retained_window_matrices.insert(id, mutant);
+                    assert!(
+                        engine
+                            .retained_measured_forward_start(&params, layout_box, &eval)
+                            .is_none(),
+                        "uncertified {invalid} blank row admitted on next line {line}"
+                    );
+                }
+                engine.retained_window_matrices.insert(id, original);
+                assert!(
+                    engine
+                        .retained_measured_forward_start(&params, layout_box, &eval)
+                        .is_some()
+                );
+            }
         }
         full.retained_window_matrices.clear();
         full.prepared_viewports = PreparedViewports::default();
@@ -229,6 +372,15 @@ fn point_scroll_measured_clipped_bottom_reuses_repeated_next_lines() {
         activate_last_engine_presentation(&mut eval, &engine, frame);
         activate_last_engine_presentation(&mut control, &full, control_frame);
     }
+    if rich_org {
+        assert!(
+            blank_proposals >= 3,
+            "got {blank_proposals} anchored-blank measured proposals"
+        );
+        println!(
+            "rich Org blanks: {blank_proposals} proposals, five uncertified-row controls each"
+        );
+    }
     assert!(
         measured_proposals >= 3,
         "got {measured_proposals} measured proposals"
@@ -236,10 +388,14 @@ fn point_scroll_measured_clipped_bottom_reuses_repeated_next_lines() {
     println!(
         "measured next-line: {scrolls} scroll reuses / {measured_proposals} measured proposals / 44 exact full traces"
     );
-    assert!(
-        scrolls >= 3,
-        "repeated next-line must reuse measured scrolls, got {scrolls}"
-    );
+    if fringe {
+        assert_eq!(scrolls, 0, "text fringe must still reject scroll replay");
+    } else {
+        assert!(
+            scrolls >= 3,
+            "repeated next-line must reuse measured scrolls, got {scrolls}"
+        );
+    }
 }
 
 #[test]

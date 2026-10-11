@@ -4330,14 +4330,15 @@ impl LayoutEngine {
                         matrix_row.enabled
                             && matrix_row.role
                                 == neomacs_display_protocol::frame_glyphs::GlyphRowRole::Text
-                            && matrix_row.displays_text
                             && !matrix_row.ends_at_zv
                     })
             })
             .cloned()
             .collect();
-        // Do not silently omit filler, EOB, or unanchored body rows from the
-        // canonical evidence: a subset is not the measured viewport.
+        // Empty logical lines are enabled Text rows with displays_text=false
+        // and equal, valid source anchors. They are measured viewport evidence,
+        // unlike EOB/filler rows. Keep the complete-body census and anchor checks
+        // below: silently omitting a body row would certify only a subset.
         if rows.len()
             != previous
                 .matrix
