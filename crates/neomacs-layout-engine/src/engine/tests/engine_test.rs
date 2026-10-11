@@ -29858,6 +29858,13 @@ fn layout_frame_rust_renders_tab_bar_text_from_lisp_tab_bar_keymap() {
     let frame_id = eval
         .frame_manager_mut()
         .create_frame("layout-tab-bar", 1600, 160, buf_id);
+    // This test exercises graphical pixel-width tab captions. A raw frame
+    // starts as a text terminal; the Lisp window-system variable does not
+    // change its output method (as in GNU's window-system function).
+    eval.frame_manager_mut()
+        .get_mut(frame_id)
+        .expect("target frame")
+        .set_window_system(Some(Value::symbol("neomacs")));
     eval.obarray_mut()
         .set_symbol_value("layout-target-frame", Value::make_frame(frame_id.0));
     eval.eval_str(
@@ -29883,15 +29890,14 @@ fn layout_frame_rust_renders_tab_bar_text_from_lisp_tab_bar_keymap() {
         Value::NIL,
     ]))
     .expect("select target frame for tab-bar debug");
-    let keymap_debug =
-        match eval.eval_form(Value::list(vec![Value::symbol("tab-bar-make-keymap-1")])) {
-            Ok(value) => eval
-                .eval_form(Value::list(vec![Value::symbol("prin1-to-string"), value]))
-                .ok()
-                .and_then(|rendered| rendered.as_runtime_string_owned())
-                .unwrap_or_else(|| "<render-unavailable>".to_string()),
-            Err(err) => format!("<error: {err}>"),
-        };
+    let keymap_debug = eval
+        .eval_str("(prin1-to-string (tab-bar-make-keymap-1))")
+        .map(|value| {
+            value
+                .as_runtime_string_owned()
+                .unwrap_or_else(|| "<non-string>".to_string())
+        })
+        .unwrap_or_else(|err| format!("<error: {err}>"));
     let tabs_debug = eval
         .eval_str("(prin1-to-string (frame-parameter nil 'tabs))")
         .ok()

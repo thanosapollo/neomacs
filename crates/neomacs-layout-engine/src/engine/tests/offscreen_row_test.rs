@@ -1121,11 +1121,15 @@ fn idle_capture_finishes_while_the_viewport_keeps_moving() {
     engine.layout_frame_rust(&mut eval, frame);
     let display_window = neomacs_display_protocol::types::DisplayWindowId::new(window.0 as i64);
     let mut completed = false;
-    // Each service opportunity is separated by a real viewport change and
-    // redisplay. A continuously moving viewport must not restart acquisition
-    // at its first row forever.
-    for step in 0..150 {
-        engine.maintain_scroll_coverage(&eval);
+    let mut preserved_capture_steps = 0;
+    // Service opportunities are not a clock: yield_now need not schedule the
+    // independently running worker before a fixed iteration count expires.
+    // Keep moving throughout a bounded real-time wait, and separately assert
+    // that redisplay itself preserves any partially acquired capture.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut step = 0;
+    while std::time::Instant::now() < deadline {
+        let maintenance = engine.maintain_scroll_coverage(&eval);
         if engine
             .prepared_viewports
             .has_computed(frame, display_window)
@@ -1133,6 +1137,7 @@ fn idle_capture_finishes_while_the_viewport_keeps_moving() {
             completed = true;
             break;
         }
+        let capture_before_motion = engine.scroll_coverage.active_capture_progress_for_test();
         let start = (step % 3 + 1) * line.len();
         scroll_window_to(
             &mut eval,
@@ -1143,9 +1148,27 @@ fn idle_capture_finishes_while_the_viewport_keeps_moving() {
             start + 5 * line.len(),
         );
         engine.layout_frame_rust(&mut eval, frame);
+        if capture_before_motion.is_some() {
+            assert_eq!(
+                engine.scroll_coverage.active_capture_progress_for_test(),
+                capture_before_motion,
+                "viewport redisplay restarted acquisition at step {step}; maintenance={maintenance:?}"
+            );
+            preserved_capture_steps += 1;
+        }
+        step += 1;
         std::thread::yield_now();
     }
-    assert!(completed, "viewport motion starved the offscreen worker");
+    assert!(
+        completed,
+        "viewport motion starved the offscreen worker after {step} service opportunities; capture={:?}; pending={:?}",
+        engine.scroll_coverage.active_capture_progress_for_test(),
+        engine.scroll_coverage.pending_source_start_for_test(),
+    );
+    assert!(
+        preserved_capture_steps > 0,
+        "no partially acquired capture crossed viewport motion"
+    );
     let actual = selected_window_layout_trace(&eval, &engine, frame);
     let mut fresh = LayoutEngine::new();
     fresh.layout_frame_rust(&mut eval, frame);
