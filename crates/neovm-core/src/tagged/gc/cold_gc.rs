@@ -125,6 +125,15 @@ impl ConcurrentClaimsState {
 }
 
 impl TaggedHeap {
+    /// Lazily install the existing cold carrier without enabling census or
+    /// concurrent claims. Each heap still owns an independent worker.
+    pub(super) fn gc_worker(&mut self) -> &mut GcWorker {
+        &mut self
+            .census
+            .get_or_insert_with(|| Box::new(GenCensus::disabled()))
+            .gc_worker
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_concurrent_hash_test(generational: bool) -> Self {
         let mut heap = knobs::with_concurrent_claims_for_test(true, Self::new);
@@ -299,6 +308,41 @@ mod tests {
         knobs::set_concurrent_claims_for_test(None);
         knobs::set_census_mode_for_test(None);
         heap
+    }
+
+    #[test]
+    fn per_heap_worker_uses_cold_carrier_without_changing_jit_state_or_policy() {
+        for claims in [false, true] {
+            for mode in [knobs::CensusMode::Off, knobs::CensusMode::Survivors] {
+                let mut first = Box::new(heap(claims, mode));
+                let mut second = Box::new(heap(claims, mode));
+                let root = first.alloc_cons(TaggedValue::fixnum(5), TaggedValue::NIL);
+                let jit_address = &first.jit as *const JitHeapState;
+                let cursor = first.jit.cons_cur.get();
+                let window = first.jit_barrier_window_for_test();
+                let first_worker = first.gc_worker() as *mut GcWorker;
+                let second_worker = second.gc_worker() as *mut GcWorker;
+                assert_ne!(first_worker, second_worker);
+                assert_eq!(&first.jit as *const JitHeapState, jit_address);
+                assert_eq!(first.jit.cons_cur.get(), cursor);
+                assert_eq!(first.jit_barrier_window_for_test(), window);
+                assert_eq!(first.concurrent_claims(), claims);
+                assert_eq!(
+                    first.census_state().is_some(),
+                    mode != knobs::CensusMode::Off
+                );
+                for _ in 0..2 {
+                    first.collect_exact(std::iter::once(root));
+                    assert_eq!(first.gc_worker() as *mut GcWorker, first_worker);
+                    assert_eq!(first.concurrent_claims(), claims);
+                    assert_eq!(
+                        first.census_state().is_some(),
+                        mode != knobs::CensusMode::Off
+                    );
+                    assert_eq!(&first.jit as *const JitHeapState, jit_address);
+                }
+            }
+        }
     }
 
     #[test]

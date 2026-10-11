@@ -138,6 +138,11 @@ pub(super) struct GenCensus {
     /// Also true while measurement history is temporarily moved out below.
     census_disabled: bool,
     pub(super) concurrent: Option<Box<super::cold_gc::ConcurrentClaimsState>>,
+    /// Per-heap worker ownership stays cold, preserving the inline heap ABI.
+    pub(super) gc_worker: GcWorker,
+    /// Phase-0 retention is independent of measurement and U35 claims. Only
+    /// the first facade exclusion installs this cold metadata.
+    pub(super) facade_mark: Option<std::sync::Arc<super::facade_mark::FacadeMarkState>>,
 }
 
 /// Only measurement history leaves the carrier during a census. Concurrent
@@ -170,6 +175,8 @@ impl GenCensus {
             last: None,
             census_disabled: false,
             concurrent: None,
+            gc_worker: GcWorker::default(),
+            facade_mark: None,
         }))
     }
 
@@ -185,6 +192,8 @@ impl GenCensus {
             last: None,
             census_disabled: true,
             concurrent: None,
+            gc_worker: GcWorker::default(),
+            facade_mark: None,
         }
     }
 

@@ -640,8 +640,8 @@ pub struct TaggedHeap {
     /// Mapped cons ranges staged by `begin_collection` for the concurrent
     /// first cycle; `launch_concurrent_mark` moves them into the job.
     staged_mapped_cons_scan: Option<Vec<(usize, usize)>>,
-    /// Mapped veclike header addresses staged alongside (see the job field).
-    staged_mapped_veclikes: Option<Vec<usize>>,
+    /// Stopped-start mapped veclike backing descriptors (see the job field).
+    staged_mapped_veclikes: Option<MappedVeclikeScanSnapshot>,
     /// Set while a stop-the-world FIRST partition cycle runs with the image
     /// pre-marked (`premark_mapped_image`): every mapped object is marked in
     /// the side tables and the flat seed pushes all their heap children, so
@@ -793,9 +793,6 @@ pub struct TaggedHeap {
     /// Receives when the GC thread has exited its mark loop (so the mutator's
     /// termination can safely take over the gray queue). Set at start.
     gc_exited: Option<std::sync::mpsc::Receiver<ConcurrentMarkResult>>,
-    /// This heap's own GC thread (`GcWorker`): shared with no other heap, so
-    /// no heap's mark or drop waits behind another heap's mark.
-    gc_worker: GcWorker,
     /// Stage 1b CONCURRENT OBARRAY SCAN: a start-captured obarray chunk snapshot
     /// staged by the start handshake (`start_concurrent_mark`) just before
     /// `launch_concurrent_mark`, which moves it into the `ConcurrentMarkJob`. The
@@ -1067,7 +1064,6 @@ impl TaggedHeap {
             gc_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gc_wake: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
             gc_exited: None,
-            gc_worker: GcWorker::default(),
             pending_obarray_scan: None,
             concurrent_obarray_start_slots: None,
             retired_vector_buffers: Vec::new(),
@@ -1849,18 +1845,13 @@ impl TaggedHeap {
                     .owned_capacity()
                     .saturating_mul(size_of::<TaggedValue>()),
             )
-            .saturating_add(
-                data.params
+            .saturating_add(data.params.named().map_or(0, |params| {
+                params
                     .required
                     .capacity()
-                    .saturating_mul(size_of::<SymId>()),
-            )
-            .saturating_add(
-                data.params
-                    .optional
-                    .capacity()
-                    .saturating_mul(size_of::<SymId>()),
-            )
+                    .saturating_add(params.optional.capacity())
+                    .saturating_mul(size_of::<SymId>())
+            }))
             .saturating_add(
                 data.resident_gnu_byte_offset_map_capacity()
                     .saturating_mul(size_of::<GnuByteOffsetMapEntry>()),
@@ -2051,7 +2042,9 @@ impl TaggedHeap {
             owned: data.constants.owned_capacity() > 0,
             mapped: false,
         });
-        stats = stats.add(Self::lambda_params_payload_layout(&data.params));
+        if let Some(params) = data.params.named() {
+            stats = stats.add(Self::lambda_params_payload_layout(params));
+        }
         if let Some(offsets) = data.resident_gnu_byte_offset_map() {
             stats = stats.add(PayloadLayout {
                 logical_bytes: std::mem::size_of_val(offsets),
@@ -2494,9 +2487,10 @@ impl TaggedHeap {
 impl Drop for TaggedHeap {
     fn drop(&mut self) {
         // Explicit finish is the only blocking completion handoff. Drop
-        // cannot establish exclusive ownership while a marker is active, so
-        // its fallback retains every marker-readable allocation and returns.
-        if self.concurrent_mark_running {
+        // cannot establish exclusive ownership while a marker or facade
+        // reader obligation remains, so its fallback retains the backing
+        // allocations and returns without waiting for either kind of reader.
+        if self.concurrent_mark_running || self.facade_mark_is_excluded() {
             self.abandon_concurrent_mark();
             crate::tagged::gc::clear_tagged_heap_if_installed(self);
             return;
@@ -2662,7 +2656,9 @@ mod heap_identity;
 pub use heap_identity::HeapIdentity;
 mod mark_word;
 use mark_word::{MarkStack, MarkWord, SharedMarkQueue};
+pub(crate) mod mapped_veclike_scan;
 pub(crate) mod scan_contract;
+use mapped_veclike_scan::MappedVeclikeScanSnapshot;
 #[cfg(test)]
 #[path = "gc/tests/shutdown_tests.rs"]
 mod shutdown_tests;
@@ -2719,9 +2715,15 @@ use chunk_map::{CHUNK_CLASS_COUNT, ChunkClass, ChunkEntry, ChunkMap, HeapChunkMa
 
 mod census;
 mod cold_gc;
+mod facade_mark;
 #[cfg(test)]
 use census::CensusRecord;
 use census::{CensusCycleKind, GenCensus, census_remset_probe_on};
+pub use facade_mark::{
+    CollectorQuiescenceError, ConcurrentMarkAdmissionError, ConcurrentMarkCapture,
+    ConcurrentMarkPermit, FacadeEpochRetention, FacadeMarkExclusion, FacadeMarkExclusionError,
+    QuiescentCollector,
+};
 
 mod alloc_region;
 #[cfg(test)]
@@ -2829,6 +2831,9 @@ mod generational_major_tests;
 #[path = "gc/tests/generational_pacing_test.rs"]
 mod generational_pacing_tests;
 
+#[cfg(test)]
+#[path = "gc/tests/bytecode_parameter_roots.rs"]
+mod bytecode_parameter_roots_tests;
 #[cfg(test)]
 #[path = "gc/tests/major_symbol_preimage_test.rs"]
 mod major_symbol_preimage_tests;
