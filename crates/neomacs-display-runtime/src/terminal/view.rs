@@ -15,7 +15,10 @@ use std::thread::{self, JoinHandle};
 use parking_lot::{FairMutex, Mutex};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use neomacs_display_protocol::neo_term_palette::NeoTermPalette;
+use neomacs_display_protocol::types::{Color, DisplayFrameId};
 use rio_vt::ansi::CursorShape;
+use rio_vt::config::colors::{ColorRgb, NamedColor};
 use rio_vt::crosswords::{Crosswords, CrosswordsSize};
 use rio_vt::event::{EventListener, RioEvent, WindowId};
 use rio_vt::performer::handler::Processor;
@@ -38,6 +41,7 @@ pub struct NeomacsEventProxy {
     /// Replies the terminal wants written back to the PTY (DA/DSR/CPR).
     pending_writes: Arc<Mutex<Vec<u8>>>,
     exact_transport: Option<Arc<transport::Transport>>,
+    palette: Arc<Mutex<NeoTermPalette>>,
     /// Latest title not yet forwarded to the evaluator.
     pending_title: Arc<Mutex<Option<String>>>,
     pending_directory: Arc<Mutex<DirectoryUpdates>>,
@@ -54,6 +58,10 @@ impl NeomacsEventProxy {
             wakeup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             exited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_writes: Arc::new(Mutex::new(Vec::new())),
+            palette: Arc::new(Mutex::new(NeoTermPalette::fallback(
+                Color::WHITE,
+                Color::BLACK,
+            ))),
             exact_transport: None,
             pending_title: Arc::new(Mutex::new(None)),
             pending_directory: Arc::new(Mutex::new(DirectoryUpdates::default())),
@@ -62,6 +70,30 @@ impl NeomacsEventProxy {
             #[cfg(test)]
             cleanup_finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn set_palette(&self, palette: NeoTermPalette) {
+        *self.palette.lock() = palette;
+    }
+
+    fn query_color(&self, index: usize) -> Option<ColorRgb> {
+        let palette = self.palette.lock();
+        let color = match index {
+            0..=15 => palette.ansi_foreground[index],
+            16..=255 => {
+                let (r, g, b) = neomacs_display_protocol::xterm_256_rgb(index as u8);
+                return Some(ColorRgb { r, g, b });
+            }
+            index if index == NamedColor::Foreground as usize => palette.foreground,
+            index if index == NamedColor::Background as usize => palette.background,
+            index if index == NamedColor::Cursor as usize => palette.cursor,
+            _ => return None,
+        };
+        Some(ColorRgb {
+            r: Color::linear_component_to_srgb_u8(color.r),
+            g: Color::linear_component_to_srgb_u8(color.g),
+            b: Color::linear_component_to_srgb_u8(color.b),
+        })
     }
 
     /// Check and clear the wakeup flag.
@@ -151,6 +183,13 @@ impl EventListener for NeomacsEventProxy {
 
     fn send_event(&self, event: RioEvent, _window_id: WindowId) {
         match event {
+            RioEvent::ColorRequest(route, index, formatter) => {
+                if let Some(color) = self.query_color(index) {
+                    // Reuse the exact same reply transport and parser formatter
+                    // as PtyWrite, including its BEL/ST terminator.
+                    self.send_event(RioEvent::PtyWrite(route, formatter(color)), _window_id);
+                }
+            }
             RioEvent::PtyWrite(_route, text) => {
                 if let Some(transport) = &self.exact_transport {
                     transport.reply(text.as_bytes());
@@ -176,6 +215,7 @@ impl EventListener for NeomacsEventProxy {
 /// A single terminal instance.
 pub struct TerminalView {
     pub id: TerminalId,
+    pub(crate) frame: Option<DisplayFrameId>,
     pub target: TerminalDisplayTarget,
     /// The terminal state (shared with PTY reader).
     pub term: Arc<FairMutex<Crosswords<NeomacsEventProxy>>>,
@@ -312,7 +352,16 @@ impl TerminalView {
         shell: Option<&str>,
         invocation: Option<&neovm_core::emacs_core::display_host::TerminalInvocation>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_invocation_with_waker(id, size, target, shell, invocation, None)
+        Self::new_invocation_with_waker(
+            id,
+            size,
+            target,
+            shell,
+            invocation,
+            None,
+            None,
+            NeoTermPalette::fallback(Color::WHITE, Color::BLACK),
+        )
     }
 
     pub(crate) fn new_invocation_with_waker(
@@ -322,8 +371,12 @@ impl TerminalView {
         shell: Option<&str>,
         invocation: Option<&neovm_core::emacs_core::display_host::TerminalInvocation>,
         native_waker: Option<winit::event_loop::EventLoopProxy>,
+        frame: Option<DisplayFrameId>,
+        palette: NeoTermPalette,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut event_proxy = NeomacsEventProxy::new(id);
+        // Install before spawn/reader startup: the child can query immediately.
+        event_proxy.set_palette(palette);
         event_proxy.native_waker = native_waker;
         if invocation.is_some() {
             event_proxy.exact_transport = Some(Arc::new(transport::Transport::new()));
@@ -566,6 +619,7 @@ impl TerminalView {
 
         Ok(Self {
             id,
+            frame,
             target,
             term,
             event_proxy,

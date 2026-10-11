@@ -205,6 +205,7 @@ os._exit(17)
     let reservation = app.shared_terminals.reserve(id).unwrap();
     app.handle_terminal(TerminalCommand::TerminalCreate {
         id,
+        frame: neomacs_display_protocol::types::DisplayFrameId::new(1),
         size: TerminalGridSize::new(80, 5).unwrap(),
         target: TerminalDisplayTarget::Floating,
         shell: None,

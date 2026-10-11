@@ -177,8 +177,10 @@ fn create(eval: &mut Context, args: Vec<Value>) -> EvalResult {
                 .to_owned(),
         ),
     };
+    let frame = crate::emacs_core::window_cmds::ensure_selected_frame_id(eval);
     let id = display_host(eval, OPERATION)?
         .create_terminal(TerminalCreateRequest {
+            frame,
             size: TerminalGridSize { cols, rows },
             target,
             shell,
@@ -298,8 +300,10 @@ fn spawn(eval: &mut Context, args: Vec<Value>) -> EvalResult {
         .buffers
         .current_buffer_id()
         .ok_or_else(|| terminal_error("no current buffer for terminal invocation"))?;
+    let frame = crate::emacs_core::window_cmds::ensure_selected_frame_id(eval);
     let id = display_host(eval, OPERATION)?
         .create_terminal(TerminalCreateRequest {
+            frame,
             size,
             target: TerminalDisplayTarget::Window { buffer },
             shell: None,

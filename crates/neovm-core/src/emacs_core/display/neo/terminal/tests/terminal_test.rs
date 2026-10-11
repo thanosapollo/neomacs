@@ -160,6 +160,7 @@ fn public_terminal_builtins_route_typed_requests_through_the_display_host() {
         *host.events.lock().expect("terminal host events"),
         vec![
             TerminalHostEvent::Create(TerminalCreateRequest {
+                frame: eval.frames.selected_frame().unwrap().id,
                 size: TerminalGridSize {
                     cols: std::num::NonZeroU16::new(80).unwrap(),
                     rows: std::num::NonZeroU16::new(24).unwrap(),

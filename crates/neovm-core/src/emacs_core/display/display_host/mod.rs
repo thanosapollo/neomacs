@@ -115,6 +115,8 @@ impl TerminalGridSize {
 /// boundary. Renderer-specific command enums stay outside `neovm-core`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalCreateRequest {
+    /// Frame owning terminal query colours, fixed at creation.
+    pub frame: crate::window::FrameId,
     pub size: TerminalGridSize,
     pub target: TerminalDisplayTarget,
     pub shell: Option<String>,

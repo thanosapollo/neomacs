@@ -1,6 +1,7 @@
 use super::*;
 
 mod backpressure_test;
+mod color_query_test;
 mod cwd_test;
 mod invocation_test;
 

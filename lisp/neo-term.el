@@ -520,8 +520,10 @@ Optional COLS, ROWS set the terminal size."
   "Run exact EXECUTABLE/ARGV in local DIRECTORY with ENVIRONMENT.
 Use the existing native PTY/parser/renderer in a separate buffer.  ENVIRONMENT
 is a complete Emacs process-environment list (first name wins, bare names
-unset); the native boundary refuses non-UTF-8 and NUL.  ORIGIN is an optional
-Eshell handback lease.  Return the new buffer, not a foreground process."
+unset); the native boundary refuses non-UTF-8 and NUL.  Prepend
+TERM=xterm-256color and COLORTERM=truecolor without modifying ENVIRONMENT.
+ORIGIN is an optional Eshell handback lease.  Return the new buffer, not a
+foreground process."
   (unless (and (fboundp 'neomacs-terminal-spawn)
                (neo-term--local-directory executable)
                (neo-term--local-directory directory)
@@ -570,7 +572,9 @@ Eshell handback lease.  Return the new buffer, not a foreground process."
             (error "Native terminal buffer changed during palette setup"))
           (let ((id (neomacs-terminal-spawn
                      neo-term-default-cols neo-term-default-rows
-                     executable argv directory environment)))
+                     executable argv directory
+                     (cons "TERM=xterm-256color"
+                           (cons "COLORTERM=truecolor" environment)))))
             (unless (and (integerp id) (> id 0))
               (error "Native terminal reservation failed"))
             (unless (and (buffer-live-p buffer)

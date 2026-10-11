@@ -2866,6 +2866,7 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         self.send_render_command(
             RenderCommand::Terminal(TerminalCommand::TerminalCreate {
                 id,
+                frame: neomacs_display_protocol::types::DisplayFrameId::new(request.frame.0),
                 size: request.size,
                 target: request.target,
                 shell: request.shell,
