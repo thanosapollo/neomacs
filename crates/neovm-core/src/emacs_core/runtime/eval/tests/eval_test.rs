@@ -23747,6 +23747,39 @@ fn batch_startup_error_with_failed_report_exits_with_error_status() {
     );
 }
 
+/// A reporter's top-level throw aborts presentation, unlike a top-level
+/// throw from ordinary command execution, and must make batch shutdown fail.
+#[test]
+fn batch_startup_error_with_throwing_report_exits_with_error_status() {
+    crate::test_utils::init_test_tracing();
+    assert_eq!(
+        batch_top_level_exit_code(
+            r#"(progn
+                 (setq command-error-function
+                       (lambda (&rest _) (throw 'top-level 'report-aborted)))
+                 (error "x"))"#,
+        ),
+        Some(-1)
+    );
+}
+
+/// Nonlocal exits from reporting retain their tag and value. Only top-level
+/// marks a failed report; an enclosing catch's throw keeps its own meaning.
+#[test]
+fn command_error_report_failure_preserves_throw_and_marks_only_top_level() {
+    let mut ev = Context::new();
+    for tag in ["report-catch", "top-level"] {
+        let flow = ev.command_error_report_failure(Flow::throw(
+            Value::symbol(tag),
+            Value::fixnum(37),
+        ));
+        let thrown = flow.as_throw().expect("reporter's throw is preserved");
+        assert!(thrown.tag.is_symbol_named(tag));
+        assert_eq!(thrown.value, Value::fixnum(37));
+        assert_eq!(ev.command_loop.error_report_failed, tag == "top-level");
+    }
+}
+
 /// Clean batch input exhaustion succeeds; a failed reporter must not change
 /// the exit status of a separate, ordinary EOF path.
 #[test]

@@ -572,7 +572,16 @@ impl Context {
     pub(super) fn command_error_report_failure(&mut self, failure: Flow) -> Flow {
         let sig = match failure.into_kind() {
             FlowKind::Signal(sig) => sig,
-            other => return Flow::from_kind(other),
+            other => {
+                let flow = Flow::from_kind(other);
+                if flow
+                    .as_throw()
+                    .is_some_and(|thrown| thrown.tag.is_symbol_named("top-level"))
+                {
+                    self.command_loop.error_report_failed = true;
+                }
+                return flow;
+            }
         };
         let sig = match self.dispatch_signal_if_needed(sig) {
             Ok(sig) => sig,
