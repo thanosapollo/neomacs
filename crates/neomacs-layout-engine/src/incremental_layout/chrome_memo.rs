@@ -174,19 +174,16 @@ impl ChromeRowFingerprint {
         let string = root.as_lisp_string()?;
         let mut encoder = PlainEncoder::default();
         encoder.string_props(string, PropertyScope::Root, 0).ok()?;
-        let mut sources: Vec<Value> = Vec::new();
+        let mut sources = rustc_hash::FxHashMap::default();
         let spans = formatted
             .source_spans()
             .iter()
             .map(|span| {
                 let source = span.source();
-                let source_index = match sources.iter().position(|seen| *seen == source) {
-                    Some(index) => index,
-                    None => {
-                        sources.push(source);
-                        sources.len() - 1
-                    }
-                };
+                // No Lisp callbacks or collection in capture; identity bits
+                // are stable, and first appearance still defines the index.
+                let next_index = sources.len();
+                let source_index = *sources.entry(source.bits()).or_insert(next_index);
                 ChromeSpanShape {
                     output_start: span.output_start(),
                     output_end: span.output_end(),
@@ -196,7 +193,7 @@ impl ChromeRowFingerprint {
             })
             .collect();
         // Whether a span's source IS the root string decides its string id.
-        let root_index = sources.iter().position(|source| *source == root);
+        let root_index = sources.get(&root.bits()).copied();
         let mut text = Vec::with_capacity(string.as_bytes().len() + 8);
         text.extend_from_slice(string.as_bytes());
         text.extend_from_slice(
