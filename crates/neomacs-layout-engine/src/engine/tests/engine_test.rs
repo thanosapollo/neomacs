@@ -50,6 +50,8 @@ mod edit_sync_engine_test;
 #[cfg(test)]
 #[path = "edit_sync_prove_first_engine_test.rs"]
 mod edit_sync_prove_first_engine_test;
+#[path = "fringe_replay_policy_test.rs"]
+mod fringe_replay_policy_test;
 #[path = "../../tests/engine_layout_validity_test.rs"]
 mod layout_validity;
 #[path = "lazy_text_hit_test.rs"]

@@ -261,6 +261,9 @@ pub struct RetainedWindowKey {
     /// -invisibility-spec, fill-column-indicator, overlay-arrow,
     /// display-line-numbers, …) — none of which move a buffer/face tick.
     pub display_var_change_count: u64,
+    /// Effective owned policy catches nested fringe-indicator-alist mutations.
+    pub(crate) fringe_indicators: crate::buffer_source::fringe_arrows::FringeArrowBitmaps,
+    pub fringe_registry_revision: u64,
 }
 
 impl RetainedWindowKey {
@@ -309,6 +312,16 @@ impl RetainedWindowKey {
             })
             .unwrap_or((0, 0, 0, false, p.buffer_size, 0));
         Self {
+            fringe_indicators: evaluator
+                .buffer_manager()
+                .get(neovm_core::buffer::BufferId(p.buffer_id))
+                .map(|buffer| {
+                    crate::buffer_source::fringe_arrows::FringeArrowBitmaps::resolve(
+                        buffer, evaluator,
+                    )
+                })
+                .unwrap_or_default(),
+            fringe_registry_revision: evaluator.fringe_bitmap_registry().revision(),
             fontset_generation: neovm_core::emacs_core::fontset::fontset_generation(),
             media_generation: evaluator.media_generation(),
             body_redisplay: evaluator.body_redisplay_revision(
@@ -446,6 +459,8 @@ impl RetainedWindowKey {
         }
         diff!(
             fontset_generation,
+            fringe_indicators,
+            fringe_registry_revision,
             prefixes,
             invisibility,
             char_table_revision,
@@ -1532,8 +1547,8 @@ impl RetainedWindowMatrix {
             return None;
         }
         // A complete prepared join at the same source origin can translate
-        // wrapped rows and their fringes without restarting line layout. Other
-        // shifts still require the ordinary conservative decoration guards.
+        // wrapped rows. Other shifts require certified row-local decorations;
+        // the content key already checks source, appearance and fringe geometry.
         let same_origin_projection =
             projected_y.is_some() && curr.window_start == self.key.window_start;
         let mut body: Vec<(usize, &MatrixRow)> = Vec::new();
@@ -1547,13 +1562,21 @@ impl RetainedWindowMatrix {
             {
                 return None;
             }
-            // Fringe bitmaps on TEXT rows are buffer-dependent decorations the
-            // replay cannot re-derive. The indicate-empty-lines fillers past
-            // EOB (!displays_text, left OR right side) are position-independent
-            // and carry real ZV bounds, so they reuse like the placeholder.
+            // Source-display and row-indicator slots survive pure placement
+            // shifts under the unchanged content key. Unknown producers still
+            // veto replay; EOB fillers retain their existing separate admission.
+            if !row.fringes_are_row_local() && row.displays_text && !same_origin_projection {
+                return None;
+            }
+            // Check before selecting either forward or backward synchronization.
+            // A fringe replacement may capture a width-1 cursor without a text
+            // glyph; glyph-based replay cannot reconstruct that geometry.
             if (row.left_fringe_bitmap.is_some() || row.right_fringe_bitmap.is_some())
-                && row.displays_text
-                && !same_origin_projection
+                && curr.point >= row.start_charpos as i64
+                && curr.point <= row.end_charpos as i64
+                && !row.glyphs[GlyphArea::Text.index()]
+                    .iter()
+                    .any(|glyph| row.glyph_covers_buffer_charpos(glyph, curr.point as usize))
             {
                 return None;
             }
@@ -1669,13 +1692,22 @@ impl RetainedWindowMatrix {
             }
         });
         let last_row = body[last].1;
+        // Truncated rows end their glyphs before the physical newline. Resume
+        // after the canonical source extent, not after the last visible glyph.
+        let walk_start = self
+            .display_snapshot
+            .rows
+            .iter()
+            .find(|row| row.row == body[last].0 as i64)
+            .and_then(|row| row.truncated_end_buffer_pos)
+            .map_or(last_row.end_charpos as i64 + 1, |end| end.as_i64());
         Some(ScrollReplay {
             dvpos,
             reused_rows,
             reused_row_snapshots,
             reused_points,
             reused_point_rows,
-            walk_start: PartialBodyWalkStart::new(last_row.end_charpos as i64 + 1),
+            walk_start: PartialBodyWalkStart::new(walk_start),
             exposed_row_base: body.get(last - s + 1).map_or(body[last].0 + 1, |row| row.0),
             exposed_row_count: s,
             exposed_text_y: last_row.pixel_y + dvpos + last_row.height_px,

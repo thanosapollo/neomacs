@@ -4,6 +4,8 @@ use neovm_core::window::{WindowDisplaySnapshot, WindowId};
 
 fn synthetic_key(window_start: i64, point: i64) -> RetainedWindowKey {
     RetainedWindowKey {
+        fringe_indicators: Default::default(),
+        fringe_registry_revision: 0,
         face_remapping: Default::default(),
         fontset_generation: 1,
         prefixes: Default::default(),

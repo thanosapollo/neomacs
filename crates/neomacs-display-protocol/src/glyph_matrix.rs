@@ -1105,6 +1105,12 @@ pub struct GlyphRow {
     /// Fringe bitmap to draw in this row's RIGHT fringe, if any. Reserved for
     /// the right-fringe path (not yet emitted downstream).
     pub right_fringe_bitmap: Option<FringeBitmapInfo>,
+    /// Producer-certified row-local decorations. Unknown writers remain unsafe
+    /// for shifted replay; bitmap IDs alone never establish provenance.
+    #[serde(default)]
+    pub left_fringe_producer: Option<RowFringeProducer>,
+    #[serde(default)]
+    pub right_fringe_producer: Option<RowFringeProducer>,
     /// Overlay-arrow bitmap for this row, drawn in the LEFT fringe.
     ///
     /// Mirrors GNU `struct glyph_row::overlay_arrow_bitmap`, which is a slot
@@ -1176,7 +1182,38 @@ pub struct FringeBitmapInfo {
     pub face_id: FaceId,
 }
 
+/// A row-local producer together with the exact slot value it certified.
+/// Source display and truncation/continuation indicators both depend on row
+/// content, not viewport placement. Window-edge decorations are not certified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RowFringeProducer {
+    SourceDisplay(FringeBitmapInfo),
+    RowIndicator(FringeBitmapInfo),
+}
+
+impl RowFringeProducer {
+    pub fn certifies(self, bitmap: FringeBitmapInfo) -> bool {
+        match self {
+            Self::SourceDisplay(value) | Self::RowIndicator(value) => value == bitmap,
+        }
+    }
+}
+
 impl GlyphRow {
+    /// Both occupied sides must come from known row-local producers. Recheck
+    /// the certified value so an untracked slot overwrite cannot retain proof.
+    pub fn fringes_are_row_local(&self) -> bool {
+        [
+            (self.left_fringe_bitmap, self.left_fringe_producer),
+            (self.right_fringe_bitmap, self.right_fringe_producer),
+        ]
+        .into_iter()
+        .all(|(bitmap, producer)| match bitmap {
+            None => true,
+            Some(bitmap) => producer.is_some_and(|p| p.certifies(bitmap)),
+        })
+    }
+
     /// The next natural buffer row begins at the same boundary after a visual
     /// wrap; a physical line end additionally consumes its newline.
     pub fn next_buffer_row_start(&self) -> Option<usize> {
@@ -1220,6 +1257,8 @@ impl GlyphRow {
             end_charpos: 0,
             left_fringe_bitmap: None,
             right_fringe_bitmap: None,
+            left_fringe_producer: None,
+            right_fringe_producer: None,
             overlay_arrow_bitmap: None,
             appearance: RowAppearance::fresh(),
         }

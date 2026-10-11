@@ -673,6 +673,10 @@ impl WindowRowGeometry {
     }
 
     fn push_chrome_row(&mut self, row: DisplayRowSnapshot) {
+        // A partial body walk can close an empty tail at the chrome boundary.
+        // Chrome replaces that matrix row; publish only its final owner rather
+        // than two snapshots with conflicting extents for the same row.
+        self.rows.retain(|previous| previous.row != row.row);
         self.rows.push(row);
     }
 
@@ -680,7 +684,9 @@ impl WindowRowGeometry {
     /// destination as [`Self::push_chrome_row`], so `finish_snapshot` (which
     /// sorts by row index) cannot tell a reused chrome row from a walked one.
     pub(super) fn push_reused_chrome(&mut self, rows: Vec<DisplayRowSnapshot>) {
-        self.rows.extend(rows);
+        for row in rows {
+            self.push_chrome_row(row);
+        }
     }
 
     pub(super) fn push_chrome_row_progress(&mut self, progress: DisplayRowOutputProgress) {

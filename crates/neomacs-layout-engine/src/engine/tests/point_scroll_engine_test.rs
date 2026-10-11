@@ -144,7 +144,7 @@ fn point_scroll_measured_blank_org_lines_reuse_and_reject_uncertified_rows() {
 }
 
 #[test]
-fn point_scroll_measured_blank_org_fringe_falls_back_with_exact_traces() {
+fn point_scroll_measured_blank_org_fringe_reuses_with_exact_traces() {
     measured_next_line_trace(true, true);
 }
 
@@ -190,8 +190,8 @@ fn measured_next_line_trace(rich_org: bool, fringe: bool) {
                     Value::list(vec![Value::keyword("foreground"), Value::string("#426789")]),
                 ));
                 if fringe {
-                    // Buffer-dependent text fringes deliberately veto scroll
-                    // replay; removing the blank-row gate must not weaken it.
+                    // Source-produced decorations must survive shifted reuse
+                    // with their exact bitmap, face and source precedence.
                     assert!(buffer.put_text_property(
                         starts[line],
                         starts[line] + 1,
@@ -360,6 +360,26 @@ fn measured_next_line_trace(rich_org: bool, fringe: bool) {
             "next line {line}, stats={:?}",
             engine.last_layout_stats()
         );
+        if fringe {
+            let actual_rows = &engine.retained_window_matrices
+                [&DisplayWindowId::new(window.0 as i64)]
+                .matrix
+                .rows;
+            let expected_rows = &full
+                .retained_window_matrices
+                .values()
+                .find(|retained| retained.key.buffer_id == control_buffer.0)
+                .unwrap()
+                .matrix
+                .rows;
+            let actual_rows: Vec<_> = actual_rows.iter().filter(|row| row.enabled).collect();
+            let expected_rows: Vec<_> = expected_rows.iter().filter(|row| row.enabled).collect();
+            assert_eq!(actual_rows.len(), expected_rows.len());
+            for (actual, expected) in actual_rows.iter().zip(expected_rows) {
+                assert_eq!(actual.left_fringe_bitmap, expected.left_fringe_bitmap);
+                assert_eq!(actual.right_fringe_bitmap, expected.right_fringe_bitmap);
+            }
+        }
         let stats = engine.last_layout_stats();
         if stats.scroll_windows > 0 {
             assert!(
@@ -388,14 +408,10 @@ fn measured_next_line_trace(rich_org: bool, fringe: bool) {
     println!(
         "measured next-line: {scrolls} scroll reuses / {measured_proposals} measured proposals / 44 exact full traces"
     );
-    if fringe {
-        assert_eq!(scrolls, 0, "text fringe must still reject scroll replay");
-    } else {
-        assert!(
-            scrolls >= 3,
-            "repeated next-line must reuse measured scrolls, got {scrolls}"
-        );
-    }
+    assert!(
+        scrolls >= 3,
+        "repeated next-line must reuse measured scrolls, got {scrolls}"
+    );
 }
 
 #[test]
