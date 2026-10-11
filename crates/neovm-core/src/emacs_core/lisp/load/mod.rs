@@ -5644,14 +5644,26 @@ pub(crate) fn bootstrap_load_path_entries(lisp_dir: &Path) -> Vec<Value> {
 /// The default `load-path`: the site-lisp directories in front of the
 /// bundled Lisp tree, mirroring the list GNU's `init_lread` hands to the
 /// `EMACSLOADPATH` splice (`src/lread.c:5477-5489`).
-fn default_load_path_entries(lisp_dir: &Path, site_lisp: &[PathBuf]) -> Vec<Value> {
+fn default_load_path_entries(
+    lisp_dir: &Path,
+    site_lisp: &[PathBuf],
+    expand_subdirectories: bool,
+) -> Vec<Value> {
     let mut entries: Vec<Value> = site_lisp
         .iter()
         .map(|dir| {
             Value::string(crate::emacs_core::fileio::host_path_to_lisp_file_name_string(dir))
         })
         .collect();
-    entries.extend(bootstrap_load_path_entries(lisp_dir));
+    if expand_subdirectories {
+        entries.extend(bootstrap_load_path_entries(lisp_dir));
+    } else if lisp_dir.is_dir() {
+        // startup.el owns expansion for ordinary CLI sessions. Seeding these
+        // subdirectories here as well makes subdirs.el insert them twice.
+        entries.push(Value::string(
+            crate::emacs_core::fileio::host_path_to_lisp_file_name_string(lisp_dir),
+        ));
+    }
     entries
 }
 
@@ -5750,13 +5762,59 @@ fn runtime_load_path_entries(
     runtime_load_path_entries_from_os(lisp_dir, std::env::var_os("EMACSLOADPATH"), &site_lisp)
 }
 
+/// Seed ordinary CLI startup before `normal-top-level` expands subdirs.el.
+/// Core evaluators and image-building tools retain their expanded search path.
+pub fn prepare_cli_startup_load_path(eval: &mut super::eval::Context) {
+    let root = runtime_project_root();
+    let site_lisp = if no_site_lisp() {
+        Vec::new()
+    } else {
+        site_lisp_load_path_entries(&root)
+    };
+    eval.set_variable(
+        "load-path",
+        Value::list(cli_load_path_entries_from_os(
+            &root.join("lisp"),
+            std::env::var_os("EMACSLOADPATH"),
+            &site_lisp,
+        )),
+    );
+}
+
+fn cli_load_path_entries_from_os(
+    lisp_dir: &Path,
+    emacs_load_path: Option<std::ffi::OsString>,
+    site_lisp: &[PathBuf],
+) -> Vec<Value> {
+    splice_runtime_load_path(
+        // Source-only launches may not have xtask's generated subdirs.el.
+        // In that case startup cannot expand the roots, so retain the core
+        // search path. Metadata-backed launches leave expansion to Lisp.
+        default_load_path_entries(lisp_dir, site_lisp, !lisp_dir.join("subdirs.el").is_file()),
+        emacs_load_path,
+    )
+}
+
+#[cfg(test)]
+#[path = "tests/cli_load_path_test.rs"]
+mod cli_load_path_tests;
+
 /// Testable core of [`runtime_load_path_entries`].
 pub(crate) fn runtime_load_path_entries_from_os(
     lisp_dir: &Path,
     emacs_load_path: Option<std::ffi::OsString>,
     site_lisp: &[PathBuf],
 ) -> Vec<Value> {
-    let default_load_path = default_load_path_entries(lisp_dir, site_lisp);
+    splice_runtime_load_path(
+        default_load_path_entries(lisp_dir, site_lisp, true),
+        emacs_load_path,
+    )
+}
+
+fn splice_runtime_load_path(
+    default_load_path: Vec<Value>,
+    emacs_load_path: Option<std::ffi::OsString>,
+) -> Vec<Value> {
     let Some(emacs_load_path) = emacs_load_path else {
         return default_load_path;
     };
