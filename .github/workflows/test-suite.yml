@@ -184,6 +184,11 @@ jobs:
       - name: Build fresh release runtime
         run: cargo xtask fresh-build --release
 
+      - name: Verify clean startup expands bundled load-path exactly once
+        run: >-
+          target/release/neomacs -Q --batch --eval
+          '(let ((seen nil) (duplicates 0)) (dolist (p load-path) (if (member p seen) (setq duplicates (1+ duplicates)) (push p seen))) (if (> duplicates 0) (error "Duplicate startup load-path entries: %d" duplicates)) (if (< (length load-path) 2) (error "Startup did not expand subdirs.el")) (if (not (locate-library "ntlm")) (error "Bundled subdirectory library unavailable")) (princ "startup-load-path-expanded-once"))'
+
       - name: Smoke the pdump relocating fallback (NEOVM_PDUMP_NO_FIXED_MAP)
         run: |
           # The planned-base hit path skips relocation validation wholesale;

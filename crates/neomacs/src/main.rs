@@ -3342,7 +3342,7 @@ fn jemalloc_release_startup_slack() {
 fn jemalloc_release_startup_slack() {}
 
 fn create_startup_evaluator_for_mode(mode: RuntimeMode, startup: &StartupOptions) -> Context {
-    let evaluator = match mode {
+    let mut evaluator = match mode {
         RuntimeMode::Raw => raw_source_bootstrap_evaluator(),
         RuntimeMode::BootstrapUse => {
             neovm_core::emacs_core::load::load_runtime_image_with_features(
@@ -3419,6 +3419,9 @@ fn create_startup_evaluator_for_mode(mode: RuntimeMode, startup: &StartupOptions
             }
         }
     };
+    if mode == RuntimeMode::FinalRun {
+        neovm_core::emacs_core::load::prepare_cli_startup_load_path(&mut evaluator);
+    }
     // Image instantiation and bootstrap loading are the startup allocation
     // churn; release their dirty-page slack once, here, for every mode.
     jemalloc_release_startup_slack();

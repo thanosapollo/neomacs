@@ -96,15 +96,22 @@ fn app_monochrome_dark_supports_a_real_edit_build_and_error_navigation_session()
                    (neomacs-app-monochrome-test-line))
                  '("warning:" "error:"))
                 compilation-faces
-                (mapcar
-                 (lambda (request)
-                   (neomacs-app-monochrome-test-face-at
-                    (car request)
-                    (cadr request)))
-                 '(("4:8" (:family :foreground :weight))
-                   ("warning:" (:foreground :background :weight))
-                   ("8:2" (:family :foreground :weight))
-                   ("error:" (:foreground :background :weight))))))
+                (save-restriction
+                  ;; A timestamp in the compilation header can contain "8:2".
+                  ;; Inspect diagnostic faces, not an earlier header match.
+                  (goto-char (point-min))
+                  (search-forward (concat source ":4:8:"))
+                  (beginning-of-line)
+                  (narrow-to-region (point) (point-max))
+                  (mapcar
+                   (lambda (request)
+                     (neomacs-app-monochrome-test-face-at
+                      (car request)
+                      (cadr request)))
+                   '(("4:8" (:family :foreground :weight))
+                     ("warning:" (:foreground :background :weight))
+                     ("8:2" (:family :foreground :weight))
+                     ("error:" (:foreground :background :weight)))))))
         (switch-to-buffer compilation-buffer)
         (setq next-error-last-buffer compilation-buffer)
         (next-error 1 t)
