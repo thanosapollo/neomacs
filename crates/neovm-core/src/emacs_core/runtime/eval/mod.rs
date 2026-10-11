@@ -57,6 +57,10 @@ use crate::window::{
     WindowLayoutQueryAdapter,
 };
 
+pub(crate) mod world;
+pub use world::{ContextShutdownError, ObarrayWriteAccess, OutstandingWorldViews};
+pub(crate) use world::{ObarrayView, OwnedRootRegistryView, WorldView};
+
 mod callback;
 pub(crate) use callback::{CheckedNativeCallback, native_callback_cache_enabled};
 mod subrs;
@@ -1015,6 +1019,42 @@ impl SavedBufferId {
     }
 }
 
+/// GNU's `unwind_excursion.window` slot (editfns.c:783-786): the selected
+/// window at `save-excursion` capture time when it displayed the current
+/// buffer, `Qnil` otherwise. Window ids start at 1, so 0 is a sentinel that
+/// never names a window and the JIT-pinned `SpecBinding` payload width
+/// (`jit_layout.rs` `ENTRY_WORDS`) is unchanged.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExcursionWindow(u64);
+
+impl ExcursionWindow {
+    /// GNU's `Qnil`: no window was recorded at capture time.
+    pub(crate) const NONE: Self = Self(0);
+
+    /// GNU `save_excursion_save` (editfns.c:783-786): record the selected
+    /// window when it displays BUFFER, `NONE` otherwise. Read-only: unlike
+    /// `ensure_selected_frame_id_in_state` this never synthesizes a frame,
+    /// so a frameless batch context records no window, like a GNU that never
+    /// ran `window-init`.
+    #[inline]
+    pub(crate) fn capture(frames: &FrameManager, buffer: BufferId) -> Self {
+        frames
+            .selected_window()
+            .filter(|window| window.buffer_id() == Some(buffer))
+            .map_or(Self::NONE, |window| Self(window.id().0))
+    }
+
+    /// The recorded window, or `None` for GNU's `Qnil`.
+    #[inline]
+    pub(crate) fn window(self) -> Option<WindowId> {
+        (self.0 != 0).then_some(WindowId(self.0))
+    }
+}
+
+static_assertions::assert_eq_size!(ExcursionWindow, u64);
+static_assertions::assert_eq_align!(ExcursionWindow, u64);
+
 mod specbinding_layout;
 
 specbinding_layout::define! {
@@ -1111,13 +1151,14 @@ pub(crate) enum SpecBinding {
     /// For VM: forms is a callable (bytecode fn), unbind_to calls apply.
     UnwindProtect { forms: Value, lexenv: Value },
     /// save-excursion state. Matches GNU SPECPDL_UNWIND_EXCURSION.
-    /// The owning evaluator's mutator records the original IDs for diagnostics
-    /// and retains their payload slots to preserve the specpdl layout. Restore
-    /// follows the traced marker's live location (GNU editfns.c:792-803), since
-    /// buffer-swap-text can move it away from these recording-time identities.
+    /// The owning evaluator's mutator records the original buffer id for
+    /// diagnostics and retains the payload slot GNU gives to
+    /// `unwind_excursion.window`. Restore follows the traced marker's live
+    /// location (GNU editfns.c:792-803), since buffer-swap-text can move it
+    /// away from the recording-time buffer identity.
     SaveExcursion {
         _saved_buffer_id: crate::buffer::BufferId,
-        _saved_marker_id: u64,
+        saved_window: ExcursionWindow,
         marker: Value,
     },
     /// save-current-buffer state. Matches GNU record_unwind_current_buffer.
@@ -1229,6 +1270,10 @@ pub(crate) enum NativeUnwindAction {
     MinibufferBuffer {
         state: Box<super::reader::MinibufferBufferUnwind>,
     },
+    /// GNU `record_unwind_protect_int (backtrace_eval_unrewind, -distance)`
+    /// (eval.c:4255): re-swap the specpdl suffix a `backtrace-eval` unbound,
+    /// restoring the frames' own bindings before their normal unwind.
+    BacktraceEvalRewind { distance: usize },
 }
 
 impl NativeUnwindAction {
@@ -1240,6 +1285,7 @@ impl NativeUnwindAction {
             }
             Self::MinibufferSession { state } => state.trace_roots(visit),
             Self::MinibufferBuffer { .. } => {}
+            Self::BacktraceEvalRewind { .. } => {}
         }
     }
 
@@ -1263,6 +1309,9 @@ impl NativeUnwindAction {
             Self::MinibufferBuffer { state } => {
                 super::reader::unwind_minibuffer_buffer(context, *state)
             }
+            Self::BacktraceEvalRewind { distance } => context
+                .specpdl_swap_suffix_for_backtrace_eval(distance, false)
+                .map(|()| Value::NIL),
         };
         context.restore_vm_roots(root_scope);
         result
@@ -1608,7 +1657,8 @@ fn trivial_spec_binding_pop(binding: &SpecBinding) -> Option<TrivialSpecBindingP
 const _: () = assert!(!std::mem::needs_drop::<TrivialSpecBindingPop>());
 
 /// `pop_simple_specpdl_suffix` retires a `SpecBinding::Let`, `LetLocal`,
-/// `LetDefault` and `LexicalEnv` with `set_len` (GNU's `--specpdl_ptr`);
+/// `LetDefault`, `LexicalEnv`, `SaveCurrentBuffer` and a completed
+/// `SaveExcursion` with `set_len` (GNU's `--specpdl_ptr`);
 /// that is only sound while those variants' payloads own nothing.
 const _: () = assert!(
     !std::mem::needs_drop::<SymId>()
@@ -1616,6 +1666,7 @@ const _: () = assert!(
         && !std::mem::needs_drop::<Value>()
         && !std::mem::needs_drop::<crate::buffer::BufferId>()
         && !std::mem::needs_drop::<SavedBufferId>()
+        && !std::mem::needs_drop::<ExcursionWindow>()
 );
 
 #[derive(Clone, Debug, Default)]
@@ -2942,9 +2993,9 @@ pub type GuiDisplayInitializer =
 pub struct Context {
     /// Arithmetic policy ownership, reconstructed rather than dumped.
     pub(crate) integer_width_context: super::builtins::IntegerWidthContext,
-    pub(crate) owned_roots: crate::emacs_core::owned_roots::OwnedRootRegistry,
+    pub(crate) owned_roots: OwnedRootRegistryView,
     /// Tagged pointer heap — sole GC and allocator.
-    pub(crate) tagged_heap: Box<crate::tagged::gc::TaggedHeap>,
+    pub(crate) tagged_heap: WorldView<crate::tagged::gc::TaggedHeap>,
     /// Mmap-backed pdump image that owns any mapped heap payloads borrowed by
     /// this evaluator's Lisp objects.
     /// The loaded pdump mapping, LEAKED to 'static at install: process-global
@@ -2969,7 +3020,7 @@ pub struct Context {
     /// none after it is.
     pub(crate) window_edge_drag: crate::emacs_core::window_edge_drag::WindowEdgeDrag,
     /// The obarray — unified symbol table with value cells, function cells, plists.
-    pub(crate) obarray: Obarray,
+    pub(crate) obarray: ObarrayView,
     /// Specpdl — special binding stack that writes directly to the obarray.
     /// Matches GNU Emacs's specpdl design.
     pub(crate) specpdl: Vec<SpecBinding>,
@@ -3036,7 +3087,7 @@ pub struct Context {
     /// When true, the printer outputs bare symbol names for symbol-with-pos.
     pub(crate) print_symbols_bare: bool,
     /// Features list (for require/provide).
-    pub(crate) features: Vec<SymId>,
+    pub(crate) features: WorldView<Vec<SymId>>,
     /// Features currently being resolved through `require`.
     pub(crate) require_stack: Vec<SymId>,
     /// Files currently being loaded (mirrors `Vloads_in_progress` in lread.c).
@@ -3097,13 +3148,13 @@ pub struct Context {
     pub(crate) processes: ProcessManager,
     /// Network manager — owns network connections, filters, and sentinels.
     /// Variable watcher list — callbacks on variable changes.
-    pub(crate) watchers: VariableWatcherList,
+    pub(crate) watchers: WorldView<VariableWatcherList>,
     /// Symbols whose variable watchers are currently running.
     ///
     /// GNU `notify_variable_watchers` temporarily sets the symbol's trapped
     /// write state to `SYMBOL_UNTRAPPED_WRITE` to suppress recursive watcher
     /// notification while a watcher callback mutates the same symbol.
-    pub(crate) active_variable_watchers: HashSet<SymId>,
+    pub(crate) active_variable_watchers: WorldView<HashSet<SymId>>,
     /// Canonical Lisp object returned by `standard-syntax-table`.
     ///
     /// GNU Emacs stores this in `Vstandard_syntax_table`; NeoVM keeps the
@@ -3141,7 +3192,7 @@ pub struct Context {
     /// Abbreviation manager — text abbreviation expansion.
     pub(crate) abbrevs: AbbrevManager,
     /// Autoload manager — deferred function loading.
-    pub(crate) autoloads: AutoloadManager,
+    pub(crate) autoloads: WorldView<AutoloadManager>,
     /// Custom variable manager — defcustom/defgroup system.
     pub(crate) custom: CustomManager,
     /// Rectangle state — stores the last killed rectangle for yank-rectangle.
@@ -3150,7 +3201,7 @@ pub struct Context {
     pub(crate) interactive: InteractiveRegistry,
     /// Tree-sitter runtime manager — loaded grammars, parser state, node handles,
     /// and compiled queries backing `treesit-*` builtins.
-    pub(crate) treesit: super::treesit::TreeSitterManager,
+    pub(crate) treesit: WorldView<super::treesit::TreeSitterManager>,
     /// Minibuffer runtime state — active minibuffer stack, prompt metadata, and history.
     pub(crate) minibuffers: MinibufferManager,
     /// Count of completed minibuffer reads observed by the evaluator.
@@ -3196,7 +3247,7 @@ pub struct Context {
     /// True while the command loop is blocked waiting for external input.
     pub(crate) waiting_for_user_input: bool,
     /// Frame manager — owns all frames and windows.
-    pub(crate) frames: FrameManager,
+    pub(crate) frames: WorldView<FrameManager>,
     /// Mode registry — major/minor modes.
     pub(crate) modes: ModeRegistry,
     /// Thread manager — cooperative threading primitives.
@@ -3325,7 +3376,7 @@ pub struct Context {
     /// Native anchor for the next Lisp-driven menu-bar popup.
     pub(crate) pending_menu_bar_popup_anchor: Option<super::MenuBarPopupAnchor>,
     /// Coding system manager — encoding/decoding registry.
-    pub(crate) coding_systems: CodingSystemManager,
+    pub(crate) coding_systems: WorldView<CodingSystemManager>,
     /// Reusable scratch-buffer lifecycle shared by code-conversion entry
     /// points. This is transient runtime state, like GNU's
     /// `Vcode_conversion_reused_workbuf` and `reused_workbuf_in_use`.
@@ -3501,8 +3552,9 @@ pub struct Context {
     /// See `SymbolByteCodeCallCache`: what each symbol's function cell resolves
     /// to for a bytecode stack call, epoch-tagged.
     pub(crate) symbol_bytecode_call_cache: crate::emacs_core::bytecode::vm::SymbolByteCodeCallCache,
-    /// Pooled backing stores for the interpreter's per-entry stacks (see
-    /// `vm::InterpreterStackPool`).
+    /// Thread-private backing stores for the interpreter's per-entry stacks
+    /// (see `vm::InterpreterStackPool`). Live frames leave this empty cache
+    /// before execution; parked roots are published separately, never here.
     pub(crate) interpreter_stacks: crate::emacs_core::bytecode::vm::InterpreterStackPool,
     /// specpdl depths of the dynamic bindings generated code has made in
     /// the current native frames (`neovm_jit_varbind` pushes, `Op::Unbind`
@@ -3543,7 +3595,7 @@ pub struct Context {
     pub(crate) macro_expand_total_us: u64,
     /// When true, collect detailed timing counters for macro/eager-load paths.
     macro_perf_enabled: bool,
-    macro_perf_stats: MacroPerfStats,
+    macro_perf_stats: WorldView<MacroPerfStats>,
     /// Bootstrapped standard interpreted-closure filter function object.
     /// Rooted so the dumped startup state's runtime closure hook remains live.
     interpreted_closure_filter_fn: Option<Value>,
@@ -3978,7 +4030,6 @@ pub(crate) struct ActiveEvalLexicalArgState {
 }
 
 pub(crate) fn begin_eval_with_lexical_arg_in_state(
-    _obarray: &mut Obarray,
     lexenv: &mut Value,
     specpdl: &mut Vec<SpecBinding>,
     lexical_arg: Option<Value>,
@@ -4001,7 +4052,6 @@ pub(crate) fn begin_eval_with_lexical_arg_in_state(
 }
 
 pub(crate) fn finish_eval_with_lexical_arg_in_state(
-    _obarray: &mut Obarray,
     lexenv: &mut Value,
     specpdl: &mut Vec<SpecBinding>,
     state: ActiveEvalLexicalArgState,
@@ -4226,7 +4276,7 @@ fn lisp_frame_manager() -> FrameManager {
     frames
 }
 
-/// The evaluator owns its `TaggedHeap` (a `Box` field) and publishes a raw
+/// The evaluator leases its World-owned `TaggedHeap` allocation and publishes a raw
 /// pointer to it in the thread-local allocation slot (`setup_thread_locals` /
 /// the constructors). That publication has no lifetime tied to the box, so the
 /// owner must retract it: without this hook the slot outlived the storage and
@@ -4254,13 +4304,13 @@ impl Context {
     /// skips those operations; callers use this explicit lifecycle boundary.
     ///
     /// # Errors
-    /// Returns an error if marker completion cannot be established. Drop then
-    /// retains marker-readable storage and skips native callbacks.
-    pub fn shutdown(mut self: Box<Self>) -> Result<(), crate::tagged::gc::MarkFinishError> {
-        // SAFETY: this consumes the boxed Context without moving its contents.
-        // The heap remains at its owner-thread address through reclamation,
-        // and this method neither reads Values nor executes Lisp afterward.
-        unsafe { self.tagged_heap.shutdown_owned_resources() }
+    /// Returns `MarkerFinish` if marker completion cannot be established; Drop
+    /// retains marker-readable storage and skips native callbacks. Returns
+    /// `OutstandingViews` if an extracted storage view prevents exclusive World
+    /// reclamation. Those views remain valid; explicit native finalizers are
+    /// skipped.
+    pub fn shutdown(self: Box<Self>) -> Result<(), ContextShutdownError> {
+        self.shutdown_world()
     }
 
     /// Stop and finish this owner's concurrent marker before orderly teardown.
@@ -4877,20 +4927,11 @@ impl Context {
         form: Value,
         lexical_arg: Option<Value>,
     ) -> EvalResult {
-        let state = begin_eval_with_lexical_arg_in_state(
-            &mut self.obarray,
-            &mut self.lexenv,
-            &mut self.specpdl,
-            lexical_arg,
-        )?;
+        let state =
+            begin_eval_with_lexical_arg_in_state(&mut self.lexenv, &mut self.specpdl, lexical_arg)?;
         let eval_result = self.eval_value(&form);
         let result = self.dispatch_signal_result_if_needed(eval_result);
-        finish_eval_with_lexical_arg_in_state(
-            &mut self.obarray,
-            &mut self.lexenv,
-            &mut self.specpdl,
-            state,
-        );
+        finish_eval_with_lexical_arg_in_state(&mut self.lexenv, &mut self.specpdl, state);
         result
     }
 
@@ -4950,7 +4991,13 @@ impl Context {
 
     #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
     pub(crate) fn add_feature(&mut self, name: &str) {
-        add_feature_in_state(&mut self.obarray, &mut self.features, name);
+        // SAFETY: this noncalling helper changes only the feature value/list;
+        // it preserves function cells, canonical descriptors and manager identity.
+        unsafe {
+            self.obarray.with_legacy_value_write(|obarray| {
+                add_feature_in_state(obarray, &mut self.features, name);
+            });
+        }
     }
 
     pub(crate) fn feature_present(&mut self, name: &str) -> bool {
@@ -4959,7 +5006,13 @@ impl Context {
 
     /// Remove a feature (used to undo temporary provides during bootstrap).
     pub(crate) fn remove_feature(&mut self, name: &str) {
-        remove_feature_in_state(&mut self.obarray, &mut self.features, name);
+        // SAFETY: this noncalling helper changes only the feature value/list;
+        // no dispatch metadata or manager authority leaves the phase.
+        unsafe {
+            self.obarray.with_legacy_value_write(|obarray| {
+                remove_feature_in_state(obarray, &mut self.features, name);
+            });
+        }
     }
 
     /// Access the obarray (for builtins that need it).
@@ -5032,13 +5085,19 @@ impl Context {
             let sym_value = Value::from_sym_id(sym);
             // Ignore the (unreachable) plist error path: these are freshly
             // interned symbols with nil plists.
-            let _ = super::builtins::symbols::put_in_obarray_values(
-                &mut self.obarray,
-                sym_value,
-                fringe_prop,
-                Value::fixnum(i64::from(index)),
-                symbols_with_pos_enabled,
-            );
+            // SAFETY: this noncalling plist operation preserves function cells,
+            // canonical descriptor identity and manager ownership; no loan escapes.
+            let _ = unsafe {
+                self.obarray.with_legacy_value_write(|obarray| {
+                    super::builtins::symbols::put_in_obarray_values(
+                        obarray,
+                        sym_value,
+                        fringe_prop,
+                        Value::fixnum(i64::from(index)),
+                        symbols_with_pos_enabled,
+                    )
+                })
+            };
         }
         self.pre_register_standard_fringe_indicator_alist();
     }
@@ -5086,14 +5145,31 @@ impl Context {
         // from `buffer_defaults` at creation, before this seed ran). GNU buffers
         // read `buffer_defaults` live; neomacs copies, so update the copies that
         // are still nil (no explicit local override).
-        self.buffers.buffer_defaults[offset] = alist;
+        self.buffers.buffer_defaults_mut()[offset] = alist;
         self.buffers
             .seed_default_slot_into_unset_buffers(info.offset, alist);
     }
 
-    /// Access the obarray mutably.
-    pub fn obarray_mut(&mut self) -> &mut Obarray {
-        &mut self.obarray
+    /// Access the opaque manager mutation interface.
+    ///
+    /// Its bounded methods retire publishing writes themselves; this does not
+    /// expose an unrestricted mutable Obarray or a forgettable writer guard.
+    #[inline(always)]
+    pub fn obarray_mut(&mut self) -> ObarrayWriteAccess<'_> {
+        ObarrayWriteAccess::new(&mut self.obarray)
+    }
+
+    /// Run a bounded mutation through the closed manager interface.
+    ///
+    /// The higher-ranked capability cannot escape. Each publishing method
+    /// retires before it returns, including permitted Rust unwinding. The
+    /// capability has no pending Drop obligation that a caller could forget.
+    #[inline(always)]
+    pub fn with_obarray_mut<R>(
+        &mut self,
+        f: impl for<'phase> FnOnce(ObarrayWriteAccess<'phase>) -> R,
+    ) -> R {
+        f(self.obarray_mut())
     }
 
     /// Public read access to the buffer manager.
@@ -6538,14 +6614,20 @@ pub(crate) fn set_runtime_binding_in_state(
     sym_id: SymId,
     value: Value,
 ) -> Result<Option<crate::buffer::BufferId>, Flow> {
-    let locus = set_runtime_binding(
-        &mut ctx.obarray,
-        &mut ctx.buffers,
-        &ctx.custom,
-        ctx.specpdl.as_slice(),
-        sym_id,
-        value,
-    )?;
+    // SAFETY: this checked, noncalling value/BLV store never changes a function
+    // cell, canonical debugger descriptor or manager identity; no interior escapes.
+    let locus = unsafe {
+        ctx.obarray.with_legacy_value_write(|obarray| {
+            set_runtime_binding(
+                obarray,
+                &mut ctx.buffers,
+                &ctx.custom,
+                ctx.specpdl.as_slice(),
+                sym_id,
+                value,
+            )
+        })
+    }?;
     // The bytecode VM (`assign_var_id`/`assign_var`) and other raw-state
     // callers route writes through this entry point. Mark redisplay dirty for
     // display-affecting vars so byte-compiled assignment repaints exactly like
@@ -7087,14 +7169,21 @@ impl Context {
         // this write has to see what the forwarder accepted, not what the
         // caller passed.
         let value = checked.value();
-        let locus = store_runtime_binding(
-            &mut self.obarray,
-            &mut self.buffers,
-            &self.custom,
-            &self.specpdl,
-            sym_id,
-            checked,
-        );
+        // SAFETY: this noncalling value/BLV store leaves function cells and
+        // canonical descriptor identity untouched; its manager loan cannot escape.
+        // Live forwarded Boolean contents remain canonical and are read afresh.
+        let locus = unsafe {
+            self.obarray.with_legacy_value_write(|obarray| {
+                store_runtime_binding(
+                    obarray,
+                    &mut self.buffers,
+                    &self.custom,
+                    &self.specpdl,
+                    sym_id,
+                    checked,
+                )
+            })
+        };
         self.publish_runtime_binding_write_by_id(sym_id, value);
         Ok(locus)
     }
@@ -7105,7 +7194,13 @@ impl Context {
     /// Any other arm is voided by `set_internal`'s store,
     /// [`Self::set_internal_after_watchers`].
     pub(crate) fn makunbound_runtime_binding_by_id(&mut self, sym_id: SymId) {
-        self.obarray.makunbound_id(sym_id);
+        // SAFETY: this short noncalling phase voids the plain value cell through
+        // Obarray's P6.1 CellWrite seam and its seqlock/SATB protocol. It cannot
+        // change dispatch metadata or leak a manager or symbol reference.
+        unsafe {
+            self.obarray
+                .with_legacy_value_write(|obarray| obarray.makunbound_id(sym_id));
+        }
         self.sync_cached_runtime_binding_by_id(sym_id, Value::NIL);
         self.sync_keyboard_runtime_binding_by_id(sym_id, Value::NIL);
         self.refresh_gc_runtime_settings_after_change_by_id(sym_id);
@@ -7410,6 +7505,7 @@ mod pdump_reconstruct;
 mod macroexpand;
 
 mod specpdl;
+pub(crate) use specpdl::{CurrentBufferScope, ExcursionScope, RestrictionScope};
 
 mod builtin_vars;
 pub(crate) use builtin_vars::builtin_frontend_on;
@@ -7482,6 +7578,14 @@ use form_head_cache::{FormHead, HeadClass};
 #[cfg(test)]
 #[path = "tests/eval_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/saved_state_scope_test.rs"]
+mod saved_state_scope_test;
+
+#[cfg(test)]
+#[path = "tests/admission_header_test.rs"]
+mod admission_header_tests;
 
 #[cfg(test)]
 #[path = "tests/gc_context_shutdown.rs"]

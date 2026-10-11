@@ -269,17 +269,17 @@ fn internal_equal_compares_char_table_and_sub_char_table_storage() {
         let right = Value::make_char_table(purpose, Value::NIL, 1);
         let left_sub = Value::make_sub_char_table(3, 128, vec![Value::NIL; 128]);
         let right_sub = Value::make_sub_char_table(3, 128, vec![Value::NIL; 128]);
-        left.with_char_table_mut(|table| table.contents[1] = left_sub)
+        left.with_char_table_mut(|table| table.set_contents(1, left_sub))
             .expect("left char-table");
         right
-            .with_char_table_mut(|table| table.contents[1] = right_sub)
+            .with_char_table_mut(|table| table.set_contents(1, right_sub))
             .expect("right char-table");
 
         assert!(equal_value(&left, &right, 0));
 
         right_sub
             .with_sub_char_table_mut(|table| {
-                table.contents.ensure_owned()[17] = Value::T;
+                table.set_contents(17, Value::T);
             })
             .expect("right sub-char-table");
         assert!(!equal_value(&left, &right, 0));

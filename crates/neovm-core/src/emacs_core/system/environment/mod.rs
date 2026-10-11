@@ -152,7 +152,7 @@ pub(crate) fn install_host_environment_snapshot(eval: &mut Context) {
 fn install_environment_snapshot(eval: &mut Context, inherited: Vec<(String, String)>) {
     let process_environment = environment_list(environment_before_launcher(inherited));
     {
-        let obarray = eval.obarray_mut();
+        let mut obarray = eval.obarray_mut();
         obarray.make_special("initial-environment");
         obarray.make_special("process-environment");
     }

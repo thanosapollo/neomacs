@@ -97,7 +97,12 @@ impl EvaluatorCompatibility<NeedsEventProperties> {
         self,
         ctx: &mut crate::emacs_core::eval::Context,
     ) -> EvaluatorCompatibility<NeedsPublicEval> {
-        symbols::init_event_symbol_properties(&mut ctx.obarray);
+        // SAFETY: compatibility setup only initializes event symbol properties;
+        // it does not call Lisp or mutate canonical function/debugger metadata.
+        unsafe {
+            ctx.obarray
+                .with_legacy_value_write(symbols::init_event_symbol_properties);
+        }
         EvaluatorCompatibility(std::marker::PhantomData)
     }
 }
@@ -3821,7 +3826,7 @@ pub(crate) fn register_subrs(ctx: &mut crate::emacs_core::eval::Context) {
     ));
     ctx.register_subr(SubrSpec::new(
         "make-string",
-        NativeFn::ContextVec(|_ctx, args| builtin_make_string(args)),
+        NativeFn::ContextVec(super::strings::builtin_make_string_in_context),
         SubrArity::new(2, Some(3)),
     ));
     ctx.register_subr(SubrSpec::new(
@@ -6955,7 +6960,7 @@ pub(crate) fn register_subrs(ctx: &mut crate::emacs_core::eval::Context) {
     // -- Vector --
     ctx.register_subr(SubrSpec::new(
         "make-vector",
-        NativeFn::ContextVec(|_ctx, args| builtin_make_vector(args)),
+        NativeFn::ContextVec(super::collections::builtin_make_vector_in_context),
         SubrArity::new(2, Some(2)),
     ));
     ctx.register_subr(SubrSpec::new(
@@ -7496,9 +7501,7 @@ pub(crate) fn register_subrs(ctx: &mut crate::emacs_core::eval::Context) {
     ));
     ctx.register_subr(SubrSpec::new(
         "make-bool-vector",
-        NativeFn::ContextVec(|_ctx, args| {
-            crate::emacs_core::chartable::builtin_make_bool_vector(args)
-        }),
+        NativeFn::ContextVec(crate::emacs_core::boolvec::builtin_make_bool_vector_in_context),
         SubrArity::new(2, Some(2)),
     ));
     ctx.register_subr(SubrSpec::new(

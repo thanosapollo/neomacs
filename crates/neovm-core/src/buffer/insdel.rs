@@ -299,6 +299,37 @@ impl Buffer {
 /// Structural text mutation entry points for buffers and indirect-buffer
 /// siblings. This is the closest Rust ownership boundary to GNU `insdel.c`.
 impl BufferManager {
+    /// Acquire an exclusive live physical edit lease. Numeric character
+    /// bounds may lie outside narrowing, but must fit the actual text.
+    /// Returns None for a missing buffer, inverted range, or end beyond text.
+    /// No Lisp callback runs here or while the lease is held. Production
+    /// edits lease a range their preparation measured
+    /// ([`Self::prepare_measured_buffer_edit`]).
+    #[cfg(test)]
+    pub(crate) fn prepare_buffer_edit(
+        &mut self,
+        id: BufferId,
+        chars: CharRange,
+    ) -> Option<crate::buffer::edit_transaction::PreparedBufferEdit<'_>> {
+        crate::buffer::edit_transaction::PreparedBufferEdit::new(self, id, chars)
+    }
+
+    /// Lease a range measured at `measured_at`, reusing the measurement
+    /// while the text is unchanged (see `PreparedBufferEdit::measured`).
+    #[inline]
+    pub(crate) fn prepare_measured_buffer_edit(
+        &mut self,
+        range: TextEditRange,
+        measured_at: crate::buffer::edit_transaction::TextMeasurement,
+    ) -> Option<crate::buffer::edit_transaction::PreparedBufferEdit<'_>> {
+        crate::buffer::edit_transaction::PreparedBufferEdit::measured(
+            self,
+            measured_at.buffer(),
+            range,
+            measured_at,
+        )
+    }
+
     pub fn edit_range_for_buffer_emacs_byte_range(
         &self,
         id: BufferId,
@@ -513,6 +544,7 @@ impl BufferManager {
         }
         let range = self.edit_range_for_buffer_emacs_byte_range(id, byte_range)?;
         self.replace_buffer_measured_region_lisp_string(id, range, text)
+            .map(|_| ())
     }
 
     pub fn replace_buffer_measured_region_lisp_string(
@@ -520,10 +552,10 @@ impl BufferManager {
         id: BufferId,
         range: TextEditRange,
         text: &LispString,
-    ) -> Option<()> {
+    ) -> Option<TextExtent> {
         // GNU: `if (nbytes_del <= 0 && inschars == 0) return;` (insdel.c:1521).
         if range.is_empty() && text.is_empty() {
-            return Some(());
+            return Some(TextExtent::ZERO);
         }
 
         // Every other shape, including an empty old range, is one
@@ -538,7 +570,7 @@ impl BufferManager {
         self.execute_shared_text_edit(id, |buffer| {
             let edit = buffer.replace_measured_region_lisp_string_edit(range, text);
             Some(SharedTextEditOutcome::edited(
-                (),
+                edit.new_extent(),
                 SharedTextEditMetadata::Replace(edit),
             ))
         })

@@ -1229,34 +1229,21 @@ impl Context {
     }
 
     pub(super) fn sf_save_excursion_value(&mut self, tail: Value) -> EvalResult {
-        let count = self.specpdl.len();
-        self.record_save_excursion();
-        let result = self.sf_progn_value(tail);
-        self.unbind_to_with_result(count, result)
+        let mut scope = ExcursionScope::enter(self);
+        let result = scope.context().sf_progn_value(tail);
+        scope.finish(result)
     }
 
     pub(super) fn sf_save_current_buffer_value(&mut self, tail: Value) -> EvalResult {
-        // Specpdl-carried like the VM arm and GNU's
-        // record_unwind_current_buffer, so a panic contained at a module/JIT
-        // boundary inside the body restores the buffer via the boundary
-        // unwind (an imperative restore here would be skipped, leaving the
-        // wrong buffer current). PS fix-wave sweep hit.
-        let count = self.specpdl.len();
-        if let Some(buf) = self.buffers.current_buffer() {
-            self.specpdl
-                .push(SpecBinding::SaveCurrentBuffer { buffer_id: buf.id });
-        }
-        let result = self.sf_progn_value(tail);
-        self.unbind_to_with_result(count, result)
+        let mut scope = CurrentBufferScope::enter(self);
+        let result = scope.context().sf_progn_value(tail);
+        scope.finish(result)
     }
 
     pub(super) fn sf_save_restriction_value(&mut self, tail: Value) -> EvalResult {
-        let count = self.specpdl.len();
-        if let Some(state) = self.buffers.save_current_restriction_state() {
-            self.specpdl.push(SpecBinding::save_restriction(state));
-        }
-        let result = self.sf_progn_value(tail);
-        self.unbind_to_with_result(count, result)
+        let mut scope = RestrictionScope::enter(self);
+        let result = scope.context().sf_progn_value(tail);
+        scope.finish(result)
     }
 
     pub(super) fn validate_throw(&self, flow: Flow) -> Flow {
@@ -1493,7 +1480,15 @@ impl Context {
         subfeatures: Option<Value>,
     ) -> EvalResult {
         self.note_macro_expansion_mutation();
-        provide_value_in_state(&mut self.obarray, &mut self.features, feature, subfeatures)?;
+        let features = &mut self.features;
+        // SAFETY: provide_value_in_state only publishes feature values and
+        // properties. Its Lisp after-load hooks run below, after this loan;
+        // no canonical function/debugger metadata or storage identity changes.
+        unsafe {
+            self.obarray.with_legacy_value_write(|obarray| {
+                provide_value_in_state(obarray, features, feature, subfeatures)
+            })
+        }?;
         self.record_load_history_entry(LoadHistoryEntry::ProvidedFeature(feature));
         // GNU Emacs Fprovide (fns.c): after adding the feature, run any
         // load-hooks registered in `after-load-alist`.

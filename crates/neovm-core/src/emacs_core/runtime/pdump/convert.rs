@@ -2183,12 +2183,12 @@ impl<'a> LoadDecoder<'a> {
                     let restored_obj = restored
                         .as_char_table_obj()
                         .expect("make-char-table returned char-table");
-                    table.defalt = restored_obj.defalt;
-                    table.parent = restored_obj.parent;
-                    table.purpose = restored_obj.purpose;
-                    table.ascii = restored_obj.ascii;
-                    table.contents = restored_obj.contents;
-                    table.extras = restored_obj.extras.clone();
+                    table.set_default(restored_obj.defalt);
+                    table.set_parent(restored_obj.parent);
+                    table.set_purpose(restored_obj.purpose);
+                    table.set_ascii(restored_obj.ascii);
+                    table.copy_contents(&restored_obj.contents);
+                    table.copy_extras(restored_obj.extras.as_slice());
                 });
             }
             DumpHeapObject::SubCharTable {
@@ -2206,9 +2206,9 @@ impl<'a> LoadDecoder<'a> {
                     let restored_obj = restored
                         .as_sub_char_table_obj()
                         .expect("make-sub-char-table returned sub-char-table");
-                    table.depth = restored_obj.depth;
-                    table.min_char = restored_obj.min_char;
-                    table.contents = restored_obj.contents.clone();
+                    // The placeholder already has the dump's depth,
+                    // min_char and slot count. Restore only its value slots.
+                    table.copy_contents(restored_obj.contents.as_slice());
                 });
             }
             DumpHeapObject::HashTable(ht) => {

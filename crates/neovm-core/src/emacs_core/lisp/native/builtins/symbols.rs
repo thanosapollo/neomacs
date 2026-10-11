@@ -750,10 +750,7 @@ pub(crate) fn builtin_fset_2(
             vec![Value::symbol("nil")],
         ));
     }
-    let would_cycle = {
-        let obarray = eval.obarray_mut();
-        would_create_function_alias_cycle_in_obarray(obarray, symbol, &def)
-    };
+    let would_cycle = would_create_function_alias_cycle_in_obarray(eval.obarray(), symbol, &def);
     if would_cycle {
         return Err(signal(
             LispCondition::CyclicFunctionIndirection,
@@ -926,9 +923,8 @@ pub(crate) fn symbol_property_get(
     // alias/redirect resolution on every `get`. `symbol_value_id_or_nil` still
     // follows defvaralias and reads the slot `specbind` writes, so a let-bound
     // override is honored.
-    let overrides = eval
-        .obarray()
-        .symbol_value_id_or_nil(overriding_plist_environment_symbol());
+    let obarray = eval.obarray();
+    let overrides = obarray.symbol_value_id_or_nil(overriding_plist_environment_symbol());
     if overrides.is_cons()
         && let Some(plist) = assq_cdr_swp(&symbol_value, overrides, symbols_with_pos_enabled)
         && let Some(propval) =
@@ -938,7 +934,7 @@ pub(crate) fn symbol_property_get(
         return Ok((sym, Some(propval)));
     }
 
-    let property = match eval.obarray().symbol_plist_snapshot_id(sym) {
+    let property = match obarray.symbol_plist_snapshot_id(sym) {
         SymbolPlistSnapshot::NoEntries => None,
         SymbolPlistSnapshot::Entries(plist) => {
             crate::emacs_core::plist::plist_get_swp(plist, &prop, symbols_with_pos_enabled)
@@ -952,7 +948,14 @@ pub(crate) fn builtin_put(
     args: Vec<Value>,
 ) -> EvalResult {
     ctx.note_macro_expansion_mutation();
-    put_in_obarray(&mut ctx.obarray, args, ctx.symbols_with_pos_enabled)
+    let symbols_with_pos_enabled = ctx.symbols_with_pos_enabled;
+    // SAFETY: plist validation/update is noncalling and changes only property
+    // Values. Neither canonical dispatch word nor storage identity can change.
+    unsafe {
+        ctx.obarray.with_legacy_value_write(|obarray| {
+            put_in_obarray(obarray, args, symbols_with_pos_enabled)
+        })
+    }
 }
 
 #[inline(always)]
@@ -963,13 +966,14 @@ pub(crate) fn builtin_put_3(
     value: Value,
 ) -> EvalResult {
     ctx.note_macro_expansion_mutation();
-    put_in_obarray_values(
-        &mut ctx.obarray,
-        symbol_value,
-        prop,
-        value,
-        ctx.symbols_with_pos_enabled,
-    )
+    let symbols_with_pos_enabled = ctx.symbols_with_pos_enabled;
+    // SAFETY: this storage-level property helper runs no Lisp and publishes
+    // only plist Values; no canonical function/debugger metadata is modified.
+    unsafe {
+        ctx.obarray.with_legacy_value_write(|obarray| {
+            put_in_obarray_values(obarray, symbol_value, prop, value, symbols_with_pos_enabled)
+        })
+    }
 }
 
 pub(crate) fn put_in_obarray(
@@ -1038,19 +1042,24 @@ pub(super) fn builtin_register_code_conversion_map(
         crate::emacs_core::plist::plist_check(plist)?;
     }
 
-    let obarray = eval.obarray_mut();
     let map_id = super::ccl::builtin_register_code_conversion_map_impl(args.clone())?;
 
-    let _ = put_in_obarray(
-        obarray,
-        vec![args[0], Value::symbol("code-conversion-map"), args[1]],
-        symbols_with_pos_enabled,
-    )?;
-    let _ = put_in_obarray(
-        obarray,
-        vec![args[0], Value::symbol("code-conversion-map-id"), map_id],
-        symbols_with_pos_enabled,
-    )?;
+    // SAFETY: registration is complete; this noncalling phase only publishes
+    // its two property Values and leaves no raw manager/interior authority.
+    unsafe {
+        eval.obarray.with_legacy_value_write(|obarray| {
+            let _ = put_in_obarray(
+                obarray,
+                vec![args[0], Value::symbol("code-conversion-map"), args[1]],
+                symbols_with_pos_enabled,
+            )?;
+            put_in_obarray(
+                obarray,
+                vec![args[0], Value::symbol("code-conversion-map-id"), map_id],
+                symbols_with_pos_enabled,
+            )
+        })
+    }?;
 
     Ok(map_id)
 }
@@ -1128,7 +1137,6 @@ pub(super) fn builtin_register_ccl_program(
     args: Vec<Value>,
 ) -> EvalResult {
     let symbols_with_pos_enabled = eval.symbols_with_pos_enabled;
-    let obarray = eval.obarray_mut();
     let was_registered = args
         .first()
         .and_then(|v| v.as_symbol_id())
@@ -1139,11 +1147,17 @@ pub(super) fn builtin_register_ccl_program(
         return Ok(program_id);
     }
 
-    let publish = put_in_obarray(
-        obarray,
-        vec![args[0], Value::symbol("ccl-program-idx"), program_id],
-        symbols_with_pos_enabled,
-    );
+    // SAFETY: CCL registration/validation finished first; property publication
+    // is noncalling and never changes canonical function/debugger metadata.
+    let publish = unsafe {
+        eval.obarray.with_legacy_value_write(|obarray| {
+            put_in_obarray(
+                obarray,
+                vec![args[0], Value::symbol("ccl-program-idx"), program_id],
+                symbols_with_pos_enabled,
+            )
+        })
+    };
     if let Err(err) = publish {
         if let Some(name) = args[0].as_symbol_id() {
             super::ccl::unregister_registered_ccl_program(name);
@@ -3531,11 +3545,42 @@ pub(crate) fn builtin_transpose_regions(
         current_id,
         changed_byte_span,
     )?;
+    let measured_at = crate::buffer::TextMeasurement::of(&eval.buffers, current_id);
     crate::emacs_core::editfns::signal_before_text_change(eval, change)?;
+    // GNU `Ftranspose_regions` runs `modify_text (start1, end2)` and then
+    // keeps using the positions it computed before (editfns.c), which reads
+    // stale bytes once a before-change function edited the buffer. Measure
+    // the same character positions in the live buffer instead, and reject
+    // them as `validate_region` would when they no longer fit.
+    let Some(target) = eval.buffers.current_buffer_id() else {
+        return Ok(Value::NIL);
+    };
+    let (transposition, change) =
+        if crate::buffer::TextMeasurement::of(&eval.buffers, target) == measured_at {
+            (transposition, change)
+        } else {
+            let Some(buf) = eval.buffers.get(target) else {
+                return Ok(Value::NIL);
+            };
+            if first.start() < buf.point_min_char_pos() || second.end() > buf.point_max_char_pos() {
+                return Err(signal(
+                    LispCondition::ArgsOutOfRange,
+                    vec![
+                        Value::fixnum(first.start().to_lisp().as_i64()),
+                        Value::fixnum(second.end().to_lisp().as_i64()),
+                    ],
+                ));
+            }
+            let transposition = buf.text_transposition_for_char_ranges(first, second);
+            let change = crate::buffer::TextChange::unchanged_extent(
+                buf.edit_range_for_char_range(transposition.char_span()),
+            );
+            (transposition, change)
+        };
     let leave_markers = args.get(4).is_some_and(|value| !value.is_nil());
     let _ = eval
         .buffers
-        .transpose_buffer_regions(current_id, transposition, leave_markers.into());
+        .transpose_buffer_regions(target, transposition, leave_markers.into());
     crate::emacs_core::editfns::signal_after_text_change(eval, change)?;
     Ok(Value::NIL)
 }
@@ -3802,65 +3847,100 @@ fn compare_lisp_strings(
     super::strings::string_ordering(lhs, rhs)
 }
 
+/// An integer decoded from a fixnum tag, hence strictly inside i64 range
+/// even after rounding to binary64. Only `ValueLtNumber::of` constructs it.
+/// This scalar has no Lisp state and can be shared between mutators.
+#[derive(Clone, Copy, Debug)]
+struct ValueLtFixnum(i64);
+
+static_assertions::assert_impl_all!(ValueLtFixnum: Send, Sync);
+
+/// Numeric operands decoded once for GNU's `value_cmp` (fns.c:3123-3132,
+/// 3263-3275). Borrowing ties bignums to their input values; comparing these
+/// operands never runs Lisp or reaches a GC safe point.
+/// Heap projections remain confined to the mutator owning the input values.
+#[derive(Clone, Copy, Debug)]
+enum ValueLtNumber<'value> {
+    Fixnum(ValueLtFixnum),
+    Float(f64),
+    Bignum(&'value Integer, std::marker::PhantomData<*const ()>),
+}
+
+impl<'value> ValueLtNumber<'value> {
+    #[inline]
+    fn of(value: &'value Value) -> Option<Self> {
+        if let Some(integer) = value.as_fixnum() {
+            Some(Self::Fixnum(ValueLtFixnum(integer)))
+        } else if let Some(float) = value.as_float() {
+            Some(Self::Float(float))
+        } else {
+            value
+                .as_bignum()
+                .map(|integer| Self::Bignum(integer, std::marker::PhantomData))
+        }
+    }
+
+    #[inline]
+    fn compare(self, other: Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::Fixnum(left), Self::Fixnum(right)) => left.0.cmp(&right.0),
+            (Self::Fixnum(integer), Self::Float(float)) => {
+                compare_fixnum_float_for_value_lt(integer, float)
+            }
+            (Self::Float(float), Self::Fixnum(integer)) => {
+                compare_fixnum_float_for_value_lt(integer, float).reverse()
+            }
+            (Self::Float(left), Self::Float(right)) => compare_floats_for_value_lt(left, right),
+            (Self::Bignum(left, _), Self::Bignum(right, _)) => left.cmp(right),
+            // A fixnum fits in Integer's inline single-limb representation;
+            // these total comparisons allocate and clone no bignum limbs.
+            (Self::Bignum(left, _), Self::Fixnum(right)) => left.cmp(&Integer::from(right.0)),
+            (Self::Fixnum(left), Self::Bignum(right, _)) => {
+                right.cmp(&Integer::from(left.0)).reverse()
+            }
+            (Self::Bignum(integer, _), Self::Float(float)) => {
+                integer.partial_cmp(&float).unwrap_or(Ordering::Equal)
+            }
+            (Self::Float(float), Self::Bignum(integer, _)) => integer
+                .partial_cmp(&float)
+                .unwrap_or(Ordering::Equal)
+                .reverse(),
+        }
+    }
+}
+
+/// GNU fns.c:3265-3267 makes NaN incomparable with every numeric operand.
+#[inline]
+fn compare_floats_for_value_lt(left: f64, right: f64) -> std::cmp::Ordering {
+    if left < right {
+        std::cmp::Ordering::Less
+    } else if left > right {
+        std::cmp::Ordering::Greater
+    } else {
+        std::cmp::Ordering::Equal
+    }
+}
+
+/// GNU fns.c:3089-3105 compares in the integer domain when conversion
+/// rounds a fixnum to the same double.
+#[inline]
+fn compare_fixnum_float_for_value_lt(integer: ValueLtFixnum, float: f64) -> std::cmp::Ordering {
+    let rounded = integer.0 as f64;
+    if rounded == float {
+        // Convert our own finite rounded fixnum, whose magnitude is at most
+        // 2^61 and therefore fits i64. Equality makes this the float's exact
+        // integral value, including either spelling of zero.
+        let exact = rounded as i64;
+        integer.0.cmp(&exact)
+    } else {
+        compare_floats_for_value_lt(rounded, float)
+    }
+}
+
+#[inline]
 fn compare_number_values_for_value_lt(lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
-    use std::cmp::Ordering;
-
-    if !lhs.is_number() || !rhs.is_number() {
-        return None;
-    }
-
-    if lhs.is_float() || rhs.is_float() {
-        if let Some(big) = lhs.as_bignum() {
-            let right = match rhs.kind() {
-                ValueKind::Fixnum(n) => n as f64,
-                ValueKind::Float => rhs.xfloat(),
-                _ => return None,
-            };
-            return Some(big.partial_cmp(&right).unwrap_or(Ordering::Equal));
-        }
-        if let Some(big) = rhs.as_bignum() {
-            let left = match lhs.kind() {
-                ValueKind::Fixnum(n) => n as f64,
-                ValueKind::Float => lhs.xfloat(),
-                _ => return None,
-            };
-            return Some(
-                big.partial_cmp(&left)
-                    .map(|ordering| ordering.reverse())
-                    .unwrap_or(Ordering::Equal),
-            );
-        }
-        let left = match lhs.kind() {
-            ValueKind::Fixnum(n) => n as f64,
-            ValueKind::Float => lhs.xfloat(),
-            _ => return None,
-        };
-        let right = match rhs.kind() {
-            ValueKind::Fixnum(n) => n as f64,
-            ValueKind::Float => rhs.xfloat(),
-            _ => return None,
-        };
-        return Some(left.partial_cmp(&right).unwrap_or(Ordering::Equal));
-    }
-
-    if !lhs.is_bignum() && !rhs.is_bignum() {
-        return match (lhs.kind(), rhs.kind()) {
-            (ValueKind::Fixnum(left), ValueKind::Fixnum(right)) => Some(left.cmp(&right)),
-            _ => None,
-        };
-    }
-
-    let left = match lhs.kind() {
-        ValueKind::Fixnum(n) => Integer::from(n),
-        ValueKind::Veclike(VecLikeType::Bignum) => lhs.as_bignum().expect("bignum").clone(),
-        _ => return None,
-    };
-    let right = match rhs.kind() {
-        ValueKind::Fixnum(n) => Integer::from(n),
-        ValueKind::Veclike(VecLikeType::Bignum) => rhs.as_bignum().expect("bignum").clone(),
-        _ => return None,
-    };
-    Some(left.cmp(&right))
+    Some(ValueLtNumber::of(lhs)?.compare(ValueLtNumber::of(rhs)?))
 }
 
 fn symbol_name_for_value_lt(
@@ -4723,7 +4803,13 @@ pub(crate) fn builtin_internal_event_symbol_parse_modifiers(
 ) -> EvalResult {
     expect_args("internal-event-symbol-parse-modifiers", &args, 1)?;
     let symbol = SymId::from_value(eval, args[0])?;
-    cache_event_symbol_properties_in_obarray(eval.obarray_mut(), symbol)?;
+    // SAFETY: event parsing/cache population only writes properties and returns
+    // a detached result; it never calls Lisp or a canonical dispatch writer.
+    unsafe {
+        eval.obarray.with_legacy_value_write(|obarray| {
+            cache_event_symbol_properties_in_obarray(obarray, symbol)
+        })
+    }?;
     Ok(eval
         .obarray()
         .get_property_id(symbol, intern("event-symbol-elements"))
@@ -5113,7 +5199,7 @@ pub(crate) fn builtin_internal_make_var_non_special(
     args: Vec<Value>,
 ) -> EvalResult {
     expect_args("internal-make-var-non-special", &args, 1)?;
-    let obarray = eval.obarray_mut();
+    let mut obarray = eval.obarray_mut();
     let symbol = expect_symbol_id(&args[0])?;
     obarray.make_non_special_id(symbol);
     Ok(Value::NIL)

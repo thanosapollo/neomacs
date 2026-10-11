@@ -447,7 +447,12 @@ fn symbol_with_pos_property_keys_follow_gnu_eq_rules() {
 fn skip_debugger_matches_raw_unibyte_ignored_error_regex() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    crate::emacs_core::errors::init_standard_errors(&mut ev.obarray);
+    // SAFETY: the native standard-error fixture writes only properties,
+    // with no Lisp/collection, canonical dispatch changes or escaping loan.
+    unsafe {
+        ev.obarray
+            .with_legacy_value_write(crate::emacs_core::errors::init_standard_errors);
+    }
     let raw = Value::heap_string(crate::heap_types::LispString::from_unibyte(vec![0xFF]));
     ev.obarray
         .set_symbol_value("debug-ignored-errors", Value::list(vec![raw]));
@@ -473,7 +478,12 @@ fn skip_debugger_matches_raw_unibyte_ignored_error_regex() {
 fn command_error_severity_follows_gnus_debug_ignored_errors() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    crate::emacs_core::errors::init_standard_errors(&mut ev.obarray);
+    // SAFETY: the native standard-error fixture writes only properties,
+    // with no Lisp/collection, canonical dispatch changes or escaping loan.
+    unsafe {
+        ev.obarray
+            .with_legacy_value_write(crate::emacs_core::errors::init_standard_errors);
+    }
     let signal_of =
         |name: &str, data: Vec<Value>| match crate::emacs_core::error::signal(name, data)
             .into_kind()
@@ -555,7 +565,12 @@ fn command_error_severity_follows_gnus_debug_ignored_errors() {
 fn command_error_severity_never_signals_on_a_bad_ignore_list() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    crate::emacs_core::errors::init_standard_errors(&mut ev.obarray);
+    // SAFETY: the native standard-error fixture writes only properties,
+    // with no Lisp/collection, canonical dispatch changes or escaping loan.
+    unsafe {
+        ev.obarray
+            .with_legacy_value_write(crate::emacs_core::errors::init_standard_errors);
+    }
     ev.eval_str(r#"(setq debug-ignored-errors '("[" end-of-buffer))"#)
         .expect("install a broken regexp entry");
     let sig = match crate::emacs_core::error::signal("end-of-buffer", vec![]).into_kind() {
@@ -28515,3 +28530,106 @@ mod byte_code_function;
 #[cfg(test)]
 #[path = "marker_identity.rs"]
 mod marker_identity;
+
+#[test]
+fn current_buffer_scope_finish_watcher_panic_restores_popped_binding_and_roots() {
+    use crate::emacs_core::error::EvalResult;
+    use crate::emacs_core::eval::CurrentBufferScope;
+    use crate::emacs_core::intern::intern;
+    use crate::emacs_core::subr::{NativeFn, SubrArity, SubrSpec};
+    fn panic_during_unlet(_: &mut Context, args: Vec<Value>) -> EvalResult {
+        if args.get(2) == Some(&Value::symbol("unlet")) {
+            panic!("exercise Rust panic in explicit scope finish");
+        }
+        Ok(Value::NIL)
+    }
+    let mut ctx = Context::new();
+    let original = ctx.buffers.current_buffer_id().unwrap();
+    let other = ctx.buffers.create_buffer("scope-finish-watcher-other");
+    let symbol = intern("scope-finish-watcher-value");
+    ctx.obarray.set_symbol_value_id(symbol, Value::fixnum(10));
+    ctx.register_subr(SubrSpec::new(
+        "scope-finish-watcher-panic",
+        NativeFn::ContextVec(panic_during_unlet),
+        SubrArity::new(4, Some(4)),
+    ));
+    let depth = ctx.specpdl.len();
+    let root_depth = ctx.vm_root_frames.len();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut scope = CurrentBufferScope::enter(&mut ctx);
+        scope
+            .context()
+            .set_current_buffer_unrecorded(other)
+            .unwrap();
+        scope
+            .context()
+            .try_specbind(symbol, Value::fixnum(20))
+            .unwrap();
+        crate::emacs_core::advice::builtin_add_variable_watcher(
+            scope.context(),
+            vec![
+                Value::from_sym_id(symbol),
+                Value::symbol("scope-finish-watcher-panic"),
+            ],
+        )
+        .unwrap();
+        let _ = scope.finish(Ok(Value::NIL));
+    }));
+    assert!(outcome.is_err());
+    assert_eq!(
+        ctx.obarray.symbol_value_id_or_nil(symbol),
+        Value::fixnum(10),
+        "a popped Let must remain owned while its watcher can panic"
+    );
+    assert_eq!(ctx.buffers.current_buffer_id(), Some(original));
+    assert_eq!(ctx.specpdl.len(), depth);
+    assert_eq!(ctx.vm_root_frames.len(), root_depth);
+    assert!(!ctx.active_variable_watchers.contains(&symbol));
+}
+
+/// Rust watcher panic must release temporary unwind roots and reinstate GNU's
+/// pending-quit bracket independently of restoring the popped variable cell.
+#[test]
+fn unbind_watcher_panic_restores_quit_and_vm_roots() {
+    use crate::emacs_core::error::EvalResult;
+    use crate::emacs_core::intern::intern;
+    use crate::emacs_core::subr::{NativeFn, SubrArity, SubrSpec};
+    fn watcher(_: &mut Context, args: Vec<Value>) -> EvalResult {
+        if args.get(2) == Some(&Value::symbol("unlet")) {
+            panic!("contained watcher panic while unwind roots are owned");
+        }
+        Ok(Value::NIL)
+    }
+    let mut ctx = Context::new();
+    let symbol = intern("unwind-roots-independent-value");
+    let depth = ctx.specpdl.len();
+    ctx.obarray.set_symbol_value_id(symbol, Value::fixnum(10));
+    ctx.try_specbind(symbol, Value::fixnum(20)).unwrap();
+    ctx.register_subr(SubrSpec::new(
+        "unwind-roots-independent-watcher",
+        NativeFn::ContextVec(watcher),
+        SubrArity::new(4, Some(4)),
+    ));
+    crate::emacs_core::advice::builtin_add_variable_watcher(
+        &mut ctx,
+        vec![
+            Value::from_sym_id(symbol),
+            Value::symbol("unwind-roots-independent-watcher"),
+        ],
+    )
+    .unwrap();
+    let frame_count = ctx.vm_root_frames.len();
+    let root_count = ctx.vm_root_frames.last().map(|frame| frame.roots.len());
+    let pending = Value::fixnum(7);
+    ctx.set_quit_flag_value(pending);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = ctx.unbind_to_with_result(depth, Ok(Value::NIL));
+    }));
+    assert!(caught.is_err());
+    assert_eq!(ctx.quit_flag_value(), pending);
+    assert_eq!(ctx.vm_root_frames.len(), frame_count);
+    assert_eq!(
+        ctx.vm_root_frames.last().map(|frame| frame.roots.len()),
+        root_count
+    );
+}

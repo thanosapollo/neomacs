@@ -2957,6 +2957,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "image-extras"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60d02eb2c9ccbbab470538fce34c7bc3be7b4e59268e65a3171367b296cdb842"
+dependencies = [
+ "image",
+]
+
+[[package]]
 name = "image-webp"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3980,7 +3989,9 @@ dependencies = [
  "freetype-rs",
  "neomacs-display-protocol",
  "neomacs-test-fonts",
+ "resvg",
  "thiserror 2.0.20",
+ "tiny-skia",
  "tracing",
  "ttf-parser",
 ]
@@ -4015,6 +4026,7 @@ dependencies = [
  "getrandom 0.4.3",
  "sha2",
  "tempfile",
+ "ureq",
  "wait-timeout",
 ]
 
@@ -4125,6 +4137,7 @@ dependencies = [
  "flate2",
  "fontdb",
  "image",
+ "image-extras",
  "imagesize 0.15.0",
  "jpeg-encoder",
  "libc",

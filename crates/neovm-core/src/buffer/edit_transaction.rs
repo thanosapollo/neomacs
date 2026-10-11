@@ -16,6 +16,159 @@ use crate::buffer::{
 use crate::emacs_core::value::Value;
 use crate::heap_types::LispString;
 
+/// Native buffer-edit failure; this immutable data contains no Lisp handles or mutation
+/// authority and may cross threads. Every mutating lease remains !Send/!Sync.
+/// Lisp callers map these causes to their existing GNU-visible conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+pub(crate) enum BufferEditError {
+    #[error("buffer is unavailable")]
+    BufferUnavailable,
+}
+static_assertions::assert_impl_all!(BufferEditError: Send, Sync);
+const _: () = assert!(
+    std::mem::size_of::<Result<(), BufferEditError>>() == std::mem::size_of::<Option<()>>()
+);
+
+/// The text state a range was measured in: its buffer and that buffer's
+/// character-modification tick. A range measured at a tick stays coherent
+/// for as long as the tick is unchanged. Plain data; it grants nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TextMeasurement {
+    buffer: BufferId,
+    chars_tick: i64,
+}
+
+impl TextMeasurement {
+    /// The current text state of BUFFER, or None for a dead buffer.
+    #[inline]
+    pub(crate) fn of(buffers: &BufferManager, buffer: BufferId) -> Option<Self> {
+        buffers.get(buffer).map(|live| Self {
+            buffer,
+            chars_tick: live.chars_modified_tick(),
+        })
+    }
+
+    #[inline]
+    pub(crate) fn buffer(self) -> BufferId {
+        self.buffer
+    }
+}
+
+/// A measured physical buffer range leased to one mutator until mutation.
+///
+/// Construction validates character bounds against the live buffer text and
+/// derives its character/Emacs-byte coordinate pair together. The exclusive
+/// BufferManager borrow excludes edits and Lisp callbacks through this manager,
+/// including its managed indirect buffers. Cloned managers own distinct mutable
+/// text storage. Buffer-module code must keep shared_clone aliases attached to
+/// their owning manager and must not mutate a detached alias while a lease lives.
+/// This lease introduces no process-global or thread-local state.
+#[must_use = "consume the prepared lease to mutate, or drop it to cancel"]
+pub(crate) struct PreparedBufferEdit<'a> {
+    buffers: &'a mut BufferManager,
+    buffer: BufferId,
+    range: TextEditRange,
+    _mutator: std::marker::PhantomData<*const ()>,
+}
+
+static_assertions::assert_not_impl_any!(PreparedBufferEdit<'static>: Send, Sync);
+
+impl std::fmt::Debug for PreparedBufferEdit<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedBufferEdit")
+            .field("buffer", &self.buffer)
+            .field("range", &self.range)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> PreparedBufferEdit<'a> {
+    /// No narrowing policy is imposed here: GNU's edit commands determine
+    /// their accessible range after hooks, while this boundary proves that
+    /// the final physical range is still live and coordinate-coherent.
+    #[inline]
+    pub(in crate::buffer) fn new(
+        buffers: &'a mut BufferManager,
+        buffer: BufferId,
+        chars: crate::buffer::CharRange,
+    ) -> Option<Self> {
+        let range = {
+            let live = buffers.get(buffer)?;
+            if chars.start() > chars.end() || chars.end() > live.total_char_end_pos() {
+                return None;
+            }
+            live.edit_range_for_char_range(chars)
+        };
+        Some(Self {
+            buffers,
+            buffer,
+            range,
+            _mutator: std::marker::PhantomData,
+        })
+    }
+
+    /// Lease a range measured while the buffer's text had `measured_at`.
+    /// Unchanged text keeps a measured character/byte pair coherent, so it is
+    /// reused without a text walk; changed text is measured again from the
+    /// range's characters, with the same validation as [`Self::new`].
+    #[inline]
+    pub(in crate::buffer) fn measured(
+        buffers: &'a mut BufferManager,
+        buffer: BufferId,
+        range: TextEditRange,
+        measured_at: TextMeasurement,
+    ) -> Option<Self> {
+        let live = buffers.get(buffer)?;
+        if measured_at.buffer != buffer || measured_at.chars_tick != live.chars_modified_tick() {
+            return Self::new(buffers, buffer, range.char_range());
+        }
+        if range.char_end() > live.total_char_end_pos() {
+            return None;
+        }
+        Some(Self {
+            buffers,
+            buffer,
+            range,
+            _mutator: std::marker::PhantomData,
+        })
+    }
+
+    /// Read-only measured geometry for notifications; this value alone
+    /// cannot authorize mutation outside the buffer implementation.
+    #[inline]
+    pub(crate) fn range(&self) -> TextEditRange {
+        self.range
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffer_id(&self) -> BufferId {
+        self.buffer
+    }
+
+    /// Delete the leased range. An empty range is a successful no-op.
+    ///
+    /// # Errors
+    /// Returns BufferUnavailable if the manager cannot find the leased buffer.
+    #[inline]
+    pub(crate) fn delete(self) -> Result<(), BufferEditError> {
+        self.buffers
+            .delete_buffer_measured_region(self.buffer, self.range)
+            .ok_or(BufferEditError::BufferUnavailable)
+    }
+
+    #[inline]
+    pub(crate) fn delete_and_extract(self) -> Option<LispString> {
+        self.buffers
+            .delete_and_extract_buffer_measured_region(self.buffer, self.range)
+    }
+
+    #[inline]
+    pub(crate) fn replace(self, text: &LispString) -> Option<TextExtent> {
+        self.buffers
+            .replace_buffer_measured_region_lisp_string(self.buffer, self.range, text)
+    }
+}
+
 #[inline]
 pub(in crate::buffer) fn lisp_string_from_buffer_bytes(
     bytes: Vec<u8>,
@@ -124,12 +277,16 @@ impl CasifyExpansion {
         })
     }
 
-    pub(in crate::buffer) fn source_pos(self) -> CharPos0 {
+    pub(crate) fn source_pos(self) -> CharPos0 {
         self.source
     }
 
+    pub(crate) fn replacement_len(self) -> CharLen {
+        self.replacement_len
+    }
+
     pub(in crate::buffer) fn growth(self) -> CharLen {
-        // Only the positive-extent property-insertion branch calls this.
+        // Only positive-extent callers may request unsigned growth.
         debug_assert!(self.replacement_len.get() > 1);
         CharLen::new(self.replacement_len.get() - 1)
     }

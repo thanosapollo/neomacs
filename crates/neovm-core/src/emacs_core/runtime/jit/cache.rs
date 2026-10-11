@@ -37,6 +37,9 @@ use crate::emacs_core::intern::SymId;
 use crate::emacs_core::symbol::Obarray;
 use crate::emacs_core::value::Value;
 
+mod opt_evidence;
+pub(crate) use opt_evidence::has_ready_opt_osr;
+
 /// Why a body is interpreted for now although it is hot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeferReason {
@@ -726,12 +729,14 @@ fn compile_osr_leaf_timed(
     drop(gate_phase);
     let lower_phase = stats::enter_phase(stats::CompilePhase::Lower);
     let opt_params = (super::compile::jit_opt_mode() == super::compile::OptMode::Opt
-        && func.jit_runtime().reopt_level() < ReoptLevel::BaselineOnly)
-        .then_some(super::opt::ir::ParamShape {
-            required: params.required(),
-            optional,
-            has_rest: params.rest().is_present(),
-        });
+        && func.jit_runtime().reopt_level() < ReoptLevel::BaselineOnly
+        && super::compile::opt_profit::primitive_osr_source_admitted(func.executable_ops())
+        && super::compile::opt_profit::osr_admitted(ops, constants, func.executable_ops().len()))
+    .then_some(super::opt::ir::ParamShape {
+        required: params.required(),
+        optional,
+        has_rest: params.rest().is_present(),
+    });
     let mut leaf = match super::compile::opt_backend::lower_best(
         ops,
         constants,
@@ -1280,8 +1285,10 @@ fn compile_cache_entry(
         }
         return CacheEntry::Deferred(DeferReason::Backlog);
     }
+    let diagnostic = stats::front_diag::begin(id, request.origin, class);
     let defer = super::bg::DeferScope::enter(class);
     let clock = stats::CompileClock::start(request.origin);
+    let diagnostic_start = diagnostic.as_ref().map(|_| clock.started());
     let cpu_started = spine_upgrade.then(super::tier2::cpu_time_us);
     let result = compile_bytecode_function_requested(func, obarray, request);
     drop(defer);
@@ -1299,6 +1306,9 @@ fn compile_cache_entry(
         super::tier2::charge_compile(charged);
     }
     stats::record_compile(elapsed, func.executable_ops().len(), &result);
+    if let (Some(diagnostic), Some(start)) = (diagnostic, diagnostic_start) {
+        diagnostic.finish(start, elapsed, result.is_ok());
+    }
     if result.is_err()
         && let Some(code) = deferred.take()
     {
@@ -2276,7 +2286,7 @@ fn request_upgrade(
     rt.disarm_leaf_slot();
     unlink_spec_slots_in(cache, Rc::as_ptr(&old));
     // SAFETY: the dormant Context provided by the native dispatch seam.
-    let obarray = (!ctx.is_null()).then(|| unsafe { &(*ctx).obarray });
+    let obarray = (!ctx.is_null()).then(|| unsafe { &*(*ctx).obarray });
     let name_hint = stats::naming_enabled()
         .then(|| callee_name_hint(ctx, id))
         .flatten();
@@ -2596,7 +2606,7 @@ pub fn try_run_compiled(
         // dispatch (see neovm_jit_call's contract); a shared read of its obarray
         // for compile-time speculation. A null ctx (shim-free test bodies) just
         // disables speculation.
-        let obarray = (!ctx.is_null()).then(|| unsafe { &(*ctx).obarray });
+        let obarray = (!ctx.is_null()).then(|| unsafe { &*(*ctx).obarray });
         // A countdown upgrade keeps its T1 live until the replacement
         // really installs. The legacy heat-driven re-tier below is unchanged.
         if super::compile::jit_tier_upgrade_enabled()
@@ -2934,7 +2944,7 @@ pub(crate) fn resolve_compiled_leaf_ptr(
         }
         match cache.get_or_insert_with(id, || {
             // SAFETY: same dormant-Context contract as try_run_compiled.
-            let obarray = (!ctx.is_null()).then(|| unsafe { &(*ctx).obarray });
+            let obarray = (!ctx.is_null()).then(|| unsafe { &*(*ctx).obarray });
             let name_hint = stats::naming_enabled()
                 .then(|| callee_name_hint(ctx, id))
                 .flatten();

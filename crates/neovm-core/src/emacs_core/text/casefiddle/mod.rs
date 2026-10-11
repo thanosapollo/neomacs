@@ -1083,26 +1083,7 @@ fn casify_replace_current_buffer_region(
             // before hook runs for that case, but the after hook requires changed text.
             // GNU sticky inheritance controls are read only after modification hooks.
             // Plain/no-expansion casing needs no policy lookup or interval allocation.
-            let after = replacement
-                .span
-                .first
-                .map(|first| {
-                    let old = EmacsByteRange::new(
-                        EmacsBytePos::new(byte_range.start().get() + first),
-                        EmacsBytePos::new(byte_range.start().get() + replacement.span.old_end),
-                    );
-                    let new = crate::buffer::TextExtent::from_emacs_bytes(
-                        &replacement.text.as_bytes()[first..replacement.span.new_end],
-                        text.is_multibyte(),
-                    );
-                    super::editfns::text_change_for_replacement_in_manager(
-                        &eval.buffers,
-                        buffer_id,
-                        old,
-                        new,
-                    )
-                })
-                .transpose()?;
+            let after = changed_char_span(&text, &replacement);
             let controls = (!replacement.expansions.is_empty()
                 && eval
                     .buffers
@@ -1122,7 +1103,13 @@ fn casify_replace_current_buffer_region(
                 &properties,
             )?;
             if let Some(after) = after {
-                super::editfns::signal_after_text_change(eval, after)?;
+                // Notify in source-aligned characters, independent of byte-width changes.
+                super::editfns::signal_after_change_chars(
+                    eval,
+                    change.old_range().char_start().add_len(after.offset),
+                    after.old_len,
+                    after.new_len,
+                )?;
             }
             Ok(end)
         };
@@ -1133,6 +1120,95 @@ fn casify_replace_current_buffer_region(
                 })
             }
             CaseAction::Up | CaseAction::Initials => apply(eval, None),
+        }
+    })
+}
+
+/// Source-aligned notification extents, including multi-character mappings.
+/// These lengths count Emacs characters, independently of byte-width changes.
+struct CasingChangedSpan {
+    offset: crate::buffer::CharLen,
+    old_len: crate::buffer::CharLen,
+    new_len: crate::buffer::CharLen,
+}
+
+fn changed_char_span(old: &LispString, new: &CasedRegion) -> Option<CasingChangedSpan> {
+    let mut expansions = new.expansions.iter().copied().peekable();
+    let mut output = lisp_string_char_codes(&new.text);
+    let mut output_end = 0;
+    let mut source_byte_end = 0;
+    let mut first = None;
+    let mut last_old_end = 0;
+    let mut last_new_end = 0;
+    for (index, old_code) in lisp_string_char_codes(old).enumerate() {
+        let replacement_len = if expansions
+            .peek()
+            .is_some_and(|expansion| expansion.source_pos().get() == index)
+        {
+            expansions
+                .next()
+                .map_or(1, |expansion| expansion.replacement_len().get())
+        } else {
+            1
+        };
+        // A contraction consumes no output; never subtract one from its extent
+        // or consume the following source character's mapped output.
+        let new_code = if replacement_len == 0 {
+            None
+        } else {
+            let code = output.next();
+            let rest = replacement_len - 1;
+            let consumed = output.by_ref().take(rest).count();
+            // Text and expansion offsets come from the same casing transducer.
+            debug_assert!(code.is_some());
+            debug_assert_eq!(consumed, rest);
+            code
+        };
+        output_end += replacement_len;
+        let source_byte_start = source_byte_end;
+        source_byte_end += if old.is_multibyte() {
+            let mut bytes = [0u8; crate::emacs_core::emacs_char::MAX_MULTIBYTE_LENGTH];
+            crate::emacs_core::emacs_char::char_string(old_code, &mut bytes)
+        } else {
+            1
+        };
+        // GNU also marks an admissible special string as changed when its
+        // bytes are identical. Preserve the transducer's first/last boundaries.
+        let special_boundary = new
+            .span
+            .first
+            .is_some_and(|first| source_byte_start == first || source_byte_end == new.span.old_end);
+        if replacement_len != 1 || new_code != Some(old_code) || special_boundary {
+            first.get_or_insert(index);
+            last_old_end = index + 1;
+            last_new_end = output_end;
+        }
+    }
+    debug_assert!(expansions.next().is_none());
+    debug_assert!(output.next().is_none());
+    first.map(|first| CasingChangedSpan {
+        offset: crate::buffer::CharLen::new(first),
+        old_len: crate::buffer::CharLen::new(last_old_end - first),
+        new_len: crate::buffer::CharLen::new(last_new_end - first),
+    })
+}
+
+/// Character codes of S in order, decoding the internal multibyte form.
+fn lisp_string_char_codes(s: &LispString) -> impl Iterator<Item = u32> + '_ {
+    let bytes = s.as_bytes();
+    let multibyte = s.is_multibyte();
+    let mut pos = 0;
+    std::iter::from_fn(move || {
+        if pos >= bytes.len() {
+            return None;
+        }
+        if multibyte {
+            Some(crate::emacs_core::emacs_char::string_char_advance(
+                bytes, &mut pos,
+            ))
+        } else {
+            pos += 1;
+            Some(u32::from(bytes[pos - 1]))
         }
     })
 }

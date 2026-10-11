@@ -5569,51 +5569,89 @@ fn run_after_insert_file_pipeline(
         intern("inhibit-modification-hooks"),
         Value::T,
     )?;
-    eval.try_specbind_or_unwind_to(specpdl_count, intern("buffer-undo-list"), Value::T)?;
+    // GNU saves the undo list and `bset_undo_list (current_buffer, Qt)`
+    // (fileio.c:5198-5199); only the normal path puts it back (:5288-5303).
+    // A signal from `format-decode` or `after-insert-file-functions` leaves
+    // undo disabled, and it is not a `let`, so nothing unwinds it (P4.10).
+    let saved_undo_list = eval
+        .buffers
+        .get(current_id)
+        .map(crate::buffer::Buffer::get_undo_list);
+    if let Some(buf) = eval.buffers.get_mut(current_id) {
+        buf.set_undo_list(Value::T);
+    }
+    let undo_root = eval.save_specpdl_roots();
+    if let Some(saved) = saved_undo_list {
+        eval.push_specpdl_root(saved);
+    }
 
-    let pipeline_result = (|| -> Result<i64, Flow> {
-        if replace_requested {
-            eval.buffers
-                .goto_buffer_emacs_byte_pos(current_id, accessible_start)
-                .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
-        }
-
-        let format_result = eval.funcall_general(
-            Value::symbol("format-decode"),
-            vec![Value::NIL, Value::fixnum(inserted), visit_value],
-        )?;
-        if !format_result.is_nil() {
-            inserted = expect_inserted_char_count(&format_result)?;
-        }
-
-        let hook_sym = intern("after-insert-file-functions");
-        let hook_value = eval.visible_variable_value_or_nil("after-insert-file-functions");
-        let hook_functions = crate::emacs_core::hook_runtime::collect_hook_functions_in_state(
-            eval, hook_sym, hook_value, true,
-        );
-        if !hook_functions.is_empty() {
-            let gc_roots = eval.save_specpdl_roots();
-            for func in &hook_functions {
-                eval.push_specpdl_root(*func);
+    let pipeline_result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<i64, Flow> {
+            if replace_requested {
+                eval.buffers
+                    .goto_buffer_emacs_byte_pos(current_id, accessible_start)
+                    .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
             }
-            eval.push_specpdl_root(Value::fixnum(inserted));
-            let hook_result = (|| -> Result<i64, Flow> {
-                let mut inserted_now = inserted;
-                for function in &hook_functions {
-                    let result = eval.apply(*function, vec![Value::fixnum(inserted_now)])?;
-                    if !result.is_nil() {
-                        inserted_now = expect_inserted_char_count(&result)?;
-                    }
+
+            let format_result = eval.funcall_general(
+                Value::symbol("format-decode"),
+                vec![Value::NIL, Value::fixnum(inserted), visit_value],
+            )?;
+            if !format_result.is_nil() {
+                inserted = expect_inserted_char_count(&format_result)?;
+            }
+
+            let hook_sym = intern("after-insert-file-functions");
+            let hook_value = eval.visible_variable_value_or_nil("after-insert-file-functions");
+            let hook_functions = crate::emacs_core::hook_runtime::collect_hook_functions_in_state(
+                eval, hook_sym, hook_value, true,
+            );
+            if !hook_functions.is_empty() {
+                let gc_roots = eval.save_specpdl_roots();
+                for func in &hook_functions {
+                    eval.push_specpdl_root(*func);
                 }
-                Ok(inserted_now)
-            })();
-            eval.restore_specpdl_roots(gc_roots);
-            inserted = hook_result?;
+                eval.push_specpdl_root(Value::fixnum(inserted));
+                let hook_result = (|| -> Result<i64, Flow> {
+                    let mut inserted_now = inserted;
+                    for function in &hook_functions {
+                        let result = eval.apply(*function, vec![Value::fixnum(inserted_now)])?;
+                        if !result.is_nil() {
+                            inserted_now = expect_inserted_char_count(&result)?;
+                        }
+                    }
+                    Ok(inserted_now)
+                })();
+                eval.restore_specpdl_roots(gc_roots);
+                inserted = hook_result?;
+            }
+
+            Ok(inserted)
+        }));
+
+    // A Rust panic crossing the decode/hooks callbacks must not leave the
+    // dynamic suffix or the undo snapshot rooted (P4.11). GNU has no unwind
+    // here (fileio.c:5198-5199 saves undo and only the normal path restores
+    // it, :5288-5303), so the cleanup is storage-only and leaves exactly
+    // what GNU's signal path leaves: the callback's selected buffer and the
+    // disabled undo list.
+    let pipeline_result = match pipeline_result {
+        Ok(result) => result,
+        Err(panic) => {
+            eval.restore_specpdl_roots(undo_root);
+            eval.discard_specpdl_to(specpdl_count);
+            std::panic::resume_unwind(panic);
         }
+    };
 
-        Ok(inserted)
-    })();
-
+    eval.restore_specpdl_roots(undo_root);
+    if pipeline_result.is_err() {
+        // GNU has no unwind here: a buffer the hooks selected stays current.
+        return finish_inserted_count_scope(eval, specpdl_count, pipeline_result);
+    }
+    if let (Some(saved), Some(buf)) = (saved_undo_list, eval.buffers.get_mut(current_id)) {
+        buf.set_undo_list(saved);
+    }
     eval.restore_current_buffer_if_live(current_id);
     let chars_modiff_after = eval
         .buffers
@@ -5962,7 +6000,10 @@ fn prepare_write_region(
     })();
     if let Err(error) = collection_result {
         eval.restore_specpdl_roots(root_scope);
-        eval.restore_current_buffer_if_live(original_buffer);
+        // GNU's only unwind here is `build_annotations_unwind`, which resets
+        // `write-region-annotation-buffers` and does not select a buffer:
+        // a buffer an annotation function selected before signaling stays
+        // current (fileio.c:5596-5600, P4.10).
         return Err(error);
     }
     let content = source.apply_annotations(&eval.buffers, &annotations)?;
@@ -6802,6 +6843,40 @@ pub(crate) fn builtin_write_region(
         }
     }
 
+    // GNU `write_region` (fileio.c:5582-5594): once no handler took the
+    // operation, save the current buffer's restriction, drop its labeled
+    // restrictions and, for START = nil, widen. Every exit restores the
+    // saved restriction, an annotation function's signal included; the
+    // current buffer is deliberately NOT restored (GNU leaves a buffer an
+    // annotation function selected current when it signals).
+    let mut restriction = super::eval::RestrictionScope::enter(eval);
+    let result = write_region_without_handler(
+        restriction.context(),
+        &args,
+        resolved,
+        visit,
+        default_lock_name,
+        mustbenew_is_excl,
+    );
+    restriction.finish(result)
+}
+
+/// The native half of `write-region`, run inside the caller's
+/// `RestrictionScope`.
+fn write_region_without_handler(
+    eval: &mut super::eval::Context,
+    args: &[Value],
+    resolved: LispString,
+    visit: WriteRegionVisit,
+    default_lock_name: LispString,
+    mustbenew_is_excl: bool,
+) -> EvalResult {
+    if let Some(current) = eval.buffers.current_buffer_id() {
+        let _ = eval.buffers.clear_buffer_labeled_restrictions(current);
+        if args[0].is_nil() {
+            super::buffer::builtin_widen_0(eval)?;
+        }
+    }
     let resolved_path = lisp_file_name_to_path_buf(&resolved);
     // GNU `Fwrite_region`:
     //   open_flags |= EQ (mustbenew, Qexcl) ? O_EXCL
