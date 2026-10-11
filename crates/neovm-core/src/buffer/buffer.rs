@@ -6484,7 +6484,8 @@ impl BufferManager {
         let len = self.dead_buffers.len();
         let capacity = self.dead_buffers.capacity();
         if capacity > FLOOR * 2 && len < capacity / 4 {
-            self.dead_buffers
+            self.storage_mut()
+                .dead_buffers
                 .shrink_to(len.saturating_mul(2).max(FLOOR));
         }
     }
