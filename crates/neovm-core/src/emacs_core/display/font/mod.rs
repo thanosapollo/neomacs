@@ -2963,6 +2963,11 @@ fn font_object_property_fields(face: &RuntimeFace, pixel_size: Option<i64>) -> V
     elems
 }
 
+fn font_name_from_property_fields(mut fields: Vec<Value>) -> Value {
+    fields[0] = Value::keyword(FONT_ENTITY_TAG);
+    font_xlfd_name(vec![Value::vector(fields)]).unwrap_or(Value::NIL)
+}
+
 fn finish_opened_font(
     mut fields: Vec<Value>,
     file: Option<&LispString>,
@@ -2973,10 +2978,7 @@ fn finish_opened_font(
 ) -> Value {
     // Render the public XLFD before changing the representation from an
     // ordinary property vector to the opaque `PVEC_FONT` tag.
-    let mut xlfd_fields = fields.clone();
-    xlfd_fields[0] = Value::keyword(FONT_ENTITY_TAG);
-    let xlfd_source = Value::vector(xlfd_fields);
-    let name = font_xlfd_name(vec![xlfd_source]).unwrap_or(Value::NIL);
+    let name = font_name_from_property_fields(fields.clone());
     let full_name = full_name
         .cloned()
         .map(Value::heap_string)
@@ -3065,13 +3067,10 @@ fn build_font_entity_for_spec_match(matched: &super::eval::ResolvedFontSpecMatch
     Value::vector(elems)
 }
 
-/// Materialize the core's opaque opened-font object from one host resolution.
-/// This is the sole host-to-Lisp construction boundary: identity, metrics,
-/// capability, and public properties enter together and cannot drift later.
-pub fn opened_font_from_resolved_match(
+fn resolved_font_property_fields(
     face: &RuntimeFace,
     matched: &super::eval::ResolvedFontMatch,
-) -> Value {
+) -> Vec<Value> {
     let opened = &matched.font;
     let canonical = &opened.resolved;
     let mut selected = face.clone();
@@ -3089,8 +3088,28 @@ pub fn opened_font_from_resolved_match(
         fields.push(Value::keyword("postscript-name"));
         fields.push(Value::string(postscript_name.clone()));
     }
+    fields
+}
+
+/// Project the opened name without materializing discarded font metadata.
+pub(crate) fn font_name_from_resolved_match(
+    face: &RuntimeFace,
+    matched: &super::eval::ResolvedFontMatch,
+) -> Value {
+    font_name_from_property_fields(resolved_font_property_fields(face, matched))
+}
+
+/// Materialize the core's opaque opened-font object from one host resolution.
+/// This is the sole host-to-Lisp construction boundary: identity, metrics,
+/// capability, and public properties enter together and cannot drift later.
+pub fn opened_font_from_resolved_match(
+    face: &RuntimeFace,
+    matched: &super::eval::ResolvedFontMatch,
+) -> Value {
+    let opened = &matched.font;
+    let canonical = &opened.resolved;
     finish_opened_font(
-        fields,
+        resolved_font_property_fields(face, matched),
         canonical
             .identity
             .file_path

@@ -58,6 +58,8 @@ mod lazy_text_hit_test;
 mod mini_window_still_test;
 #[path = "mode_line_gate_engine_test.rs"]
 mod mode_line_gate_engine_test;
+#[path = "point_scroll_engine_test.rs"]
+mod point_scroll_engine_test;
 #[cfg(test)]
 #[path = "posn_current_matrix_clear_engine_test.rs"]
 mod posn_current_matrix_clear_engine_test;
@@ -3979,6 +3981,85 @@ fn phase1_cursor_move_matches_full_rebuild_golden() {
         incremental, reference,
         "cursor-only output must be byte-identical to a full rebuild"
     );
+}
+
+#[test]
+fn transient_face_remapping_preserves_cursor_only_replay() {
+    let (mut eval, frame, buffer, _) = incr_editing_frame("alpha\nbeta\n", 800, 240);
+    let mut engine = LayoutEngine::new();
+    engine.layout_frame_rust(&mut eval, frame);
+    let revision = eval.display_var_change_count;
+    eval.eval_str("(let ((face-remapping-alist '((default . bold)))) nil)")
+        .expect("temporary face remapping");
+    assert_eq!(eval.display_var_change_count, revision);
+    eval.buffer_manager_mut()
+        .get_mut(buffer)
+        .unwrap()
+        .goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(2));
+    engine.layout_frame_rust(&mut eval, frame);
+    assert_eq!(engine.last_layout_stats().cursor_only_windows, 1);
+    let retained = selected_window_layout_trace(&eval, &engine, frame);
+    let mut full = LayoutEngine::new();
+    full.layout_frame_rust(&mut eval, frame);
+    assert_eq!(retained, selected_window_layout_trace(&eval, &full, frame));
+}
+
+#[test]
+fn face_remapping_captures_float_values_independently_of_lisp_storage() {
+    let (mut eval, _, buffer, _) = incr_editing_frame("alpha\n", 800, 240);
+    let form = "(setq face-remapping-alist (list (list 'default (list :height 2.0))))";
+    eval.eval_str(form).unwrap();
+    let first = eval.layout_face_remapping_input(buffer).unwrap();
+    eval.eval_str(form).unwrap();
+    assert_eq!(first, eval.layout_face_remapping_input(buffer).unwrap());
+    eval.eval_str("(setcar (cdr (car (cdr (car face-remapping-alist)))) 1.5)")
+        .unwrap();
+    assert_ne!(first, eval.layout_face_remapping_input(buffer).unwrap());
+}
+
+#[test]
+fn effective_face_remapping_changes_rebuild_retained_rows() {
+    let (mut eval, frame, _, _) = incr_editing_frame("alpha\nbeta\n", 800, 240);
+    let mut engine = LayoutEngine::new();
+    engine.layout_frame_rust(&mut eval, frame);
+    for form in [
+        "(setq face-remapping-alist '((default (:height 2.0))))",
+        "(setcar (cdr (car (cdr (car face-remapping-alist)))) 1.5)",
+        "(setq face-remapping-alist '((default (:foreground \"#ff0000\"))))",
+        "(setq face-remapping-alist '((default (:foreground \"#ff0000\")) . t))",
+        "(setcdr face-remapping-alist nil)",
+        "(setcdr face-remapping-alist t)",
+        "(setcdr face-remapping-alist nil)",
+        "(aset (car (cdr (car (cdr (car face-remapping-alist))))) 1 ?0)",
+        "(setq face-remapping-alist (list (cons 'default 'bold)))",
+        "(setcdr (car face-remapping-alist) 'italic)",
+        "(setq face-remapping-alist '((default (:foreground-color \"#ff0000\"))))",
+        "(setq face-remapping-alist '((default (:foreground-color \"#0000ff\"))))",
+        "(aset (car (cdr (car (cdr (car face-remapping-alist))))) 1 ?f)",
+        "(setq face-remapping-alist '((default (:background-color \"#ff0000\"))))",
+        "(setq face-remapping-alist '((default (:background-color \"#0000ff\"))))",
+        "(setq face-remapping-alist '((default (:height 1.0 foreground \"#ff0000\"))))",
+        "(setq face-remapping-alist '((default (:height 1.0 foreground \"#0000ff\"))))",
+        "(setq face-remapping-alist '((default (::height 1.0 ::foreground \"#ff0000\"))))",
+        "(setq face-remapping-alist '((default (::height 1.0 ::foreground \"#0000ff\"))))",
+        "(setq face-remapping-alist '((default (:height 1.0 inherit (:foreground \"#ff0000\")))))",
+        "(setq face-remapping-alist '((default (:height 1.0 inherit (:foreground \"#0000ff\")))))",
+        "(setq face-remapping-alist nil)",
+        "(force-window-update)",
+    ] {
+        eval.eval_str(form).expect(form);
+        engine.layout_frame_rust(&mut eval, frame);
+        assert_eq!(engine.last_layout_stats().cursor_only_windows, 0, "{form}");
+        assert!(engine.last_layout_stats().full_windows > 0, "{form}");
+        let retained = selected_window_layout_trace(&eval, &engine, frame);
+        let mut full = LayoutEngine::new();
+        full.layout_frame_rust(&mut eval, frame);
+        assert_eq!(
+            retained,
+            selected_window_layout_trace(&eval, &full, frame),
+            "{form}"
+        );
+    }
 }
 
 /// GNU `xdisp.c:19861-19865` refuses cursor-only redisplay when relative line

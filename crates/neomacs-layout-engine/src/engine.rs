@@ -2347,7 +2347,8 @@ impl LayoutEngine {
                     let mut cursor_only =
                         self.build_cursor_only_replay(params, *layout_box, evaluator);
                     let mut prepared_faces = None;
-                    if cursor_only.is_none() {
+                    // Historical cursor replays likewise cannot decide margins.
+                    if cursor_only.is_none() && params.scroll_margin <= 0 {
                         if let Some((replay, faces)) = self.prepared_viewports.replay(
                             frame_id,
                             DisplayWindowId::new(params.window_id),
@@ -2393,14 +2394,30 @@ impl LayoutEngine {
                         if resolved_start.get() != key.window_start {
                             let mut prepared_key = key.clone();
                             prepared_key.window_start = resolved_start.get();
-                            if let Some((replay, faces)) = self.prepared_viewports.replay(
-                                frame_id,
-                                DisplayWindowId::new(params.window_id),
-                                &prepared_key,
-                                params.force_start,
-                            ) {
+                            if params.scroll_margin <= 0
+                                && let Some((replay, faces)) = self.prepared_viewports.replay(
+                                    frame_id,
+                                    DisplayWindowId::new(params.window_id),
+                                    &prepared_key,
+                                    params.force_start,
+                                )
+                            {
                                 cursor_only = Some(replay);
                                 prepared_faces = Some(faces);
+                            }
+                            if cursor_only.is_none()
+                                && resolved_start.get() > params.window_start
+                                && params.display_line_numbers
+                                    == crate::types::DisplayLineNumbersMode::Off
+                            {
+                                let mut resolved_params = params.clone();
+                                resolved_params.window_start = resolved_start.get();
+                                scroll = self
+                                    .build_scroll_replay(&resolved_params, *layout_box, evaluator)
+                                    .map(|mut replay| {
+                                        replay.point_driven = true;
+                                        replay
+                                    });
                             }
                         }
                     }
@@ -2409,7 +2426,9 @@ impl LayoutEngine {
                     // Prefer an existing backward synchronization plan over
                     // shifting an older page with less predictable overlap.
                     if cursor_only.is_none()
-                        && scroll.as_ref().is_none_or(|replay| replay.sync.is_none())
+                        && scroll
+                            .as_ref()
+                            .is_none_or(|replay| replay.sync.is_none() && !replay.point_driven)
                         && params.selected
                         && self
                             .retained_window_matrices
@@ -2431,7 +2450,10 @@ impl LayoutEngine {
                         }
                     }
                     if cursor_only.is_none()
+                        && params.scroll_margin <= 0
                         && !is_edit
+                        // A cursor replay cannot carry the newly chosen start.
+                        && scroll.as_ref().is_none_or(|replay| !replay.point_driven)
                         && !params.is_minibuffer()
                         && self
                             .prepared_viewports
@@ -4149,6 +4171,11 @@ impl LayoutEngine {
             );
             return None;
         };
+        // Retained cursor placement has no measured margin decision. Let the
+        // canonical walk decide when point moves with a nonzero scroll margin.
+        if params.scroll_margin > 0 && prev.key.point != params.point {
+            return None;
+        }
         let curr_key = RetainedWindowKey::from_params(params, layout_box, evaluator);
         let mut replay = match prev.cursor_only_replay(&curr_key) {
             Ok(replay) => replay,
@@ -4660,7 +4687,9 @@ impl LayoutEngine {
                         frame_params,
                         layout_box,
                         position_publication,
-                        scroll_replay.is_some(),
+                        scroll_replay
+                            .as_ref()
+                            .is_some_and(|replay| !replay.point_driven),
                     )
                 }),
             ViewportResolutionPhase::Measure(measurement) => {
@@ -4668,6 +4697,11 @@ impl LayoutEngine {
             }
             ViewportResolutionPhase::Commit(window_start) => *window_start,
         };
+        // Sibling Lisp can change the scroll policy after phase A. A point
+        // replay is only valid for the start phase B independently chooses.
+        let scroll_replay = scroll_replay.filter(|replay| {
+            !replay.point_driven || replay.new_window_start == resolved_window_start.get()
+        });
         let resolved_params;
         let params = if resolved_window_start.get() == params.window_start {
             params
@@ -4792,6 +4826,9 @@ impl LayoutEngine {
             params
         };
 
+        let point_driven_replay = scroll_replay
+            .as_ref()
+            .is_some_and(|replay| replay.point_driven);
         let scroll_dvpos = scroll_replay
             .as_ref()
             .map(|replay| replay.dvpos)
@@ -4932,6 +4969,16 @@ impl LayoutEngine {
             return LeafLayoutAttempt::LogicalInputsChanged;
         }
 
+        #[cfg(test)]
+        if point_driven_replay
+            && matches!(
+                &render_outcome,
+                BufferSourceRenderAttemptOutcome::ReplayMispredicted
+            )
+        {
+            viewport_retry_depth_probe::note_point_scroll_rejection();
+        }
+
         // The contiguous pre-pass above is an optimization, not a semantic
         // visibility boundary.  A provisional row walk can jump over an
         // arbitrarily large invisible/folded span and reach visible positions
@@ -5066,7 +5113,14 @@ impl LayoutEngine {
                 return LeafLayoutAttempt::Retry(Box::new(WindowLayoutRetry {
                     params: params.clone(),
                     remaining_visibility_retries,
-                    viewport_resolution: viewport_resolution.clone(),
+                    // The point-driven plan already consumed the canonical
+                    // line-motion heuristic. Re-running it against the old
+                    // visible end would advance twice before measuring rows.
+                    viewport_resolution: if point_driven_replay {
+                        ViewportResolutionPhase::Commit(resolved_window_start)
+                    } else {
+                        viewport_resolution.clone()
+                    },
                 }));
             }
             BufferSourceRenderAttemptOutcome::ResolveViewport {

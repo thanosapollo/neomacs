@@ -164,6 +164,7 @@ pub struct RetainedWindowKey {
     pub char_table_revision: neovm_core::window::CharTableLayoutRevision,
     pub symbol_property_revision: neovm_core::emacs_core::symbol::SymbolPropertyRevision,
     pub display_table: neovm_core::window::LayoutDisplayTableInput,
+    pub face_remapping: neovm_core::window::LayoutFaceRemappingInput,
     /// Generation of asynchronously decoded media (see
     /// `Context::invalidate_media`). An image that finishes decoding changes
     /// none of the buffer ticks or geometry below, so without this term the
@@ -316,6 +317,9 @@ impl RetainedWindowKey {
             display_table: evaluator
                 .layout_display_table_input(neovm_core::buffer::BufferId(p.buffer_id))
                 .unwrap_or_default(),
+            face_remapping: evaluator
+                .layout_face_remapping_input(neovm_core::buffer::BufferId(p.buffer_id))
+                .unwrap_or_default(),
             prefixes: evaluator
                 .layout_prefix_inputs(neovm_core::buffer::BufferId(p.buffer_id))
                 .unwrap_or_default(),
@@ -442,6 +446,7 @@ impl RetainedWindowKey {
             char_table_revision,
             symbol_property_revision,
             display_table,
+            face_remapping,
             media_generation,
             buffer_id,
             window_start,
@@ -707,6 +712,9 @@ pub struct ScrollReplay {
     /// stops where the next row would begin at the plan's `stop_charpos`;
     /// only then are these rows installed, moved by what the walk produced.
     pub(crate) sync: Option<edit_sync::EditSyncPlan>,
+    /// The start was chosen for point motion, so phase B must revalidate it
+    /// and the assembled rows must still satisfy the full viewport policy.
+    pub(crate) point_driven: bool,
     /// An edit replay (window-start kept), as opposed to a scroll.
     pub(crate) edit: bool,
     /// Sealed frame-face generation that owns every ID in `reused_rows`.
@@ -1584,6 +1592,7 @@ impl RetainedWindowMatrix {
                 chrome_memo: None,
                 one_line_contract: None,
                 sync: Some(plan),
+                point_driven: false,
                 edit: false,
                 face_generation: self.face_generation,
             });
@@ -1668,6 +1677,7 @@ impl RetainedWindowMatrix {
             chrome_memo: None,
             one_line_contract: None,
             sync: None,
+            point_driven: false,
             edit: false,
             face_generation: self.face_generation,
         })
@@ -1956,6 +1966,7 @@ impl RetainedWindowMatrix {
                 chrome_memo: None,
                 one_line_contract: None,
                 sync: Some(plan),
+                point_driven: false,
                 edit: true,
                 face_generation: self.face_generation,
             });
@@ -2177,6 +2188,7 @@ impl RetainedWindowMatrix {
                     chrome_memo: None,
                     one_line_contract: None,
                     sync: None,
+                    point_driven: false,
                     edit: true,
                     face_generation: self.face_generation,
                 });
@@ -2206,6 +2218,7 @@ impl RetainedWindowMatrix {
             chrome_memo: None,
             one_line_contract: None,
             sync: None,
+            point_driven: false,
             edit: true,
             face_generation: self.face_generation,
         })

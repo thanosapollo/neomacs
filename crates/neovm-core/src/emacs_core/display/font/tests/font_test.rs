@@ -1849,6 +1849,166 @@ fn query_font_uses_opened_object_metrics_without_a_font_file() {
 }
 
 #[test]
+fn font_name_projection_matches_opened_font_properties() {
+    crate::test_utils::init_test_tracing();
+    let _eval = Context::new();
+    let mut requested = RuntimeFace::new("default");
+    requested.family = Some(Value::string("Requested Family"));
+    requested.foundry = Some(Value::string("REQUESTED"));
+    requested.weight = Some(FontWeight::BOLD);
+    requested.slant = Some(FontSlant::Italic);
+    requested.width = Some(FontWidth::Expanded);
+    requested.height = Some(crate::face::FaceHeight::Absolute(370));
+
+    for (foundry, weight, slant, width, pixel_size) in [
+        (
+            None,
+            FontWeight::NORMAL,
+            FontSlant::Normal,
+            FontWidth::Normal,
+            0,
+        ),
+        (
+            Some("TEST"),
+            FontWeight::SEMI_BOLD,
+            FontSlant::Oblique,
+            FontWidth::Condensed,
+            19,
+        ),
+        (
+            Some("Test Foundry"),
+            FontWeight::LIGHT,
+            FontSlant::ReverseItalic,
+            FontWidth::ExtraExpanded,
+            27,
+        ),
+        (
+            None,
+            FontWeight::BOLD,
+            FontSlant::ReverseOblique,
+            FontWidth::UltraCondensed,
+            12,
+        ),
+    ] {
+        let matched = ResolvedFontMatch {
+            font: crate::emacs_core::eval::test_resolved_opened_font(
+                "Selected Family",
+                foundry,
+                Some("/tmp/Selected.ttf"),
+                weight,
+                slant,
+                width,
+                Some("Selected-PostScript"),
+                FontPxProbeResult {
+                    pixel_size,
+                    height: 30,
+                    ascent: 22,
+                    descent: 8,
+                    max_width: 19,
+                    space_width: 10,
+                    average_width: 11,
+                },
+                None,
+            ),
+            glyph_code: Some(17),
+        };
+        let name = font_name_from_resolved_match(&requested, &matched);
+        let object = opened_font_from_resolved_match(&requested, &matched);
+        assert_eq!(
+            name.as_utf8_str(),
+            font_name_value(&object).unwrap().as_utf8_str()
+        );
+        let name = name.as_utf8_str().expect("XLFD name");
+        assert!(
+            name.starts_with(&format!("-{}-", foundry.unwrap_or("*"))),
+            "{name}"
+        );
+        assert!(name.contains("Selected Family"), "{name}");
+        assert!(!name.contains("Requested"), "{name}");
+        assert!(
+            name.contains(&format!("-{}-*", pixel_size.max(1))),
+            "{name}"
+        );
+        assert!(name.ends_with("-0-iso10646-1"), "{name}");
+    }
+}
+
+#[test]
+fn face_font_name_projection_does_not_cons_font_capabilities() {
+    use crate::tagged::gc::MemoryUseCountSlot;
+
+    crate::test_utils::init_test_tracing();
+    let mut eval = Context::new();
+    ensure_selected_gui_frame(&mut eval);
+    let mut matched = resolved_font_match(
+        "Selected Family",
+        Some("/tmp/Selected.ttf"),
+        Some("Selected-PostScript"),
+        Some(17),
+        FontPxProbeResult {
+            pixel_size: 19,
+            height: 24,
+            ascent: 18,
+            descent: 6,
+            max_width: 14,
+            space_width: 9,
+            average_width: 11,
+        },
+        None,
+    );
+    let conses = || Value::memory_use_counts_snapshot()[MemoryUseCountSlot::ConsCells.index()];
+    let face = RuntimeFace::new("default");
+    let expected = font_name_from_resolved_match(&face, &matched);
+    let before = conses();
+    let _ = font_name_from_resolved_match(&face, &matched);
+    let small_projection = conses() - before;
+
+    eval.set_display_host(Box::new(FontAtDisplayHost {
+        matched: Some(matched.clone()),
+        ..Default::default()
+    }));
+    let args = || {
+        vec![
+            Value::symbol("default"),
+            Value::NIL,
+            Value::fixnum('好' as i64),
+        ]
+    };
+    builtin_face_font(&mut eval, args()).unwrap();
+    let before = conses();
+    let name = builtin_face_font(&mut eval, args()).unwrap();
+    let small_builtin = conses() - before;
+    assert_eq!(name.as_utf8_str(), expected.as_utf8_str());
+
+    let side = vec![("latn".to_owned(), vec![(None, vec!["liga".to_owned(); 64])]); 8];
+    matched.font.capability = Some(FontOtfCapability {
+        gsub: side.clone(),
+        gpos: side,
+    });
+    let before = conses();
+    let name = font_name_from_resolved_match(&face, &matched);
+    assert_eq!(conses() - before, small_projection);
+    assert_eq!(name.as_utf8_str(), expected.as_utf8_str());
+
+    let before = conses();
+    let object = opened_font_from_resolved_match(&face, &matched);
+    assert!(
+        conses() - before >= 1000,
+        "fixture must exercise capability allocation"
+    );
+    assert!(object.as_font_data().unwrap().capability.is_cons());
+    eval.set_display_host(Box::new(FontAtDisplayHost {
+        matched: Some(matched),
+        ..Default::default()
+    }));
+    builtin_face_font(&mut eval, args()).unwrap();
+    let before = conses();
+    let name = builtin_face_font(&mut eval, args()).unwrap();
+    assert_eq!(conses() - before, small_builtin);
+    assert_eq!(name.as_utf8_str(), expected.as_utf8_str());
+}
+
+#[test]
 fn opened_font_retains_exact_backend_identity_and_variations() {
     use neomacs_display_protocol::font::{
         FontFileAsset, FontOutlineAsset, FontReplay, FontSlantKind, FontVariationCoord,

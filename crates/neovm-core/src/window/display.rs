@@ -783,7 +783,24 @@ impl crate::emacs_core::eval::Context {
             prefixes: self.layout_prefix_inputs(buffer_id)?,
             invisibility: self.layout_invisibility_input(buffer_id)?,
             display_table: self.layout_display_table_input(buffer_id)?,
+            face_remapping: self.layout_face_remapping_input(buffer_id)?,
         })
+    }
+
+    /// Capture effective remappings, including any currently active binding.
+    pub fn layout_face_remapping_input(
+        &self,
+        buffer_id: BufferId,
+    ) -> Option<super::LayoutFaceRemappingInput> {
+        let buffer = self.buffers.get(buffer_id)?;
+        let value = self.obarray.value_in_buffer_id(
+            Some(buffer),
+            super::WindowLayoutVariable::FaceRemappingAlist.sym_id(),
+        );
+        Some(super::LayoutFaceRemappingInput::capture(
+            value.unwrap_or(Value::NIL),
+            self.redisplay_generation(),
+        ))
     }
 
     /// Capture glyph-vector inputs for the effective buffer/standard table.
