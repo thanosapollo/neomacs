@@ -1280,6 +1280,19 @@ impl super::eval::Context {
         request: &WaitRequest,
         mut outcome: WaitServiceOutcome,
     ) -> Result<Option<WaitCompletion>, Flow> {
+        // GNU process.c leaves a keyboard wait as soon as a timer (or any
+        // callback of the pass) left `unread-command-events` non-empty: "If
+        // there is unread keyboard input, also return"
+        // (`requeued_command_events_pending_p` under `read_kbd != 0`).
+        // Without it a bounded command wait (the auto-save idle deadline, a
+        // timed `read-event`) sleeps until its own deadline with the timer's
+        // event already queued.
+        if request.completes_on_command_input()
+            && !outcome.has_command_input_pending()
+            && self.has_requeued_command_events()
+        {
+            outcome.record_command_input_pending();
+        }
         // The service pass checks for command input BEFORE its redisplay
         // step, so input that arrives during that redisplay (a frontend
         // completing its wake, a config whose echo traffic lands exactly

@@ -4805,6 +4805,12 @@ impl Context {
         }
     }
 
+    /// Mirrors GNU `requeued_command_events_pending_p` (keyboard.c).
+    pub(crate) fn has_requeued_command_events(&self) -> bool {
+        self.eval_symbol("unread-command-events")
+            .is_ok_and(|value| value.is_cons())
+    }
+
     /// Whether any Lisp-visible input-processing queue has an event to replay.
     ///
     /// Mirrors GNU `requeued_events_pending_p` (keyboard.c): ending a keyboard

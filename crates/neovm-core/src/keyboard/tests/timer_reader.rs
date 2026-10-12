@@ -285,3 +285,66 @@ fn timer_minibuffer_acceptance_preserves_outer_prefix_and_input_on_error() {
         );
     }
 }
+
+fn interactive_timer_reader_context() -> (
+    crate::emacs_core::Context,
+    crossbeam_channel::Sender<crate::keyboard::InputEvent>,
+) {
+    let mut eval = crate::test_utils::runtime_startup_context();
+    let scratch = eval.buffers.create_buffer("*timer-unread*");
+    eval.buffers.set_current(scratch);
+    let frame = eval.frames.create_frame("F1", 80, 24, scratch);
+    assert!(eval.frames.select_frame(frame));
+    eval.set_variable("noninteractive", Value::NIL);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    eval.input_rx = Some(rx);
+    (eval, tx)
+}
+
+/// GNU `wait_reading_process_output` returns to `read_char` as soon as a
+/// timer leaves `unread-command-events` non-empty (process.c, the
+/// `requeued_command_events_pending_p` checks), even when the wait has a
+/// finite deadline.  A timed `read-event` must return the timer's event
+/// promptly instead of sleeping until its own timeout and returning nil.
+#[test]
+fn timer_unread_event_wakes_timed_read_event() {
+    crate::test_utils::init_test_tracing();
+    let (mut eval, _tx) = interactive_timer_reader_context();
+    let started = std::time::Instant::now();
+    let result = eval
+        .eval_str(
+            "(progn
+               (run-at-time 0.2 nil (lambda () (push ?x unread-command-events)))
+               (read-event nil nil 10))",
+        )
+        .expect("timed read-event");
+    let elapsed = started.elapsed();
+    assert_eq!(result, Value::fixnum('x' as i64));
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "timer-queued event waited {elapsed:?} for the read timeout"
+    );
+}
+
+/// The command loop folds the idle `auto-save-timeout` deadline into its key
+/// wait.  A timer-queued event must not wait behind that deadline.
+#[test]
+fn timer_unread_event_wakes_key_sequence_before_auto_save_deadline() {
+    crate::test_utils::init_test_tracing();
+    let (mut eval, _tx) = interactive_timer_reader_context();
+    eval.eval_str(
+        "(progn
+           (setq auto-save-timeout 10 auto-save-interval 0)
+           (setq num-nonmacro-input-events (1+ num-nonmacro-input-events))
+           (run-at-time 0.2 nil (lambda () (push ?z unread-command-events))))",
+    )
+    .expect("arm unread timer");
+    let started = std::time::Instant::now();
+    let (keys, _) = eval.read_key_sequence().expect("timer-queued key");
+    let elapsed = started.elapsed();
+    assert_eq!(keys, vec![Value::fixnum('z' as i64)]);
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "timer-queued key waited {elapsed:?} for the auto-save deadline"
+    );
+}
