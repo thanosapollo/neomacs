@@ -992,7 +992,39 @@ impl WindowChromeSourceSpan {
 struct WindowChromeStringSources {
     area: PresentedWindowChromeArea,
     presented: Vec<PresentedWindowChromeString>,
+    spans: WindowChromeSourceSpans,
+}
+
+/// Formatter spans normally arrive in output order without overlaps. Validate
+/// that once, then avoid scanning every preceding leaf string for every glyph.
+/// Keep the original first-match lookup for any noncanonical sidecar: sorting
+/// would silently change provenance when spans overlap.
+struct WindowChromeSourceSpans {
     spans: Vec<WindowChromeSourceSpan>,
+    ordered: bool,
+}
+
+impl WindowChromeSourceSpans {
+    fn new(spans: Vec<WindowChromeSourceSpan>) -> Self {
+        let ordered = spans.iter().all(|span| span.output_start < span.output_end)
+            && spans
+                .windows(2)
+                .all(|pair| pair[0].output_end <= pair[1].output_start);
+        Self { spans, ordered }
+    }
+
+    fn source_position(&self, output_position: usize) -> Option<(GlyphStringId, usize)> {
+        if !self.ordered {
+            return self
+                .spans
+                .iter()
+                .find_map(|span| span.source_position(output_position));
+        }
+        let index = self
+            .spans
+            .partition_point(|span| span.output_end <= output_position);
+        self.spans.get(index)?.source_position(output_position)
+    }
 }
 
 impl WindowChromeStringSources {
@@ -1005,18 +1037,21 @@ impl WindowChromeStringSources {
         let root_value = formatted.value();
         let mut values = vec![root_value];
         let mut string_ids = vec![root_id];
-        let mut source_ids: Vec<(Value, GlyphStringId)> = Vec::new();
+        let mut source_ids = rustc_hash::FxHashMap::default();
         let mut spans = Vec::with_capacity(formatted.source_spans().len());
 
         for span in formatted.source_spans().iter().copied() {
             let source = span.source();
-            let string_id = if source == root_value {
+            let string_id = if source.bits() == root_value.bits() {
                 root_id
-            } else if let Some((_, id)) = source_ids.iter().find(|(value, _)| *value == source) {
+            } else if let Some(id) = source_ids.get(&source.bits()) {
                 *id
             } else {
                 let id = GlyphStringId::new(source_ids.len().saturating_add(2) as u64);
-                source_ids.push((source, id));
+                // This loop invokes neither Lisp nor collection. Identity bits
+                // are stable here; ids still follow first appearance, not hash
+                // iteration order. Equal-text distinct strings stay distinct.
+                source_ids.insert(source.bits(), id);
                 values.push(source);
                 string_ids.push(id);
                 id
@@ -1038,14 +1073,12 @@ impl WindowChromeStringSources {
         Ok(Self {
             area,
             presented,
-            spans,
+            spans: WindowChromeSourceSpans::new(spans),
         })
     }
 
     fn source_position(&self, output_position: usize) -> Option<(GlyphStringId, usize)> {
-        self.spans
-            .iter()
-            .find_map(|span| span.source_position(output_position))
+        self.spans.source_position(output_position)
     }
 }
 
@@ -1575,10 +1608,13 @@ fn eval_status_line_format_output(
         window_id,
         neovm_core::emacs_core::xdisp::column_spec_consumed(),
     );
+    // The formatter output is already an owned Lisp string. Checking whether
+    // it contains characters does not require a lossy UTF-8 copy of the entire
+    // row (and must keep unibyte/raw-byte strings just like multibyte ones).
     if rendered
         .value()
-        .as_runtime_string_owned()
-        .is_some_and(|s| !s.is_empty())
+        .as_lisp_string()
+        .is_some_and(|string| !string.as_bytes().is_empty())
     {
         Some(rendered)
     } else {
@@ -2486,3 +2522,7 @@ pub(crate) fn window_chrome_row_height_for_face_at_scale(
 #[cfg(test)]
 #[path = "display_status_line/tests/display_status_line_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "display_status_line/tests/chrome_source_cost_test.rs"]
+mod chrome_source_cost_tests;

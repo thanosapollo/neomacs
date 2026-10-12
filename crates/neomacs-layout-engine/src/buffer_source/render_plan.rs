@@ -39,7 +39,7 @@ use crate::incremental_layout::{
 };
 use crate::neovm_bridge::{FaceResolver, LayoutBufferView, ResolvedFace, RustBufferAccess};
 use crate::types::WindowParams;
-use crate::viewport_resolution::ForwardViewportMeasurement;
+use crate::viewport_resolution::{ForwardViewportMeasurement, ViewportDecision};
 use crate::window_layout::{WindowChromeMetrics, WindowLayoutBox};
 use crate::window_output::{
     TextWindowCursor, TextWindowCursorRole, TextWindowCursorSlots, TextWindowOutputTarget,
@@ -1249,7 +1249,8 @@ impl BufferSourceOutputSetup {
                     .builder()
                     .install_finalized_output_row(*idx, row.clone());
             }
-            // An edit replay keeps window-start: it never scrolls. Point must
+            // A point-driven scroll must also prove that the cursor fits after
+            // exposing its new rows. An edit replay never scrolls. Point must
             // end up on a row wholly on screen, and when the walk did not place
             // the cursor itself, on a reused row the cursor can be put back on.
             // Otherwise the edit carried point below the window or onto the
@@ -1259,7 +1260,7 @@ impl BufferSourceOutputSetup {
             // gives up when it cannot find the cursor (xdisp.c:23077-23110).
             // A synchronized walk that pushed point's row partly below the
             // window lands here too.
-            if scroll.edit {
+            if scroll.edit || scroll.point_driven {
                 use crate::display_text_window_row_lifecycle::TextWindowCursorPublishStatus;
                 let point = scroll.new_point.max(0) as usize;
                 let point_row_on_screen = match cursor_status {
@@ -1294,6 +1295,40 @@ impl BufferSourceOutputSetup {
                 scroll.reused_point_rows,
             );
             output_emitter.normalize_body_start_cols();
+            if scroll.point_driven {
+                // Partial-walk geometry starts below the reused rows. Validate
+                // the complete viewport in visual order, with its real start.
+                let mut rows = output_emitter.rows().to_vec();
+                rows.sort_by_key(|row| row.row);
+                let body = layout_box.body();
+                let retry = crate::display_text_window_row_lifecycle::TextWindowVisibilityRetryRequest::new(
+                    &rows,
+                    scroll.new_window_start,
+                    source.accessible_start(),
+                    source.accessible_end(),
+                    params.point_charpos().get(),
+                    walk_setup.charpos,
+                    false,
+                    (body.y - params.bounds.y).round() as i64,
+                    (body.bottom() - params.bounds.y).round() as i64,
+                    crate::scroll_policy::ScrollPolicy::from_window_params(params),
+                    params.scroll_margin,
+                    None,
+                    buf_access,
+                )
+                .decide();
+                if !matches!(retry.viewport_decision(), ViewportDecision::Keep)
+                    || retry
+                        .retry_window_start()
+                        .is_some_and(|start| start > scroll.new_window_start)
+                {
+                    crate::window_output::restore_text_window_retry_checkpoint(
+                        output.reborrow(),
+                        retry_checkpoint,
+                    );
+                    return BufferSourceRenderAttemptOutcome::ReplayMispredicted;
+                }
+            }
 
             let mut redisplay_positions = scroll_positions.unwrap_or_else(|| {
                 TextWindowRedisplayPositions::from_output_rows(

@@ -1,16 +1,55 @@
-//! Owned syntactic dependencies of faces on prefix/replacement strings.
+//! Owned syntactic dependencies of displayed face specifications.
 //! This does not resolve faces, evaluate filters or copy arbitrary Lisp graphs.
 use crate::buffer::{CharPos0, text_props::TextPropertiesRef};
 use crate::emacs_core::{
     plist::plist_get,
     value::{Value, list_to_vec},
 };
-use crate::face::{DecorationProperty, LFaceAttr};
-use rustc_hash::FxHashMap;
+use crate::face::{DecorationProperty, LFaceAttr, normalize_face_attribute_name};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct StringFaceInputs(Arc<[FaceRun]>);
+
+/// Effective remappings owned independently of mutable Lisp lists and strings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LayoutFaceRemappingInput {
+    entries: Arc<[(Token, Arc<[Token]>)]>,
+    improper_tail: bool,
+    opaque_generation: Option<u64>,
+}
+
+impl LayoutFaceRemappingInput {
+    pub(super) fn capture(mut alist: Value, generation: u64) -> Self {
+        let mut entries = Vec::new();
+        let mut seen = FxHashSet::default();
+        let mut opaque = false;
+        while alist.is_cons() {
+            if !seen.insert(alist.bits()) {
+                opaque = true;
+                break;
+            }
+            let entry = alist.cons_car();
+            if entry.is_cons() {
+                let key = atom(entry.cons_car());
+                let input = capture_face(entry.cons_cdr());
+                opaque |= matches!(key, Token::Opaque(_))
+                    || input.iter().any(|token| matches!(token, Token::Opaque(_)));
+                entries.push((key, input));
+            }
+            alist = alist.cons_cdr();
+        }
+        Self {
+            entries: entries.into(),
+            // Core font queries reject the whole improper alist, while the
+            // display resolver can still consume entries preceding its tail.
+            improper_tail: !alist.is_nil(),
+            // Unsupported compound resources retain conservative invalidation.
+            opaque_generation: opaque.then_some(generation),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FaceRun {
@@ -29,6 +68,8 @@ enum FaceProperty {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
     Atom(usize),
+    Float(u64),
+    Opaque(usize),
     String { bytes: Arc<[u8]>, multibyte: bool },
     List,
     Attributes,
@@ -74,11 +115,15 @@ impl StringFaceInputs {
 }
 
 fn atom(value: Value) -> Token {
+    if let Some(number) = value.as_float() {
+        return Token::Float(number.to_bits());
+    }
     match value.as_lisp_string() {
         Some(string) => Token::String {
             bytes: string.as_bytes().into(),
             multibyte: string.is_multibyte(),
         },
+        None if value.is_cons() || value.is_veclike() => Token::Opaque(value.bits()),
         None => Token::Atom(value.bits()),
     }
 }
@@ -115,7 +160,7 @@ fn capture_face(value: Value) -> Arc<[Token]> {
                 }
                 let Some(items) = list_to_vec(&value) else {
                     // The current resolver rejects improper/cyclic face lists.
-                    tokens.push(Token::Atom(value.bits()));
+                    tokens.push(Token::Opaque(value.bits()));
                     continue;
                 };
                 if items[0]
@@ -144,8 +189,9 @@ fn capture_face(value: Value) -> Arc<[Token]> {
                     tokens.push(Token::Attributes);
                     pending.push(Work::End);
                     for pair in items.chunks_exact(2).rev() {
-                        if let Some(key) =
-                            pair[0].as_symbol_name().and_then(LFaceAttr::from_keyword)
+                        if let Some(key) = pair[0]
+                            .as_symbol_name()
+                            .and_then(|name| normalize_face_attribute_name(name).parse().ok())
                         {
                             pending.push(Work::Attribute(key, pair[1]));
                         }

@@ -37,7 +37,7 @@ use neovm_core::emacs_core::{Context, Value};
 /// The four logical arrow bitmaps resolved once per window for the body rows.
 /// `None` means the indicator resolves to no bitmap (GNU `NO_FRINGE_BITMAP`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct FringeArrowBitmaps {
+pub(crate) struct FringeArrowBitmaps {
     /// `truncation` left element — `left-arrow`.
     truncation_left: Option<u16>,
     /// `truncation` right element — `right-arrow`.
@@ -49,7 +49,7 @@ struct FringeArrowBitmaps {
 }
 
 impl FringeArrowBitmaps {
-    fn resolve<B: LayoutBufferView>(buffer: &B, ctx: &Context) -> Self {
+    pub(crate) fn resolve<B: LayoutBufferView>(buffer: &B, ctx: &Context) -> Self {
         let truncation = Value::from_sym_id(intern("truncation"));
         let continuation = Value::from_sym_id(intern("continuation"));
         let resolve = |sym: Value, right_p: bool| {
@@ -324,12 +324,18 @@ impl DisplayWindowRowMutation for ResolvedFringeArrowRowMutation {
                 bitmap_index,
                 face_id: self.face_id,
             });
+            row.left_fringe_producer = row
+                .left_fringe_bitmap
+                .map(neomacs_display_protocol::glyph_matrix::RowFringeProducer::RowIndicator);
         }
         if let Some(bitmap_index) = self.right {
             row.right_fringe_bitmap = Some(FringeBitmapInfo {
                 bitmap_index,
                 face_id: self.face_id,
             });
+            row.right_fringe_producer = row
+                .right_fringe_bitmap
+                .map(neomacs_display_protocol::glyph_matrix::RowFringeProducer::RowIndicator);
         }
     }
 }

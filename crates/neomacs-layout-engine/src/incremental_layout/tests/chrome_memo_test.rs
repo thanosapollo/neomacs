@@ -204,3 +204,62 @@ fn the_fingerprint_record_keeps_one_row_per_kind() {
     );
     reset_fingerprint_record();
 }
+
+#[test]
+fn chrome_fingerprint_distinguishes_equal_text_source_identity_topology() {
+    let mut eval = Context::new();
+    eval.eval_str("(setq noninteractive nil)")
+        .expect("interactive");
+    let buffer = eval.buffer_manager().current_buffer().expect("buffer").id();
+    let frame =
+        eval.frame_manager_mut()
+            .create_frame("chrome-fingerprint-sources", 640, 480, buffer);
+    let window = eval
+        .frame_manager()
+        .get(frame)
+        .expect("frame")
+        .selected_window;
+    let mut capture = |same_source: bool| {
+        let first = Value::string("same");
+        let second = if same_source {
+            first
+        } else {
+            Value::string("same")
+        };
+        let formatted = neovm_core::emacs_core::xdisp::format_mode_line_for_display_with_sources(
+            &mut eval,
+            Value::list(vec![first, second, first]),
+            Value::make_window(window.0),
+            Value::make_buffer(buffer),
+            80,
+        );
+        ChromeRowFingerprint::capture(inputs(), &formatted).expect("plain sources")
+    };
+    let repeated = capture(true);
+    let distinct = capture(false);
+    assert_ne!(
+        repeated, distinct,
+        "equal text must not merge distinct mouse sources"
+    );
+    assert_eq!(
+        distinct,
+        capture(false),
+        "fresh objects with the same identity topology memoize"
+    );
+    assert_eq!(
+        repeated
+            .spans
+            .iter()
+            .map(|span| span.source_index)
+            .collect::<Vec<_>>(),
+        vec![0, 0, 0]
+    );
+    assert_eq!(
+        distinct
+            .spans
+            .iter()
+            .map(|span| span.source_index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 0]
+    );
+}

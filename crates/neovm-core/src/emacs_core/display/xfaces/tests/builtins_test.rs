@@ -1635,6 +1635,60 @@ fn face_font_eval_returns_font_name_on_live_gui_frame() {
 }
 
 #[test]
+fn face_font_uses_name_only_host_operation_and_preserves_character_requests() {
+    use crate::emacs_core::display_host::ResolvedFontName;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct NameOnlyHost(Rc<RefCell<Vec<FontResolveRequest>>>);
+    impl DisplayHost for NameOnlyHost {
+        fn realize_gui_frame(&mut self, _request: GuiFrameHostRequest) -> Result<(), String> {
+            Ok(())
+        }
+        fn resize_gui_frame(&mut self, _request: GuiFrameHostRequest) -> Result<(), String> {
+            Ok(())
+        }
+        fn resolve_font_for_char(
+            &mut self,
+            _request: FontResolveRequest,
+        ) -> Result<Option<ResolvedFontMatch>, String> {
+            panic!("face-font must not request a complete opened font");
+        }
+        fn resolve_font_name_for_char(
+            &mut self,
+            request: FontResolveRequest,
+        ) -> Result<Option<ResolvedFontName>, String> {
+            self.0.borrow_mut().push(request);
+            Ok(Some(ResolvedFontName {
+                family: "Name Only Mono".into(),
+                foundry: None,
+                weight: 400,
+                slant: FontSlant::ReverseOblique,
+                width: FontWidth::Condensed,
+                pixel_size: 23,
+                postscript_name: Some("NameOnlyMono".into()),
+            }))
+        }
+    }
+    let mut eval = Context::new();
+    let frame_id = ensure_selected_gui_frame(&mut eval);
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    eval.set_display_host(Box::new(NameOnlyHost(requests.clone())));
+    for character in [None, Some(0x03bb), Some(0x3fff80)] {
+        let mut args = vec![Value::symbol("default")];
+        if let Some(code) = character {
+            args.extend([Value::NIL, Value::fixnum(code)]);
+        }
+        let name = builtin_face_font(&mut eval, args).unwrap();
+        assert!(name.as_utf8_str().unwrap().contains("Name Only Mono"));
+        let request = requests.borrow();
+        let request = request.last().unwrap();
+        assert_eq!(request.frame_id, frame_id);
+        assert_eq!(request.character.code(), character.unwrap_or(77) as u32);
+    }
+}
+
+#[test]
 fn face_font_returns_nil_when_the_host_cannot_realize_the_face() {
     let mut eval = Context::new();
     ensure_selected_gui_frame(&mut eval);

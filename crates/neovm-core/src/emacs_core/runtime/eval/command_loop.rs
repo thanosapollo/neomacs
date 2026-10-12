@@ -1733,10 +1733,13 @@ impl Context {
                     self.chrome_dirty.mark_all();
                 }
             }
-            // A display-affecting variable changed: the incremental fast paths
-            // key on this counter so they re-lay instead of reusing rows shaped
-            // under the old setting (the four buffer/face ticks do not move here).
-            self.display_var_change_count = self.display_var_change_count.wrapping_add(1);
+            // Remappings have an owned effective-value key. Org temporarily
+            // binds them while measuring columns; restored bindings must not
+            // discard every window's retained rows. Other display variables
+            // still invalidate rows through the broad generation counter.
+            if resolved != crate::window::WindowLayoutVariable::FaceRemappingAlist.sym_id() {
+                self.display_var_change_count = self.display_var_change_count.wrapping_add(1);
+            }
         }
     }
 
@@ -2919,6 +2922,8 @@ impl Context {
                 self.buffers.reclaim_dead_buffer(id);
             }
         }
+        // Once per completed prune batch, not once per swept buffer.
+        self.buffers.shrink_dead_buffer_records();
     }
 
     /// Drop the deleted-process records whose process object this cycle

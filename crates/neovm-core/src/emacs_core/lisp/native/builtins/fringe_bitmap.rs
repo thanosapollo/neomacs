@@ -82,14 +82,28 @@ pub struct FringeBitmapRegistry {
     /// by the display pipeline (which only carries the integer index).
     by_index: FxHashMap<u32, SymId>,
     next_index: u32,
+    revision: u64,
 }
 
 impl FringeBitmapRegistry {
+    /// Changes to registry geometry or face overrides invalidate retained rows.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn changed(&mut self) {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("fringe registry revision exhausted");
+    }
+
     pub fn new() -> Self {
         Self {
             user_bitmaps: FxHashMap::default(),
             by_index: FxHashMap::default(),
             next_index: FIRST_USER_FRINGE_BITMAP_INDEX,
+            revision: 0,
         }
     }
 
@@ -115,6 +129,7 @@ impl FringeBitmapRegistry {
             MAX_STANDARD_FRINGE_BITMAPS, STANDARD_FRINGE_BITMAPS,
         };
 
+        self.changed();
         let mut assigned = Vec::with_capacity(STANDARD_FRINGE_BITMAPS.len());
         for entry in STANDARD_FRINGE_BITMAPS {
             let sym = crate::emacs_core::intern::intern(entry.name);
@@ -148,6 +163,7 @@ impl FringeBitmapRegistry {
         existing_index: Option<u32>,
         mut bitmap: FringeBitmap,
     ) -> u32 {
+        self.changed();
         let index = match existing_index.or_else(|| self.index_of(sym)) {
             Some(index) => index,
             None => {
@@ -172,6 +188,7 @@ impl FringeBitmapRegistry {
     /// in `by_index` cleared; we do not reuse it eagerly (GNU walks the array
     /// for a free slot, but never below `MAX_STANDARD_FRINGE_BITMAPS`).
     pub fn destroy(&mut self, sym: SymId) {
+        self.changed();
         if let Some(bitmap) = self.user_bitmaps.remove(&sym) {
             let _ = bitmap;
         }
@@ -205,6 +222,7 @@ impl FringeBitmapRegistry {
     /// Record a `set-fringe-bitmap-face` override (by face name). Returns true
     /// when the bitmap exists.
     pub fn set_face(&mut self, sym: SymId, face: Option<String>) -> bool {
+        self.changed();
         match self.user_bitmaps.get_mut(&sym) {
             Some(bitmap) => {
                 bitmap.face = face;

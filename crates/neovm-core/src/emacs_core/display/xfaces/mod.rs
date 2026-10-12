@@ -351,13 +351,12 @@ use super::error::{Flow, LispCondition, signal};
 use super::font::alternative_font_registry_alist;
 use super::font::{
     FrameFontRealization, alternative_font_family_alist, default_face_font_attr_affects_frame_font,
-    face_remapping_for_current_buffer, font_name_value, font_string_text, font_value_fields,
-    font_value_text, font_vector_get_flexible, frame_device_designator_p, frame_id_from_designator,
-    frame_parameter_for_face_attribute, is_font, is_font_entity, is_font_spec,
-    live_frame_designator_in_state, live_frame_font_attribute_fallback,
-    opened_font_from_resolved_match, publish_face_attribute_to_frame_parameter,
-    replace_alternative_font_registry_alist, resolve_font_match, resolve_live_frame_font_request,
-    sync_live_default_face_font_state, sync_live_frame_font_state,
+    face_remapping_for_current_buffer, font_name_from_host_projection, font_string_text,
+    font_value_fields, font_value_text, font_vector_get_flexible, frame_device_designator_p,
+    frame_id_from_designator, frame_parameter_for_face_attribute, is_font, is_font_entity,
+    is_font_spec, live_frame_designator_in_state, live_frame_font_attribute_fallback,
+    publish_face_attribute_to_frame_parameter, replace_alternative_font_registry_alist,
+    resolve_live_frame_font_request, sync_live_default_face_font_state, sync_live_frame_font_state,
 };
 
 use super::intern::intern;
@@ -4367,6 +4366,93 @@ pub(crate) fn builtin_face_id(args: Vec<Value>) -> EvalResult {
     ))
 }
 
+// Read live vectors for each query: Lisp can mutate the exposed face table and
+// its vectors without advancing the face-change counter.
+fn leaf_runtime_face_for_font(
+    eval: &super::eval::Context,
+    frame_id: FrameId,
+    name: &str,
+) -> Option<RuntimeFace> {
+    let entry = lookup_frame_lisp_face_vector(eval, frame_id, name)?;
+    let vector = face_hash_entry_lisp_vector(entry)?;
+    let face = runtime_face_from_lisp_face_vector(name, vector);
+    face.inherit.is_none().then_some(face)
+}
+
+fn append_font_face_dependencies(reference: Value, pending: &mut Vec<Value>) {
+    let Some(items) = list_to_vec(&reference) else {
+        return;
+    };
+    if items
+        .first()
+        .and_then(|item| item.as_symbol_name())
+        .is_some_and(|name| name.starts_with(':'))
+    {
+        // Match resolve_face_ref's grammar and duplicate-attribute handling.
+        pending.extend(RuntimeFace::from_plist("--inline--", &items).inherit);
+    } else {
+        pending.extend(items);
+    }
+}
+
+fn face_table_for_font(
+    eval: &super::eval::Context,
+    frame_id: FrameId,
+    name: &str,
+    remapping: &crate::face::FaceRemapping,
+) -> Option<crate::face::FaceTable> {
+    let mut table = crate::face::FaceTable::new();
+    let mut pending = vec![Value::symbol(name)];
+    if !remapping.is_empty() {
+        pending.push(Value::symbol("default"));
+    }
+    let mut seen = HashSet::default();
+    while let Some(reference) = pending.pop() {
+        // Inheritance graphs may contain cyclic or shared mutable conses.
+        if reference.is_nil() || !seen.insert(reference.bits()) {
+            continue;
+        }
+        let Some(name) = reference.as_symbol_name() else {
+            append_font_face_dependencies(reference, &mut pending);
+            continue;
+        };
+        let entry = lookup_frame_lisp_face_vector_by_symbol(eval, frame_id, reference)?;
+        let vector = face_hash_entry_lisp_vector(entry)?;
+        let face = runtime_face_from_lisp_face_vector(name, vector);
+        pending.extend(face.inherit);
+        table.define(name, face);
+        for entry in remapping.get(name).into_iter().flatten() {
+            match entry {
+                crate::face::FaceRemapEntry::RemapFace(target) => pending.push(*target),
+                crate::face::FaceRemapEntry::RemapAttrs(attrs) => pending.extend(attrs.inherit),
+            }
+        }
+    }
+    Some(table)
+}
+
+fn resolve_face_for_font(
+    eval: &super::eval::Context,
+    frame_id: FrameId,
+    name: &str,
+    remapping: &crate::face::FaceRemapping,
+) -> RuntimeFace {
+    if remapping.is_empty() {
+        if let Some(face) = leaf_runtime_face_for_font(eval, frame_id, name) {
+            return face;
+        }
+    }
+    // Only materialization is narrowed. The existing resolver still owns
+    // inheritance order, relative heights, remapping, and recursion limits.
+    let table = face_table_for_font(eval, frame_id, name, remapping)
+        .unwrap_or_else(|| runtime_face_table_from_frame_lisp_faces(eval, frame_id, false));
+    if remapping.is_empty() {
+        table.resolve(name)
+    } else {
+        table.resolve_with_remapping(name, remapping)
+    }
+}
+
 pub(crate) fn builtin_face_font(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     expect_min_args("face-font", &args, 1)?;
     expect_max_args("face-font", &args, 3)?;
@@ -4438,12 +4524,7 @@ pub(crate) fn builtin_face_font(eval: &mut super::eval::Context, args: Vec<Value
 
     let face_name = resolve_face_name_for_domain(eval, &args[0], false)?;
     let remapping = face_remapping_for_current_buffer(eval);
-    let face_table = runtime_face_table_from_frame_lisp_faces(eval, frame_id, false);
-    let face = if remapping.is_empty() {
-        face_table.resolve(&face_name)
-    } else {
-        face_table.resolve_with_remapping(&face_name, &remapping)
-    };
+    let face = resolve_face_for_font(eval, frame_id, &face_name, &remapping);
     let character = if let Some(character) = args.get(2).filter(|value| !value.is_nil()) {
         let code = super::builtins::expect_character_code(character)? as u32;
         let Some(ch) = crate::emacs_core::emacs_char::EmacsChar::from_code(code) else {
@@ -4456,8 +4537,19 @@ pub(crate) fn builtin_face_font(eval: &mut super::eval::Context, args: Vec<Value
         // an XLFD pixel size; fabricating a name corrupts window-font-*.
         crate::emacs_core::emacs_char::EmacsChar::from_char('M')
     };
-    Ok(resolve_font_match(eval, frame_id, character, &face)
-        .and_then(|matched| font_name_value(&opened_font_from_resolved_match(&face, &matched)))
+    Ok(eval
+        .display_host
+        .as_mut()
+        .and_then(|host| {
+            host.resolve_font_name_for_char(super::display_host::FontResolveRequest {
+                frame_id,
+                character,
+                face: face.clone(),
+            })
+            .ok()
+            .flatten()
+        })
+        .map(|matched| font_name_from_host_projection(&face, &matched))
         .unwrap_or(Value::NIL))
 }
 

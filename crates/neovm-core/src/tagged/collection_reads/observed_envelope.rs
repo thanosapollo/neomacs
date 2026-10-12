@@ -6,18 +6,27 @@
 //! and the reclamation epoch are atomic. No old owner header is dereferenced.
 
 use super::super::gc::{
-    BarrierWindow, CompiledObservationGate, collection_observation_epoch,
-    collection_observed_metadata,
+    BarrierWindow, CollectionObservedWord, CompiledObservationGate, collection_observation_epoch,
+    collection_observed_word,
 };
 use super::super::value::TAG_MASK;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
+use std::sync::atomic::Ordering;
 
 const EMPTY_BOUNDS: (usize, usize) = (usize::MAX, 0);
 const MAX_RECLAMATION_RETRIES: usize = 3;
 
+struct ObservedWord {
+    metadata: CollectionObservedWord,
+    mask: u64,
+    // Distinct tagged identities can occupy one metadata address bit.
+    tags: [u64; TAG_MASK + 1],
+}
+
 pub(super) struct ObservedEnvelope {
     owners: FxHashSet<usize>,
+    words: FxHashMap<usize, ObservedWord>,
     addresses: BTreeSet<usize>,
     epoch: Option<u64>,
     dump: BarrierWindow,
@@ -35,6 +44,7 @@ impl ObservedEnvelope {
     pub(super) fn new() -> Self {
         Self {
             owners: FxHashSet::default(),
+            words: FxHashMap::default(),
             addresses: BTreeSet::new(),
             epoch: Some(collection_observation_epoch()),
             dump: BarrierWindow::NONE,
@@ -72,7 +82,7 @@ impl ObservedEnvelope {
     fn refresh_reclaimed(&mut self, dump: BarrierWindow) {
         for _ in 0..MAX_RECLAMATION_RETRIES {
             let before = collection_observation_epoch();
-            self.retain_owners(dump, collection_observed_metadata);
+            self.retain_words(dump, |metadata| metadata.word.load(Ordering::Acquire));
             let after = collection_observation_epoch();
             if before == after {
                 self.epoch = Some(after);
@@ -84,13 +94,28 @@ impl ObservedEnvelope {
 
     /// Insert even when another mutator already set the process-wide mark.
     /// New observations update both buckets and the ordered address ledger;
-    /// only reclamation or a dump-span change scans all local identities.
+    /// reclamation queries each permanent metadata word just once.
     /// A newly observed owner closes any gap covering it before the caller
     /// publishes its shared mark or snapshots the dependency's revision.
     pub(super) fn insert(&mut self, bits: usize) -> bool {
         if !self.owners.insert(bits) {
             return false;
         }
+        let Some((metadata, mask)) = collection_observed_word(bits) else {
+            // Only heap owners have collection observations.
+            self.owners.remove(&bits);
+            return false;
+        };
+        let word = self
+            .words
+            .entry(metadata.word as *const _ as usize)
+            .or_insert_with(|| ObservedWord {
+                metadata,
+                mask: 0,
+                tags: [0; TAG_MASK + 1],
+            });
+        word.mask |= mask;
+        word.tags[bits & TAG_MASK] |= mask;
         let address = bits & !TAG_MASK;
         if self.excluded.is_some_and(|gap| gap.covers(address)) {
             self.excluded = None;
@@ -173,28 +198,33 @@ impl ObservedEnvelope {
         true
     }
 
-    /// Keep the owners `live` accepts; the result equals `rebuild` over the
-    /// survivors. Every epoch advance follows a death of some observed owner,
-    /// so this runs on most incremental sweep slices: with an unchanged dump
-    /// span only the dead addresses leave the ordered ledger and the bounds are
-    /// re-read from its ends, instead of re-sorting every survivor.
-    fn retain_owners(&mut self, dump: BarrierWindow, live: impl Fn(usize) -> bool) {
-        if self.dump != dump {
-            self.owners.retain(|&bits| live(bits));
-            self.rebuild(dump);
-            return;
-        }
+    /// Inspect one atomic word per bucket, visiting identities only for cleared
+    /// bits. Permanent descriptors never require a reclaimed owner lookup.
+    fn retain_words(
+        &mut self,
+        dump: BarrierWindow,
+        mut load: impl FnMut(CollectionObservedWord) -> u64,
+    ) {
         let reclaimed = &mut self.reclaimed;
         reclaimed.clear();
-        self.owners.retain(|&bits| {
-            let keep = live(bits);
-            if !keep {
-                reclaimed.push(bits);
+        self.words.retain(|_, word| {
+            let missing = word.mask & !load(word.metadata);
+            if missing != 0 {
+                for (tag, mask) in word.tags.iter_mut().enumerate() {
+                    let mut dead = *mask & missing;
+                    while dead != 0 {
+                        let bit = dead.trailing_zeros();
+                        reclaimed.push(word.metadata.address_for_bit(bit) | tag);
+                        dead &= dead - 1;
+                    }
+                    *mask &= !missing;
+                }
+                word.mask &= !missing;
             }
-            keep
+            word.mask != 0
         });
-        if self.reclaimed.is_empty() {
-            return;
+        for &bits in &self.reclaimed {
+            self.owners.remove(&bits);
         }
         for &bits in &self.reclaimed {
             let address = bits & !TAG_MASK;
@@ -203,8 +233,13 @@ impl ObservedEnvelope {
                 self.addresses.remove(&address);
             }
         }
+        let changed = !self.reclaimed.is_empty();
         self.reclaimed.clear();
-        self.recompute_bounds();
+        if self.dump != dump {
+            self.rebuild(dump);
+        } else if changed {
+            self.recompute_bounds();
+        }
     }
 
     #[cold]
@@ -217,8 +252,6 @@ impl ObservedEnvelope {
             self.excluded = None;
         }
         self.dump = dump;
-        // Bulk construction sorts once instead of inserting node by node.
-        self.addresses = self.owners.iter().map(|&bits| bits & !TAG_MASK).collect();
         self.recompute_bounds();
     }
 
@@ -272,11 +305,11 @@ fn include(bounds: &mut (usize, usize), address: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tagged::value::{TAG_CONS, TAG_STRING, TAG_VECLIKE};
+    use crate::tagged::value::{TAG_CONS, TAG_FLOAT, TAG_STRING, TAG_VECLIKE};
     use proptest::prelude::*;
 
     /// The ledger and bounds a from-scratch scan of `owners` yields: the
-    /// definition `retain_owners` must match after any reclamation.
+    /// definition `retain_words` must match after any reclamation.
     fn scanned(owners: &FxHashSet<usize>, dump: BarrierWindow) -> String {
         let mut addresses = BTreeSet::new();
         let (mut full, mut below, mut above) = (EMPTY_BOUNDS, EMPTY_BOUNDS, EMPTY_BOUNDS);
@@ -324,6 +357,34 @@ mod tests {
         address & !TAG_MASK | tag
     }
 
+    fn metadata_key(bits: usize) -> (usize, u64) {
+        let (metadata, mask) = collection_observed_word(bits).unwrap();
+        (metadata.word as *const _ as usize, mask)
+    }
+
+    fn live_words(owners: &FxHashSet<usize>) -> FxHashMap<usize, u64> {
+        let mut words = FxHashMap::default();
+        for &bits in owners {
+            let (key, mask) = metadata_key(bits);
+            *words.entry(key).or_default() |= mask;
+        }
+        words
+    }
+
+    fn retain_survivors(
+        envelope: &mut ObservedEnvelope,
+        survivors: &FxHashSet<usize>,
+        dump: BarrierWindow,
+    ) {
+        let words = live_words(survivors);
+        envelope.retain_words(dump, |metadata| {
+            words
+                .get(&(metadata.word as *const _ as usize))
+                .copied()
+                .unwrap_or(0)
+        });
+    }
+
     proptest! {
         #[test]
         fn reclaiming_owners_matches_a_full_rescan(
@@ -359,9 +420,12 @@ mod tests {
             prop_assert_eq!(&envelope.owners, &all);
             prop_assert_eq!(state(&envelope), scanned(&all, dump));
 
-            // Same dump span: the incremental path.
-            envelope.retain_owners(dump, |bits| !dead.contains(&bits));
-            let survivors: FxHashSet<usize> = all.difference(&dead).copied().collect();
+            // Synthetic non-cons aliases share one metadata bit, exactly as
+            // the production string/vector/float plane does.
+            let dead_cells: FxHashSet<_> = dead.iter().copied().map(metadata_key).collect();
+            let survivors: FxHashSet<usize> = all.iter().copied()
+                .filter(|&bits| !dead_cells.contains(&metadata_key(bits))).collect();
+            retain_survivors(&mut envelope, &survivors, dump);
             prop_assert_eq!(&envelope.owners, &survivors);
             prop_assert_eq!(state(&envelope), scanned(&survivors, dump));
 
@@ -372,10 +436,109 @@ mod tests {
                 .copied()
                 .filter(|bits| (bits >> 4) % 2 == usize::from(second % 2))
                 .collect();
-            envelope.retain_owners(moved, |bits| !doomed.contains(&bits));
             let rest: FxHashSet<usize> = survivors.difference(&doomed).copied().collect();
+            retain_survivors(&mut envelope, &rest, moved);
             prop_assert_eq!(&envelope.owners, &rest);
             prop_assert_eq!(state(&envelope), scanned(&rest, moved));
         }
+    }
+
+    #[test]
+    fn reclamation_loads_each_word_once_and_preserves_tagged_aliases() {
+        let mut envelope = ObservedEnvelope::new();
+        let mut owners = FxHashSet::default();
+        for slot in 0..512 {
+            for tag in [TAG_CONS, TAG_STRING, TAG_VECLIKE, TAG_FLOAT] {
+                let bits = (0x400000 + slot * 8) | tag;
+                assert!(envelope.insert(bits));
+                owners.insert(bits);
+            }
+        }
+        let words = live_words(&owners);
+        assert_eq!(words.len(), 16);
+        let mut loads = FxHashMap::<usize, usize>::default();
+        envelope.retain_words(BarrierWindow::NONE, |metadata| {
+            let key = metadata.word as *const _ as usize;
+            *loads.entry(key).or_default() += 1;
+            words[&key]
+        });
+        assert_eq!(loads.len(), 16);
+        assert!(loads.values().all(|&count| count == 1));
+        assert_eq!(envelope.owners, owners);
+
+        let dead_cons = 0x400008 | TAG_CONS;
+        owners.remove(&dead_cons);
+        let words = live_words(&owners);
+        loads.clear();
+        envelope.retain_words(BarrierWindow::NONE, |metadata| {
+            let key = metadata.word as *const _ as usize;
+            *loads.entry(key).or_default() += 1;
+            words[&key]
+        });
+        assert_eq!(loads.len(), 16);
+        assert!(loads.values().all(|&count| count == 1));
+        assert_eq!(envelope.owners.len(), 2047);
+        assert_eq!(envelope.owners, owners);
+        assert!(envelope.owners.contains(&(0x400008 | TAG_STRING)));
+
+        let dead_noncons_address = 0x400010;
+        for tag in [TAG_STRING, TAG_VECLIKE, TAG_FLOAT] {
+            owners.remove(&(dead_noncons_address | tag));
+        }
+        let words = live_words(&owners);
+        loads.clear();
+        let dump = BarrierWindow::span(0x400100, 0x400200);
+        envelope.retain_words(dump, |metadata| {
+            let key = metadata.word as *const _ as usize;
+            *loads.entry(key).or_default() += 1;
+            words[&key]
+        });
+        assert_eq!(loads.len(), 16);
+        assert!(loads.values().all(|&count| count == 1));
+        assert_eq!(envelope.owners, owners);
+        assert!(envelope.owners.contains(&(0x400008 | TAG_STRING)));
+        assert!(envelope.owners.contains(&(dead_noncons_address | TAG_CONS)));
+        assert_eq!(state(&envelope), scanned(&owners, dump));
+    }
+
+    #[test]
+    fn changed_dump_and_empty_buckets_keep_gap_and_bounds_exact() {
+        let mut envelope = ObservedEnvelope::new();
+        let first = 0x600010 | TAG_CONS;
+        let last = 0x600500 | TAG_STRING;
+        envelope.insert(first);
+        envelope.insert(last);
+        assert!(envelope.exclude_unobserved(0x600300 | TAG_CONS));
+        let survivors = FxHashSet::from_iter([last]);
+        retain_survivors(&mut envelope, &survivors, BarrierWindow::NONE);
+        assert_eq!(envelope.words.len(), 1);
+        assert!(envelope.excluded.is_some());
+        assert_eq!(state(&envelope), scanned(&survivors, BarrierWindow::NONE));
+
+        let dump = BarrierWindow::span(0x600200, 0x600400);
+        retain_survivors(&mut envelope, &survivors, dump);
+        assert!(envelope.excluded.is_none());
+        assert_eq!(state(&envelope), scanned(&survivors, dump));
+        retain_survivors(&mut envelope, &FxHashSet::default(), dump);
+        assert!(envelope.words.is_empty());
+        assert!(envelope.owners.is_empty());
+        assert_eq!(envelope.full_bounds(), EMPTY_BOUNDS);
+        assert!(envelope.insert(last));
+        retain_survivors(&mut envelope, &survivors, dump);
+        assert_eq!(envelope.words.len(), 1);
+        assert_eq!(state(&envelope), scanned(&survivors, dump));
+    }
+
+    #[test]
+    fn word_registration_does_not_publish_an_observation() {
+        let bits = 0x700018 | TAG_CONS;
+        let (metadata, mask) = collection_observed_word(bits).unwrap();
+        let before = metadata.word.load(Ordering::Acquire);
+        let mut envelope = ObservedEnvelope::new();
+        envelope.insert(bits);
+        assert_eq!(metadata.word.load(Ordering::Acquire), before);
+        let (word, jit_mask) = crate::tagged::gc::cons_collection_observed_word(bits);
+        assert!(std::ptr::eq(word, metadata.word));
+        assert_eq!(mask, jit_mask);
     }
 }

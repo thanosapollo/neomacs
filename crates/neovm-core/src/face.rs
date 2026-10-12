@@ -114,6 +114,15 @@ impl LFaceAttr {
 
 pub(crate) const LFACE_VECTOR_SIZE: usize = 20;
 
+/// Keep rendered attribute spellings identical to their cache dependencies.
+pub(crate) fn normalize_face_attribute_name(name: &str) -> &str {
+    match name.trim_start_matches(':') {
+        "foreground-color" => "foreground",
+        "background-color" => "background",
+        name => name,
+    }
+}
+
 pub(crate) const LFACE_ATTRS: [LFaceAttr; LFACE_VECTOR_SIZE - 1] = [
     LFaceAttr::Family,
     LFaceAttr::Foundry,
@@ -1148,16 +1157,16 @@ impl Face {
                     continue;
                 }
             };
-            let key = key.trim_start_matches(':');
+            let key = normalize_face_attribute_name(key);
             let val = &plist[i + 1];
 
             match key {
-                "foreground" | "foreground-color" => {
+                "foreground" => {
                     if let Some(s) = val.as_utf8_str() {
                         face.foreground = realize_color_spec(s, palette);
                     }
                 }
-                "background" | "background-color" => {
+                "background" => {
                     if let Some(s) = val.as_utf8_str() {
                         face.background = realize_color_spec(s, palette);
                     }

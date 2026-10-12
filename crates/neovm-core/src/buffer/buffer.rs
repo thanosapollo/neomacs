@@ -2099,6 +2099,9 @@ pub(crate) struct ModeLineNumberAnchor {
     pub(crate) accessible_start: EmacsBytePos,
     pub(crate) line_start: EmacsBytePos,
     pub(crate) line_number: usize,
+    /// Text revision at which the coordinate was counted. Unlike the dirty
+    /// region, this survives a redisplay acknowledgement before the next use.
+    pub(crate) chars_modified_tick: i64,
 }
 
 impl AccessibleBufferRegionSnapshot {
@@ -2295,8 +2298,8 @@ pub struct Buffer {
     /// xdisp.c:29486-29620, held per BUFFER here): the accessible-region
     /// origin plus a recently displayed line start, so `%l` counts newlines
     /// only from the anchor instead of from BUF_BEGV. Validity is checked
-    /// against both the restriction and the unchanged-region accumulator (the
-    /// BEG_UNCHANGED analog) at each use.
+    /// against the restriction and text revision at each use, independently
+    /// of redisplay's resettable unchanged-region accumulator.
     pub(crate) line_number_anchor: std::cell::Cell<Option<ModeLineNumberAnchor>>,
     /// Unique identifier.
     pub(crate) id: BufferId,
@@ -2476,6 +2479,10 @@ impl Buffer {
     }
 
     fn swap_owned_text_state_with(&mut self, other: &mut Self) {
+        // These buffer-local counts belonged to the outgoing text. Incoming
+        // character ticks can collide with their cached revisions.
+        self.line_number_anchor.set(None);
+        other.line_number_anchor.set(None);
         mem::swap(&mut self.text, &mut other.text);
         mem::swap(&mut self.point, &mut other.point);
         mem::swap(&mut self.accessible_start, &mut other.accessible_start);
@@ -5558,6 +5565,9 @@ impl LiveBuffers {
     }
 }
 
+/// A killed buffer's record, boxed so an empty map bucket costs a pointer.
+type DeadBufferRecord = Box<Buffer>;
+
 /// A current-buffer selection and a stable view of editor buffer storage.
 ///
 /// A runtime World owns the storage allocation. Standalone managers and
@@ -5589,7 +5599,11 @@ pub struct BufferStorage {
     /// Killed buffer objects. GNU does not destroy the Lisp buffer object;
     /// it makes `BUFFER_LIVE_P` false while keeping slots like
     /// `last_name` and `filename` queryable.
-    dead_buffers: FxHashMap<BufferId, Buffer>,
+    ///
+    /// Records are boxed so spare buckets cost a pointer, not an inline
+    /// `Buffer` (about 1.3 KB). After GC pruning, a sparse map shrinks with
+    /// headroom for ordinary create/kill churn.
+    dead_buffers: FxHashMap<BufferId, DeadBufferRecord>,
     /// The base buffer object of each killed indirect buffer that has a
     /// record. GNU `mark_buffer` marks `base_buffer`, so a referenced dead
     /// indirect buffer keeps its (dead) base, whose record would otherwise
@@ -6453,7 +6467,7 @@ impl BufferManager {
 
     /// Immutable access to a killed buffer by id.
     pub fn get_dead(&self, id: BufferId) -> Option<&Buffer> {
-        self.dead_buffers.get(&id)
+        self.dead_buffers.get(&id).map(Box::as_ref)
     }
 
     /// How many killed buffers still have a record here.
@@ -6461,9 +6475,33 @@ impl BufferManager {
         self.dead_buffers.len()
     }
 
+    /// Entry bytes the killed-record map keeps reserved: usable capacity
+    /// times entry size, leaving out control bytes.
+    #[cfg(test)]
+    pub(crate) fn dead_buffer_map_reserved_bytes(&self) -> usize {
+        self.dead_buffers.capacity() * std::mem::size_of::<(BufferId, DeadBufferRecord)>()
+    }
+
+    /// Release a burst's spare table after the GC finishes pruning records.
+    /// A quarter-full trigger and a half-full target leave growth headroom;
+    /// retaining at least 64 entries avoids reallocating for small, steady
+    /// create/kill churn. Hash-table rounding can retain up to 128 entries.
+    pub(crate) fn shrink_dead_buffer_records(&mut self) {
+        const FLOOR: usize = 64;
+        let len = self.dead_buffers.len();
+        let capacity = self.dead_buffers.capacity();
+        if capacity > FLOOR * 2 && len < capacity / 4 {
+            self.storage_mut()
+                .dead_buffers
+                .shrink_to(len.saturating_mul(2).max(FLOOR));
+        }
+    }
+
     /// Immutable access to a buffer object, live or killed.
     pub fn get_any(&self, id: BufferId) -> Option<&Buffer> {
-        self.buffers.get(&id).or_else(|| self.dead_buffers.get(&id))
+        self.buffers
+            .get(&id)
+            .or_else(|| self.dead_buffers.get(&id).map(Box::as_ref))
     }
 
     /// Mutable access to a buffer by id.
@@ -6774,7 +6812,7 @@ impl BufferManager {
         for killed_id in &killed_ids {
             let mut buf = self.storage_mut().buffers.remove(killed_id)?;
             buf.mark_killed_after_local_reset();
-            self.storage_mut().dead_buffers.insert(*killed_id, buf);
+            self.storage_mut().dead_buffers.insert(*killed_id, Box::new(buf));
         }
         // The buffer objects stop being roots: each killed record now lives
         // exactly as long as its object is referenced (`reclaim_dead_buffer`).
@@ -6805,7 +6843,9 @@ impl BufferManager {
 
     /// Return the last known name for a dead buffer id, if available.
     pub fn dead_buffer_last_name_value(&self, id: BufferId) -> Option<Value> {
-        self.dead_buffers.get(&id).map(Buffer::last_name_value)
+        self.dead_buffers
+            .get(&id)
+            .map(|buffer| buffer.last_name_value())
     }
 
     /// Drop the record of a killed buffer whose object the collector freed.
@@ -7502,6 +7542,13 @@ impl BufferManager {
         let root_id = self.modified_state_root_id(id)?;
         let buf = self.storage_mut().buffers.get_mut(&root_id)?;
         buf.text.set_modified_tick(tick);
+        // MODIFF is explicitly settable: a later character edit can reuse a
+        // cached CHARS_MODIFF. Invalidate every view of this shared text now.
+        for buf in self.storage_mut().buffers.values_mut() {
+            if buf.base_buffer.unwrap_or(buf.id) == root_id {
+                buf.line_number_anchor.set(None);
+            }
+        }
         Some(())
     }
 

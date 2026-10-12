@@ -187,9 +187,11 @@ impl RenderedDisplayRow {
         // per fringe per row).
         if row.left_fringe_bitmap.is_none() {
             row.left_fringe_bitmap = rendered_row.left_fringe_bitmap;
+            row.left_fringe_producer = rendered_row.left_fringe_producer;
         }
         if row.right_fringe_bitmap.is_none() {
             row.right_fringe_bitmap = rendered_row.right_fringe_bitmap;
+            row.right_fringe_producer = rendered_row.right_fringe_producer;
         }
         DisplayRowVerticalMetrics::from_row(rendered_row).include_in_row(row);
         merge_display_row_source_slot_bounds(row, &self.source_slots);

@@ -3,6 +3,34 @@
 use super::*;
 use crate::face::Face;
 
+#[test]
+fn shifted_fringe_proof_requires_both_exact_producer_slots() {
+    let mut row = GlyphRow::new(GlyphRowRole::Text);
+    let left = bitmap(1, 21);
+    let right = bitmap(1, 22);
+    row.left_fringe_bitmap = Some(left);
+    assert!(!row.fringes_are_row_local());
+    row.left_fringe_producer = Some(RowFringeProducer::SourceDisplay(left));
+    assert!(row.fringes_are_row_local());
+    row.right_fringe_bitmap = Some(right);
+    assert!(!row.fringes_are_row_local());
+    row.right_fringe_producer = Some(RowFringeProducer::RowIndicator(right));
+    assert!(row.fringes_are_row_local());
+    let mut shifted = row.clone();
+    shifted.pixel_y -= 20.0;
+    assert!(shifted.fringes_are_row_local());
+    shifted.left_fringe_bitmap = Some(bitmap(1, 99));
+    assert!(
+        !shifted.fringes_are_row_local(),
+        "same bitmap with different face is not certified"
+    );
+    shifted.left_fringe_bitmap = Some(bitmap(2, 21));
+    assert!(
+        !shifted.fringes_are_row_local(),
+        "same face with different bitmap is not certified"
+    );
+}
+
 fn bitmap(index: u16, face: u32) -> FringeBitmapInfo {
     FringeBitmapInfo {
         bitmap_index: index,

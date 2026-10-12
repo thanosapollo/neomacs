@@ -445,6 +445,12 @@ pub fn column_spec_consumed() -> bool {
     COLUMN_SPEC_CONSUMED.with(std::cell::Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    // Requested newline-scan span, not wall time: a deterministic cost guard.
+    static MODE_LINE_NEWLINE_SCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn prefix_line_and_column(
     buf: &Buffer,
     accessible: AccessibleEmacsByteRange,
@@ -459,49 +465,47 @@ fn prefix_line_and_column(
         .prev_newline_emacs_byte(end, origin)
         .map(|nl| nl.add_len(crate::buffer::EmacsByteLen::new(1)))
         .unwrap_or(origin);
-    // Line number: GNU keeps a base_line_pos/base_line_number anchor so the
-    // newline count runs from a recently displayed line, not from the buffer
-    // start (xdisp.c:29486-29620) — O(distance moved), not O(point). The
-    // anchor (held per buffer) is valid only when no edit landed at or
-    // before it since the last accepted redisplay: the unchanged-region
-    // accumulator is the BEG_UNCHANGED analog of GNU's
-    // BASE_LINE_NUMBER_VALID_P (xdisp.c:19351). An invalid or missing
-    // anchor falls back to the full prefix scan (SIMD over the gap buffer).
-    let anchor = buf.line_number_anchor.get();
-    let anchor_valid = anchor.is_some_and(|anchor| {
+    // GNU's base_line_pos/base_line_number keeps the count local to the
+    // window (xdisp.c, decode_mode_spec case 'l'). We have a buffer-local
+    // anchor instead: count the signed distance between line starts, then
+    // reseat on every query. Keeping the old anchor for 32 KiB both rescanned
+    // that prefix on forward motion and fell back to BEGV on backward motion.
+    //
+    // Qualify by the text tick, not just BEG_UNCHANGED: redisplay can reset
+    // the unchanged-region accumulator before this buffer is queried again.
+    // Conversely a newly computed anchor is valid even with pending edits.
+    // This conservatively rebuilds once for ANY text edit, unlike GNU's
+    // more selective unchanged-prefix check; property-only edits don't affect
+    // newline counts. Restriction changes with the same origin are safe as
+    // long as the anchor remains inside the accessible region.
+    let tick = buf.chars_modified_tick();
+    let anchor = buf.line_number_anchor.get().filter(|anchor| {
         anchor.accessible_start == origin
-            && anchor.line_start <= end
-            && buf.changed_char_range().is_none_or(|(dirty_start, _)| {
-                buf.char_pos_to_emacs_byte_pos_clamped(crate::buffer::CharPos0::new(
-                    dirty_start.max(0) as usize,
-                )) > anchor.line_start
-            })
+            && anchor.chars_modified_tick == tick
+            && origin <= anchor.line_start
+            && anchor.line_start <= accessible.end()
     });
-    let line = if anchor_valid {
-        let anchor = anchor.expect("validated mode-line number anchor");
-        anchor.line_number + buf.count_newlines_emacs_byte(anchor.line_start, end)
-    } else {
-        buf.count_newlines_emacs_byte(origin, end) + 1
+    let count = |start: EmacsBytePos, end: EmacsBytePos| {
+        #[cfg(test)]
+        MODE_LINE_NEWLINE_SCAN_BYTES.with(|bytes| {
+            bytes.set(bytes.get() + end.get() - start.get());
+        });
+        buf.count_newlines_emacs_byte(start, end)
     };
-    // Re-seat the anchor at this line's start whenever it was invalid or
-    // point moved far from it (GNU re-seats near the window when the count
-    // drifts past a few window heights, xdisp.c:29544-29552).
-    const RESEAT_DISTANCE_BYTES: usize = 32 * 1024;
-    if !anchor_valid
-        || end.get().abs_diff(
-            anchor
-                .expect("validated mode-line number anchor")
-                .line_start
-                .get(),
-        ) > RESEAT_DISTANCE_BYTES
-    {
-        buf.line_number_anchor
-            .set(Some(crate::buffer::buffer::ModeLineNumberAnchor {
-                accessible_start: origin,
-                line_start: bol,
-                line_number: line,
-            }));
-    }
+    let line = match anchor {
+        Some(anchor) if anchor.line_start <= bol => {
+            anchor.line_number + count(anchor.line_start, bol)
+        }
+        Some(anchor) => anchor.line_number - count(bol, anchor.line_start),
+        None => count(origin, bol) + 1,
+    };
+    buf.line_number_anchor
+        .set(Some(crate::buffer::buffer::ModeLineNumberAnchor {
+            accessible_start: origin,
+            line_start: bol,
+            line_number: line,
+            chars_modified_tick: tick,
+        }));
     let mut tail = Vec::new();
     buf.copy_emacs_byte_range_to(EmacsByteRange::new(bol, end), &mut tail);
     let col = emacs_char_count(&tail, buf.get_multibyte());
@@ -10074,3 +10078,7 @@ mod mode_line_outer_flow;
 #[cfg(test)]
 #[path = "tests/mode_line_outer_handlers_test.rs"]
 mod mode_line_outer_handlers;
+
+#[cfg(test)]
+#[path = "tests/mode_line_line_number_test.rs"]
+mod mode_line_line_number;

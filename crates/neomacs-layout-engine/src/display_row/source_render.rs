@@ -382,8 +382,22 @@ impl DisplayCurrentRowMutation for SetRowFringeBitmapMutation {
 
     fn apply(self, row: &mut GlyphRow) -> Self::Output {
         match self.side {
-            DisplayFringeSide::Left => row.left_fringe_bitmap = Some(self.info),
-            DisplayFringeSide::Right => row.right_fringe_bitmap = Some(self.info),
+            DisplayFringeSide::Left => {
+                row.left_fringe_bitmap = Some(self.info);
+                row.left_fringe_producer = Some(
+                    neomacs_display_protocol::glyph_matrix::RowFringeProducer::SourceDisplay(
+                        self.info,
+                    ),
+                );
+            }
+            DisplayFringeSide::Right => {
+                row.right_fringe_bitmap = Some(self.info);
+                row.right_fringe_producer = Some(
+                    neomacs_display_protocol::glyph_matrix::RowFringeProducer::SourceDisplay(
+                        self.info,
+                    ),
+                );
+            }
         }
     }
 }

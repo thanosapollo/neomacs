@@ -188,6 +188,59 @@ fn temp_buffers_stay_flat(mut ev: Context, count: usize) {
     );
 }
 
+/// GNU frees a dead `struct buffer` outright: a burst of temporary buffers
+/// must leave neither record-sized buckets nor a burst-sized table behind.
+#[test]
+fn a_burst_of_killed_buffers_leaves_no_record_sized_buckets_behind() {
+    let mut ev = Context::new();
+    let burst = 2_000;
+    uncollected_temp_buffer_burst(&mut ev, burst);
+    assert!(
+        ev.buffers.dead_buffer_count() > burst / 2,
+        "the burst must accumulate killed records before collecting"
+    );
+    let peak = ev.buffers.dead_buffer_map_reserved_bytes();
+    collect_twice(&mut ev);
+    assert_eq!(ev.buffers.dead_buffer_count(), 0, "records reclaimed");
+    let reserved = ev.buffers.dead_buffer_map_reserved_bytes();
+    assert!(reserved < peak / 4, "burst-sized table was released");
+    assert!(
+        reserved
+            <= 128 * std::mem::size_of::<(crate::buffer::BufferId, Box<crate::buffer::Buffer>)>(),
+        "the emptied killed-record map still reserves {reserved} bytes"
+    );
+}
+
+#[test]
+fn small_killed_buffer_churn_keeps_the_shrunk_table_capacity() {
+    let mut ev = Context::new();
+    uncollected_temp_buffer_burst(&mut ev, 200);
+    collect_twice(&mut ev);
+    let reserved = ev.buffers.dead_buffer_map_reserved_bytes();
+    assert!(reserved > 0, "retain table headroom after a burst");
+    for _ in 0..16 {
+        uncollected_temp_buffer_burst(&mut ev, 16);
+        assert!(ev.buffers.dead_buffer_count() >= 16);
+        assert_eq!(ev.buffers.dead_buffer_map_reserved_bytes(), reserved);
+        collect_twice(&mut ev);
+        assert_eq!(ev.buffers.dead_buffer_count(), 0);
+        assert_eq!(ev.buffers.dead_buffer_map_reserved_bytes(), reserved);
+    }
+}
+
+fn uncollected_temp_buffer_burst(ev: &mut Context, count: usize) {
+    let form = format!(
+        "(let ((gc-cons-threshold most-positive-fixnum))
+           (let ((i 0))
+             (while (< i {count})
+               (let ((b (get-buffer-create (generate-new-buffer-name \" *temp*\"))))
+                 (save-current-buffer (set-buffer b) (insert \"x\"))
+                 (kill-buffer b))
+               (setq i (1+ i)))))"
+    );
+    ev.eval_str(&form).expect("temp-buffer burst");
+}
+
 #[test]
 fn a_referenced_killed_buffer_stays_a_dead_buffer_across_gc() {
     referenced_killed_buffer_survives(Context::new());

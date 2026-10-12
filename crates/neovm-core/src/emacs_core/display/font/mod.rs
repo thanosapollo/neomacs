@@ -2779,8 +2779,7 @@ fn apply_face_layers_with_remapping(
                 // Named text faces contribute their explicit inheritance,
                 // not another default baseline. The first list entry wins.
                 for name in names.iter().rev() {
-                    let contribution =
-                        face_table.resolve_text_face_with_remapping(name, remapping);
+                    let contribution = face_table.resolve_text_face_with_remapping(name, remapping);
                     face = face.merge(&contribution);
                 }
             }
@@ -2963,6 +2962,11 @@ fn font_object_property_fields(face: &RuntimeFace, pixel_size: Option<i64>) -> V
     elems
 }
 
+fn font_name_from_property_fields(mut fields: Vec<Value>) -> Value {
+    fields[0] = Value::keyword(FONT_ENTITY_TAG);
+    font_xlfd_name(vec![Value::vector(fields)]).unwrap_or(Value::NIL)
+}
+
 fn finish_opened_font(
     mut fields: Vec<Value>,
     file: Option<&LispString>,
@@ -2973,10 +2977,7 @@ fn finish_opened_font(
 ) -> Value {
     // Render the public XLFD before changing the representation from an
     // ordinary property vector to the opaque `PVEC_FONT` tag.
-    let mut xlfd_fields = fields.clone();
-    xlfd_fields[0] = Value::keyword(FONT_ENTITY_TAG);
-    let xlfd_source = Value::vector(xlfd_fields);
-    let name = font_xlfd_name(vec![xlfd_source]).unwrap_or(Value::NIL);
+    let name = font_name_from_property_fields(fields.clone());
     let full_name = full_name
         .cloned()
         .map(Value::heap_string)
@@ -3065,6 +3066,54 @@ fn build_font_entity_for_spec_match(matched: &super::eval::ResolvedFontSpecMatch
     Value::vector(elems)
 }
 
+fn resolved_font_property_fields(
+    face: &RuntimeFace,
+    matched: &super::eval::ResolvedFontMatch,
+) -> Vec<Value> {
+    resolved_font_name_property_fields(
+        face,
+        &super::display_host::ResolvedFontName::from_match(matched),
+    )
+}
+
+fn resolved_font_name_property_fields(
+    face: &RuntimeFace,
+    matched: &super::display_host::ResolvedFontName,
+) -> Vec<Value> {
+    let mut selected = face.clone();
+    selected.family = Some(Value::from_sym_id(intern(&matched.family)));
+    selected.foundry = matched
+        .foundry
+        .as_ref()
+        .map(|foundry| Value::from_sym_id(intern(foundry.as_utf8_str().unwrap_or_default())));
+    selected.weight = Some(FontWeight::from_css_weight(matched.weight));
+    selected.slant = Some(matched.slant);
+    selected.width = Some(matched.width);
+    let mut fields =
+        font_object_property_fields(&selected, Some(i64::from(matched.pixel_size.max(1))));
+    if let Some(postscript_name) = &matched.postscript_name {
+        fields.push(Value::keyword("postscript-name"));
+        fields.push(Value::string(postscript_name.clone()));
+    }
+    fields
+}
+
+/// Project the opened name without materializing discarded font metadata.
+#[cfg(test)]
+pub(crate) fn font_name_from_resolved_match(
+    face: &RuntimeFace,
+    matched: &super::eval::ResolvedFontMatch,
+) -> Value {
+    font_name_from_property_fields(resolved_font_property_fields(face, matched))
+}
+
+pub(crate) fn font_name_from_host_projection(
+    face: &RuntimeFace,
+    matched: &super::display_host::ResolvedFontName,
+) -> Value {
+    font_name_from_property_fields(resolved_font_name_property_fields(face, matched))
+}
+
 /// Materialize the core's opaque opened-font object from one host resolution.
 /// This is the sole host-to-Lisp construction boundary: identity, metrics,
 /// capability, and public properties enter together and cannot drift later.
@@ -3074,23 +3123,8 @@ pub fn opened_font_from_resolved_match(
 ) -> Value {
     let opened = &matched.font;
     let canonical = &opened.resolved;
-    let mut selected = face.clone();
-    selected.family = Some(Value::from_sym_id(intern(&canonical.family)));
-    selected.foundry = opened
-        .foundry
-        .as_ref()
-        .map(|foundry| Value::from_sym_id(intern(foundry.as_utf8_str().unwrap_or_default())));
-    selected.weight = Some(FontWeight::from_css_weight(canonical.weight));
-    selected.slant = Some(opened.slant);
-    selected.width = Some(opened.width());
-    let mut fields =
-        font_object_property_fields(&selected, Some(i64::from(opened.metrics.pixel_size.max(1))));
-    if let Some(postscript_name) = &canonical.postscript_name {
-        fields.push(Value::keyword("postscript-name"));
-        fields.push(Value::string(postscript_name.clone()));
-    }
     finish_opened_font(
-        fields,
+        resolved_font_property_fields(face, matched),
         canonical
             .identity
             .file_path

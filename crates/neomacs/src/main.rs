@@ -1527,6 +1527,55 @@ impl Drop for PrimaryWindowDisplayHost {
 }
 
 impl PrimaryWindowDisplayHost {
+    /// Shared exact selection for full font objects and name-only queries.
+    fn select_font_for_request(
+        &mut self,
+        request: &FontResolveRequest,
+    ) -> Result<Option<SelectedFontInfo>, String> {
+        // cosmic-text/fontdb consume Unicode scalar values. Keep the full
+        // Emacs character in the protocol and reject unsupported raw-byte or
+        // non-Unicode codes only at this explicit backend boundary.
+        let Some(character) = request.character.as_rust_char() else {
+            return Ok(None);
+        };
+        let requested_family_storage = request.face.family_runtime_string_owned();
+        let requested_family = requested_family_storage.as_deref().unwrap_or("Monospace");
+        let requested_weight = request
+            .face
+            .weight
+            .unwrap_or(FontWeight::NORMAL)
+            .css_weight();
+        let requested_italic = request
+            .face
+            .slant
+            .map(|slant| slant.is_italic())
+            .unwrap_or(false);
+        let font_size = self.font_sizing.font_size_px_for_face(&request.face);
+        let selected = self
+            .synchronized_font_metrics()
+            .select_font_for_realized_face_char(
+                character,
+                neomacs_layout_engine::font::metrics::RealizedFaceFontSelection::new(
+                    requested_family,
+                    requested_weight,
+                    requested_italic,
+                    font_size,
+                ),
+            );
+        tracing::debug!(
+            target: "neomacs::font_at",
+            character = request.character.code(),
+            requested_family,
+            requested_weight,
+            requested_italic,
+            font_size,
+            request_face = ?request.face,
+            selected = ?selected,
+            "display host resolved font-at request"
+        );
+        Ok(selected)
+    }
+
     fn realize_deferred_gui_frame(
         &mut self,
         request: GuiFrameHostRequest,
@@ -2160,47 +2209,7 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         &mut self,
         request: FontResolveRequest,
     ) -> Result<Option<ResolvedFontMatch>, String> {
-        // cosmic-text/fontdb consume Unicode scalar values. Keep the full
-        // Emacs character in the protocol and reject unsupported raw-byte or
-        // non-Unicode codes only at this explicit backend boundary.
-        let Some(character) = request.character.as_rust_char() else {
-            return Ok(None);
-        };
-        let requested_family_storage = request.face.family_runtime_string_owned();
-        let requested_family = requested_family_storage.as_deref().unwrap_or("Monospace");
-        let requested_weight = request
-            .face
-            .weight
-            .unwrap_or(FontWeight::NORMAL)
-            .css_weight();
-        let requested_italic = request
-            .face
-            .slant
-            .map(|slant| slant.is_italic())
-            .unwrap_or(false);
-        let font_size = self.font_sizing.font_size_px_for_face(&request.face);
-        let selected = self
-            .synchronized_font_metrics()
-            .select_font_for_realized_face_char(
-                character,
-                neomacs_layout_engine::font::metrics::RealizedFaceFontSelection::new(
-                    requested_family,
-                    requested_weight,
-                    requested_italic,
-                    font_size,
-                ),
-            );
-        tracing::debug!(
-            target: "neomacs::font_at",
-            character = request.character.code(),
-            requested_family,
-            requested_weight,
-            requested_italic,
-            font_size,
-            request_face = ?request.face,
-            selected = ?selected,
-            "display host resolved font-at request"
-        );
+        let selected = self.select_font_for_request(&request)?;
         Ok(selected.map(|font| {
             let glyph_code = font.glyph_code;
             ResolvedFontMatch {
@@ -2210,6 +2219,15 @@ impl DisplayHost for PrimaryWindowDisplayHost {
                 }),
             }
         }))
+    }
+
+    fn resolve_font_name_for_char(
+        &mut self,
+        request: FontResolveRequest,
+    ) -> Result<Option<neovm_core::emacs_core::display_host::ResolvedFontName>, String> {
+        Ok(self
+            .select_font_for_request(&request)?
+            .map(core_font_name_from_selection))
     }
 
     fn resolve_frame_font(
@@ -5137,6 +5155,32 @@ fn core_font_px_metrics(
         max_width: metrics.max_width,
         space_width: metrics.space_width,
         average_width: metrics.average_width,
+    }
+}
+
+/// Name-only projection: deliberately has no capability loader or file I/O.
+fn core_font_name_from_selection(
+    font: SelectedFontInfo,
+) -> neovm_core::emacs_core::display_host::ResolvedFontName {
+    use neovm_core::face::FontWidth;
+    neovm_core::emacs_core::display_host::ResolvedFontName {
+        family: font.resolved.family,
+        foundry: font.foundry.as_deref().map(LispString::from_utf8),
+        weight: font.resolved.weight,
+        slant: font.slant,
+        width: match font.resolved.width {
+            1 => FontWidth::UltraCondensed,
+            2 => FontWidth::ExtraCondensed,
+            3 => FontWidth::Condensed,
+            4 => FontWidth::SemiCondensed,
+            6 => FontWidth::SemiExpanded,
+            7 => FontWidth::Expanded,
+            8 => FontWidth::ExtraExpanded,
+            9 => FontWidth::UltraExpanded,
+            _ => FontWidth::Normal,
+        },
+        pixel_size: font.metrics.pixel_size,
+        postscript_name: font.resolved.postscript_name,
     }
 }
 

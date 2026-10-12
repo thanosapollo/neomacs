@@ -95,6 +95,47 @@ fn cons_address_bit(address: usize) -> (usize, usize, u64) {
     )
 }
 
+/// Permanent metadata, safe to retain after the corresponding owners die.
+#[derive(Clone, Copy)]
+pub(crate) struct CollectionObservedWord {
+    pub(crate) word: &'static AtomicU64,
+    address_base: usize,
+}
+
+impl CollectionObservedWord {
+    pub(crate) fn address_for_bit(self, bit: u32) -> usize {
+        self.address_base + bit as usize * CONS_ADDRESS_ALIGN
+    }
+}
+
+/// Register an owner's metadata before publishing its observation. The two
+/// planes remain distinct, while non-cons tags share their address bit.
+pub(crate) fn collection_observed_word(bits: usize) -> Option<(CollectionObservedWord, u64)> {
+    let address = bits & !TAG_MASK;
+    if address == 0 {
+        return None;
+    }
+    let noncons = match bits & TAG_MASK {
+        TAG_CONS => false,
+        TAG_STRING | TAG_FLOAT | TAG_VECLIKE => true,
+        _ => return None,
+    };
+    let (_, index, mask) = cons_address_bit(address);
+    let bitmap = observation_radix::lookup_or_register(address);
+    let word = if noncons {
+        &bitmap.noncons[index]
+    } else {
+        &bitmap.cons[index]
+    };
+    Some((
+        CollectionObservedWord {
+            word,
+            address_base: address & !(CONS_ADDRESS_ALIGN * u64::BITS as usize - 1),
+        },
+        mask,
+    ))
+}
+
 /// Obtain a process-stable full-width atomic word for a baked Cons guard.
 /// Registration is cold and does not dereference or root the owner. Clearing
 /// and reuse change this word's bits, never its address. Serialized AOT code
@@ -206,8 +247,8 @@ fn cons_observed(address: usize) -> bool {
 /// Neither plane lookup dereferences Lisp storage. A reused address that was
 /// observed again can conservatively survive another mutator's old ledger;
 /// certificates still require the caller to retain their original owners.
-#[inline]
-pub(crate) fn collection_observed_metadata(bits: usize) -> bool {
+#[cfg(test)]
+fn collection_observed_metadata(bits: usize) -> bool {
     let address = bits & !TAG_MASK;
     if address == 0 {
         return false;

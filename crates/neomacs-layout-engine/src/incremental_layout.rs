@@ -164,6 +164,7 @@ pub struct RetainedWindowKey {
     pub char_table_revision: neovm_core::window::CharTableLayoutRevision,
     pub symbol_property_revision: neovm_core::emacs_core::symbol::SymbolPropertyRevision,
     pub display_table: neovm_core::window::LayoutDisplayTableInput,
+    pub face_remapping: neovm_core::window::LayoutFaceRemappingInput,
     /// Generation of asynchronously decoded media (see
     /// `Context::invalidate_media`). An image that finishes decoding changes
     /// none of the buffer ticks or geometry below, so without this term the
@@ -185,6 +186,10 @@ pub struct RetainedWindowKey {
     pub buffer_id: u64,
     pub window_start: i64,
     pub point: i64,
+    /// Viewport cursor-margin policy. Lisp in an earlier sibling can change
+    /// this after cursor-only admission without bumping a display tick; phase
+    /// B must then discard the plan admitted under the previous margin.
+    pub scroll_margin: i64,
     /// Effective line-number semantics baked into the retained left margin.
     /// Unlike a generic display-variable generation, this typed value also
     /// declares how bare point motion invalidates body glyphs.
@@ -256,6 +261,9 @@ pub struct RetainedWindowKey {
     /// -invisibility-spec, fill-column-indicator, overlay-arrow,
     /// display-line-numbers, …) — none of which move a buffer/face tick.
     pub display_var_change_count: u64,
+    /// Effective owned policy catches nested fringe-indicator-alist mutations.
+    pub(crate) fringe_indicators: crate::buffer_source::fringe_arrows::FringeArrowBitmaps,
+    pub fringe_registry_revision: u64,
 }
 
 impl RetainedWindowKey {
@@ -304,6 +312,16 @@ impl RetainedWindowKey {
             })
             .unwrap_or((0, 0, 0, false, p.buffer_size, 0));
         Self {
+            fringe_indicators: evaluator
+                .buffer_manager()
+                .get(neovm_core::buffer::BufferId(p.buffer_id))
+                .map(|buffer| {
+                    crate::buffer_source::fringe_arrows::FringeArrowBitmaps::resolve(
+                        buffer, evaluator,
+                    )
+                })
+                .unwrap_or_default(),
+            fringe_registry_revision: evaluator.fringe_bitmap_registry().revision(),
             fontset_generation: neovm_core::emacs_core::fontset::fontset_generation(),
             media_generation: evaluator.media_generation(),
             body_redisplay: evaluator.body_redisplay_revision(
@@ -316,6 +334,9 @@ impl RetainedWindowKey {
             display_table: evaluator
                 .layout_display_table_input(neovm_core::buffer::BufferId(p.buffer_id))
                 .unwrap_or_default(),
+            face_remapping: evaluator
+                .layout_face_remapping_input(neovm_core::buffer::BufferId(p.buffer_id))
+                .unwrap_or_default(),
             prefixes: evaluator
                 .layout_prefix_inputs(neovm_core::buffer::BufferId(p.buffer_id))
                 .unwrap_or_default(),
@@ -325,6 +346,7 @@ impl RetainedWindowKey {
             buffer_id: p.buffer_id,
             window_start: p.window_start,
             point: p.point,
+            scroll_margin: p.scroll_margin,
             display_line_numbers: p.display_line_numbers,
             buffer_begv: p.buffer_begv,
             buffer_size,
@@ -437,15 +459,19 @@ impl RetainedWindowKey {
         }
         diff!(
             fontset_generation,
+            fringe_indicators,
+            fringe_registry_revision,
             prefixes,
             invisibility,
             char_table_revision,
             symbol_property_revision,
             display_table,
+            face_remapping,
             media_generation,
             buffer_id,
             window_start,
             point,
+            scroll_margin,
             display_line_numbers,
             buffer_begv,
             buffer_size,
@@ -707,6 +733,12 @@ pub struct ScrollReplay {
     /// stops where the next row would begin at the plan's `stop_charpos`;
     /// only then are these rows installed, moved by what the walk produced.
     pub(crate) sync: Option<edit_sync::EditSyncPlan>,
+    /// The start was chosen for point motion, so phase B must revalidate it
+    /// and the assembled rows must still satisfy the full viewport policy.
+    pub(crate) point_driven: bool,
+    /// The point-driven decision came from retained measured rows, not the
+    /// source resolver; phase B must reproduce both decisions independently.
+    pub(crate) point_measured: bool,
     /// An edit replay (window-start kept), as opposed to a scroll.
     pub(crate) edit: bool,
     /// Sealed frame-face generation that owns every ID in `reused_rows`.
@@ -1515,8 +1547,8 @@ impl RetainedWindowMatrix {
             return None;
         }
         // A complete prepared join at the same source origin can translate
-        // wrapped rows and their fringes without restarting line layout. Other
-        // shifts still require the ordinary conservative decoration guards.
+        // wrapped rows. Other shifts require certified row-local decorations;
+        // the content key already checks source, appearance and fringe geometry.
         let same_origin_projection =
             projected_y.is_some() && curr.window_start == self.key.window_start;
         let mut body: Vec<(usize, &MatrixRow)> = Vec::new();
@@ -1530,13 +1562,21 @@ impl RetainedWindowMatrix {
             {
                 return None;
             }
-            // Fringe bitmaps on TEXT rows are buffer-dependent decorations the
-            // replay cannot re-derive. The indicate-empty-lines fillers past
-            // EOB (!displays_text, left OR right side) are position-independent
-            // and carry real ZV bounds, so they reuse like the placeholder.
+            // Source-display and row-indicator slots survive pure placement
+            // shifts under the unchanged content key. Unknown producers still
+            // veto replay; EOB fillers retain their existing separate admission.
+            if !row.fringes_are_row_local() && row.displays_text && !same_origin_projection {
+                return None;
+            }
+            // Check before selecting either forward or backward synchronization.
+            // A fringe replacement may capture a width-1 cursor without a text
+            // glyph; glyph-based replay cannot reconstruct that geometry.
             if (row.left_fringe_bitmap.is_some() || row.right_fringe_bitmap.is_some())
-                && row.displays_text
-                && !same_origin_projection
+                && curr.point >= row.start_charpos as i64
+                && curr.point <= row.end_charpos as i64
+                && !row.glyphs[GlyphArea::Text.index()]
+                    .iter()
+                    .any(|glyph| row.glyph_covers_buffer_charpos(glyph, curr.point as usize))
             {
                 return None;
             }
@@ -1548,13 +1588,11 @@ impl RetainedWindowMatrix {
         if projected_y.is_some() && curr.window_start < body[0].1.start_charpos as i64 {
             return None;
         }
-        // Whole-row scroll distance: the body row whose start matches the new
-        // window_start. `None` (no match) → partial-row scroll or scroll-up → bail.
-        // Match only rows that DISPLAY buffer text: an empty line or the EOB
-        // placeholder now also carries a real buffer position, but window_start
-        // is always the position of a line that shows text, so gating on
-        // `displays_text` keeps a positionless-but-real empty row from being
-        // taken as the new top (GNU only starts a window at a text row).
+        // Only a displayed-text row certifies this replay's resume origin.
+        // Equal blank matrix/snapshot anchors describe retained geometry, not
+        // the canonical source walk: a full walk can consume that newline and
+        // resume on the next text row. Keep blank-origin scrolling on the full
+        // path until that source transition has its own certificate.
         // P3.5 G3: the start moved BACK. Walk the newly exposed rows from the
         // new start and synchronize with the old first row below them.
         if curr.window_start < body[0].1.start_charpos as i64 && edit_sync::scroll_back_enabled() {
@@ -1584,6 +1622,8 @@ impl RetainedWindowMatrix {
                 chrome_memo: None,
                 one_line_contract: None,
                 sync: Some(plan),
+                point_driven: false,
+                point_measured: false,
                 edit: false,
                 face_generation: self.face_generation,
             });
@@ -1650,13 +1690,22 @@ impl RetainedWindowMatrix {
             }
         });
         let last_row = body[last].1;
+        // Truncated rows end their glyphs before the physical newline. Resume
+        // after the canonical source extent, not after the last visible glyph.
+        let walk_start = self
+            .display_snapshot
+            .rows
+            .iter()
+            .find(|row| row.row == body[last].0 as i64)
+            .and_then(|row| row.truncated_end_buffer_pos)
+            .map_or(last_row.end_charpos as i64 + 1, |end| end.as_i64());
         Some(ScrollReplay {
             dvpos,
             reused_rows,
             reused_row_snapshots,
             reused_points,
             reused_point_rows,
-            walk_start: PartialBodyWalkStart::new(last_row.end_charpos as i64 + 1),
+            walk_start: PartialBodyWalkStart::new(walk_start),
             exposed_row_base: body.get(last - s + 1).map_or(body[last].0 + 1, |row| row.0),
             exposed_row_count: s,
             exposed_text_y: last_row.pixel_y + dvpos + last_row.height_px,
@@ -1668,6 +1717,8 @@ impl RetainedWindowMatrix {
             chrome_memo: None,
             one_line_contract: None,
             sync: None,
+            point_driven: false,
+            point_measured: false,
             edit: false,
             face_generation: self.face_generation,
         })
@@ -1956,6 +2007,8 @@ impl RetainedWindowMatrix {
                 chrome_memo: None,
                 one_line_contract: None,
                 sync: Some(plan),
+                point_driven: false,
+                point_measured: false,
                 edit: true,
                 face_generation: self.face_generation,
             });
@@ -2177,6 +2230,8 @@ impl RetainedWindowMatrix {
                     chrome_memo: None,
                     one_line_contract: None,
                     sync: None,
+                    point_driven: false,
+                    point_measured: false,
                     edit: true,
                     face_generation: self.face_generation,
                 });
@@ -2206,6 +2261,8 @@ impl RetainedWindowMatrix {
             chrome_memo: None,
             one_line_contract: None,
             sync: None,
+            point_driven: false,
+            point_measured: false,
             edit: true,
             face_generation: self.face_generation,
         })

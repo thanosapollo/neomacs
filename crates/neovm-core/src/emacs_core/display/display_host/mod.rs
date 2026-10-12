@@ -158,6 +158,34 @@ pub struct FontResolveRequest {
     pub face: RuntimeFace,
 }
 
+/// Public name properties of one exact host-selected font, without its
+/// coverage, metrics payload, file identity or OpenType capability tables.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedFontName {
+    pub family: String,
+    pub foundry: Option<LispString>,
+    pub weight: u16,
+    pub slant: crate::face::FontSlant,
+    pub width: crate::face::FontWidth,
+    pub pixel_size: u32,
+    pub postscript_name: Option<String>,
+}
+
+impl ResolvedFontName {
+    pub fn from_match(matched: &ResolvedFontMatch) -> Self {
+        let opened = &matched.font;
+        Self {
+            family: opened.resolved.family.clone(),
+            foundry: opened.foundry.clone(),
+            weight: opened.resolved.weight,
+            slant: opened.slant,
+            width: opened.width(),
+            pixel_size: opened.metrics.pixel_size,
+            postscript_name: opened.resolved.postscript_name.clone(),
+        }
+    }
+}
+
 /// Host-local reference to an exact selected font entity. Handles are never
 /// reused during a host's lifetime; the host validates every lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -544,6 +572,16 @@ pub trait DisplayHost {
         _request: FontResolveRequest,
     ) -> Result<Option<ResolvedFontMatch>, String> {
         Ok(None)
+    }
+    /// Resolve only the properties consumed by `face-font`. Native hosts can
+    /// avoid opening capability tables; existing hosts retain their selection
+    /// behavior through the complete-font fallback.
+    fn resolve_font_name_for_char(
+        &mut self,
+        request: FontResolveRequest,
+    ) -> Result<Option<ResolvedFontName>, String> {
+        self.resolve_font_for_char(request)
+            .map(|matched| matched.as_ref().map(ResolvedFontName::from_match))
     }
     fn resolve_frame_font(
         &mut self,
