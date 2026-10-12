@@ -63,6 +63,43 @@ fn current_p(ctx: &mut Context) -> String {
 }
 
 #[test]
+fn revision_observes_synchronous_state_before_deferred_callbacks() {
+    let (mut ctx, host) = lisp_context("lisp-revision");
+    create_model(&mut ctx);
+    let revision = |ctx: &mut Context| eval_printed(ctx, "(neomacs-model-revision model-test-m)");
+    assert_eq!(revision(&mut ctx), "nil");
+    // The native state hook records these before the ordinary event hook
+    // drains callbacks. Querying must not depend on a delivered callback.
+    eval_printed(
+        &mut ctx,
+        &format!(
+            "(progn (neomacs-model--note {FIRST_MODEL_ID} 'ready '(:triangles (1 1)))          (neomacs-model--note {FIRST_MODEL_ID} 'readiness '(:current t :rev 8 :req 0)))"
+        ),
+    );
+    assert_eq!(eval_printed(&mut ctx, "model-test-log"), "nil");
+    assert_eq!(revision(&mut ctx), "8");
+    assert_eq!(eval_printed(&mut ctx, "(null neomacs-model--queue)"), "nil");
+    readiness(&mut ctx, false, 9, 0);
+    assert_eq!(revision(&mut ctx), "nil");
+    readiness(&mut ctx, true, 12, 0);
+    assert_eq!(revision(&mut ctx), "12");
+    eval_printed(&mut ctx, "(neomacs-model-set-view model-test-m 10 20 1)");
+    assert_eq!(revision(&mut ctx), "nil");
+    readiness(&mut ctx, true, 13, 1);
+    assert_eq!(revision(&mut ctx), "13");
+    host.live.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(revision(&mut ctx), "nil");
+    host.live.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(revision(&mut ctx), "nil", "replacement needs a new fence");
+    readiness(&mut ctx, true, 14, 1);
+    assert_eq!(revision(&mut ctx), "14");
+    eval_printed(&mut ctx, "(neomacs-model-freeze model-test-m)");
+    assert_eq!(revision(&mut ctx), "nil");
+    eval_printed(&mut ctx, "(neomacs-model-destroy model-test-m)");
+    assert_eq!(revision(&mut ctx), "nil");
+}
+
+#[test]
 fn create_registers_the_model_and_tracks_status_and_readiness() {
     let (mut ctx, host) = lisp_context("lisp-lifecycle");
     create_model(&mut ctx);

@@ -441,7 +441,7 @@ fn model_events_without_the_library_loaded_are_dropped() {
     let (mut ctx, _host) = model_context();
     assert!(
         ctx.obarray
-            .symbol_value("neomacs-model-event-functions")
+            .symbol_value_copied("neomacs-model-event-functions")
             .is_none(),
         "the primitive path starts without neomacs-model.el"
     );

@@ -231,6 +231,7 @@ fn read_bounded(path: std::path::PathBuf) -> Result<ObjMesh, ObjError> {
         .expect("read_obj_file blocked instead of rejecting a non-regular file")
 }
 
+#[cfg(unix)]
 #[test]
 fn fifo_and_symlink_to_fifo_are_rejected_without_blocking() {
     let dir = scratch("fifo-anchor.obj", b"")

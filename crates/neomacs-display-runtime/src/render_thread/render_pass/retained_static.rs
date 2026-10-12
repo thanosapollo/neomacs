@@ -264,7 +264,6 @@ pub(in crate::render_thread) fn retained_scene_is_current(
             .depends_on
             .iter()
             .all(|(id, snapshot)| now.2.get(id) == snapshot.as_ref())
-
 }
 
 /// Build a single-glyph mini-frame for each filled-box cursor in the frame

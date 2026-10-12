@@ -706,13 +706,17 @@ pub fn read_obj_file_within(
 ) -> Result<(ObjMesh, u64), ObjError> {
     let max_bytes = max_bytes.min(MAX_OBJ_FILE_BYTES);
     use sha2::Digest;
-    use std::os::unix::fs::OpenOptionsExt;
-    // O_NONBLOCK so a FIFO (or a symlink to one) cannot block the open; the
-    // type and size then come from the opened descriptor, so the file
-    // checked is the file read.
-    let file = std::fs::File::options()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+    let mut options = std::fs::File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A FIFO (including a symlink to one) must not block the open.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    // Validate the descriptor on every platform: the file checked is the
+    // file read, even if a pathname is replaced between lookup and open.
+    let file = options
         .open(path)
         .map_err(|e| ObjError::Io(e.to_string()))?;
     let meta = file.metadata().map_err(|e| ObjError::Io(e.to_string()))?;

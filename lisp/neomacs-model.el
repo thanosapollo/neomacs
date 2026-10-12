@@ -350,6 +350,16 @@ showing MODEL."
            (car readiness)
            (eql (nth 2 readiness) (neomacs-model--entry-issued entry))))))
 
+(defun neomacs-model-revision (model)
+  "Return the revision of MODEL's current authoritative picture, or nil.
+Readiness is recorded synchronously on native event arrival, before
+user callbacks run.  This query therefore identifies the settled
+picture even while its callback is deferred.  Return nil without
+current presentation authority, including pending requests, active
+interaction, renderer loss, loading, frozen and destroyed models."
+  (when (neomacs-model-current-p model)
+    (nth 1 (neomacs-model--entry-readiness (neomacs-model--entry model)))))
+
 ;;;; Destruction
 
 (defun neomacs-model-destroy (model)

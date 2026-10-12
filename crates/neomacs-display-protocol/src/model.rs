@@ -5,7 +5,7 @@
 //! the evaluator owns mesh names and callbacks; these types are what crosses
 //! between them, in both directions.
 
-/// Camera in canvas-3d units: degrees, degrees, zoom 0.25..=4.
+/// Orbit camera: yaw and pitch in degrees, zoom 0.25..=4.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelView {
     pub yaw: f64,
@@ -13,13 +13,13 @@ pub struct ModelView {
     pub zoom: f64,
 }
 
-/// Smallest and largest zoom (`gnosis-model--view`).
+/// Smallest and largest supported camera zoom.
 pub const MODEL_ZOOM_RANGE: std::ops::RangeInclusive<f64> = 0.25..=4.0;
 /// Largest absolute camera angle in degrees.
 pub const MODEL_MAX_ANGLE: f64 = 1_000_000.0;
 /// Logical edge range of a model glyph (design §2).
 pub const MODEL_EDGE_RANGE: std::ops::RangeInclusive<u32> = 32..=2048;
-/// Most meshes in one model (Gnosis accepts 255 scene objects).
+/// Maximum number of meshes in one model.
 pub const MODEL_MAX_MESHES: usize = 255;
 
 impl Default for ModelView {
@@ -33,7 +33,7 @@ impl Default for ModelView {
 }
 
 impl ModelView {
-    /// Validate as `gnosis-model--view` and canvas-3d do.
+    /// Validate finite camera angles and the supported zoom range.
     pub fn validated(self) -> Result<Self, String> {
         let finite = [self.yaw, self.pitch, self.zoom]
             .iter()
@@ -85,7 +85,7 @@ pub struct ModelMeshSpec {
     pub sha256: Option<[u8; 32]>,
 }
 
-/// A question target painted on the model (design §2). Mesh numbers are
+/// A highlight target painted on the model. Mesh numbers are
 /// indices into the model's mesh list; labels never reach the renderer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelTarget {
