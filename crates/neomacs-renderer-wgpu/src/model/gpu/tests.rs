@@ -537,9 +537,56 @@ fn byte_accounting_matches_the_design_formula() {
     let uniform = std::mem::size_of::<CameraUniform>() as u64;
     assert_eq!(
         geometry_bytes(10, 64),
-        160 + 768 + 1024 + 8 + 2 * uniform + 20 + 512
+        160 + 768 + 1024 + 8 + 2 * uniform + 12 + 256
     );
     assert_eq!(target_bytes(10, 20), 200 * 36);
+}
+
+#[test]
+fn pick_intersection_retains_f64_precision_and_camera_fit() {
+    let triangle = [
+        [-0.9, -0.8, 0.1234567890123],
+        [0.8, -0.7, -0.2345678901234],
+        [0.1, 0.9, 0.3456789012345],
+    ];
+    for (yaw, pitch, logical, size_px, texel) in [
+        (0.0, 0.0, (200, 100), (128, 64), (64, 32)),
+        (29.0, -17.0, (100, 200), (64, 128), (32, 64)),
+    ] {
+        let request = PickRequest {
+            view: ModelView {
+                yaw,
+                pitch,
+                zoom: 1.3,
+            },
+            logical,
+            size_px,
+            texel,
+        };
+        let weights = pick_weights(triangle, &request).unwrap();
+        assert!(weights.iter().all(|w| *w >= 0.0));
+        assert!((weights.iter().sum::<f64>() - 1.0).abs() < 1e-14);
+        let point =
+            [0, 1, 2].map(|axis| (0..3).map(|i| weights[i] * triangle[i][axis]).sum::<f64>());
+        let rotation = request.view.rotation();
+        let q = [0, 1].map(|i| (0..3).map(|j| rotation[i][j] * point[j]).sum::<f64>());
+        let scale = request.view.zoom * 0.8;
+        let sx = scale * (logical.1 as f64 / logical.0 as f64).min(1.0);
+        let sy = scale * (logical.0 as f64 / logical.1 as f64).min(1.0);
+        let want = [
+            ((texel.0 as f64 + 0.5) / size_px.0 as f64 * 2.0 - 1.0) / sx,
+            (1.0 - (texel.1 as f64 + 0.5) / size_px.1 as f64 * 2.0) / sy,
+        ];
+        assert!((q[0] - want[0]).abs() < 1e-14);
+        assert!((q[1] - want[1]).abs() < 1e-14);
+    }
+    let request = PickRequest {
+        view: ModelView::default(),
+        logical: (64, 64),
+        size_px: (64, 64),
+        texel: (32, 32),
+    };
+    assert!(pick_weights([[0.0; 3]; 3], &request).is_none());
 }
 
 const QUAD: &[u8] = b"v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nf 1 2 3 4\n";

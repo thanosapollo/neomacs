@@ -41,7 +41,6 @@ struct VertexOut {
     // Unrotated normalised position (canvas-3d `normalized_point`).
     @location(2) pos: vec3<f32>,
     @location(3) @interpolate(flat) face: u32,
-    @location(4) bary: vec3<f32>,
 };
 
 fn rotate(v: vec3<f32>) -> vec3<f32> {
@@ -61,8 +60,6 @@ fn vs_main(@builtin(vertex_index) vertex: u32) -> VertexOut {
     out.mesh = face.w;
     out.pos = p;
     out.face = face_id;
-    let corner = vertex % 3u;
-    out.bary = vec3<f32>(f32(corner == 0u), f32(corner == 1u), f32(corner == 2u));
     return out;
 }
 
@@ -95,14 +92,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 struct PickOut {
     // (mesh + 1, global face + 1); 0 is background.
     @location(0) ids: vec2<u32>,
-    // Barycentric weights of corners 1 and 2.
-    @location(1) bary: vec2<f32>,
 };
 
 @fragment
 fn fs_pick(in: VertexOut) -> PickOut {
     var out: PickOut;
     out.ids = vec2<u32>(u32(in.mesh + 0.5) + 1u, in.face + 1u);
-    out.bary = in.bary.yz;
     return out;
 }

@@ -692,7 +692,8 @@ fn nested_delivery_context(test: &str, wait: &str) -> Context {
                        (let ((model-test-active t))
                          {wait}
                          (let ((key (read-event)))
-                           (push (list 'key key (neomacs-model-current-p model))
+                           (push (list 'key key (neomacs-model-current-p model)
+                                       (neomacs-model-revision model))
                                  model-test-log))))))
              (add-hook 'neomacs-model-event-functions
                        (lambda (_id _type _plist) (error "Model test hook boom"))
@@ -760,7 +761,7 @@ fn nested_input_reader_sees_readiness_queued_behind_the_callback() {
     let mut ctx = nested_delivery_context("lisp-nested-read", "nil");
     queue_input(&mut ctx, nested_delivery_input());
     assert_eq!(eval_printed(&mut ctx, "(read-event)"), "121");
-    assert_nested_delivery(&mut ctx, "((view nil) (key 120 nil) (readiness nil))");
+    assert_nested_delivery(&mut ctx, "((view nil) (key 120 nil nil) (readiness nil))");
 }
 
 #[test]
@@ -783,8 +784,37 @@ fn nested_wait_sees_readiness_queued_behind_the_callback() {
     );
     assert_nested_delivery(
         &mut ctx,
-        "((view nil) (waited nil) (key 120 nil) (readiness nil))",
+        "((view nil) (waited nil) (key 120 nil nil) (readiness nil))",
     );
+}
+
+#[test]
+fn nested_reader_and_wait_see_current_revision_before_deferred_callback() {
+    for (name, wait) in [
+        ("lisp-nested-current-read", "nil"),
+        (
+            "lisp-nested-current-wait",
+            "(accept-process-output nil 0.05)",
+        ),
+    ] {
+        let mut ctx = nested_delivery_context(name, wait);
+        let mut input = nested_delivery_input();
+        input[1] = model_input(ModelEvent::Readiness {
+            current: true,
+            rev: 7,
+            req: 0,
+        });
+        queue_input(&mut ctx, input);
+        assert_eq!(eval_printed(&mut ctx, "(read-event)"), "121");
+        assert_eq!(
+            eval_printed(&mut ctx, "(reverse model-test-log)"),
+            "((view nil) (key 120 t 7) (readiness nil))"
+        );
+        assert_eq!(
+            eval_printed(&mut ctx, "(reverse model-test-hooks)"),
+            "((hook view nil) (hook readiness nil))"
+        );
+    }
 }
 
 #[test]
@@ -1325,7 +1355,7 @@ fn every_member_handles_an_event_before_the_next_at_the_read_route() {
     queue_input(&mut ctx, nested_delivery_input());
     assert_eq!(eval_printed(&mut ctx, "(read-event)"), "121");
     assert_whole_event_order(&mut ctx);
-    assert_nested_delivery(&mut ctx, "((view nil) (key 120 nil) (readiness nil))");
+    assert_nested_delivery(&mut ctx, "((view nil) (key 120 nil nil) (readiness nil))");
 }
 
 #[test]
@@ -1346,7 +1376,7 @@ fn every_member_handles_an_event_before_the_next_at_the_wait_route() {
     assert_whole_event_order(&mut ctx);
     assert_nested_delivery(
         &mut ctx,
-        "((view nil) (waited nil) (key 120 nil) (readiness nil))",
+        "((view nil) (waited nil) (key 120 nil nil) (readiness nil))",
     );
 }
 

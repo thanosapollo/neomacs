@@ -21,10 +21,9 @@ pub const MODEL_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8
 pub const MAX_MODEL_EDGE_PX: u32 = 2048;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const PICK_IDS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
-const PICK_BARY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
 const SAMPLES: u32 = 4;
-/// Two 1x1 texel copies, each at a 256-byte aligned row.
-const PICK_STAGING_BYTES: u64 = 512;
+/// One identity texel copy at a 256-byte aligned row.
+const PICK_STAGING_BYTES: u64 = 256;
 
 /// canvas-3d colours (`render.py`).
 const BONE: [f32; 3] = [0.92, 0.77, 0.59];
@@ -69,7 +68,7 @@ pub fn geometry_bytes(vertices: u64, triangles: u64) -> u64 {
         + 16 * triangles
         + triangles.div_ceil(32).max(1) * 4
         + 2 * std::mem::size_of::<CameraUniform>() as u64
-        + (8 + 8 + 4)
+        + (8 + 4)
         + PICK_STAGING_BYTES
 }
 
@@ -180,8 +179,6 @@ struct Targets {
 struct PickTargets {
     ids: wgpu::Texture,
     ids_view: wgpu::TextureView,
-    bary: wgpu::Texture,
-    bary_view: wgpu::TextureView,
     depth: wgpu::TextureView,
     staging: wgpu::Buffer,
     /// 0 idle, 1 mapping, 2 mapped, 3 map failed.
@@ -218,6 +215,10 @@ pub struct ModelGpu {
     /// rewritten on every draw.
     marks_written: Option<Vec<u32>>,
     vertex_count: u32,
+    /// Original f64 geometry in the normalised frame, in global face order.
+    /// CPU-owned (72 bytes per triangle), not part of GPU byte accounting.
+    pick_triangles: Vec<[[f64; 3]; 3]>,
+    pick_request: Option<PickRequest>,
     targets: Targets,
     pick: PickTargets,
     /// Geometry and fixed-resource bytes ([`geometry_bytes`]).
@@ -320,14 +321,6 @@ impl PickTargets {
             1,
             wgpu::TextureUsages::COPY_SRC,
         );
-        let bary = target(
-            device,
-            "model pick barycentric",
-            one,
-            PICK_BARY_FORMAT,
-            1,
-            wgpu::TextureUsages::COPY_SRC,
-        );
         let depth = target(
             device,
             "model pick depth",
@@ -338,9 +331,7 @@ impl PickTargets {
         );
         Self {
             ids_view: ids.create_view(&Default::default()),
-            bary_view: bary.create_view(&Default::default()),
             ids,
-            bary,
             depth: depth.create_view(&Default::default()),
             staging: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("model pick staging"),
@@ -365,6 +356,7 @@ impl ModelGpu {
         let mut positions: Vec<[f32; 4]> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
         let mut faces: Vec<[f32; 4]> = Vec::new();
+        let mut pick_triangles = Vec::new();
         for (mesh_index, mesh) in scene.meshes().iter().enumerate() {
             let base = u32::try_from(positions.len()).map_err(|_| "model too large")?;
             positions.extend(mesh.vertices.iter().map(|v| {
@@ -373,6 +365,10 @@ impl ModelGpu {
             }));
             for tri in &mesh.triangles {
                 indices.extend(tri.iter().map(|i| base + i));
+                pick_triangles.push(tri.map(|i| {
+                    let v = mesh.vertices[i as usize];
+                    [0, 1, 2].map(|axis| (v[axis] - scene.centre()[axis]) / scene.radius())
+                }));
                 let n = face_normal(tri.map(|i| mesh.vertices[i as usize]))
                     .ok_or("degenerate triangle")?;
                 faces.push([n[0] as f32, n[1] as f32, n[2] as f32, mesh_index as f32]);
@@ -546,7 +542,7 @@ impl ModelGpu {
             let pick_pipeline = pipeline(
                 "model pick pipeline",
                 "fs_pick",
-                &[colour(PICK_IDS_FORMAT), colour(PICK_BARY_FORMAT)],
+                &[colour(PICK_IDS_FORMAT)],
                 1,
             );
             Self {
@@ -560,6 +556,8 @@ impl ModelGpu {
                 marks_words,
                 marks_written: None,
                 vertex_count,
+                pick_triangles,
+                pick_request: None,
                 targets: Targets::new(device, size_px),
                 pick: PickTargets::new(device),
                 geometry_bytes: geometry_bytes(positions.len() as u64, faces.len() as u64),
@@ -726,10 +724,7 @@ impl ModelGpu {
                 };
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("model pick pass"),
-                    color_attachments: &[
-                        attachment(&self.pick.ids_view),
-                        attachment(&self.pick.bary_view),
-                    ],
+                    color_attachments: &[attachment(&self.pick.ids_view)],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &self.pick.depth,
                         depth_ops: Some(wgpu::Operations {
@@ -746,7 +741,9 @@ impl ModelGpu {
                 pass.set_bind_group(0, &self.pick_bind_group, &[]);
                 pass.draw(0..self.vertex_count, 0..1);
             }
-            for (texture, offset) in [(&self.pick.ids, 0), (&self.pick.bary, 256)] {
+            {
+                let texture = &self.pick.ids;
+                let offset = 0;
                 encoder.copy_texture_to_buffer(
                     wgpu::TexelCopyTextureInfo {
                         texture,
@@ -771,6 +768,7 @@ impl ModelGpu {
             }
             queue.submit(Some(encoder.finish()));
         })?;
+        self.pick_request = Some(*request);
         let state = self.pick.state.clone();
         state.store(PICK_MAPPING, Ordering::Release);
         self.pick
@@ -808,12 +806,29 @@ impl ModelGpu {
                         return PickPoll::Failed("model pick readback unavailable".to_owned());
                     };
                     let ids: [u32; 2] = bytemuck::pod_read_unaligned(&mapped[0..8]);
-                    let bary: [f32; 2] = bytemuck::pod_read_unaligned(&mapped[256..264]);
-                    decode_pick(ids, bary)
+                    if ids[1] == 0 {
+                        Ok(RawPick { hit: None })
+                    } else {
+                        self.pick_request
+                            .as_ref()
+                            .and_then(|request| {
+                                self.pick_triangles
+                                    .get((ids[1] - 1) as usize)
+                                    .and_then(|triangle| pick_weights(*triangle, request))
+                            })
+                            .map(|weights| RawPick {
+                                hit: Some((ids[1] - 1, weights)),
+                            })
+                            .ok_or_else(|| "model pick intersection unavailable".to_owned())
+                    }
                 };
                 self.pick.staging.unmap();
                 self.pick.state.store(PICK_IDLE, Ordering::Release);
-                PickPoll::Done(raw)
+                self.pick_request = None;
+                match raw {
+                    Ok(raw) => PickPoll::Done(raw),
+                    Err(error) => PickPoll::Failed(error),
+                }
             }
             PICK_MAP_FAILED => {
                 self.pick.state.store(PICK_IDLE, Ordering::Release);
@@ -824,16 +839,47 @@ impl ModelGpu {
     }
 }
 
-/// Decode the pick texels: (mesh + 1, face + 1) and (b1, b2).
-fn decode_pick(ids: [u32; 2], bary: [f32; 2]) -> RawPick {
-    if ids[1] == 0 {
-        return RawPick { hit: None };
+/// Intersect the orthographic texel-centre ray with the GPU-selected face.
+/// GPU depth/tie/coverage decides identity; original f64 geometry decides
+/// coordinates. Solving in camera XY is the ray/triangle intersection for
+/// this orthographic camera, without an artificial ray-origin distance.
+fn pick_weights(triangle: [[f64; 3]; 3], request: &PickRequest) -> Option<[f64; 3]> {
+    let rotation = request.view.rotation();
+    let q = triangle.map(|p| {
+        [0, 1].map(|i| rotation[i][0] * p[0] + rotation[i][1] * p[1] + rotation[i][2] * p[2])
+    });
+    let (w, h) = (request.size_px.0.max(1), request.size_px.1.max(1));
+    let (x, y) = (request.texel.0.min(w - 1), request.texel.1.min(h - 1));
+    let (lw, lh) = (
+        request.logical.0.max(1) as f64,
+        request.logical.1.max(1) as f64,
+    );
+    let scale = request.view.zoom * 0.8;
+    let sx = scale * (lh / lw).min(1.0);
+    let sy = scale * (lw / lh).min(1.0);
+    let p = [
+        ((x as f64 + 0.5) / w as f64 * 2.0 - 1.0) / sx,
+        (1.0 - (y as f64 + 0.5) / h as f64 * 2.0) / sy,
+    ];
+    let a = [q[1][0] - q[0][0], q[1][1] - q[0][1]];
+    let b = [q[2][0] - q[0][0], q[2][1] - q[0][1]];
+    let d = [p[0] - q[0][0], p[1] - q[0][1]];
+    let det = a[0] * b[1] - a[1] * b[0];
+    let b1 = (d[0] * b[1] - d[1] * b[0]) / det;
+    let b2 = (a[0] * d[1] - a[1] * d[0]) / det;
+    let weights = [1.0 - b1 - b2, b1, b2];
+    if !weights
+        .iter()
+        .all(|v| v.is_finite() && *v >= -1e-5 && *v <= 1.0 + 1e-5)
+    {
+        return None;
     }
-    let (b1, b2) = (f64::from(bary[0]), f64::from(bary[1]));
-    let b0 = (1.0 - b1 - b2).max(0.0);
-    RawPick {
-        hit: Some((ids[1] - 1, [b0, b1, b2])),
-    }
+    // A GPU-covered boundary may lie just outside the f64 triangle because
+    // rasterisation uses f32 geometry. Snap only that rounding fringe; keep
+    // public point-target weights nonnegative and summing to one.
+    let weights = weights.map(|v| v.clamp(0.0, 1.0));
+    let sum: f64 = weights.iter().sum();
+    Some(weights.map(|v| v / sum))
 }
 
 /// The clear colour for an Emacs (sRGB) `background`: the target is an
