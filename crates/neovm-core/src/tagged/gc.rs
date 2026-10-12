@@ -2787,6 +2787,10 @@ use reclamation::ReclamationMode;
 
 mod cons_block_trailer;
 use cons_block_trailer::*;
+mod observation_reclaims;
+pub(crate) use observation_reclaims::{
+    ObservationReclaim, observation_reclaim_cursor, observation_reclaims_since,
+};
 mod collection_observed;
 pub(crate) use collection_observed::{
     CollectionObservedWord, advance_collection_observation_epoch,

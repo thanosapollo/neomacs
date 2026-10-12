@@ -286,7 +286,15 @@ pub(crate) fn clear_noncons_collection_observed_metadata(address: usize) -> bool
     if word.load(Ordering::Acquire) & mask == 0 {
         return false;
     }
-    word.fetch_and(!mask, Ordering::Release) & mask != 0
+    let cleared = word.fetch_and(!mask, Ordering::Release) & mask;
+    super::observation_reclaims::record(
+        CollectionObservedWord {
+            word,
+            address_base: address & !(CONS_ADDRESS_ALIGN * u64::BITS as usize - 1),
+        },
+        cleared,
+    );
+    cleared != 0
 }
 
 /// Clear only dead cells before a stopped-world owned-block sweep puts them
@@ -333,7 +341,15 @@ fn clear_cons_observed_dead_slow(
             spread_live_bits(live & valid)
         };
         if current & !keep != 0 {
-            changed |= observed.fetch_and(keep, Ordering::Release) & !keep != 0;
+            let cleared = observed.fetch_and(keep, Ordering::Release) & !keep;
+            super::observation_reclaims::record(
+                CollectionObservedWord {
+                    word: observed,
+                    address_base: base + word * u64::BITS as usize * CONS_ADDRESS_ALIGN,
+                },
+                cleared,
+            );
+            changed |= cleared != 0;
         }
     }
     if changed {
@@ -366,10 +382,18 @@ pub(super) fn clear_cons_observed_block(base: usize) {
 fn clear_cons_observed_block_slow(base: usize) {
     if let Some(bitmap) = observation_radix::lookup(base) {
         let mut changed = false;
-        for word in &bitmap.cons {
-            if word.load(Ordering::Acquire) != 0 {
+        for (index, word) in bitmap.cons.iter().enumerate() {
+            let cleared = word.load(Ordering::Acquire);
+            if cleared != 0 {
                 // Whole-granule ownership excludes concurrent new marks.
                 word.store(0, Ordering::Release);
+                super::observation_reclaims::record(
+                    CollectionObservedWord {
+                        word,
+                        address_base: base + index * u64::BITS as usize * CONS_ADDRESS_ALIGN,
+                    },
+                    cleared,
+                );
                 changed = true;
             }
         }
