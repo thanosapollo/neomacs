@@ -6,8 +6,9 @@
 //! and the reclamation epoch are atomic. No old owner header is dereferenced.
 
 use super::super::gc::{
-    BarrierWindow, CollectionObservedWord, CompiledObservationGate, collection_observation_epoch,
-    collection_observed_word,
+    BarrierWindow, CollectionObservedWord, CompiledObservationGate, ObservationReclaim,
+    collection_observation_epoch, collection_observed_word, observation_reclaim_cursor,
+    observation_reclaims_since,
 };
 use super::super::value::TAG_MASK;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -38,6 +39,8 @@ pub(super) struct ObservedEnvelope {
     excluded: Option<BarrierWindow>,
     // Reused buffer for the owners one reclamation pass removes.
     reclaimed: Vec<usize>,
+    reclaim_cursor: u64,
+    reclaim_words: Vec<ObservationReclaim>,
 }
 
 impl ObservedEnvelope {
@@ -53,6 +56,8 @@ impl ObservedEnvelope {
             above: EMPTY_BOUNDS,
             excluded: None,
             reclaimed: Vec::new(),
+            reclaim_cursor: observation_reclaim_cursor(),
+            reclaim_words: Vec::new(),
         }
     }
 
@@ -82,9 +87,18 @@ impl ObservedEnvelope {
     fn refresh_reclaimed(&mut self, dump: BarrierWindow) {
         for _ in 0..MAX_RECLAMATION_RETRIES {
             let before = collection_observation_epoch();
-            self.retain_words(dump, |metadata| metadata.word.load(Ordering::Acquire));
+            let (cursor, complete) =
+                observation_reclaims_since(self.reclaim_cursor, &mut self.reclaim_words);
+            if complete {
+                self.retain_reclaimed_words(dump, |metadata| metadata.word.load(Ordering::Acquire));
+            } else {
+                // A sleeping mutator can lose bounded history. The original
+                // metadata scan remains the conservative recovery protocol.
+                self.retain_words(dump, |metadata| metadata.word.load(Ordering::Acquire));
+            }
             let after = collection_observation_epoch();
             if before == after {
+                self.reclaim_cursor = cursor;
                 self.epoch = Some(after);
                 return;
             }
@@ -198,6 +212,28 @@ impl ObservedEnvelope {
         true
     }
 
+    /// Visit only cleared words present in this mutator's ledger. Re-check the
+    /// atomic bit: an observed same-address replacement must survive, just as
+    /// it did in the full scan. Duplicate entries and other heaps are harmless.
+    fn retain_reclaimed_words(
+        &mut self,
+        dump: BarrierWindow,
+        mut load: impl FnMut(CollectionObservedWord) -> u64,
+    ) {
+        self.reclaimed.clear();
+        for entry in &self.reclaim_words {
+            let key = entry.metadata.word as *const _ as usize;
+            if let Some(word) = self.words.get_mut(&key) {
+                let missing = word.mask & entry.mask & !load(word.metadata);
+                remove_word_bits(word, missing, &mut self.reclaimed);
+                if word.mask == 0 {
+                    self.words.remove(&key);
+                }
+            }
+        }
+        self.finish_reclaimed(dump);
+    }
+
     /// Inspect one atomic word per bucket, visiting identities only for cleared
     /// bits. Permanent descriptors never require a reclaimed owner lookup.
     fn retain_words(
@@ -209,20 +245,13 @@ impl ObservedEnvelope {
         reclaimed.clear();
         self.words.retain(|_, word| {
             let missing = word.mask & !load(word.metadata);
-            if missing != 0 {
-                for (tag, mask) in word.tags.iter_mut().enumerate() {
-                    let mut dead = *mask & missing;
-                    while dead != 0 {
-                        let bit = dead.trailing_zeros();
-                        reclaimed.push(word.metadata.address_for_bit(bit) | tag);
-                        dead &= dead - 1;
-                    }
-                    *mask &= !missing;
-                }
-                word.mask &= !missing;
-            }
+            remove_word_bits(word, missing, reclaimed);
             word.mask != 0
         });
+        self.finish_reclaimed(dump);
+    }
+
+    fn finish_reclaimed(&mut self, dump: BarrierWindow) {
         for &bits in &self.reclaimed {
             self.owners.remove(&bits);
         }
@@ -285,6 +314,22 @@ impl ObservedEnvelope {
     }
 }
 
+fn remove_word_bits(word: &mut ObservedWord, missing: u64, reclaimed: &mut Vec<usize>) {
+    if missing == 0 {
+        return;
+    }
+    for (tag, mask) in word.tags.iter_mut().enumerate() {
+        let mut dead = *mask & missing;
+        while dead != 0 {
+            let bit = dead.trailing_zeros();
+            reclaimed.push(word.metadata.address_for_bit(bit) | tag);
+            dead &= dead - 1;
+        }
+        *mask &= !missing;
+    }
+    word.mask &= !missing;
+}
+
 /// Bounds of an ascending address run, `EMPTY_BOUNDS` when it is empty.
 fn span_bounds<'a>(mut addresses: impl DoubleEndedIterator<Item = &'a usize>) -> (usize, usize) {
     match addresses.next() {
@@ -301,6 +346,10 @@ fn include(bounds: &mut (usize, usize), address: usize) {
     bounds.0 = bounds.0.min(address);
     bounds.1 = bounds.1.max(address + 1);
 }
+
+#[cfg(test)]
+#[path = "tests/observed_reclaims_test.rs"]
+mod reclaim_tests;
 
 #[cfg(test)]
 mod tests {

@@ -391,6 +391,11 @@ impl TaggedHeap {
             && self.sweep_symbol_with_pos_page_cursor >= self.sweep_symbol_with_pos_page_end
             && self.sweep_marker_page_cursor >= self.sweep_marker_page_end
             && self.sweep_bignum_page_cursor >= self.sweep_bignum_page_end;
+        if has_collection_observations() {
+            // Slots can be reused between slices, so keep this publication at
+            // every slice boundary. Include observation refresh in GC timing.
+            self.publish_barrier_window();
+        }
         let slice_us = t0.elapsed().as_micros() as u64;
         self.sweep_slice_us_total += slice_us;
         self.sweep_slice_count += 1;
@@ -410,11 +415,12 @@ impl TaggedHeap {
         }
         if done {
             self.finish_incremental_sweep();
-        }
-        if has_collection_observations() {
-            // A slice can free/reuse slots before the entire sweep completes.
-            // Its cleared marks and epoch are visible before this publication.
-            self.publish_barrier_window();
+            if has_collection_observations() {
+                // Finalization may release whole arenas. Re-derive protocol
+                // state after it as before, even though dead bits were cleared
+                // and refreshed in the timed slice above.
+                self.publish_barrier_window();
+            }
         }
         done
     }
