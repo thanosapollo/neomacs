@@ -21,8 +21,11 @@ use crate::render_thread::frame_stats;
 use crate::render_thread::frame_windows::{
     GuiFrameNativeWindowState, GuiFrameRenderState, RetainedCursorCell, RetainedStatic,
 };
+use crate::render_thread::models::{ModelPicture, picture_of};
 use crate::render_thread::state::PointerAppearanceState;
+use neomacs_renderer_wgpu::model::store::Snapshot;
 use neomacs_renderer_wgpu::{FullFrameTexture, SnapshotSize, UnpooledTexture, WgpuRenderer};
+use std::collections::{BTreeMap, HashSet};
 
 /// Whether this frame may be composed from the retained static scene:
 /// the coordinator asked for a compositor-only cursor frame, and the scene is
@@ -75,6 +78,9 @@ pub(super) fn is_valid(render: &GuiFrameRenderState, size: SnapshotSize) -> bool
 /// Draws onto `composition_view`, which is the frame-post source when the
 /// post shader is on and the swapchain view otherwise; the caller owns that
 /// choice and the frame-post step that follows.
+///
+/// Answers what the composed frame pictures of the native models
+/// ([`retained_frame_picture`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw(
     renderer: &mut WgpuRenderer,
@@ -85,16 +91,23 @@ pub(super) fn draw(
     inputs: &FrameDrawInputs<'_>,
     cursor_visible: bool,
     hovered_scroll_bar: Option<neomacs_display_protocol::ScrollBarIdentity>,
-) -> Result<(), super::surface::FrameRenderFailure> {
+) -> Result<ModelPicture, super::surface::FrameRenderFailure> {
     let Some(native_size) = SnapshotSize::new(native.content_size().0, native.content_size().1)
     else {
         // wgpu rejects a zero extent, so there is no scene to retain and
         // nothing to composite from. Reaching this would mean the window was
         // asked to draw at a size `resize` already refuses to configure.
-        return Ok(());
+        return Ok(ModelPicture::new());
     };
     let generation = render.compositor.current_scene_generation;
-    let retained_valid = is_valid(render, native_size);
+    let retained_valid = matches!(
+        &render.compositor.retained_static,
+        Some(rs) if retained_scene_is_current(
+            (rs.generation, rs.texture.size(), &rs.models),
+            (generation, native_size, inputs.models),
+        )
+    );
+
     if !retained_valid {
         ensure_retained_static_texture(renderer, render, native_size);
         let retained_view = render
@@ -106,7 +119,11 @@ pub(super) fn draw(
             .view()
             .clone();
         // Render the full cursorless static scene into the retained
-        // texture (this runs the glyph pipeline once per generation).
+        // texture (this runs the glyph pipeline once per generation), and
+        // record which models (root and child) it composited and which it
+        // referenced.
+        let _ = renderer.take_drawn_surfaces();
+        renderer.collect_referenced_surfaces();
         super::render_frame_window_contents(
             renderer,
             native,
@@ -122,9 +139,15 @@ pub(super) fn draw(
             native.scale_factor as f32,
             &render.pointer_appearance,
         );
+        let models = RetainedModels::record(
+            renderer.take_drawn_surfaces(),
+            renderer.take_referenced_surfaces(),
+            inputs.models,
+        );
         if let Some(rs) = render.compositor.retained_static.as_mut() {
             rs.generation = generation;
             rs.cursor_cells = cells;
+            rs.models = models;
         }
         frame_stats::count(&frame_stats::RETAINED_STATIC_BUILDS);
     }
@@ -166,7 +189,87 @@ pub(super) fn draw(
         render.emacs_frame_id,
         frame.presentation_id,
     );
-    Ok(())
+    Ok(retained_frame_picture(
+        render
+            .compositor
+            .retained_static
+            .as_ref()
+            .map(|rs| &rs.models.picture),
+        picture_of(renderer.take_drawn_surfaces(), inputs.models),
+    ))
+}
+
+/// What a retained-static frame pictures of the models: the retained
+/// raster's provenance (the whole picture, root and child), and any model
+/// a partial cursor overlay redrew in a cell over it. The overlay never
+/// replaces the raster's provenance: it repaints a cell of the same scene.
+pub(in crate::render_thread) fn retained_frame_picture(
+    retained: Option<&ModelPicture>,
+    overlay: ModelPicture,
+) -> ModelPicture {
+    let mut picture = retained.cloned().unwrap_or_default();
+    for (id, snapshot) in overlay {
+        picture.entry(id).or_insert(snapshot);
+    }
+    picture
+}
+
+/// What a retained raster records of the native models when it is built.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(in crate::render_thread) struct RetainedModels {
+    /// Provenance: every model the raster composited (root glyphs and
+    /// child frames alike) at the snapshot its texture showed then. A frame
+    /// blitting the raster presents exactly these.
+    pub(in crate::render_thread) picture: ModelPicture,
+    /// Dependencies: every surface the raster's glyph passes referenced,
+    /// drawn or not, with what the store said the model's texture showed
+    /// at the build (`None`: loading, absent, or not a model). A glyph whose
+    /// model was not yet drawable composites nothing; once the model
+    /// uploads, the raster no longer pictures the scene (SOL-REVIEW-2
+    /// MUST 3, OPUS-REVIEW MUST 1).
+    depends_on: BTreeMap<u32, Option<Snapshot>>,
+}
+
+impl RetainedModels {
+    /// The record of a raster whose build composited `drawn` and referenced
+    /// `referenced` surfaces, with `current` what every model's texture
+    /// showed for that frame. The draw and its tests share this.
+    pub(in crate::render_thread) fn record(
+        drawn: Option<HashSet<u32>>,
+        referenced: HashSet<u32>,
+        current: &ModelPicture,
+    ) -> Self {
+        let picture = picture_of(drawn, current);
+        let depends_on = referenced
+            .into_iter()
+            .chain(picture.keys().copied())
+            .map(|id| (id, current.get(&id).copied()))
+            .collect();
+        Self {
+            picture,
+            depends_on,
+        }
+    }
+}
+
+/// Whether a retained scene built as `built` (editor scene generation,
+/// size, and its model record) still pictures the scene `now`: same
+/// generation and size, and every model its glyphs referenced is as the
+/// store had it then. A model redrawn (orbit, zoom, Lisp request, rescale)
+/// or freed since leaves the raster showing old pixels, and one uploaded
+/// since leaves it missing pixels; no editor scene change would replace
+/// either. A model the raster does not reference is irrelevant to it.
+pub(in crate::render_thread) fn retained_scene_is_current(
+    built: (u64, SnapshotSize, &RetainedModels),
+    now: (u64, SnapshotSize, &ModelPicture),
+) -> bool {
+    built.0 == now.0
+        && built.1 == now.1
+        && built
+            .2
+            .depends_on
+            .iter()
+            .all(|(id, snapshot)| now.2.get(id) == snapshot.as_ref())
 }
 
 /// Build a single-glyph mini-frame for each filled-box cursor in the frame

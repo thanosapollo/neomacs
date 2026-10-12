@@ -299,6 +299,7 @@ impl RenderApp {
         self.update_terminals();
 
         self.process_webkit_frames();
+        self.render_dirty_models();
         self.process_shader_surfaces();
         self.synchronize_image_residency();
         self.process_pending_images();

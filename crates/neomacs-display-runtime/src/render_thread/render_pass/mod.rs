@@ -44,9 +44,10 @@
 pub(in crate::render_thread) mod chrome;
 mod composition_targets;
 mod full_render;
+pub(in crate::render_thread) mod model_provenance;
 mod present;
 mod retained_scroll;
-mod retained_static;
+pub(in crate::render_thread) mod retained_static;
 pub(super) use retained_scroll::RetainedScroll;
 mod scene;
 pub(in crate::render_thread) mod surface;
@@ -73,6 +74,12 @@ struct RenderedFrameSurface {
     output: wgpu::SurfaceTexture,
     frame: crate::core::frame_glyphs::FrameGlyphBuffer,
     projection: Option<neomacs_display_protocol::InteractionProjection>,
+    /// What the composed picture holds of the native models (design §6.2).
+    models: super::models::ModelPicture,
+    /// Whether the composition also shows an older picture than its fresh
+    /// glyph passes, which `models` cannot describe
+    /// ([`model_provenance::blends_older_pictures`]).
+    blends_older: bool,
 }
 
 /// The inputs one frame's content draw needs that are fixed for the whole
@@ -94,6 +101,8 @@ struct FrameDrawInputs<'a> {
     scroll_indicators_enabled: bool,
     retain_scroll_body: bool,
     toolbar: &'a ToolbarResources,
+    /// What every native model's texture shows for this frame.
+    models: &'a super::models::ModelPicture,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -174,6 +183,7 @@ fn render_frame_window_contents_to_surface(
     compositor_only_hint: bool,
     render_policy: &crate::render_thread::render_quality::RenderQualityPolicy,
     device_lost: &mut crate::render_thread::device_loss::DeviceLossDetector,
+    models: &super::models::ModelPicture,
 ) -> Result<RenderedFrameSurface, FrameRenderFailure> {
     // Reserve interactive child composition before acquiring a swapchain,
     // sampling motion, publishing projections or consuming presentation hints.
@@ -210,6 +220,7 @@ fn render_frame_window_contents_to_surface(
         feature_plan,
         device_lost,
         targets.native,
+        models,
     );
     window_state.render.child_opacity_src = None;
     window_state.render.child_resize_src = None;
@@ -230,6 +241,7 @@ fn render_frame_window_contents_reserved(
     feature_plan: crate::render_thread::render_quality::RenderFeaturePlan,
     device_lost: &mut crate::render_thread::device_loss::DeviceLossDetector,
     native_content: Option<neomacs_renderer_wgpu::SnapshotLease>,
+    models: &super::models::ModelPicture,
 ) -> Result<RenderedFrameSurface, FrameRenderFailure> {
     let render = &mut window_state.render;
     let native = match &mut window_state.lifecycle {
@@ -410,6 +422,7 @@ fn render_frame_window_contents_reserved(
         scroll_indicators_enabled,
         retain_scroll_body: extra_line_spacing == 0.0 && extra_letter_spacing == 0.0,
         toolbar,
+        models,
     };
 
     // The retained-static fast path is a whole composition strategy; it
@@ -434,12 +447,15 @@ fn render_frame_window_contents_reserved(
             cursor_visible,
             hovered_scroll_bar,
         );
-        if let Err(error) = draw_result {
-            renderer.set_scale_factor(old_scale_factor);
-            renderer.resize(old_width, old_height);
-            render.mark_dirty();
-            return Err(error);
-        }
+        let models = match draw_result {
+            Ok(models) => models,
+            Err(error) => {
+                renderer.set_scale_factor(old_scale_factor);
+                renderer.resize(old_width, old_height);
+                render.mark_dirty();
+                return Err(error);
+            }
+        };
         if frame_post_active {
             renderer.frame_post_to_view(
                 &composition_view,
@@ -467,10 +483,15 @@ fn render_frame_window_contents_reserved(
         // so hit testing went on using the morph's last mid-motion transform
         // for every frame afterwards, until some later morph happened to
         // publish again.
+        // Eligibility excludes every composition that shows an older
+        // picture (pane placement, transitions, child crossfades): the
+        // raster's own provenance is the whole picture.
         return Ok(RenderedFrameSurface {
             output,
             frame,
             projection: pane_projection,
+            models,
+            blends_older: false,
         });
     }
 
@@ -513,6 +534,18 @@ fn render_frame_window_contents_reserved(
         return Err(error);
     }
 
+    // A full composition replaces the whole picture: it holds exactly the
+    // models its glyph passes (root and child frames) composited now, so a
+    // fully clipped glyph pictures nothing.
+    let models = super::models::picture_of(renderer.take_drawn_surfaces(), models);
+    // Asked after the composition, so a transition or child crossfade that
+    // finished this frame (showing the new picture alone) no longer counts.
+    let blends_older = model_provenance::blends_older_pictures(
+        render,
+        !pane_blits.is_empty(),
+        renderer.frame_sample(),
+    );
+
     if frame_post_active {
         renderer.frame_post_to_view(
             &composition_view,
@@ -536,6 +569,8 @@ fn render_frame_window_contents_reserved(
         output,
         frame,
         projection: pane_projection,
+        models,
+        blends_older,
     })
 }
 

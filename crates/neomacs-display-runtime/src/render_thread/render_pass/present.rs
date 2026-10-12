@@ -54,6 +54,9 @@ impl RenderApp {
         };
 
         let is_primary_frame = self.frame_windows.is_primary_frame_id(emacs_frame_id);
+        // Dirty models were drawn above; this is what their textures show
+        // while this frame composites them.
+        let model_picture = self.model_picture();
         let Some(renderer) = self.renderer.as_mut() else {
             return SubmissionResult::Timeout;
         };
@@ -81,6 +84,8 @@ impl RenderApp {
             .compositor
             .transitions
             .apply_policy(self.transition_policy);
+        // The drawn set describes this window's composite only.
+        let _ = renderer.take_drawn_surfaces();
 
         let rendered = super::render_frame_window_contents_to_surface(
             renderer,
@@ -94,17 +99,25 @@ impl RenderApp {
             compositor_only_hint,
             &self.render_policy,
             &mut self.device_lost,
+            &model_picture,
         );
         let RenderedFrameSurface {
             output,
             frame,
             projection,
+            models,
+            blends_older,
         } = match rendered {
             Ok(rendered) => rendered,
             Err(failure) => {
                 #[cfg(feature = "video")]
                 renderer.cancel_video_surface_render();
-                return failure.submission_result();
+                let result = failure.submission_result();
+                if result == SubmissionResult::Occluded {
+                    // Not showing: it leaves every model's showing set.
+                    self.note_models_window_gone(emacs_frame_id);
+                }
+                return result;
             }
         };
         if is_primary_frame {
@@ -205,6 +218,7 @@ impl RenderApp {
         #[cfg(feature = "video")]
         renderer.finish_submitted_video_surface();
         frame_stats::note_submission(neomacs_display_protocol::frame_time::observe_platform_now());
+        self.note_models_frame_submitted(emacs_frame_id, &models, blends_older);
 
         if !child_frame_ids.is_empty() || !removed_child_frame_ids.is_empty() {
             tracing::debug!(

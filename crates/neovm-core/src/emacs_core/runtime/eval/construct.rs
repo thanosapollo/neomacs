@@ -2303,6 +2303,8 @@ impl Context {
             window_layout_query_adapter: WindowLayoutQueryAdapter::Unavailable,
             scroll_goal: None,
             display_host: None,
+            live_models: std::collections::HashSet::new(),
+            model_events: Default::default(),
             tty_frame_host_factory: None,
             gui_display_initializer: None,
             visual_config: neomacs_display_protocol::VisualConfig::default(),

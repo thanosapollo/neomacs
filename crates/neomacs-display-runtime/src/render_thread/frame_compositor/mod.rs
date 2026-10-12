@@ -226,7 +226,8 @@ impl FrameCompositor {
 
 /// A cursorless render of the current scene, retained across cursor-only
 /// frames so an ambient cursor effect composites over it instead of
-/// re-running the glyph pipeline. Validity is generation- and size-keyed.
+/// re-running the glyph pipeline. Validity is keyed on the generation, the
+/// size and the snapshot of every native model it pictures.
 pub(crate) struct RetainedStatic {
     /// The scene texture, its GPU-budget category and its cost as one value.
     ///
@@ -246,6 +247,10 @@ pub(crate) struct RetainedStatic {
     /// frame. The box color still cycles: it is recomputed from the frame
     /// sample time inside `emit_cursor_visual`, not baked here.
     pub(super) cursor_cells: Vec<RetainedCursorCell>,
+    /// The raster's model provenance (every model it composited, root and
+    /// child, at the snapshot drawn) and dependencies (every model its
+    /// glyphs referenced, drawable or not, as the store had it then).
+    pub(super) models: crate::render_thread::render_pass::retained_static::RetainedModels,
 }
 
 /// A retained single-glyph mini-frame for one filled-box cursor cell, plus the
@@ -264,6 +269,7 @@ impl RetainedStatic {
             // first fast-path frame.
             generation: u64::MAX,
             cursor_cells: Vec::new(),
+            models: Default::default(),
         }
     }
 }

@@ -16,6 +16,7 @@ webview = []
 [dependencies]
 enum_dispatch.workspace = true
 rustc-hash.workspace = true
+sha2.workspace = true
 cosmic-text.workspace = true
 swash.workspace = true
 fontdb.workspace = true

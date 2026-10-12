@@ -788,6 +788,28 @@ pub trait DisplayHost {
     fn destroy_shader_surface(&self, _id: u32) -> Result<(), String> {
         Ok(())
     }
+    /// Whether a GPU renderer that can draw native models is live now
+    /// (published by the render thread, not mere host presence). TTY,
+    /// batch and test hosts stay inert.
+    fn model_renderer_available(&self) -> bool {
+        false
+    }
+    /// Queue a native model (`ShaderSurfaceContent::Model`) in the surface
+    /// id space and return its id. The load is asynchronous: its outcome
+    /// arrives as `keyboard::InputEvent::Model`. Freed like any surface,
+    /// through `destroy_shader_surface`.
+    fn create_model(&self, _request: ShaderSurfaceCreateRequest) -> Result<u32, String> {
+        Err("native models are unsupported by this display host".to_owned())
+    }
+    /// Send Lisp request `req` (monotonic per model) changing model `id`.
+    fn update_model(
+        &self,
+        _id: u32,
+        _req: u64,
+        _change: neomacs_display_protocol::model::ModelChange,
+    ) -> Result<(), String> {
+        Err("native models are unsupported by this display host".to_owned())
+    }
     fn create_terminal(&self, _request: TerminalCreateRequest) -> Result<TerminalId, String> {
         Err("neo-term is unsupported by this display host".to_owned())
     }

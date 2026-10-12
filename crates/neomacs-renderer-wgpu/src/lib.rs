@@ -17,6 +17,7 @@ pub mod image_probe;
 mod image_scale;
 mod image_sequence;
 pub mod media_budget;
+pub mod model;
 #[cfg(target_os = "linux")]
 pub mod native_presentation;
 pub mod renderer;

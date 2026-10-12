@@ -27,6 +27,123 @@ use winit::dpi::PhysicalPosition;
 use winit::event::{DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase};
 use winit::window::WindowId;
 
+/// Zoom notches, possibly fractional, in one wheel event over a model:
+/// line deltas count as notches; pixel deltas (touchpads) count one notch
+/// per 50 px.
+fn model_wheel_notches(delta: MouseScrollDelta) -> Option<f64> {
+    let notches = match delta {
+        MouseScrollDelta::LineDelta(_, y) | MouseScrollDelta::ContinuousLineDelta(_, y) => {
+            f64::from(y)
+        }
+        MouseScrollDelta::PixelDelta(p) => p.y / 50.0,
+        _ => return None,
+    };
+    notches.is_finite().then_some(notches)
+}
+
+/// The most notches one wheel event may zoom.
+const MODEL_WHEEL_MAX_NOTCHES: f64 = 10.0;
+
+/// Wheel input over models, turned into whole zoom notches. Fractions
+/// (touchpads, high-resolution wheels) carry over to the next event of the
+/// same gesture, so a stream of small deltas zooms as much as one big one.
+#[derive(Debug, Default)]
+pub(super) struct ModelWheel {
+    remainder: Option<WheelRemainder>,
+}
+
+/// The part of a notch one device has scrolled over one model and not yet
+/// zoomed, and when.
+#[derive(Debug)]
+struct WheelRemainder {
+    device: Option<DeviceId>,
+    id: u32,
+    notches: f64,
+    at: std::time::Instant,
+}
+
+impl ModelWheel {
+    /// The whole notches `delta` from `device` over model `id` amounts to,
+    /// with what this device last left over this model. That remainder is
+    /// dropped when the gesture changes hands (another device or model,
+    /// or the wheel leaving the model: [`Self::reset`]), when a new
+    /// gesture starts or the old one ends, and after a quiet period as
+    /// long as the one that settles a wheel burst.
+    pub(super) fn notches(
+        &mut self,
+        device: Option<DeviceId>,
+        id: u32,
+        delta: MouseScrollDelta,
+        phase: TouchPhase,
+        now: std::time::Instant,
+    ) -> i32 {
+        let previous = self.remainder.take();
+        let Some(step) = model_wheel_notches(delta) else {
+            return 0;
+        };
+        let carried = previous
+            .filter(|r| {
+                r.device == device
+                    && r.id == id
+                    && phase != TouchPhase::Started
+                    && now.saturating_duration_since(r.at)
+                        < neomacs_renderer_wgpu::model::store::WHEEL_QUIET
+            })
+            .map_or(0.0, |r| r.notches);
+        let total = (carried + step).clamp(-MODEL_WHEEL_MAX_NOTCHES, MODEL_WHEEL_MAX_NOTCHES);
+        // Whole notches toward zero; the fraction waits for the next event.
+        let whole = total.trunc();
+        let left = total - whole;
+        if left != 0.0 && !matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            self.remainder = Some(WheelRemainder {
+                device,
+                id,
+                notches: left,
+                at: now,
+            });
+        }
+        whole as i32
+    }
+
+    /// The wheel left the models: nothing carries into a later gesture.
+    pub(super) fn reset(&mut self) {
+        self.remainder = None;
+    }
+
+    /// The model a remainder is waiting over, if any.
+    pub(super) fn pending_model(&self) -> Option<u32> {
+        self.remainder.as_ref().map(|r| r.id)
+    }
+
+    /// The pointer moved and is now over model `over` (or none): a
+    /// remainder left over another model belongs to a gesture that has
+    /// moved on, even if the pointer comes back within the quiet period.
+    pub(super) fn pointer_over(&mut self, over: Option<u32>) {
+        if self.pending_model().is_some_and(|id| Some(id) != over) {
+            self.reset();
+        }
+    }
+}
+
+impl RenderApp {
+    /// Wheel input from `device` over interactive model `id` zooms it
+    /// (design §5.1) and never scrolls the buffer.
+    pub(super) fn wheel_over_model(
+        &mut self,
+        device: Option<DeviceId>,
+        id: u32,
+        delta: MouseScrollDelta,
+        phase: TouchPhase,
+        now: std::time::Instant,
+    ) {
+        let notches = self.model_wheel.notches(device, id, delta, phase, now);
+        // Even input completing no notch reaches the store: it keeps an
+        // active burst from settling while the gesture goes on.
+        self.models.wheel(id, notches, now);
+        self.flush_model_events();
+    }
+}
+
 // Embedded browsers own their distance policy and fractional viewport. Do not
 // impose the editor's integral Lisp boundary on their input.
 #[cfg(any(test, feature = "webview"))]
@@ -875,6 +992,44 @@ impl RenderApp {
         }
     }
 
+    /// Left button over a model glyph (design §5.1): an unmodified press
+    /// on a ready, unfrozen model starts a capture; the release ends it,
+    /// picking when there was no orbit. Both still reach Lisp afterwards.
+    fn route_model_button(&mut self, window_id: WindowId, state: ElementState) {
+        if self.models.is_empty() {
+            return;
+        }
+        let Some(window_state) = self.frame_windows.get_by_winit(window_id) else {
+            return;
+        };
+        let key = window_state.render.emacs_frame_id;
+        let (x, y) = window_state.render.mouse_pos;
+        let (ev_x, ev_y, target_fid) = Self::pointer_target_for_frame_window(window_state, x, y);
+        let hit =
+            Self::surface_target_for_frame_window(&window_state.render, target_fid, ev_x, ev_y)
+                .filter(|(id, _, _)| self.models.contains(*id))
+                .map(|(id, u, v)| neomacs_renderer_wgpu::model::GlyphHit { id, u, v });
+        match state {
+            ElementState::Pressed => {
+                if self.modifiers == 0
+                    && let Some(hit) = hit
+                {
+                    self.models.press(key, hit, (f64::from(x), f64::from(y)));
+                }
+            }
+            ElementState::Released => match self.renderer.as_mut() {
+                Some(renderer) => self.models.release(
+                    key,
+                    hit,
+                    neomacs_display_protocol::frame_time::observe_platform_now().into_instant(),
+                    renderer,
+                ),
+                None => self.models.cancel_capture(),
+            },
+        }
+        self.flush_model_events();
+    }
+
     pub(super) fn handle_mouse_input(
         &mut self,
         window_id: WindowId,
@@ -882,6 +1037,9 @@ impl RenderApp {
         button: MouseButton,
     ) {
         self.record_idle_dim_activity(window_id);
+        if button == MouseButton::Left {
+            self.route_model_button(window_id, state);
+        }
         #[cfg(feature = "webview")]
         let captured_release = if state == ElementState::Released {
             self.webview_pointer_capture.take()
@@ -1468,6 +1626,25 @@ impl RenderApp {
             let (ev_x, ev_y, target_fid) = pointer_owner
                 .raw_target()
                 .unwrap_or_else(|| Self::pointer_target_for_frame_window(window_state, lx, ly));
+            // A model orbit owns the motion of its capture: it is not
+            // forwarded to Lisp, so no drag tracking can start (design §5.1).
+            let model_owned = self.models.motion(
+                window_state.render.emacs_frame_id,
+                (f64::from(lx), f64::from(ly)),
+            );
+            // A wheel fraction left over a model ends when the pointer
+            // leaves that model's glyph. Asked only while one is pending,
+            // since the surface search reads every glyph in the frame.
+            if self.model_wheel.pending_model().is_some() {
+                let over = Self::surface_target_for_frame_window(
+                    &window_state.render,
+                    target_fid,
+                    ev_x,
+                    ev_y,
+                )
+                .map(|(id, _, _)| id);
+                self.model_wheel.pointer_over(over);
+            }
             // iMouse hover state (docs/display-engine/SHADER_SURFACES.md):
             // resolved here rather than while drawing, because which surface
             // the pointer is over is a question about the composition, and the
@@ -1535,7 +1712,7 @@ impl RenderApp {
             if dirty {
                 window_state.render.mark_dirty();
             }
-            if event.is_none() {
+            if event.is_none() && !model_owned {
                 let position = PointerPosition {
                     x: ev_x,
                     y: ev_y,
@@ -1565,6 +1742,7 @@ impl RenderApp {
                 self.comms.send_input(event);
             }
         }
+        self.flush_model_events();
         #[cfg(feature = "webview")]
         if let Some((delivery, input)) = webview_delivery
             && let Some(system) = self.webview_system.as_mut()
@@ -1579,6 +1757,9 @@ impl RenderApp {
     }
 
     pub(super) fn handle_cursor_left(&mut self, window_id: WindowId) {
+        // The pointer left the window: a wheel fraction left over a model
+        // does not wait for its return.
+        self.model_wheel.reset();
         if let Some(window_state) = self.frame_windows.get_by_winit_mut(window_id) {
             window_state.render.clear_pointer_hover();
             window_state.render.scroll_input.reset();
@@ -1606,6 +1787,30 @@ impl RenderApp {
                     window_state.render.mouse_pos.1,
                 )
             });
+            // Wheel over a model zooms it instead of scrolling (design §5.1;
+            // the default awaits Thanos's decision).
+            if self.modifiers == 0
+                && !self.models.is_empty()
+                && let Some((surface_id, _, _)) = Self::surface_target_for_frame_window(
+                    &window_state.render,
+                    target_fid,
+                    ev_x,
+                    ev_y,
+                )
+                && self.models.is_interactive(surface_id)
+            {
+                self.wheel_over_model(
+                    device,
+                    surface_id,
+                    delta,
+                    phase,
+                    neomacs_display_protocol::frame_time::observe_platform_now().into_instant(),
+                );
+                return;
+            }
+            // Not over an interactive model (or modified): any fraction
+            // left over a model belongs to a gesture that has moved on.
+            self.model_wheel.reset();
             let position = PointerPosition {
                 x: ev_x,
                 y: ev_y,

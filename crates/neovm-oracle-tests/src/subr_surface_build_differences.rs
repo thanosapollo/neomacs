@@ -56,6 +56,8 @@ const DECLARED_HERE_ONLY: &str = "
   neomacs-effect-names neomacs-effect-schema neomacs--effect-set
   neomacs--effects-apply neomacs-frame-edges neomacs-frame-geometry
   neomacs-frame-shader neomacs-frame-shader-set-uniform neomacs-image-extent
+  neomacs-model--available-p neomacs-model--create neomacs-model--freeze neomacs-model--id
+  neomacs-model--resize neomacs-model--set-highlight neomacs-model--set-view
   neomacs-mouse-absolute-pixel-position neomacs-open-tls-stream neomacs-primary-selection-get
   neomacs-primary-selection-owner neomacs-primary-selection-set neomacs-set-buffer-text-backend
   neomacs-set-default-buffer-text-backend

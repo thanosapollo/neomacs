@@ -200,3 +200,55 @@ fn active_animation_max_fps_takes_max_cap_and_uncapped_forces_full_rate() {
     cache.mark_drawn(3);
     assert_eq!(cache.active_animation_max_fps(), None);
 }
+
+/// SOL-REVIEW-3 SHOULD 1: a full-render-only workload (no retained build
+/// ever takes the references) that creates, displays and frees surfaces
+/// one after another keeps no history of their references.
+#[test]
+fn references_do_not_accumulate_without_a_retained_build() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("skipping: no headless wgpu adapter");
+        return;
+    };
+    let image = ImageCache::new(&device);
+    let mut cache = ShaderSurfaceCache::new(&device);
+    let data = vec![255u8; 4 * 4 * 4];
+    for id in 1..=200 {
+        cache
+            .create_pixels(
+                &device,
+                &queue,
+                image.bind_group_layout(),
+                image.sampler(),
+                id,
+                &data,
+                4,
+                4,
+            )
+            .expect("create pixel surface");
+        // A full frame composites the glyph: referenced and drawn.
+        cache.note_composite();
+        cache.note_referenced(id);
+        cache.mark_drawn(id);
+        assert_eq!(
+            cache.take_drawn(),
+            Some(std::collections::HashSet::from([id]))
+        );
+        cache.free(id);
+        assert!(
+            cache.referenced_len() <= 1,
+            "{} references held after {id} frames",
+            cache.referenced_len()
+        );
+    }
+    // A retained build still sees exactly what its own passes reached.
+    cache.collect_referenced();
+    cache.note_referenced(7);
+    cache.note_referenced(9);
+    assert_eq!(
+        cache.take_referenced(),
+        std::collections::HashSet::from([7, 9])
+    );
+    cache.note_referenced(11);
+    assert_eq!(cache.referenced_len(), 0, "collection ended with the build");
+}

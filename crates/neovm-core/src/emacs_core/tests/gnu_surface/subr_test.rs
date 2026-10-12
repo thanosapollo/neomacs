@@ -338,6 +338,34 @@ const DECLARED_HERE_AND_NOT_BY_THE_REFERENCE_GNU: &[DeclaredHere] = &[
         why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
     },
     DeclaredHere {
+        name: "neomacs-model--available-p",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-model--create",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-model--freeze",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-model--id",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-model--resize",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-model--set-highlight",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
+        name: "neomacs-model--set-view",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
         name: "neomacs-mouse-absolute-pixel-position",
         why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
     },

@@ -337,6 +337,8 @@ fn destroy(eval: &mut Context, args: Vec<Value>) -> EvalResult {
     let id = surface_id_from_value(args[0]).ok_or_else(|| {
         surface_error("neomacs-surface-destroy: ID must be a surface handle or id")
     })?;
+    // A destroyed model accepts no further requests (`model::live_model_id`).
+    eval.live_models.remove(&id);
     if let Some(host) = eval.display_host.as_ref() {
         host.destroy_shader_surface(id).map_err(surface_error)?;
     }

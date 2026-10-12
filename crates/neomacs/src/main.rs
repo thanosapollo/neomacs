@@ -2834,6 +2834,15 @@ impl DisplayHost for PrimaryWindowDisplayHost {
                 }
             }
             ShaderSurfaceContent::Pixels { data } => SurfaceSource::Pixels { data },
+            ShaderSurfaceContent::Model {
+                meshes,
+                view,
+                background,
+            } => SurfaceSource::Model {
+                meshes,
+                view,
+                background,
+            },
         };
         let surface_id = next_host_surface_id();
         self.send_render_command(
@@ -2874,6 +2883,31 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         self.send_render_command(
             RenderCommand::Asset(AssetCommand::SurfaceFree { id }),
             "failed to queue surface destroy",
+        )
+    }
+
+    fn model_renderer_available(&self) -> bool {
+        self.render_capabilities.model_renderer_live()
+    }
+
+    /// A model is a surface: same id space, same `SurfaceCreate` (never
+    /// animated, never evicted), freed by `destroy_shader_surface`.
+    fn create_model(&self, request: ShaderSurfaceCreateRequest) -> Result<u32, String> {
+        if !matches!(request.content, ShaderSurfaceContent::Model { .. }) {
+            return Err("create_model needs model content".to_owned());
+        }
+        self.create_shader_surface(request)
+    }
+
+    fn update_model(
+        &self,
+        id: u32,
+        req: u64,
+        change: neomacs_display_protocol::model::ModelChange,
+    ) -> Result<(), String> {
+        self.send_render_command(
+            RenderCommand::Asset(AssetCommand::ModelUpdate { id, req, change }),
+            "failed to queue model update",
         )
     }
 

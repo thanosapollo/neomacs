@@ -2870,6 +2870,9 @@ impl Context {
         if ids.is_empty() {
             return;
         }
+        for id in &ids {
+            self.live_models.remove(id);
+        }
         let Some(host) = self.display_host.as_ref() else {
             return;
         };

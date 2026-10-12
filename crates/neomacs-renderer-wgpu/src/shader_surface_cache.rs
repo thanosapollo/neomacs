@@ -168,6 +168,10 @@ pub struct CachedShaderSurface {
     scale: f32,
 }
 
+/// A rendered-texture surface entry built by
+/// [`ShaderSurfaceCache::prepare_rendered`] and not yet installed.
+pub struct PreparedSurface(CachedShaderSurface);
+
 pub struct ShaderSurfaceCache {
     surfaces: HashMap<u32, CachedShaderSurface>,
     uniform_bind_group_layout: wgpu::BindGroupLayout,
@@ -180,6 +184,19 @@ pub struct ShaderSurfaceCache {
     /// Surface whose `iMouse.zw` is currently held positive by a button
     /// press; `set_mouse_release` negates it and clears this.
     pressed: Option<u32>,
+    /// Surfaces composited since the last `take_drawn`, and whether a glyph
+    /// composite ran at all (native model showing sets, design §6.2).
+    drawn: std::collections::HashSet<u32>,
+    composited: bool,
+    /// Surfaces a glyph composite reached since `collect_referenced`, drawn
+    /// or not: a glyph naming a surface the cache
+    /// does not hold yet (a model still loading) is referenced but not
+    /// drawn. A retained raster depends on these (design §6.2).
+    referenced: std::collections::HashSet<u32>,
+    /// Whether references are collected: only between a retained build's
+    /// `collect_referenced` and its `take_referenced`, so full-render-only
+    /// workloads keep no reference history (SOL-REVIEW-3 SHOULD 1).
+    collecting_referenced: bool,
 }
 
 impl ShaderSurfaceCache {
@@ -232,11 +249,29 @@ impl ShaderSurfaceCache {
             channel_sampler,
             fallback_channel_view,
             pressed: None,
+            drawn: std::collections::HashSet::new(),
+            referenced: std::collections::HashSet::new(),
+            collecting_referenced: false,
+            composited: false,
         }
     }
 
     pub fn get(&self, id: u32) -> Option<&CachedShaderSurface> {
         self.surfaces.get(&id)
+    }
+
+    /// Logical and physical size of surface `id` (tests).
+    #[cfg(test)]
+    pub(crate) fn sizes(&self, id: u32) -> Option<((u32, u32), (u32, u32))> {
+        self.surfaces
+            .get(&id)
+            .map(|s| ((s.width, s.height), (s.width_px, s.height_px)))
+    }
+
+    /// How many surface references the collector holds (tests).
+    #[cfg(test)]
+    pub(crate) fn referenced_len(&self) -> usize {
+        self.referenced.len()
     }
 
     /// Whether any shader surface exists at all.
@@ -495,6 +530,87 @@ impl ShaderSurfaceCache {
         Ok((width, height))
     }
 
+    /// Install an already-rendered texture (a native model view, design
+    /// §4.1) as surface `id`, so both composite paths sample it unchanged.
+    /// Like pixel surfaces it has no pipeline, so DPI rescale leaves it as is.
+    /// A rejected composite bind group is an error and installs nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_rendered(
+        &mut self,
+        device: &wgpu::Device,
+        composite_layout: &wgpu::BindGroupLayout,
+        composite_sampler: &wgpu::Sampler,
+        id: u32,
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        logical: (u32, u32),
+        physical: (u32, u32),
+    ) -> Result<(), String> {
+        let prepared = Self::prepare_rendered(
+            device,
+            composite_layout,
+            composite_sampler,
+            texture,
+            view,
+            logical,
+            physical,
+        )?;
+        self.install_prepared(id, prepared);
+        Ok(())
+    }
+
+    /// The fallible half of [`Self::insert_rendered`]: build the surface
+    /// entry (its composite bind group) without touching the cache, so a
+    /// caller can stage it with other resources and commit all or nothing.
+    pub fn prepare_rendered(
+        device: &wgpu::Device,
+        composite_layout: &wgpu::BindGroupLayout,
+        composite_sampler: &wgpu::Sampler,
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        (width, height): (u32, u32),
+        (width_px, height_px): (u32, u32),
+    ) -> Result<PreparedSurface, String> {
+        let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let composite_bind_group =
+            Self::composite_bind_group(device, composite_layout, composite_sampler, &view);
+        let rejected = pollster::block_on(validation.pop());
+        let exhausted = pollster::block_on(oom.pop());
+        if let Some(error) = rejected.or(exhausted) {
+            return Err(format!("composite bind group rejected: {error}"));
+        }
+        Ok(PreparedSurface(CachedShaderSurface {
+            texture,
+            view,
+            composite_bind_group,
+            pipeline: None,
+            uniform_buffer: None,
+            channel0: None,
+            uniform_slots: HashMap::new(),
+            custom: [[0.0; 4]; SURFACE_USER_UNIFORM_SLOTS],
+            mouse: [0.0; 4],
+            elapsed: 0.0,
+            frame_index: 0,
+            animate: false,
+            fps: None,
+            last_render: None,
+            dirty: false,
+            active_until: None,
+            width,
+            height,
+            width_px,
+            height_px,
+            scale: 1.0,
+        }))
+    }
+
+    /// The infallible half of [`Self::insert_rendered`]: install (or
+    /// replace) surface `id`.
+    pub fn install_prepared(&mut self, id: u32, prepared: PreparedSurface) {
+        self.surfaces.insert(id, prepared.0);
+    }
+
     /// Resample every shader surface's render target to a new scale factor
     /// (DPI change / monitor move). Physical size is recomputed from the
     /// retained logical size EXACTLY as `create_shader` would at the new
@@ -639,6 +755,8 @@ impl ShaderSurfaceCache {
     /// Stamp a surface as composited this frame; animation demand and the
     /// iTime clock stay live for `ACTIVE_GRACE` past the last composite.
     pub fn mark_drawn(&mut self, id: u32) {
+        self.composited = true;
+        self.drawn.insert(id);
         if let Some(surface) = self.surfaces.get_mut(&id) {
             // LIFETIME, NOT PHASE: a real clock read, because the grace window
             // is compared against real clock reads in `has_active_surfaces`
@@ -646,6 +764,41 @@ impl ShaderSurfaceCache {
             // outside a frame where no sample exists.
             surface.active_until = Some(Instant::now() + ACTIVE_GRACE);
         }
+    }
+
+    /// A glyph composite pass reached a visible surface glyph for `id`,
+    /// whether or not the cache holds a texture for it. Recorded only while
+    /// a retained build collects ([`Self::collect_referenced`]).
+    pub fn note_referenced(&mut self, id: u32) {
+        if self.collecting_referenced {
+            self.referenced.insert(id);
+        }
+    }
+
+    /// A retained build starts: collect the references its passes make,
+    /// until [`Self::take_referenced`].
+    pub fn collect_referenced(&mut self) {
+        self.referenced.clear();
+        self.collecting_referenced = true;
+    }
+
+    /// The surfaces referenced since [`Self::collect_referenced`]; ends the
+    /// collection.
+    pub fn take_referenced(&mut self) -> std::collections::HashSet<u32> {
+        self.collecting_referenced = false;
+        std::mem::take(&mut self.referenced)
+    }
+
+    /// A glyph composite pass ran (even one drawing no surface).
+    pub fn note_composite(&mut self) {
+        self.composited = true;
+    }
+
+    /// The surfaces composited since the last call; `None` when no glyph
+    /// composite ran.
+    pub fn take_drawn(&mut self) -> Option<std::collections::HashSet<u32>> {
+        let drawn = std::mem::take(&mut self.drawn);
+        std::mem::replace(&mut self.composited, false).then_some(drawn)
     }
 
     /// Whether any animated surface was composited recently — the

@@ -317,6 +317,7 @@ impl RenderApp {
             event_loop.set_control_flow(self.startup_control_flow());
             return;
         }
+        self.service_models(now);
         self.refresh_monitor_snapshot(event_loop, true);
         self.complete_pending_scale_changes();
         self.presentation_observer.dispatch_pending(
@@ -398,6 +399,9 @@ impl RenderApp {
             );
         }
         let destroyed = self.frame_windows.process_destroys();
+        for frame_id in &destroyed {
+            self.note_models_window_destroyed(*frame_id);
+        }
         if self
             .tooltips
             .owner()
@@ -535,6 +539,11 @@ impl RenderApp {
         if let Some(receipt_poll) = self.presentation_observer.dispatch_deadline(now) {
             let receipt_poll = receipt_poll.into_instant();
             deadline = Some(deadline.map_or(receipt_poll, |d| d.min(receipt_poll)));
+        }
+        // Model loads, picks and wheel quiet deadlines complete with no
+        // further input (design §4.2, §5).
+        if let Some(model_wake) = self.model_deadline(now.into_instant()) {
+            deadline = Some(deadline.map_or(model_wake, |d| d.min(model_wake)));
         }
         if self.has_pending_images() {
             const IMAGE_DECODE_POLL_INTERVAL: std::time::Duration =
@@ -1089,6 +1098,7 @@ impl RenderApp {
         // lease. The WPE reactor must still be alive to consume those release
         // commands and acknowledge the native buffers.
         drop(self.renderer.take());
+        self.note_models_renderer_lost();
         // Now no renderer-owned browser frame can refer back to WPE; stop the
         // WebKit views and their reactor-local EGL/GObject state.
         #[cfg(feature = "webview")]

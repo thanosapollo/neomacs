@@ -131,6 +131,55 @@ impl RenderApp {
         }
     }
 
+    /// `WindowEvent::Occluded` for native frame `emacs_frame_id`.
+    ///
+    /// Occlusion is scheduling input: an occluded window presents nothing;
+    /// exposure issues exactly one recovery frame. winit sends it on X11,
+    /// macOS, iOS and the web; on Wayland it is never sent (a hidden or
+    /// minimized Wayland window just stops receiving frame callbacks), so
+    /// there the models learn of hiding only from Lisp's visibility
+    /// requests, which leave until the next presentation
+    /// ([`Self::note_models_visibility`]). A window the compositor alone
+    /// hides there (another workspace, fully covered) is unobservable: it
+    /// stays in the showing sets as long as its frames are accepted, and a
+    /// successfully submitted Wayland frame is no proof that the compositor
+    /// displayed it (SOL-REVIEW-3 NIT 2).
+    ///
+    /// An occluded window shows no model: it leaves the showing sets and
+    /// its capture ends at once (both reported before any later input),
+    /// and it rejoins only by presenting after exposure (design §6.2).
+    pub(super) fn handle_window_occluded(&mut self, emacs_frame_id: u64, occluded: bool) {
+        if occluded {
+            self.note_models_window_hidden(emacs_frame_id);
+        } else {
+            self.note_models_window_shown(emacs_frame_id);
+        }
+        let id = super::frame_sched::NativeWindowId(emacs_frame_id);
+        let action = self.frame_coordinator.set_occluded(id, occluded);
+        if action == super::frame_sched::PacingAction::RequestRedraw
+            && let Some(window_state) = self.frame_windows.get(emacs_frame_id)
+        {
+            window_state.request_redraw();
+        }
+    }
+
+    /// `WindowEvent::Focused` for native frame `emacs_frame_id`, as far as
+    /// the models are concerned.
+    pub(super) fn handle_window_focus_models(&mut self, emacs_frame_id: u64, focused: bool) {
+        if focused {
+            // A focused window is shown, whether or not the window
+            // system reported its exposure (Wayland reports none).
+            self.note_models_window_shown(emacs_frame_id);
+        } else {
+            // A model orbit held in this window ends with its focus
+            // (design §4.6); one held in another window does not.
+            self.models.cancel_capture_in(emacs_frame_id);
+            // Wheel input after focus returns starts a new gesture.
+            self.model_wheel.reset();
+            self.flush_model_events();
+        }
+    }
+
     pub(super) fn handle_window_event(
         &mut self,
         event_loop: &dyn ActiveEventLoop,
@@ -288,6 +337,7 @@ impl RenderApp {
                     self.frame_coordinator
                         .set_focused(super::frame_sched::NativeWindowId(sched_id), focused);
                 }
+                self.handle_window_focus_models(emacs_fid, focused);
                 if !focused {
                     // Focus left: any modifier-side observation is stale
                     // (the keys are tracked on this window's own key
@@ -335,18 +385,8 @@ impl RenderApp {
 
             WindowEvent::Occluded(occluded) => {
                 tracing::info!("WindowEvent::Occluded: {occluded}");
-                // Occlusion is scheduling input: an occluded window presents
-                // nothing; exposure issues exactly one recovery frame. On
-                // Wayland this event also stands in for hidden/minimized,
-                // where frame callbacks would otherwise stop delivering.
                 if let Some(sched_id) = self.frame_windows.event_frame_for_winit(window_id) {
-                    let id = super::frame_sched::NativeWindowId(sched_id);
-                    let action = self.frame_coordinator.set_occluded(id, occluded);
-                    if action == super::frame_sched::PacingAction::RequestRedraw
-                        && let Some(window_state) = self.frame_windows.get(sched_id)
-                    {
-                        window_state.request_redraw();
-                    }
+                    self.handle_window_occluded(sched_id, occluded);
                 }
             }
 

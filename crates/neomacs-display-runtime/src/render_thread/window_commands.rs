@@ -191,6 +191,9 @@ impl RenderApp {
             }
             WindowCommand::SetWindowVisibility { frame, visibility } => {
                 let emacs_frame_id = frame.raw_id();
+                // Whether the window system can confirm the hiding: winit
+                // answers `None` where it cannot (Wayland, for both).
+                let mut platform_reports_hiding = false;
                 if let Some(window) = self
                     .frame_windows
                     .get_mut(emacs_frame_id)
@@ -204,10 +207,12 @@ impl RenderApp {
                         crate::thread_comm::WindowVisibility::Iconified => {
                             window.set_visible(true);
                             window.set_minimized(true);
+                            platform_reports_hiding = window.is_minimized().is_some();
                         }
                         crate::thread_comm::WindowVisibility::Invisible => {
                             window.set_minimized(false);
                             window.set_visible(false);
+                            platform_reports_hiding = window.is_visible().is_some();
                         }
                     }
                 } else {
@@ -216,6 +221,7 @@ impl RenderApp {
                         emacs_frame_id
                     );
                 }
+                self.note_models_visibility(emacs_frame_id, visibility, platform_reports_hiding);
             }
             WindowCommand::SetWindowPosition { x, y } => {
                 if let Some(window) = self

@@ -375,6 +375,16 @@ impl SpecialInputServiceOutcome {
         }
     }
 
+    /// Work that may have changed displayed buffers but is no GUI
+    /// activity: it neither completes a wait on activity nor acknowledges
+    /// a frame resize.
+    pub(crate) fn redisplay_only() -> Self {
+        Self {
+            redisplay_needed: true,
+            activity: SpecialInputServiceActivity::None,
+        }
+    }
+
     pub(crate) fn merge(self, other: Self) -> Self {
         Self {
             redisplay_needed: self.redisplay_needed || other.redisplay_needed,
@@ -1491,6 +1501,13 @@ pub enum InputEvent {
     /// pre-validation accepted it. Runs `neomacs-surface-error-functions`
     /// with the surface id and the renderer's error string.
     SurfaceCreateFailed { id: u32, error: String },
+    /// Something the renderer reports about native model `id` (load
+    /// outcome, request settlement, readiness, camera, pick). Runs
+    /// `neomacs-model-event-functions` with `(ID TYPE PLIST)`.
+    Model {
+        id: u32,
+        event: neomacs_display_protocol::model::ModelEvent,
+    },
     /// A full-frame shader failed to build on the render thread after
     /// evaluator-side validation accepted it.
     FrameShaderFailed { error: String },
@@ -4253,6 +4270,10 @@ impl crate::emacs_core::eval::Context {
 
         crate::emacs_core::builtins::drain_file_notify_events(self)?;
         crate::emacs_core::dbusbind::drain_events(self)?;
+        // Model events a throw out of a callback left queued.
+        if crate::emacs_core::model::drain_model_events(self)? {
+            outcome = outcome.merge(SpecialInputServiceOutcome::redisplay_only());
+        }
 
         if self.sync_pending_resize_events() {
             outcome = outcome.merge(SpecialInputServiceOutcome::resize_with_redisplay());
@@ -4333,6 +4354,13 @@ impl crate::emacs_core::eval::Context {
                     // Not user activity and needs no redisplay — just run the
                     // hook (mirrors MonitorsChanged running its hook here).
                     self.handle_surface_create_failed_input_event(id, &error)?;
+                }
+                InputEvent::Model { id, event } => {
+                    // Callbacks may change buffers (status lines, highlights),
+                    // so redisplay after servicing. Not a resize: a model
+                    // event must not acknowledge a frame-resize wait.
+                    self.handle_model_input_event(id, &event)?;
+                    outcome = outcome.merge(SpecialInputServiceOutcome::redisplay_only());
                 }
                 InputEvent::FrameShaderFailed { error } => {
                     let effects =
@@ -4479,6 +4507,19 @@ impl crate::emacs_core::eval::Context {
         ];
         crate::emacs_core::hook_runtime::run_named_hook_with_args(self, &args)?;
         self.handle_terminal_exited_input_event(id)
+    }
+
+    /// Deliver one native model event to Lisp: run
+    /// `neomacs-model-event-functions` with `(ID TYPE PLIST)`, queued
+    /// behind any delivery already running and with each member's errors
+    /// isolated (`model::deliver_model_event`). An unbound hook (the
+    /// library not loaded) runs nothing.
+    pub(crate) fn handle_model_input_event(
+        &mut self,
+        id: u32,
+        event: &neomacs_display_protocol::model::ModelEvent,
+    ) -> crate::emacs_core::error::EvalResult {
+        crate::emacs_core::model::deliver_model_event(self, id, event)
     }
 
     fn handle_terminal_exited_input_event(
@@ -5482,6 +5523,11 @@ impl crate::emacs_core::eval::Context {
                 self.handle_surface_create_failed_input_event(id, &error)?;
                 Ok(None)
             }
+            InputEvent::Model { id, event } => {
+                self.handle_model_input_event(id, &event)?;
+                self.redisplay()?;
+                Ok(None)
+            }
             InputEvent::FrameShaderFailed { error } => {
                 let effects = crate::frontend_events::report_frame_shader_failure(self, &error)?;
                 if effects.redisplay_needed {
@@ -5936,6 +5982,8 @@ impl crate::emacs_core::eval::Context {
             self.drain_eval_tasks();
             crate::emacs_core::builtins::drain_file_notify_events(self)?;
             crate::emacs_core::dbusbind::drain_events(self)?;
+            // Model events a throw out of a callback left queued.
+            crate::emacs_core::model::drain_model_events(self)?;
             match self.pop_queued_read_char_event(idle_policy)? {
                 QueuedReadCharEvent::Event(event) => return Ok(Some(event)),
                 QueuedReadCharEvent::HandledInternally => continue,

@@ -25,6 +25,7 @@ const LOCALIZED_SUBR_CATALOG: &[SubrBatch] = &[
     crate::emacs_core::composite::SUBRS,
     crate::emacs_core::neo::terminal::SUBRS,
     crate::emacs_core::shader_surface::SUBRS,
+    crate::emacs_core::model::SUBRS,
     crate::emacs_core::video::SUBRS,
     crate::emacs_core::xwidget::SUBRS,
     crate::emacs_core::indent::SUBRS,
@@ -399,6 +400,7 @@ pub(crate) fn register_subrs(ctx: &mut crate::emacs_core::eval::Context) {
     ));
     crate::emacs_core::neo::terminal::register_subrs(ctx);
     crate::emacs_core::shader_surface::register_subrs(ctx);
+    crate::emacs_core::model::register_subrs(ctx);
     crate::emacs_core::video::register_subrs(ctx);
     crate::emacs_core::xwidget::register_subrs(ctx);
     ctx.register_subr(

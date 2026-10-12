@@ -585,6 +585,7 @@ impl WgpuRenderer {
     /// frame, a different pixel for every frame of a pane morph. The compositor
     /// resolves it against the projection and calls `surface_mouse_hover`.
     pub(super) fn draw_inline_surfaces(&mut self, ctx: &mut FramePassCtx<'_, '_>) {
+        self.caches.surface.note_composite();
         let frame_glyphs = ctx.params.frame_glyphs;
         let mut quads = Vec::new();
         for glyph in &frame_glyphs.glyphs {
@@ -663,6 +664,7 @@ impl WgpuRenderer {
                     continue;
                 }
 
+                self.caches.surface.note_referenced(surface_id.get());
                 if self.caches.surface.get(surface_id.get()).is_some() {
                     self.caches.surface.mark_drawn(surface_id.get());
                     self.media_budget

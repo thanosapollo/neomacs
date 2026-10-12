@@ -1704,8 +1704,11 @@ impl WgpuRenderer {
                         height,
                         ..
                     } = glyph
-                        && self.caches.surface.get(surface_id.get()).is_some()
                     {
+                        self.caches.surface.note_referenced(surface_id.get());
+                        if self.caches.surface.get(surface_id.get()).is_none() {
+                            continue;
+                        }
                         self.caches.surface.mark_drawn(surface_id.get());
                         surface_quads.push(MediaQuad {
                             id: surface_id.get(),

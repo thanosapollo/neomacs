@@ -140,6 +140,27 @@ fn surface_create_failure_reaches_the_evaluator_with_id_and_error() {
 }
 
 #[test]
+fn model_event_reaches_the_evaluator_unchanged() {
+    use neomacs_display_protocol::model::ModelEvent;
+    let model_event = ModelEvent::Readiness {
+        current: true,
+        rev: 12,
+        req: 7,
+    };
+    let event = convert_display_event(&DisplayEvent::Model {
+        id: 0x7000_000a,
+        event: model_event.clone(),
+    });
+    match event {
+        Some(KbInputEvent::Model { id, event }) => {
+            assert_eq!(id, 0x7000_000a);
+            assert_eq!(event, model_event);
+        }
+        other => panic!("expected Model, got {other:?}"),
+    }
+}
+
+#[test]
 fn frame_shader_failure_reaches_the_evaluator() {
     let event = convert_display_event(&DisplayEvent::FrameShaderFailed {
         error: "device rejected frame pipeline".to_owned(),

@@ -1,0 +1,271 @@
+//! Native models on the render thread (design §4–§6): the glue between the
+//! renderer-independent [`ModelStore`], the renderer that implements its GPU
+//! host, the frame loop and the ordered input channel.
+//!
+//! The store survives renderer loss. Every event it produces goes out
+//! through `comms.send_input`, the channel keys and mouse events use, after
+//! the state change it reports.
+
+use std::collections::HashSet;
+use std::time::Instant;
+
+use neomacs_display_protocol::frame_time::EventTime;
+
+use neomacs_renderer_wgpu::model::store::ModelGpuHost;
+
+use super::RenderApp;
+
+/// The models a picture holds, each with the snapshot its pixels show.
+pub(super) type ModelPicture =
+    std::collections::BTreeMap<u32, neomacs_renderer_wgpu::model::store::Snapshot>;
+
+/// The models among the composited surfaces `drawn`, each at the snapshot
+/// `current` says its texture shows (other surfaces are not models).
+pub(super) fn picture_of(drawn: Option<HashSet<u32>>, current: &ModelPicture) -> ModelPicture {
+    drawn
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|id| Some((id, *current.get(&id)?)))
+        .collect()
+}
+
+impl RenderApp {
+    fn model_host(&mut self) -> Option<&mut dyn ModelGpuHost> {
+        self.renderer
+            .as_mut()
+            .map(|renderer| renderer as &mut dyn ModelGpuHost)
+    }
+
+    /// Send every pending model event to the evaluator, in order.
+    pub(super) fn flush_model_events(&mut self) {
+        for (id, event) in self.models.take_events() {
+            self.comms
+                .send_input(crate::thread_comm::InputEvent::Model { id, event });
+        }
+    }
+
+    /// Finished loads, uploads a renderer lacks, wheel deadlines and picks,
+    /// as of the loop's wake `now`. Runs on every loop wake, so an idle
+    /// editor still completes a load and delivers a pick with no further
+    /// input.
+    pub(super) fn service_models(&mut self, now: EventTime) {
+        // An empty store may still owe a load result (a model freed while
+        // loading): drain it, or the loop polls for it forever.
+        if self.models.is_empty() && !self.models.has_pending_loads() {
+            return;
+        }
+        let mut models = std::mem::take(&mut self.models);
+        models.poll_loads(self.model_host());
+        if let Some(host) = self.model_host() {
+            models.upload_pending(host);
+        }
+        models.tick(now.into_instant(), self.model_host());
+        self.models = models;
+        self.flush_model_events();
+    }
+
+    /// Before a frame composites: follow the device scale, then draw every
+    /// dirty model into its texture.
+    pub(super) fn render_dirty_models(&mut self) {
+        if self.models.is_empty() {
+            return;
+        }
+        let scale = self
+            .frame_windows
+            .windows
+            .values()
+            .filter(|window| window.window().is_some())
+            .map(|window| window.scale_factor() as f32)
+            .fold(0.0f32, f32::max);
+        let mut models = std::mem::take(&mut self.models);
+        if let Some(host) = self.model_host() {
+            if scale > 0.0 {
+                models.set_scale(scale, host);
+            }
+            models.render_dirty(host);
+        }
+        self.models = models;
+        self.flush_model_events();
+    }
+
+    /// What every model's texture shows now: taken once a frame has drawn
+    /// its dirty models and before it composites them.
+    pub(super) fn model_picture(&self) -> ModelPicture {
+        self.models.rendered_snapshots()
+    }
+
+    /// Top-level window `emacs_frame_id` presented a frame whose whole
+    /// picture (root and child frames, fresh or retained) holds `picture`.
+    pub(super) fn note_models_presented(&mut self, emacs_frame_id: u64, picture: &ModelPicture) {
+        if self.models.is_empty() {
+            return;
+        }
+        self.models.presented(emacs_frame_id, picture);
+        self.flush_model_events();
+    }
+
+    /// Top-level window `emacs_frame_id` submitted a frame whose fresh
+    /// glyph passes composited `picture`; `blends_older` is whether its
+    /// composition also showed an older picture
+    /// ([`super::render_pass::model_provenance::blends_older_pictures`]).
+    /// The presentation branch of `render_frame_window_impl`.
+    pub(super) fn note_models_frame_submitted(
+        &mut self,
+        emacs_frame_id: u64,
+        picture: &ModelPicture,
+        blends_older: bool,
+    ) {
+        if blends_older {
+            self.note_models_presented_blended(emacs_frame_id, picture);
+        } else {
+            self.note_models_presented(emacs_frame_id, picture);
+        }
+    }
+
+    /// [`Self::note_models_presented`] for a frame whose composition also
+    /// shows pixels of an older picture than its fresh glyph passes
+    /// ([`super::render_pass::model_provenance::blends_older_pictures`]):
+    /// `picture` is what those passes composited.
+    pub(super) fn note_models_presented_blended(
+        &mut self,
+        emacs_frame_id: u64,
+        picture: &ModelPicture,
+    ) {
+        if self.models.is_empty() {
+            return;
+        }
+        self.models.presented_blended(emacs_frame_id, picture);
+        self.flush_model_events();
+    }
+
+    /// Window `emacs_frame_id` is gone, or showed nothing in its last
+    /// attempt: it shows no model. Runs on an empty store too, so a hidden
+    /// mark set while no model existed does not outlive the window.
+    pub(super) fn note_models_window_gone(&mut self, emacs_frame_id: u64) {
+        self.models.window_gone(emacs_frame_id);
+        self.flush_model_events();
+    }
+
+    /// Window `emacs_frame_id` was deleted: it shows no model, and its
+    /// older pictures (composition ring, transition sources) are gone.
+    pub(super) fn note_models_window_destroyed(&mut self, emacs_frame_id: u64) {
+        self.models.window_destroyed(emacs_frame_id);
+        self.model_wheel.reset();
+        self.flush_model_events();
+    }
+
+    /// Window `emacs_frame_id` is hidden, iconified or occluded: it leaves
+    /// now (its capture ends) and stays out until shown and presented.
+    pub(super) fn note_models_window_hidden(&mut self, emacs_frame_id: u64) {
+        self.models.window_hidden(emacs_frame_id);
+        // A wheel fraction left over a model in a window that stopped
+        // showing does not carry into a gesture after it returns, even
+        // without a leave or focus event (SOL-REVIEW-3 SHOULD 2).
+        self.model_wheel.reset();
+        self.flush_model_events();
+    }
+
+    /// Lisp asked to show, hide or iconify window `emacs_frame_id`.
+    ///
+    /// Hidden and iconified frames show no model (design §6.2), and the
+    /// window leaves at once on the request itself. Whether it then stays
+    /// out depends on `platform_reports_hiding`: whether the window system
+    /// can tell us the window's visibility (winit's `is_visible` or
+    /// `is_minimized` answers). Where it can (X11, macOS, Windows), the
+    /// window stays out until it is shown, exposed or focused again. Where
+    /// it cannot (Wayland: no `Occluded`, `set_visible` is a no-op, and a
+    /// compositor may ignore the minimize request), a window still on
+    /// screen would otherwise stay out forever; it rejoins at its next
+    /// successful presentation instead. A minimized window whose compositor
+    /// withholds frame callbacks presents nothing more and stays out; one
+    /// that keeps presenting is counted at the revision it presents, so
+    /// the fence still never claims pixels it did not present.
+    pub(super) fn note_models_visibility(
+        &mut self,
+        emacs_frame_id: u64,
+        visibility: crate::thread_comm::WindowVisibility,
+        platform_reports_hiding: bool,
+    ) {
+        match visibility {
+            crate::thread_comm::WindowVisibility::Visible => {
+                self.note_models_window_shown(emacs_frame_id);
+            }
+            crate::thread_comm::WindowVisibility::Iconified
+            | crate::thread_comm::WindowVisibility::Invisible => {
+                // Even where the hiding cannot be confirmed, the request
+                // ends a wheel gesture over the window's models.
+                self.model_wheel.reset();
+                if platform_reports_hiding {
+                    self.note_models_window_hidden(emacs_frame_id);
+                } else {
+                    self.note_models_window_gone(emacs_frame_id);
+                }
+            }
+        }
+    }
+
+    /// Window `emacs_frame_id` is shown again: its next presentation
+    /// rejoins the showing sets.
+    pub(super) fn note_models_window_shown(&mut self, emacs_frame_id: u64) {
+        self.models.window_shown(emacs_frame_id);
+    }
+
+    /// The renderer went away (device loss or teardown). The invalidation
+    /// (a settling `View`, then `Readiness{current: nil}`) goes out on the
+    /// ordered input channel now, ahead of any later key.
+    pub(super) fn note_models_renderer_lost(&mut self) {
+        self.comms.capabilities.set_model_renderer_live(false);
+        self.models.renderer_lost();
+        self.flush_model_events();
+    }
+
+    /// A renderer is live: publish it and upload what it lacks.
+    pub(super) fn note_models_renderer_ready(&mut self) {
+        self.comms.capabilities.set_model_renderer_live(true);
+        self.service_models(neomacs_display_protocol::frame_time::observe_platform_now());
+    }
+
+    /// The next instant the loop must wake for model work.
+    pub(super) fn model_deadline(&self, now: Instant) -> Option<Instant> {
+        self.models.next_deadline(now)
+    }
+
+    pub(super) fn handle_model_create(
+        &mut self,
+        id: u32,
+        meshes: Vec<neomacs_display_protocol::model::ModelMeshSpec>,
+        view: neomacs_display_protocol::model::ModelView,
+        background: [f32; 4],
+        logical: (u32, u32),
+    ) {
+        self.models.create(id, meshes, view, background, logical);
+        self.flush_model_events();
+    }
+
+    pub(super) fn handle_model_update(
+        &mut self,
+        id: u32,
+        req: u64,
+        change: neomacs_display_protocol::model::ModelChange,
+    ) {
+        let mut models = std::mem::take(&mut self.models);
+        models.update(id, req, change, self.model_host());
+        self.models = models;
+        self.flush_model_events();
+    }
+
+    /// Free surface `id` if it is a model; answers whether it was.
+    pub(super) fn handle_model_free(&mut self, id: u32) -> bool {
+        if !self.models.contains(id) {
+            return false;
+        }
+        let mut models = std::mem::take(&mut self.models);
+        models.free(id, self.model_host());
+        self.models = models;
+        true
+    }
+}
+
+#[cfg(test)]
+#[path = "models/tests.rs"]
+mod tests;

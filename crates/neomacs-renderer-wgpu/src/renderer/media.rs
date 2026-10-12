@@ -615,6 +615,27 @@ impl WgpuRenderer {
         self.caches.surface.set_mouse_release();
     }
 
+    /// The surfaces composited since the last call, or `None` when no
+    /// glyph composite ran (a retained frame), so the caller can tell "the
+    /// frame lacks it" from "the frame was not recomposited".
+    pub fn take_drawn_surfaces(&mut self) -> Option<std::collections::HashSet<u32>> {
+        self.caches.surface.take_drawn()
+    }
+
+    /// A retained build starts: collect the surfaces its glyph passes
+    /// reach, for [`Self::take_referenced_surfaces`].
+    pub fn collect_referenced_surfaces(&mut self) {
+        self.caches.surface.collect_referenced();
+    }
+
+    /// The surfaces whose glyphs a composite reached since
+    /// [`Self::collect_referenced_surfaces`], drawn or not (a superset of
+    /// the drawn ones): what a retained raster depends on, including models
+    /// not yet drawable. Ends the collection.
+    pub fn take_referenced_surfaces(&mut self) -> std::collections::HashSet<u32> {
+        self.caches.surface.take_referenced()
+    }
+
     /// Free a shader surface's GPU objects.
     pub fn free_surface(&mut self, id: u32) {
         self.caches.surface.free(id);

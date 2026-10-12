@@ -203,7 +203,8 @@ fn video_channel_reuses_an_opaque_video_handle() {
     let surfaces = host.surfaces.lock().expect("surface host requests");
     let channel0 = surfaces.last().and_then(|request| match &request.content {
         super::eval::ShaderSurfaceContent::Shader { channel0, .. } => *channel0,
-        super::eval::ShaderSurfaceContent::Pixels { .. } => None,
+        super::eval::ShaderSurfaceContent::Pixels { .. }
+        | super::eval::ShaderSurfaceContent::Model { .. } => None,
     });
     assert_eq!(
         channel0,

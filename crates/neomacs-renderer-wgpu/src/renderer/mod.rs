@@ -48,6 +48,7 @@ mod layer_effects;
 mod layer_media;
 mod layer_text;
 mod media;
+mod models;
 mod pattern_effects;
 mod pointer_override;
 mod resources;
@@ -196,6 +197,8 @@ pub struct WgpuRenderer {
     draw_parameters: draw::DrawParameterCache,
     /// Texture/media caches
     pub(super) caches: RenderCaches,
+    /// Uploaded native models and their GPU budget (model/store.rs).
+    pub(super) models: models::ModelCache,
     /// Bounded asynchronous timestamp queries for frame-content passes.
     #[cfg(feature = "video")]
     pub(super) gpu_frame_timer: crate::gpu_frame_timing::GpuFrameTimer,
@@ -1193,6 +1196,7 @@ impl WgpuRenderer {
             #[cfg(feature = "video")]
             gpu_frame_timer,
             arenas: VertexArenas::new(),
+            models: models::ModelCache::new(),
             frame_post: None,
             media_budget: crate::media_budget::MediaBudget::new(),
             snapshots: SnapshotPool::new(GpuBudget::new()),

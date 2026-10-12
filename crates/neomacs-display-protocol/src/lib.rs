@@ -29,6 +29,7 @@ pub mod input_progress;
 pub mod interaction_projection;
 pub mod media_clock;
 pub mod menu;
+pub mod model;
 pub mod modifier_policy;
 pub mod motion_spec;
 pub mod neo_term_palette;

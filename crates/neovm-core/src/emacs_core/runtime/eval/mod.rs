@@ -2705,6 +2705,14 @@ pub enum ShaderSurfaceContent {
     Pixels {
         data: Vec<u8>,
     },
+    /// Native model view (`neomacs-model--create`): OBJ meshes in Lisp's
+    /// mesh order, drawn with the canvas-3d camera on an sRGB RGBA
+    /// background (alpha 1). Created through `DisplayHost::create_model`.
+    Model {
+        meshes: Vec<neomacs_display_protocol::model::ModelMeshSpec>,
+        view: neomacs_display_protocol::model::ModelView,
+        background: [f32; 4],
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3363,6 +3371,12 @@ pub struct Context {
     pub(crate) scroll_goal: Option<crate::emacs_core::xdisp::motion::ScrollGoal>,
     /// Host-display bridge for GUI frame realization.
     pub display_host: Option<Box<dyn DisplayHost>>,
+    /// Surface ids of native models (`neomacs-model--create`) not yet
+    /// destroyed, so update primitives refuse a destroyed or non-model
+    /// handle. GC-freed handles leave no Lisp reference to refuse.
+    pub(crate) live_models: std::collections::HashSet<u32>,
+    /// Native model events awaiting `neomacs-model-event-functions`.
+    pub(crate) model_events: crate::emacs_core::model::ModelEventQueue,
     /// Frontend-owned opener for additional text terminals requested by
     /// `make-terminal-frame`. The VM owns identities; platform code owns the
     /// device, raw-mode, input, renderer, and lifecycle resources.
