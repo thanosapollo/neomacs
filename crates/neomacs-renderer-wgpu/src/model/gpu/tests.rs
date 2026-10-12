@@ -535,9 +535,10 @@ fn camera_fit_uses_the_logical_aspect() {
 #[test]
 fn byte_accounting_matches_the_design_formula() {
     let uniform = std::mem::size_of::<CameraUniform>() as u64;
+    // Region marks: 4 bits per face, 64 faces in 8 words.
     assert_eq!(
         geometry_bytes(10, 64),
-        160 + 768 + 1024 + 8 + 2 * uniform + 12 + 256
+        160 + 768 + 1024 + 32 + 2 * uniform + 12 + 256
     );
     assert_eq!(target_bytes(10, 20), 200 * 36);
 }
@@ -641,6 +642,281 @@ fn region_and_point_targets_paint_the_right_fragments() {
     gpu.render(&device, &queue, &d).unwrap();
     let rgba = read_rgba(&device, &queue, &gpu);
     assert!(!blue_marked(pixel(&rgba, 64, 32, 32)), "other mesh only");
+}
+
+/// The dominant channel of a lit fragment: 0 red, 1 green, 2 blue, or
+/// `None` for unmarked bone (all channels well lit).
+fn layer_channel(px: [u8; 4]) -> Option<usize> {
+    let max = *px[..3].iter().max().unwrap();
+    let low = px[..3].iter().filter(|c| **c < 40).count();
+    (low == 2 && max > 150).then(|| px[..3].iter().position(|c| *c == max).unwrap())
+}
+
+/// Layers paint together, each in its colour, a later layer winning
+/// where they overlap: region, whole mesh and point layers, and two
+/// region layers sharing a face.
+#[test]
+fn layers_paint_their_colours_and_later_layers_win() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("skipping: no headless wgpu adapter");
+        return;
+    };
+    let scene = ModelScene::new(vec![parse_obj(QUAD, remaining_limits(&[])).unwrap()]).unwrap();
+    let mut gpu = ModelGpu::new(&device, &queue, &scene, (64, 64)).unwrap();
+    let (red, green, blue) = ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
+    let render = |gpu: &mut ModelGpu, layers: Vec<GpuLayer>| {
+        let mut d = draw(ModelView::default(), (64, 64), [0.0, 0.0, 0.0, 1.0]);
+        d.highlight.layers = layers;
+        gpu.render(&device, &queue, &d).unwrap();
+        let rgba = read_rgba(&device, &queue, gpu);
+        // (22, 22) is face 1 (upper left), (42, 42) face 0 and (34, 34)
+        // face 0 inside the point disc around the centre.
+        [(22, 22), (42, 42), (34, 34)].map(|(x, y)| layer_channel(pixel(&rgba, 64, x, y)))
+    };
+    let point = GpuPoint {
+        mesh: 0,
+        centre: scene.normalise([0.0, 0.0, 0.0]),
+        radius: (0.3 / scene.radius()) as f32,
+    };
+    // Red whole mesh first, so the green region on face 1 wins over it
+    // there, and the blue point, last, wins at the centre.
+    assert_eq!(
+        render(
+            &mut gpu,
+            vec![
+                GpuLayer {
+                    color: red,
+                    paint: GpuPaint::Mesh(0)
+                },
+                GpuLayer {
+                    color: green,
+                    paint: GpuPaint::Faces(vec![1])
+                },
+                GpuLayer {
+                    color: blue,
+                    paint: GpuPaint::Point(point)
+                },
+            ]
+        ),
+        [Some(1), Some(0), Some(2)]
+    );
+    // Order reversed: the whole red mesh, last, wins everywhere.
+    assert_eq!(
+        render(
+            &mut gpu,
+            vec![
+                GpuLayer {
+                    color: blue,
+                    paint: GpuPaint::Point(point)
+                },
+                GpuLayer {
+                    color: green,
+                    paint: GpuPaint::Faces(vec![1])
+                },
+                GpuLayer {
+                    color: red,
+                    paint: GpuPaint::Mesh(0)
+                },
+            ]
+        ),
+        [Some(0), Some(0), Some(0)]
+    );
+    // Two region layers share face 1: the later (blue) wins there; face
+    // 0 is only in the earlier (green) one.
+    assert_eq!(
+        render(
+            &mut gpu,
+            vec![
+                GpuLayer {
+                    color: green,
+                    paint: GpuPaint::Faces(vec![0, 1])
+                },
+                GpuLayer {
+                    color: blue,
+                    paint: GpuPaint::Faces(vec![1])
+                },
+            ]
+        ),
+        [Some(2), Some(1), Some(1)]
+    );
+    // Same faces, other layer numbers: the marks are rewritten.
+    assert_eq!(
+        render(
+            &mut gpu,
+            vec![
+                GpuLayer {
+                    color: blue,
+                    paint: GpuPaint::Faces(vec![1])
+                },
+                GpuLayer {
+                    color: green,
+                    paint: GpuPaint::Faces(vec![0, 1])
+                },
+            ]
+        ),
+        [Some(1), Some(1), Some(1)]
+    );
+    // No layers: plain bone.
+    assert_eq!(render(&mut gpu, vec![]), [None, None, None]);
+    // The last regions again, after none: the cached marks still apply.
+    assert_eq!(
+        render(
+            &mut gpu,
+            vec![
+                GpuLayer {
+                    color: blue,
+                    paint: GpuPaint::Faces(vec![1])
+                },
+                GpuLayer {
+                    color: green,
+                    paint: GpuPaint::Faces(vec![0, 1])
+                },
+            ]
+        ),
+        [Some(1), Some(1), Some(1)]
+    );
+}
+
+/// A strip of five unit quads side by side: ten faces, so region marks
+/// span two words (faces 0-7 in word 0, faces 8-9 in word 1).
+const STRIP: &[u8] = b"v -5 -1 0\nv -3 -1 0\nv -3 1 0\nv -5 1 0\n\
+v -3 -1 0\nv -1 -1 0\nv -1 1 0\nv -3 1 0\n\
+v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\n\
+v 1 -1 0\nv 3 -1 0\nv 3 1 0\nv 1 1 0\n\
+v 3 -1 0\nv 5 -1 0\nv 5 1 0\nv 3 1 0\n\
+f 1 2 3 4\nf 5 6 7 8\nf 9 10 11 12\nf 13 14 15 16\nf 17 18 19 20\n";
+
+/// Every layer slot and both mark words decode exactly: eight region
+/// layers in eight colours (two of them midtones) paint each face the
+/// colour of the last layer listing it, byte for byte the colour that
+/// layer paints alone; untouched faces stay bone; a whole-mesh layer in
+/// the last slot wins everywhere.
+#[test]
+fn eight_layers_decode_across_mark_words_with_exact_colours() {
+    let Some((device, queue)) = try_device() else {
+        eprintln!("skipping: no headless wgpu adapter");
+        return;
+    };
+    let scene = ModelScene::new(vec![parse_obj(STRIP, remaining_limits(&[])).unwrap()]).unwrap();
+    assert_eq!(scene.triangle_count(), 10);
+    let size = (256, 256);
+    let mut gpu = ModelGpu::new(&device, &queue, &scene, size).unwrap();
+    let render = |gpu: &mut ModelGpu, layers: Vec<GpuLayer>| {
+        let mut d = draw(ModelView::default(), size, [0.0, 0.0, 0.0, 1.0]);
+        d.highlight.layers = layers;
+        gpu.render(&device, &queue, &d).unwrap();
+        read_rgba(&device, &queue, gpu)
+    };
+    let faces = |faces: &[u32], color: [f32; 3]| GpuLayer {
+        color,
+        paint: GpuPaint::Faces(faces.to_vec()),
+    };
+    let (w, _) = gpu.size_px();
+    // Find an interior probe pixel of each face: the fully red pixel
+    // nearest the centroid of the pixels it paints red alone.
+    let probes: Vec<(u32, u32)> = (0..10)
+        .map(|f| {
+            let rgba = render(&mut gpu, vec![faces(&[f], [1.0, 0.0, 0.0])]);
+            let red: Vec<(u32, u32)> = (0..rgba.len() as u32 / 4)
+                .map(|i| (i % w, i / w))
+                .filter(|&(x, y)| {
+                    let p = pixel(&rgba, w, x, y);
+                    p[0] > 150 && p[1] < 10 && p[2] < 10
+                })
+                .collect();
+            assert!(red.len() > 50, "face {f} paints {} pixels", red.len());
+            let n = red.len() as f64;
+            let cx = red.iter().map(|p| p.0 as f64).sum::<f64>() / n;
+            let cy = red.iter().map(|p| p.1 as f64).sum::<f64>() / n;
+            *red.iter()
+                .min_by(|a, b| {
+                    let d = |p: &(u32, u32)| (p.0 as f64 - cx).powi(2) + (p.1 as f64 - cy).powi(2);
+                    d(a).total_cmp(&d(b))
+                })
+                .unwrap()
+        })
+        .collect();
+    let colours: [[f32; 3]; 8] = [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 1.0],
+        [1.0, 0.0, 1.0],
+        [0.5, 0.25, 0.75],
+        [0.2, 0.6, 0.4],
+    ];
+    // What colour `c` looks like on face `f` painted alone.
+    let alone = |gpu: &mut ModelGpu, f: u32, c: [f32; 3]| {
+        let (x, y) = probes[f as usize];
+        pixel(&render(gpu, vec![faces(&[f], c)]), w, x, y)
+    };
+    let expected_by_face: Vec<[u8; 4]> = (0..10u32)
+        .map(|f| match f {
+            1..=6 => alone(&mut gpu, f, colours[f as usize]),
+            7 | 8 => alone(&mut gpu, f, colours[7]),
+            _ => alone(&mut gpu, f, colours[0]),
+        })
+        .collect();
+    let bone = render(&mut gpu, vec![]);
+    let bone: Vec<[u8; 4]> = probes.iter().map(|&(x, y)| pixel(&bone, w, x, y)).collect();
+    let all: Vec<u32> = (0..10).collect();
+    let mut eight = vec![faces(&all, colours[0])];
+    eight.extend((1..=6).map(|f| faces(&[f], colours[f as usize])));
+    // Slot 7 (mark 8) on face 7 (word 0, top nibble) and face 8 (word 1).
+    eight.push(faces(&[7, 8], colours[7]));
+    let rgba = render(&mut gpu, eight.clone());
+    let got: Vec<[u8; 4]> = probes.iter().map(|&(x, y)| pixel(&rgba, w, x, y)).collect();
+    assert_eq!(got, expected_by_face);
+    // Independently of the renderer: the strip is flat, so every face has
+    // one light factor, read off bone; a layer colour must then show as
+    // colour x light (sRGB in, sRGB texture out), midtones included.
+    let light = bone[0][0] as f32 / 255.0 / BONE[0];
+    for ch in 0..3 {
+        let modelled = BONE[ch] * light * 255.0;
+        assert!(
+            (bone[0][ch] as f32 - modelled).abs() <= 2.0,
+            "bone {:?} light {light}",
+            bone[0]
+        );
+    }
+    for (f, px) in got.iter().enumerate() {
+        let colour = match f {
+            1..=6 => colours[f],
+            7 | 8 => colours[7],
+            _ => colours[0],
+        };
+        for ch in 0..3 {
+            let modelled = colour[ch] * light * 255.0;
+            assert!(
+                (px[ch] as f32 - modelled).abs() <= 2.0,
+                "face {f} channel {ch}: {px:?} vs {colour:?} x {light}"
+            );
+        }
+    }
+    // The midtones are distinct from bone and from each other.
+    assert_ne!(got[6], got[7]);
+    assert!(got.iter().zip(&bone).all(|(g, b)| g != b));
+    // Slot 7 alone: only faces 7 and 8 change.
+    let rgba = render(&mut gpu, vec![faces(&[7, 8], colours[7])]);
+    for f in 0..10usize {
+        let (x, y) = probes[f];
+        let p = pixel(&rgba, w, x, y);
+        if f == 7 || f == 8 {
+            assert_eq!(p, expected_by_face[f], "face {f}");
+        } else {
+            assert_eq!(p, bone[f], "face {f}");
+        }
+    }
+    // A whole-mesh layer in the last slot wins over every region.
+    eight[7] = GpuLayer {
+        color: colours[7],
+        paint: GpuPaint::Mesh(0),
+    };
+    let rgba = render(&mut gpu, eight);
+    let mesh = alone(&mut gpu, 0, colours[7]);
+    let rgba_probe: Vec<[u8; 4]> = probes.iter().map(|&(x, y)| pixel(&rgba, w, x, y)).collect();
+    assert!(rgba_probe.iter().all(|p| *p == mesh), "{rgba_probe:?}");
 }
 
 fn pick_now(

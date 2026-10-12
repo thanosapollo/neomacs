@@ -5,6 +5,19 @@
 // follow canvas-3d (render.py), which stored Gnosis views were authored
 // against.
 
+// One highlight layer: its colour and what it paints.
+struct Layer {
+    colour: vec4<f32>,
+    // x: painted whole mesh + 1 (0 none); y: point mesh + 1 (0 none);
+    // z: 1 when the region marks naming this layer apply.
+    paint: vec4<f32>,
+    // Point: xyz centre and w radius, in the normalised frame.
+    point: vec4<f32>,
+};
+
+// Must match MAX_GPU_LAYERS in gpu.rs.
+const MAX_LAYERS: u32 = 8u;
+
 struct Camera {
     // Rows of R = Ry(yaw) * Rx(pitch); w unused.
     r0: vec4<f32>,
@@ -17,13 +30,9 @@ struct Camera {
     // The colour pass uses (0, 0, 1, 1).
     pick: vec4<f32>,
     base: vec4<f32>,
-    marked: vec4<f32>,
-    // x: painted whole mesh + 1 (0 none: a target object, or the selection
-    // when there is no target); y: point-target mesh + 1 (0 none); z: 1 when
-    // the region marks apply.
-    paint: vec4<f32>,
-    // Point target: xyz centre and w radius, in the normalised frame.
-    point: vec4<f32>,
+    // x: number of layers in use. Later layers win where they overlap.
+    count: vec4<f32>,
+    layers: array<Layer, MAX_LAYERS>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -31,7 +40,7 @@ struct Camera {
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
 // xyz: unit face normal; w: mesh index.
 @group(0) @binding(3) var<storage, read> faces: array<vec4<f32>>;
-// One bit per global face: region target membership.
+// Four bits per global face: 1 + the last region layer listing it, or 0.
 @group(0) @binding(4) var<storage, read> marks: array<u32>;
 
 struct VertexOut {
@@ -78,14 +87,25 @@ fn is_mesh(mesh: f32, plus_one: f32) -> bool {
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let light = 0.28 + 0.72 * abs(dot(normalize(in.normal), normalize(vec3<f32>(-0.4, 0.6, 1.0))));
-    var marked = is_mesh(in.mesh, camera.paint.x);
-    if (is_mesh(in.mesh, camera.paint.y)) {
-        marked = marked || distance(in.pos, camera.point.xyz) <= camera.point.w;
+    let region = (marks[in.face / 8u] >> ((in.face % 8u) * 4u)) & 15u;
+    let count = min(u32(camera.count.x + 0.5), MAX_LAYERS);
+    var colour = camera.base.rgb;
+    // The last layer covering this fragment wins.
+    for (var k = 0u; k < count; k = k + 1u) {
+        let i = count - 1u - k;
+        let layer = camera.layers[i];
+        var marked = is_mesh(in.mesh, layer.paint.x);
+        if (is_mesh(in.mesh, layer.paint.y)) {
+            marked = marked || distance(in.pos, layer.point.xyz) <= layer.point.w;
+        }
+        if (layer.paint.z > 0.5) {
+            marked = marked || region == i + 1u;
+        }
+        if (marked) {
+            colour = layer.colour.rgb;
+            break;
+        }
     }
-    if (camera.paint.z > 0.5) {
-        marked = marked || ((marks[in.face / 32u] >> (in.face % 32u)) & 1u) == 1u;
-    }
-    let colour = select(camera.base.rgb, camera.marked.rgb, marked);
     return vec4<f32>(srgb_to_linear(colour * light), 1.0);
 }
 

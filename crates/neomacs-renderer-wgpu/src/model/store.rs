@@ -16,10 +16,13 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use neomacs_display_protocol::model::{
-    ModelChange, ModelEvent, ModelHit, ModelMeshSpec, ModelTarget, ModelView,
+    MODEL_MAX_HIGHLIGHT_LAYERS, ModelChange, ModelEvent, ModelHighlightLayer, ModelHit,
+    ModelMeshSpec, ModelTarget, ModelView,
 };
 
-use super::gpu::{GpuHighlight, GpuPoint, ModelDraw, PickPoll, PickRequest, RawPick};
+use super::gpu::{
+    GpuHighlight, GpuLayer, GpuPaint, GpuPoint, ModelDraw, PickPoll, PickRequest, RawPick,
+};
 use super::loader::{LoadRequest, LoadResult, ModelLoader};
 use super::readiness::{Readiness, WindowKey};
 use super::scene::ModelScene;
@@ -98,6 +101,9 @@ struct Entry {
     view: ModelView,
     target: Option<ModelTarget>,
     selected: Option<u16>,
+    /// Coloured layers; a layers request clears `target` and `selected`
+    /// and a target/selection request clears these.
+    layers: Vec<ModelHighlightLayer>,
     /// A highlight request made while loading, validated at upload.
     unvalidated_highlight: Option<u64>,
     background: [f32; 4],
@@ -263,6 +269,7 @@ impl ModelStore {
                 view,
                 target: None,
                 selected: None,
+                layers: Vec::new(),
                 unvalidated_highlight: None,
                 background,
                 logical,
@@ -485,10 +492,17 @@ impl ModelStore {
                     .selected
                     .filter(|m| *m as usize >= scene.meshes().len())
                     .map(|m| format!("selected mesh {m} out of range"))
+            })
+            .or_else(|| {
+                entry
+                    .layers
+                    .iter()
+                    .find_map(|layer| target_error(scene, &layer.target))
             });
         if let Some(error) = error {
             entry.target = None;
             entry.selected = None;
+            entry.layers.clear();
             entry.dirty = true;
             entry.readiness.bump();
             self.emit(id, ModelEvent::Error { req, error });
@@ -592,9 +606,52 @@ impl ModelStore {
                     }
                 };
                 let entry = self.entries.get_mut(&id).expect("live");
-                let changed = entry.target != target || entry.selected != selected;
+                let changed = entry.target != target
+                    || entry.selected != selected
+                    || !entry.layers.is_empty();
                 entry.target = target;
                 entry.selected = selected;
+                entry.layers.clear();
+                if ready {
+                    if changed {
+                        entry.dirty = true;
+                        entry.readiness.bump();
+                    }
+                    self.validate_highlight(id, Some(req));
+                } else {
+                    entry.unvalidated_highlight = Some(req);
+                }
+            }
+            ModelChange::HighlightLayers(layers) => {
+                let layers = if layers.len() > MODEL_MAX_HIGHLIGHT_LAYERS {
+                    Err(format!(
+                        "at most {MODEL_MAX_HIGHLIGHT_LAYERS} highlight layers, got {}",
+                        layers.len()
+                    ))
+                } else {
+                    layers
+                        .into_iter()
+                        .map(ModelHighlightLayer::validated)
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                let layers = layers.unwrap_or_else(|error| {
+                    // The same applied fallback as a malformed target:
+                    // no highlight, one `Error` for the request.
+                    self.emit(
+                        id,
+                        ModelEvent::Error {
+                            req: Some(req),
+                            error,
+                        },
+                    );
+                    Vec::new()
+                });
+                let entry = self.entries.get_mut(&id).expect("live");
+                let changed =
+                    entry.target.is_some() || entry.selected.is_some() || entry.layers != layers;
+                entry.target = None;
+                entry.selected = None;
+                entry.layers = layers;
                 if ready {
                     if changed {
                         entry.dirty = true;
@@ -687,7 +744,11 @@ impl ModelStore {
                 view: entry.view,
                 logical: entry.logical,
                 background: entry.background,
-                highlight: gpu_highlight(&scene, entry.target.as_ref(), entry.selected),
+                highlight: if entry.layers.is_empty() {
+                    gpu_highlight(&scene, entry.target.as_ref(), entry.selected)
+                } else {
+                    gpu_layers(&scene, &entry.layers)
+                },
             };
             match host.model_render(id, &draw) {
                 Ok(()) => {
@@ -1226,6 +1287,44 @@ pub fn gpu_highlight(
         }
     }
     out
+}
+
+/// Resolve (validated) coloured layers into what the GPU paints, in
+/// order: a later layer wins where layers overlap. A point whose face
+/// has no position paints nothing, as with a single target.
+pub fn gpu_layers(scene: &ModelScene, layers: &[ModelHighlightLayer]) -> GpuHighlight {
+    let layers = layers
+        .iter()
+        .filter_map(|layer| {
+            let paint = match &layer.target {
+                ModelTarget::Object { mesh } => GpuPaint::Mesh(*mesh),
+                ModelTarget::Point {
+                    mesh,
+                    face,
+                    barycentric,
+                    tolerance,
+                } => GpuPaint::Point(GpuPoint {
+                    mesh: *mesh,
+                    centre: scene.normalise(scene.point_on(*mesh, *face, *barycentric)?),
+                    radius: (tolerance / scene.radius()) as f32,
+                }),
+                ModelTarget::Region { mesh, faces } => GpuPaint::Faces(
+                    faces
+                        .iter()
+                        .filter_map(|f| scene.global_face(*mesh, *f))
+                        .collect(),
+                ),
+            };
+            Some(GpuLayer {
+                color: layer.color,
+                paint,
+            })
+        })
+        .collect();
+    GpuHighlight {
+        layers,
+        ..GpuHighlight::default()
+    }
 }
 
 #[cfg(test)]

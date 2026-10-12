@@ -16,8 +16,8 @@ pub(crate) use subrs::SUBRS;
 pub(crate) use subrs::register_subrs;
 
 use neomacs_display_protocol::model::{
-    MODEL_EDGE_RANGE, MODEL_MAX_MESHES, ModelChange, ModelEvent, ModelMeshSpec, ModelTarget,
-    ModelView,
+    MODEL_EDGE_RANGE, MODEL_MAX_HIGHLIGHT_LAYERS, MODEL_MAX_MESHES, ModelChange, ModelEvent,
+    ModelHighlightLayer, ModelMeshSpec, ModelTarget, ModelView,
 };
 
 use super::error::{EvalResult, Flow, FlowKind, FlowResultExt, signal};
@@ -356,6 +356,59 @@ fn set_highlight(eval: &mut Context, args: Vec<Value>) -> EvalResult {
         args[1],
         CALLER,
         ModelChange::Highlight { target, selected },
+    )
+}
+
+/// (neomacs-model--set-highlight-layers HANDLE REQ LAYERS)
+///
+/// LAYERS is a list of at most [`MODEL_MAX_HIGHLIGHT_LAYERS`] entries
+/// `(TARGET R G B)`: a target plist (see [`model_target`]) and its sRGB
+/// colour, three numbers in 0..1. They replace the whole highlight,
+/// target and selection included; nil clears it.
+fn set_highlight_layers(eval: &mut Context, args: Vec<Value>) -> EvalResult {
+    const CALLER: &str = "neomacs-model--set-highlight-layers";
+    let entries = list_to_vec(&args[2])
+        .ok_or_else(|| model_error(format!("{CALLER}: LAYERS must be a list")))?;
+    if entries.len() > MODEL_MAX_HIGHLIGHT_LAYERS {
+        return Err(model_error(format!(
+            "{CALLER}: at most {MODEL_MAX_HIGHLIGHT_LAYERS} highlight layers, got {}",
+            entries.len()
+        )));
+    }
+    let layers = entries
+        .into_iter()
+        .map(|entry| {
+            let items = list_to_vec(&entry)
+                .filter(|items| items.len() == 4)
+                .ok_or_else(|| {
+                    model_error(format!("{CALLER}: each layer must be (TARGET R G B)"))
+                })?;
+            let mut rgb = [0.0; 3];
+            for (slot, item) in rgb.iter_mut().zip(&items[1..]) {
+                *slot = item
+                    .as_number_f64()
+                    .filter(|c| (0.0..=1.0).contains(c))
+                    .ok_or_else(|| {
+                        model_error(format!(
+                            "{CALLER}: layer colour must be three numbers in 0..1"
+                        ))
+                    })?;
+            }
+            let [r, g, b] = rgb;
+            ModelHighlightLayer {
+                target: model_target(items[0], CALLER)?,
+                color: [r as f32, g as f32, b as f32],
+            }
+            .validated()
+            .map_err(|err| model_error(format!("{CALLER}: {err}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    send_update(
+        eval,
+        args[0],
+        args[1],
+        CALLER,
+        ModelChange::HighlightLayers(layers),
     )
 }
 

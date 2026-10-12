@@ -8,7 +8,9 @@ use super::model_test::{
     FIRST_MODEL_ID, RecordingModelDisplayHost, eval_printed, obj_file, scratch_dir, signal_of,
     updates,
 };
-use neomacs_display_protocol::model::{ModelChange, ModelEvent, ModelHit, ModelTarget, ModelView};
+use neomacs_display_protocol::model::{
+    ModelChange, ModelEvent, ModelHighlightLayer, ModelHit, ModelTarget, ModelView,
+};
 
 /// A runtime-startup context with the recording host and the real
 /// `lisp/neomacs-model.el` loaded. Two mesh files' paths are in
@@ -494,6 +496,187 @@ fn set_highlight_maps_mesh_ids_to_indices() {
         "4"
     );
     assert_eq!(updates(&host).len(), 4);
+}
+
+#[test]
+fn set_highlight_layers_maps_ids_and_colours_and_keeps_the_old_form() {
+    let (mut ctx, host) = lisp_context("lisp-layers");
+    create_model(&mut ctx);
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            "(and (memq 'highlight-layers (neomacs-model-capabilities)) t)"
+        ),
+        "t"
+    );
+    assert_eq!(
+        eval_printed(&mut ctx, "neomacs-model-max-highlight-layers"),
+        "8"
+    );
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            r##"(list
+                 (neomacs-model-set-highlight
+                  model-test-m
+                  :layers '((:target (:mesh "b" :kind region :faces (3 1)) :color "#00ff00")
+                            (:mesh "a" :color "#ff0000")
+                            (:target (:mesh "a" :kind point :face 2
+                                      :barycentric [0.2 0.3 0.5] :tolerance 0.1)
+                             :color "#0000ff")))
+                 (neomacs-model-set-highlight model-test-m :layers nil)
+                 (neomacs-model-set-highlight model-test-m :target '(:mesh "b" :kind object)))"##
+        ),
+        "(1 2 3)"
+    );
+    let id = FIRST_MODEL_ID;
+    let layer = |target, color| ModelHighlightLayer { target, color };
+    assert_eq!(
+        updates(&host),
+        vec![
+            (
+                id,
+                1,
+                ModelChange::HighlightLayers(vec![
+                    layer(
+                        ModelTarget::Region {
+                            mesh: 1,
+                            faces: vec![3, 1],
+                        },
+                        [0.0, 1.0, 0.0],
+                    ),
+                    layer(ModelTarget::Object { mesh: 0 }, [1.0, 0.0, 0.0]),
+                    layer(
+                        ModelTarget::Point {
+                            mesh: 0,
+                            face: 2,
+                            barycentric: [0.2, 0.3, 0.5],
+                            tolerance: 0.1,
+                        },
+                        [0.0, 0.0, 1.0],
+                    ),
+                ]),
+            ),
+            (id, 2, ModelChange::HighlightLayers(vec![])),
+            (
+                id,
+                3,
+                ModelChange::Highlight {
+                    target: Some(ModelTarget::Object { mesh: 1 }),
+                    selected: None,
+                },
+            ),
+        ]
+    );
+    // Rejections signal before any request number is taken.
+    let nine = "(make-list 9 '(:mesh \"a\" :color \"#00ff00\"))";
+    let cases = [
+        (
+            r##"(neomacs-model-set-highlight model-test-m :layers nil :target '(:mesh "a" :kind object))"##.to_owned(),
+            "cannot be combined",
+        ),
+        (
+            r##"(neomacs-model-set-highlight model-test-m :selected "a" :layers nil)"##.to_owned(),
+            "cannot be combined",
+        ),
+        (
+            format!("(neomacs-model-set-highlight model-test-m :layers {nine})"),
+            "At most 8",
+        ),
+        (
+            r##"(neomacs-model-set-highlight model-test-m :layers '((:mesh "zz" :color "#00ff00")))"##.to_owned(),
+            "Unknown model mesh",
+        ),
+        (
+            r##"(neomacs-model-set-highlight model-test-m :layers '((:mesh "a" :color "no-such-colour")))"##.to_owned(),
+            "color",
+        ),
+        (
+            r##"(neomacs-model-set-highlight model-test-m :layers '((:mesh "a")))"##.to_owned(),
+            "color",
+        ),
+        (
+            r##"(neomacs-model-set-highlight model-test-m
+                 :layers '((:mesh "a" :target (:mesh "a" :kind object) :color "#00ff00")))"##.to_owned(),
+            "exactly one",
+        ),
+        (
+            r##"(neomacs-model-set-highlight model-test-m :layers '((:color "#00ff00")))"##.to_owned(),
+            "exactly one",
+        ),
+        (
+            "(neomacs-model-set-highlight model-test-m :layers '(x))".to_owned(),
+            "plist",
+        ),
+        (
+            "(neomacs-model-set-highlight model-test-m :layers 'x)".to_owned(),
+            "must be a list",
+        ),
+        // A missing value never falls back to clearing the highlight.
+        (
+            "(neomacs-model-set-highlight model-test-m :layers)".to_owned(),
+            "KEYWORD VALUE pairs",
+        ),
+        (
+            "(neomacs-model-set-highlight model-test-m :layers nil :unknown)".to_owned(),
+            "KEYWORD VALUE pairs",
+        ),
+        // Both keys present, whatever their values.
+        (
+            r##"(neomacs-model-set-highlight model-test-m
+                 :layers '((:mesh "a" :target nil :color "#00ff00")))"##
+                .to_owned(),
+            "exactly one",
+        ),
+        (
+            r##"(neomacs-model-set-highlight model-test-m
+                 :layers '((:target (:mesh "a" :kind object) :mesh nil :color "#00ff00")))"##
+                .to_owned(),
+            "exactly one",
+        ),
+        (
+            r##"(neomacs-model-set-highlight model-test-m :layers '((:target nil :color "#00ff00")))"##
+                .to_owned(),
+            "exactly one",
+        ),
+    ];
+    for (form, expect) in cases {
+        let printed = signal_of(&mut ctx, &form);
+        assert!(
+            printed.contains(expect),
+            "{form} signalled {printed}, expected {expect}"
+        );
+    }
+    assert_eq!(updates(&host).len(), 3);
+    assert_eq!(
+        eval_printed(
+            &mut ctx,
+            "(neomacs-model-set-highlight model-test-m :selected \"a\")"
+        ),
+        "4"
+    );
+    // A named Emacs colour works too, as far as this frame resolves
+    // names (a batch frame may not); numeric specs never depend on it.
+    if eval_printed(&mut ctx, r#"(and (neomacs-model--rgb "green") t)"#) != "t" {
+        return;
+    }
+    eval_printed(
+        &mut ctx,
+        r#"(neomacs-model-set-highlight model-test-m :layers '((:mesh "b" :color "green")))"#,
+    );
+    match updates(&host).last() {
+        Some((_, 5, ModelChange::HighlightLayers(layers))) => {
+            assert_eq!(layers.len(), 1);
+            assert_eq!(layers[0].target, ModelTarget::Object { mesh: 1 });
+            let [r, g, b] = layers[0].color;
+            assert!(
+                r < 0.1 && g > 0.4 && b < 0.1,
+                "green resolved to {:?}",
+                layers[0].color
+            );
+        }
+        other => panic!("expected the named-colour layers request, got {other:?}"),
+    }
 }
 
 #[test]

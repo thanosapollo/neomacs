@@ -8,7 +8,7 @@ use super::eval::{
     Context, DisplayHost, GuiFrameHostRequest, ShaderSurfaceContent, ShaderSurfaceCreateRequest,
 };
 use neomacs_display_protocol::model::{
-    ModelChange, ModelEvent, ModelHit, ModelMeshSpec, ModelTarget, ModelView,
+    ModelChange, ModelEvent, ModelHighlightLayer, ModelHit, ModelMeshSpec, ModelTarget, ModelView,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -546,6 +546,83 @@ fn update_primitives_send_each_change_with_its_request_number() {
             (id, 7, ModelChange::Freeze),
         ]
     );
+}
+
+#[test]
+fn highlight_layers_primitive_sends_targets_and_colours() {
+    let (mut ctx, host) = context_with_model("layers");
+    ctx.eval_str(
+        r#"(progn
+             (neomacs-model--set-highlight-layers
+              model-test-m 1
+              '(((:mesh 1 :kind object) 0 1 0)
+                ((:mesh 0 :kind region :faces (3 1)) 1 0 0.5)
+                ((:mesh 0 :kind point :face 4 :barycentric [0.2 0.3 0.5] :tolerance 0.1)
+                 0.25 0.5 1)))
+             (neomacs-model--set-highlight-layers model-test-m 2 nil))"#,
+    )
+    .expect("layers");
+    let layer = |target, color| ModelHighlightLayer { target, color };
+    assert_eq!(
+        updates(&host),
+        vec![
+            (
+                FIRST_MODEL_ID,
+                1,
+                ModelChange::HighlightLayers(vec![
+                    layer(ModelTarget::Object { mesh: 1 }, [0.0, 1.0, 0.0]),
+                    layer(
+                        ModelTarget::Region {
+                            mesh: 0,
+                            faces: vec![3, 1],
+                        },
+                        [1.0, 0.0, 0.5],
+                    ),
+                    layer(
+                        ModelTarget::Point {
+                            mesh: 0,
+                            face: 4,
+                            barycentric: [0.2, 0.3, 0.5],
+                            tolerance: 0.1,
+                        },
+                        [0.25, 0.5, 1.0],
+                    ),
+                ]),
+            ),
+            (FIRST_MODEL_ID, 2, ModelChange::HighlightLayers(vec![])),
+        ]
+    );
+}
+
+#[test]
+fn highlight_layers_primitive_rejects_bad_layers_before_the_host() {
+    let (mut ctx, host) = context_with_model("layers-reject");
+    let nine = "'(".to_owned() + &"((:mesh 0 :kind object) 0 1 0) ".repeat(9) + ")";
+    let cases = [
+        ("'x".to_owned(), "LAYERS"),
+        (nine, "at most 8"),
+        (
+            "'(((:mesh 0 :kind object) 0 1))".to_owned(),
+            "(TARGET R G B)",
+        ),
+        ("'(((:mesh 0 :kind object) 0 2 0))".to_owned(), "colour"),
+        ("'(((:mesh 0 :kind object) 0 x 0))".to_owned(), "colour"),
+        ("'(((:mesh 0 :kind bogus) 0 1 0))".to_owned(), ":kind"),
+        (
+            "'(((:mesh 0 :kind region :faces (1 1)) 0 1 0))".to_owned(),
+            "distinct",
+        ),
+        ("'((nil 0 1 0))".to_owned(), "mesh index"),
+    ];
+    for (layers, expect) in cases {
+        let form = format!("(neomacs-model--set-highlight-layers model-test-m 1 {layers})");
+        let printed = signal_of(&mut ctx, &form);
+        assert!(
+            printed.starts_with("(error ") && printed.contains(expect),
+            "{form} signalled {printed}, expected {expect}"
+        );
+    }
+    assert!(updates(&host).is_empty(), "rejections never reach the host");
 }
 
 #[test]

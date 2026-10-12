@@ -103,6 +103,7 @@ fn loading_entry(token: u64) -> Entry {
         view: ModelView::default(),
         target: None,
         selected: None,
+        layers: Vec::new(),
         unvalidated_highlight: None,
         background: [0.0, 0.0, 0.0, 1.0],
         logical: (64, 32),
@@ -636,6 +637,226 @@ fn highlight_resolution_follows_canvas_3d_precedence() {
     let p = point.point.unwrap();
     assert_eq!((point.mesh, p.mesh), (None, 0));
     assert!((p.radius as f64 - 0.5 / scene.radius()).abs() < 1e-7);
+}
+
+// ----------------------------------------------------------------------
+// Coloured highlight layers.
+
+const GREEN: [f32; 3] = [0.0, 1.0, 0.0];
+const RED: [f32; 3] = [1.0, 0.0, 0.0];
+
+fn layer(target: ModelTarget, color: [f32; 3]) -> ModelHighlightLayer {
+    ModelHighlightLayer { target, color }
+}
+
+#[test]
+fn layers_resolve_in_order_with_their_colours() {
+    let scene = scene();
+    let resolved = gpu_layers(
+        &scene,
+        &[
+            layer(
+                ModelTarget::Region {
+                    mesh: 1,
+                    faces: vec![1],
+                },
+                GREEN,
+            ),
+            layer(ModelTarget::Object { mesh: 0 }, RED),
+            layer(
+                ModelTarget::Point {
+                    mesh: 0,
+                    face: 0,
+                    barycentric: [0.5, 0.0, 0.5],
+                    tolerance: 0.5,
+                },
+                [0.0, 0.0, 1.0],
+            ),
+        ],
+    );
+    assert_eq!(
+        (resolved.mesh, resolved.point.is_none(), resolved.faces),
+        (None, true, None)
+    );
+    assert_eq!(resolved.layers.len(), 3);
+    assert_eq!(
+        resolved.layers[0],
+        GpuLayer {
+            color: GREEN,
+            paint: GpuPaint::Faces(vec![3]),
+        }
+    );
+    assert_eq!(
+        resolved.layers[1],
+        GpuLayer {
+            color: RED,
+            paint: GpuPaint::Mesh(0),
+        }
+    );
+    match &resolved.layers[2].paint {
+        GpuPaint::Point(p) => {
+            assert_eq!(p.mesh, 0);
+            assert!((p.radius as f64 - 0.5 / scene.radius()).abs() < 1e-7);
+        }
+        other => panic!("expected a point layer, got {other:?}"),
+    }
+}
+
+/// Layers and the single target replace each other; both bump readiness
+/// like any highlight, and `nil` layers clear everything.
+#[test]
+fn layers_replace_the_target_and_are_revision_qualified() {
+    let mut host = FakeHost::default();
+    let mut store = loaded_store(&mut host);
+    store.update(
+        5,
+        1,
+        ModelChange::Highlight {
+            target: Some(ModelTarget::Object { mesh: 1 }),
+            selected: Some(0),
+        },
+        h(&mut host),
+    );
+    shown(&mut store, &mut host);
+    store.take_events();
+    let layers = vec![
+        layer(ModelTarget::Object { mesh: 1 }, GREEN),
+        layer(ModelTarget::Object { mesh: 0 }, RED),
+    ];
+    store.update(
+        5,
+        2,
+        ModelChange::HighlightLayers(layers.clone()),
+        h(&mut host),
+    );
+    assert_eq!(kinds(&store.take_events()), ["R{false,3,2}"]);
+    shown(&mut store, &mut host);
+    assert_eq!(kinds(&store.take_events()), ["R{true,3,2}"]);
+    let draw = host.draws.last().unwrap().highlight.clone();
+    assert_eq!((draw.mesh, draw.layers.len()), (None, 2));
+    // The same layers again change nothing visible: settled, no redraw.
+    let renders = host.draws.len();
+    store.update(5, 3, ModelChange::HighlightLayers(layers), h(&mut host));
+    shown(&mut store, &mut host);
+    assert_eq!(kinds(&store.take_events()), ["R{true,3,3}"]);
+    assert_eq!(host.draws.len(), renders);
+    // A target request drops the layers again.
+    store.update(
+        5,
+        4,
+        ModelChange::Highlight {
+            target: None,
+            selected: Some(1),
+        },
+        h(&mut host),
+    );
+    shown(&mut store, &mut host);
+    let draw = host.draws.last().unwrap().highlight.clone();
+    assert_eq!((draw.mesh, draw.layers.len()), (Some(1), 0));
+    // Empty layers clear the selection too.
+    store.update(5, 5, ModelChange::HighlightLayers(vec![]), h(&mut host));
+    shown(&mut store, &mut host);
+    assert_eq!(
+        host.draws.last().unwrap().highlight,
+        GpuHighlight::default()
+    );
+    assert_eq!(
+        kinds(&store.take_events()),
+        ["R{false,4,4}", "R{true,4,4}", "R{false,5,5}", "R{true,5,5}"]
+    );
+}
+
+/// One bad layer is the applied fallback for the whole request: no
+/// highlight, one `Error`, whether malformed, out of range or too many.
+#[test]
+fn an_invalid_layer_clears_every_layer_and_reports_once() {
+    let mut host = FakeHost::default();
+    let mut store = loaded_store(&mut host);
+    let good = layer(ModelTarget::Object { mesh: 0 }, GREEN);
+    let cases = [
+        vec![
+            good.clone(),
+            layer(
+                ModelTarget::Region {
+                    mesh: 1,
+                    faces: vec![99],
+                },
+                RED,
+            ),
+        ],
+        vec![good.clone(), layer(ModelTarget::Object { mesh: 7 }, RED)],
+        vec![
+            good.clone(),
+            layer(ModelTarget::Object { mesh: 1 }, [2.0, 0.0, 0.0]),
+        ],
+        vec![good.clone(); MODEL_MAX_HIGHLIGHT_LAYERS + 1],
+    ];
+    let mut req = 0;
+    for layers in cases {
+        req += 1;
+        store.update(
+            5,
+            req,
+            ModelChange::HighlightLayers(vec![good.clone()]),
+            h(&mut host),
+        );
+        shown(&mut store, &mut host);
+        assert_eq!(host.draws.last().unwrap().highlight.layers.len(), 1);
+        store.take_events();
+        req += 1;
+        store.update(5, req, ModelChange::HighlightLayers(layers), h(&mut host));
+        let events = kinds(&store.take_events());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|k| k.starts_with("Error"))
+                .collect::<Vec<_>>(),
+            [&format!("Error{{Some({req})}}")],
+            "{events:?}"
+        );
+        shown(&mut store, &mut host);
+        assert_eq!(
+            host.draws.last().unwrap().highlight,
+            GpuHighlight::default()
+        );
+    }
+}
+
+/// Layers requested while loading are validated at upload, like a target.
+#[test]
+fn layers_requested_while_loading_are_validated_at_upload() {
+    let mut host = FakeHost::default();
+    let mut store = ModelStore::new();
+    store.entries.insert(5, loading_entry(1));
+    store.update(
+        5,
+        1,
+        ModelChange::HighlightLayers(vec![
+            layer(ModelTarget::Object { mesh: 1 }, GREEN),
+            layer(
+                ModelTarget::Point {
+                    mesh: 0,
+                    face: 0,
+                    barycentric: [1.0, 0.0, 0.0],
+                    tolerance: 0.1,
+                },
+                RED,
+            ),
+        ]),
+        None,
+    );
+    store.take_events();
+    store.loaded(
+        LoadResult {
+            id: 5,
+            token: 1,
+            outcome: Ok(scene()),
+        },
+        h(&mut host),
+    );
+    assert_eq!(kinds(&store.take_events()), ["ready"]);
+    shown(&mut store, &mut host);
+    assert_eq!(host.draws.last().unwrap().highlight.layers.len(), 2);
 }
 
 // ----------------------------------------------------------------------

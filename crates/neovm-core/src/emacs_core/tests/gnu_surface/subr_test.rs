@@ -362,6 +362,10 @@ const DECLARED_HERE_AND_NOT_BY_THE_REFERENCE_GNU: &[DeclaredHere] = &[
         why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
     },
     DeclaredHere {
+        name: "neomacs-model--set-highlight-layers",
+        why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
+    },
+    DeclaredHere {
         name: "neomacs-model--set-view",
         why: WhyThisBuildDeclaresIt::PortOwnPrimitiveInThePortsOwnNamespace,
     },

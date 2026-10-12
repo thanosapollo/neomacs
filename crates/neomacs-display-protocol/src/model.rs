@@ -147,15 +147,48 @@ impl ModelTarget {
     }
 }
 
+/// Largest number of layers one highlight request may paint.
+pub const MODEL_MAX_HIGHLIGHT_LAYERS: usize = 8;
+
+/// One coloured highlight layer: `target` painted in `color`, three
+/// sRGB components in 0..=1 (an Emacs colour, like a face colour).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelHighlightLayer {
+    pub target: ModelTarget,
+    pub color: [f32; 3],
+}
+
+impl ModelHighlightLayer {
+    /// [`ModelTarget::validated`] plus finite colour components in 0..=1.
+    pub fn validated(self) -> Result<Self, String> {
+        if !self
+            .color
+            .iter()
+            .all(|c| c.is_finite() && (0.0..=1.0).contains(c))
+        {
+            return Err("highlight layer colour needs three components in 0..1".to_owned());
+        }
+        Ok(Self {
+            target: self.target.validated()?,
+            color: self.color,
+        })
+    }
+}
+
 /// What Lisp asks of a live model. Each request carries its `req` number.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelChange {
     View(ModelView),
-    /// Both fields are replaced. A target suppresses `selected` painting.
+    /// Both fields are replaced, and any layers cleared. A target
+    /// suppresses `selected` painting.
     Highlight {
         target: Option<ModelTarget>,
         selected: Option<u16>,
     },
+    /// Replace the whole highlight (target and selection included) by
+    /// at most [`MODEL_MAX_HIGHLIGHT_LAYERS`] coloured layers, painted
+    /// together; a later layer wins where layers overlap. Empty clears.
+    HighlightLayers(Vec<ModelHighlightLayer>),
     /// New logical size, in the model edge range.
     Resize {
         width: u32,
@@ -254,5 +287,19 @@ mod tests {
         assert!(region(vec![3, 1]).validated().is_ok());
         assert!(region(vec![]).validated().is_err());
         assert!(region(vec![1, 1]).validated().is_err());
+    }
+
+    #[test]
+    fn highlight_layer_validation_checks_colour_and_target() {
+        let layer = |target, color| ModelHighlightLayer { target, color };
+        let object = ModelTarget::Object { mesh: 2 };
+        assert!(layer(object.clone(), [0.0, 0.5, 1.0]).validated().is_ok());
+        assert!(layer(object.clone(), [0.0, 1.5, 1.0]).validated().is_err());
+        assert!(layer(object, [f32::NAN, 0.0, 0.0]).validated().is_err());
+        let empty = ModelTarget::Region {
+            mesh: 0,
+            faces: vec![],
+        };
+        assert!(layer(empty, [0.0, 1.0, 0.0]).validated().is_err());
     }
 }

@@ -59,14 +59,23 @@ pub fn model_target_px(width: u32, height: u32, scale: f32, max_edge: u32) -> (u
     (px(w), px(h))
 }
 
+/// Highlight layers one draw paints at most (the uniform's layer array).
+pub const MAX_GPU_LAYERS: usize = neomacs_display_protocol::model::MODEL_MAX_HIGHLIGHT_LAYERS;
+/// Faces per region-mark word: each face has a 4-bit layer number.
+const MARKS_PER_WORD: usize = 8;
+// `model.wgsl` sizes its layer array as 8 (`MAX_LAYERS`), and a 4-bit
+// region mark holds a layer number + 1.
+const _: () = assert!(MAX_GPU_LAYERS == 8 && MAX_GPU_LAYERS < 16);
+
 /// GPU bytes of a model's geometry and fixed resources (design §4.4):
 /// positions 16 B·V, indices 12 B·T, face records 16 B·T, region marks
-/// ⌈T/32⌉·4 B, the two camera uniforms, the 1x1 pick targets and staging.
+/// ⌈T/8⌉·4 B (4 bits per face), the two camera uniforms, the 1x1 pick
+/// targets and staging.
 pub fn geometry_bytes(vertices: u64, triangles: u64) -> u64 {
     16 * vertices
         + 12 * triangles
         + 16 * triangles
-        + triangles.div_ceil(32).max(1) * 4
+        + triangles.div_ceil(MARKS_PER_WORD as u64).max(1) * 4
         + 2 * std::mem::size_of::<CameraUniform>() as u64
         + (8 + 4)
         + PICK_STAGING_BYTES
@@ -80,12 +89,71 @@ pub fn target_bytes(width_px: u32, height_px: u32) -> u64 {
 }
 
 /// What to paint, already resolved against the scene (design §2): a whole
-/// mesh, a point disc on one mesh, and/or region faces (global numbers).
+/// mesh, a point disc on one mesh, and/or region faces (global numbers),
+/// all in the highlight colour; then coloured `layers`, in order, a later
+/// one winning where they overlap. At most [`MAX_GPU_LAYERS`] paints in
+/// all (the store never combines the two forms).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GpuHighlight {
     pub mesh: Option<u16>,
     pub point: Option<GpuPoint>,
     pub faces: Option<Vec<u32>>,
+    pub layers: Vec<GpuLayer>,
+}
+
+/// One coloured highlight layer resolved against the scene.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuLayer {
+    /// sRGB components in 0..=1.
+    pub color: [f32; 3],
+    pub paint: GpuPaint,
+}
+
+/// What one layer paints.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GpuPaint {
+    Mesh(u16),
+    Point(GpuPoint),
+    /// Global face numbers.
+    Faces(Vec<u32>),
+}
+
+impl GpuHighlight {
+    /// Every paint in drawing order: the single-colour fields first (as
+    /// layers in the highlight colour), then `layers`; at most
+    /// [`MAX_GPU_LAYERS`].
+    fn paints(&self) -> Vec<(&[f32; 3], PaintRef<'_>)> {
+        let mut out = Vec::new();
+        if let Some(mesh) = self.mesh {
+            out.push((&HIGHLIGHT, PaintRef::Mesh(mesh)));
+        }
+        if let Some(point) = &self.point {
+            out.push((&HIGHLIGHT, PaintRef::Point(point)));
+        }
+        if let Some(faces) = &self.faces {
+            out.push((&HIGHLIGHT, PaintRef::Faces(faces)));
+        }
+        for layer in &self.layers {
+            let paint = match &layer.paint {
+                GpuPaint::Mesh(mesh) => PaintRef::Mesh(*mesh),
+                GpuPaint::Point(point) => PaintRef::Point(point),
+                GpuPaint::Faces(faces) => PaintRef::Faces(faces),
+            };
+            out.push((&layer.color, paint));
+        }
+        // Unreachable: the store sends either at most 3 single-colour
+        // paints or at most MODEL_MAX_HIGHLIGHT_LAYERS layers, never both.
+        debug_assert!(out.len() <= MAX_GPU_LAYERS, "too many highlight paints");
+        out.truncate(MAX_GPU_LAYERS);
+        out
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PaintRef<'a> {
+    Mesh(u16),
+    Point(&'a GpuPoint),
+    Faces(&'a [u32]),
 }
 
 /// A point target in the normalised frame the GPU draws.
@@ -133,6 +201,17 @@ pub enum PickPoll {
     Failed(String),
 }
 
+/// One highlight layer as `model.wgsl`'s `Layer` reads it.
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct LayerUniform {
+    colour: [f32; 4],
+    /// x: painted whole mesh + 1; y: point mesh + 1; z: 1 for region marks.
+    paint: [f32; 4],
+    /// Point centre (normalised frame) and radius.
+    point: [f32; 4],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
@@ -142,9 +221,9 @@ struct CameraUniform {
     scale: [f32; 4],
     pick: [f32; 4],
     base: [f32; 4],
-    marked: [f32; 4],
-    paint: [f32; 4],
-    point: [f32; 4],
+    /// x: number of layers in use.
+    count: [f32; 4],
+    layers: [LayerUniform; MAX_GPU_LAYERS],
 }
 
 impl CameraUniform {
@@ -159,9 +238,8 @@ impl CameraUniform {
             scale: [scale[0], scale[1], 0.0, 0.0],
             pick: [0.0, 0.0, 1.0, 1.0],
             base: [BONE[0], BONE[1], BONE[2], 1.0],
-            marked: [HIGHLIGHT[0], HIGHLIGHT[1], HIGHLIGHT[2], 1.0],
-            paint: [0.0; 4],
-            point: [0.0; 4],
+            count: [0.0; 4],
+            layers: [LayerUniform::default(); MAX_GPU_LAYERS],
         }
     }
 }
@@ -211,9 +289,9 @@ pub struct ModelGpu {
     pick_camera: wgpu::Buffer,
     marks: wgpu::Buffer,
     marks_words: usize,
-    /// Region faces currently in `marks`, so an unchanged target is not
-    /// rewritten on every draw.
-    marks_written: Option<Vec<u32>>,
+    /// Region layers currently in `marks`, as (layer number, global
+    /// faces), so unchanged regions are not rewritten on every draw.
+    marks_written: Option<Vec<(u32, Vec<u32>)>>,
     vertex_count: u32,
     /// Original f64 geometry in the normalised frame, in global face order.
     /// CPU-owned (72 bytes per triangle), not part of GPU byte accounting.
@@ -374,7 +452,7 @@ impl ModelGpu {
                 faces.push([n[0] as f32, n[1] as f32, n[2] as f32, mesh_index as f32]);
             }
         }
-        let marks_words = faces.len().div_ceil(32).max(1);
+        let marks_words = faces.len().div_ceil(MARKS_PER_WORD).max(1);
         let limits = device.limits();
         for (name, bytes) in [
             ("positions", positions.len() * 16),
@@ -610,30 +688,52 @@ impl ModelGpu {
     ) -> Result<(), String> {
         let background = clear_color(draw.background);
         let mut uniform = CameraUniform::new(&draw.view, draw.logical);
-        let highlight = &draw.highlight;
-        uniform.paint[0] = highlight.mesh.map_or(0.0, |m| m as f32 + 1.0);
-        if let Some(point) = highlight.point {
-            uniform.paint[1] = point.mesh as f32 + 1.0;
-            uniform.point = [
-                point.centre[0],
-                point.centre[1],
-                point.centre[2],
-                point.radius,
-            ];
+        let paints = draw.highlight.paints();
+        uniform.count[0] = paints.len() as f32;
+        // Region layers, as (layer number, faces): each face's mark is the
+        // number + 1 of the last region layer listing it, so the shader,
+        // trying layers last first, finds the one that wins.
+        let mut regions: Vec<(u32, &[u32])> = Vec::new();
+        for (slot, (number, (color, paint))) in
+            uniform.layers.iter_mut().zip(paints.iter().enumerate())
+        {
+            slot.colour = [color[0], color[1], color[2], 1.0];
+            match *paint {
+                PaintRef::Mesh(mesh) => slot.paint[0] = mesh as f32 + 1.0,
+                PaintRef::Point(point) => {
+                    slot.paint[1] = point.mesh as f32 + 1.0;
+                    slot.point = [
+                        point.centre[0],
+                        point.centre[1],
+                        point.centre[2],
+                        point.radius,
+                    ];
+                }
+                PaintRef::Faces(faces) => {
+                    slot.paint[2] = 1.0;
+                    regions.push((number as u32, faces));
+                }
+            }
         }
-        uniform.paint[2] = if highlight.faces.is_some() { 1.0 } else { 0.0 };
-        let marks = highlight
-            .faces
-            .as_ref()
-            .filter(|faces| self.marks_written.as_ref() != Some(*faces));
+        let unchanged = self.marks_written.as_ref().is_some_and(|written| {
+            written.len() == regions.len()
+                && written
+                    .iter()
+                    .zip(&regions)
+                    .all(|((n, f), (m, g))| n == m && f.as_slice() == *g)
+        });
+        let marks = (!regions.is_empty() && !unchanged).then_some(&regions);
         // Both writes allocate staging memory: scope them with the pass.
         // The marks count as written only once the scope reports success.
         let rendered = scoped(device, "model render rejected", || {
-            if let Some(faces) = marks {
+            if let Some(regions) = marks {
                 let mut words = vec![0u32; self.marks_words];
-                for &face in faces {
-                    if let Some(word) = words.get_mut(face as usize / 32) {
-                        *word |= 1 << (face % 32);
+                for (number, faces) in regions {
+                    for &face in *faces {
+                        let shift = (face as usize % MARKS_PER_WORD) * 4;
+                        if let Some(word) = words.get_mut(face as usize / MARKS_PER_WORD) {
+                            *word = (*word & !(0xf << shift)) | ((number + 1) << shift);
+                        }
                     }
                 }
                 queue.write_buffer(&self.marks, 0, bytemuck::cast_slice(&words));
@@ -674,8 +774,13 @@ impl ModelGpu {
         });
         match rendered {
             Ok(()) => {
-                if let Some(faces) = marks {
-                    self.marks_written = Some(faces.clone());
+                if let Some(regions) = marks {
+                    self.marks_written = Some(
+                        regions
+                            .iter()
+                            .map(|(number, faces)| (*number, faces.to_vec()))
+                            .collect(),
+                    );
                 }
             }
             Err(_) => self.marks_written = None,

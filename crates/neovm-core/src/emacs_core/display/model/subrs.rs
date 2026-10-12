@@ -30,6 +30,11 @@ crate::emacs_core::subr::define_subrs! {
         SubrArity::new(4, Some(4)),
     ),
     SubrSpec::new(
+        "neomacs-model--set-highlight-layers",
+        NativeFn::ContextVec(set_highlight_layers),
+        SubrArity::new(3, Some(3)),
+    ),
+    SubrSpec::new(
         "neomacs-model--resize",
         NativeFn::ContextVec(resize),
         SubrArity::new(4, Some(4)),

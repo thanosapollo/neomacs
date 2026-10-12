@@ -42,6 +42,13 @@
 ;; picture Lisp holds as current when the callback runs, with its hit
 ;; mesh given by ID.
 ;;
+;; `neomacs-model-set-highlight' paints either one target (or a selected
+;; mesh) in the highlight colour, or up to
+;; `neomacs-model-max-highlight-layers' coloured :layers at once.  Clients
+;; detect layer support with
+;;   (and (fboundp 'neomacs-model-capabilities)
+;;        (memq 'highlight-layers (neomacs-model-capabilities)))
+;;
 ;; Left-dragging a model orbits it and a click picks; the wheel zooms.
 ;; Mesh IDs never reach the renderer: they are mapped to indices here.
 
@@ -58,6 +65,8 @@
                   (handle req yaw pitch zoom))
 (declare-function neomacs-model--set-highlight "model/mod.rs"
                   (handle req target selected))
+(declare-function neomacs-model--set-highlight-layers "model/mod.rs"
+                  (handle req layers))
 (declare-function neomacs-model--resize "model/mod.rs" (handle req width height))
 (declare-function neomacs-model--freeze "model/mod.rs" (handle req))
 (declare-function neomacs-surface-destroy "shader_surface/mod.rs" (id))
@@ -253,20 +262,84 @@ The angles are kept wrapped into 0..360.  Return the request number."
       (plist-put copy :mesh
                  (neomacs-model--mesh-index entry (plist-get spec :mesh))))))
 
+(defconst neomacs-model-max-highlight-layers 8
+  "Largest number of :layers one `neomacs-model-set-highlight' paints.")
+
+;;;###autoload
+(defun neomacs-model-capabilities ()
+  "Return a list of the optional native model features available.
+Members:
+  `highlight-layers'  `neomacs-model-set-highlight' accepts :layers."
+  (and (fboundp 'neomacs-model--set-highlight-layers)
+       (list 'highlight-layers)))
+
+(defun neomacs-model--color-rgb (color)
+  "Return colour string COLOR as three numbers in 0..1, or nil.
+Numeric specs such as \"#00ff00\" are exact on any frame; names go
+through `color-name-to-rgb' and so depend on the selected frame."
+  (or (let ((values (ignore-errors (color-values-from-color-spec color))))
+        (and values (mapcar (lambda (c) (/ c 65535.0)) values)))
+      (neomacs-model--rgb color)))
+
+(defun neomacs-model--layer (entry layer)
+  "Return highlight LAYER for the renderer: (TARGET R G B).
+ENTRY is the model's registry entry; LAYER is (:target SPEC :color
+COLOR) or (:mesh ID :color COLOR)."
+  (unless (and (proper-list-p layer) (cl-evenp (length layer)))
+    (error "Model highlight layer must be a plist: %S" layer))
+  (let ((target (plist-get layer :target))
+        (mesh (plist-get layer :mesh))
+        (color (plist-get layer :color)))
+    (unless (and (stringp color) (neomacs-model--color-rgb color))
+      (error "Unknown model highlight layer color %S" color))
+    ;; By key, not value: (:mesh "a" :target nil ...) names both.
+    (unless (and (xor (plist-member layer :target) (plist-member layer :mesh))
+                 (or target mesh))
+      (error "Model highlight layer needs exactly one of :target and :mesh: %S"
+             layer))
+    (cons (neomacs-model--target
+           entry (or target (list :mesh mesh :kind 'object)))
+          (neomacs-model--color-rgb color))))
+
 (defun neomacs-model-set-highlight (model &rest plist)
   "Replace MODEL's highlight with PLIST; return the request number.
 :target SPEC or nil, SPEC one of
   (:mesh ID :kind object)
   (:mesh ID :kind point :face N :barycentric [A B C] :tolerance R)
   (:mesh ID :kind region :faces (N ...))
-:selected MESH-ID or nil, painted only when there is no target."
+:selected MESH-ID or nil, painted only when there is no target.
+:layers LAYERS, instead of :target and :selected: a list of at most
+  `neomacs-model-max-highlight-layers' plists, each either
+  (:target SPEC :color COLOR) or (:mesh ID :color COLOR), COLOR a
+  colour name.  They are painted together, a later layer winning
+  where layers overlap; nil clears the highlight.
+Target and selection use the highlight colour.  Highlights never
+change what a click picks."
   (let* ((entry (neomacs-model--entry model))
-         (target (neomacs-model--target entry (plist-get plist :target)))
-         (selected (let ((id (plist-get plist :selected)))
-                     (and id (neomacs-model--mesh-index entry id)))))
-    (neomacs-model--request
-     model (lambda (req)
-             (neomacs-model--set-highlight model req target selected)))))
+         (keys (cl-loop for key in plist by #'cddr collect key))
+         (send
+          (if (memq :layers keys)
+              (let ((layers (plist-get plist :layers)))
+                (unless (cl-evenp (length plist))
+                  (error "Model :layers needs KEYWORD VALUE pairs: %S" plist))
+                (when (or (memq :target keys) (memq :selected keys))
+                  (error "Model :layers cannot be combined with :target or :selected"))
+                (unless (proper-list-p layers)
+                  (error "Model :layers must be a list"))
+                (when (> (length layers) neomacs-model-max-highlight-layers)
+                  (error "At most %d model highlight layers, got %d"
+                         neomacs-model-max-highlight-layers (length layers)))
+                (let ((layers (mapcar (lambda (layer)
+                                        (neomacs-model--layer entry layer))
+                                      layers)))
+                  (lambda (req)
+                    (neomacs-model--set-highlight-layers model req layers))))
+            (let ((target (neomacs-model--target entry (plist-get plist :target)))
+                  (selected (let ((id (plist-get plist :selected)))
+                              (and id (neomacs-model--mesh-index entry id)))))
+              (lambda (req)
+                (neomacs-model--set-highlight model req target selected))))))
+    (neomacs-model--request model send)))
 
 (defun neomacs-model-resize (model width height)
   "Resize MODEL to WIDTH x HEIGHT logical pixels (32..2048).
