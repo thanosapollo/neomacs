@@ -1,4 +1,5 @@
 use super::{Face, FaceTable, Value, ValueKind, face_symbol_value, normalized_face_name_value};
+use crate::emacs_core::value::list_to_vec;
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
@@ -15,8 +16,8 @@ use std::collections::{HashMap, HashSet};
 pub enum FaceRemapEntry {
     /// Remap to another named face.
     RemapFace(Value),
-    /// Inline attribute plist parsed into a `Face`.
-    RemapAttrs(Face),
+    /// Inline attributes and their original order (GNU merges plists in order).
+    RemapAttrs(Face, Vec<Value>),
 }
 
 /// Parsed form of the buffer-local `face-remapping-alist`.
@@ -117,7 +118,7 @@ impl FaceRemapping {
                 // Check if it's a plist (starts with keyword)
                 if items[0].as_keyword_id().is_some() {
                     let face = Face::from_plist("--remap--", &items);
-                    return vec![FaceRemapEntry::RemapAttrs(face)];
+                    return vec![FaceRemapEntry::RemapAttrs(face, items)];
                 }
 
                 // Otherwise it's a list of specs: (face1 face2 (:k v ...) ...)
@@ -136,7 +137,7 @@ impl FaceRemapping {
                                 && sub_items.first().is_some_and(|v| v.is_keyword())
                             {
                                 let face = Face::from_plist("--remap--", &sub_items);
-                                entries.push(FaceRemapEntry::RemapAttrs(face));
+                                entries.push(FaceRemapEntry::RemapAttrs(face, sub_items));
                             }
                         }
                         _ => {}
@@ -160,6 +161,130 @@ enum RemappingBase {
 }
 
 impl FaceTable {
+    /// GNU lookup_named_face starts with canonical DEFAULT_FACE_ID attributes,
+    /// then merges the (possibly remapped) named reference into that base.
+    /// Unlike text realization, an implicit default is not buffer-remapped.
+    /// Merge inheritance into the existing base before direct attributes so
+    /// relative heights are applied, and rounded, at each GNU merge boundary.
+    pub fn resolve_for_font(&self, name: &str, remapping: &FaceRemapping) -> Face {
+        let mut result = self.resolve("default");
+        self.merge_font_reference(
+            &mut result,
+            face_symbol_value(name),
+            remapping,
+            &mut Vec::new(),
+            0,
+        );
+        result.inherit = None;
+        result
+    }
+
+    fn merge_font_reference(
+        &self,
+        base: &mut Face,
+        reference: Value,
+        remapping: &FaceRemapping,
+        seen: &mut Vec<(Value, bool)>,
+        depth: usize,
+    ) {
+        if depth > 40 || reference.is_nil() {
+            return;
+        }
+        if let Some(reference) = normalized_face_name_value(&reference) {
+            let name = reference.as_symbol_name().unwrap();
+            // lookup_named_face's initial vector lookup has no normal merge
+            // point; merge_named_face installs one before looking up remaps.
+            let normal = depth != 0;
+            if normal && !Self::push_font_merge_point(seen, reference, false) {
+                return;
+            }
+            if let Some(entries) = remapping.get(name)
+                && Self::push_font_merge_point(seen, reference, true)
+            {
+                // get_lface_attributes builds a remapping in an unspecified
+                // vector first; relative entries compose before meeting base.
+                let mut contribution = Face::new(name);
+                for entry in entries.iter().rev() {
+                    match entry {
+                        FaceRemapEntry::RemapFace(target) => {
+                            self.merge_font_reference(
+                                &mut contribution,
+                                *target,
+                                remapping,
+                                seen,
+                                depth + 1,
+                            );
+                        }
+                        FaceRemapEntry::RemapAttrs(_, items) => {
+                            self.merge_font_plist(
+                                &mut contribution,
+                                items,
+                                remapping,
+                                seen,
+                                depth + 1,
+                            );
+                        }
+                    }
+                }
+                seen.pop();
+                *base = base.merge(&contribution);
+            } else if let Some(face) = self.faces.get(&reference) {
+                if let Some(inherit) = face.inherit {
+                    self.merge_font_reference(base, inherit, remapping, seen, depth + 1);
+                }
+                *base = base.merge(face);
+            }
+            if normal {
+                seen.pop();
+            }
+        } else if let Some(items) = list_to_vec(&reference) {
+            if items.first().is_some_and(|value| value.is_keyword()) {
+                self.merge_font_plist(base, &items, remapping, seen, depth + 1);
+            } else {
+                for item in items.iter().rev() {
+                    self.merge_font_reference(base, *item, remapping, seen, depth + 1);
+                }
+            }
+        }
+    }
+
+    /// GNU push_named_merge_point: remaps hide earlier normal merge points,
+    /// but a second point of the same kind is a cycle. Stack entries are
+    /// path-scoped, permitting repeated references in independent list arms.
+    fn push_font_merge_point(seen: &mut Vec<(Value, bool)>, name: Value, remap: bool) -> bool {
+        for &(previous, previous_remap) in seen.iter().rev() {
+            if previous == name {
+                if previous_remap == remap {
+                    return false;
+                }
+                if previous_remap {
+                    break;
+                }
+            }
+        }
+        seen.push((name, remap));
+        true
+    }
+
+    fn merge_font_plist(
+        &self,
+        base: &mut Face,
+        items: &[Value],
+        remapping: &FaceRemapping,
+        seen: &mut Vec<(Value, bool)>,
+        depth: usize,
+    ) {
+        // Anonymous face refs process :inherit at its written position,
+        // unlike named vectors, which always process inheritance first.
+        for pair in items.chunks_exact(2) {
+            if pair[0] == Value::keyword("inherit") {
+                self.merge_font_reference(base, pair[1], remapping, seen, depth + 1);
+            } else {
+                *base = base.merge(&Face::from_plist("--font--", pair));
+            }
+        }
+    }
+
     /// Resolve a text-face contribution, including explicit inheritance but
     /// without injecting the default face into an existing text/overlay base.
     pub(crate) fn resolve_text_face_with_remapping(
@@ -240,7 +365,7 @@ impl FaceTable {
                         };
                         self.resolve_remapped(target_name, remapping, seen, depth + 1, base)
                     }
-                    FaceRemapEntry::RemapAttrs(attrs) => attrs.clone(),
+                    FaceRemapEntry::RemapAttrs(attrs, _) => attrs.clone(),
                 };
                 result = result.merge(&contribution);
             }
