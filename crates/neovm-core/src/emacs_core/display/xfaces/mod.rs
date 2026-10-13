@@ -4388,8 +4388,12 @@ fn append_font_face_dependencies(reference: Value, pending: &mut Vec<Value>) {
         .and_then(|item| item.as_symbol_name())
         .is_some_and(|name| name.starts_with(':'))
     {
-        // Match resolve_face_ref's grammar and duplicate-attribute handling.
-        pending.extend(RuntimeFace::from_plist("--inline--", &items).inherit);
+        // Named font queries merge every :inherit at its written position.
+        for pair in items.chunks_exact(2) {
+            if pair[0] == Value::keyword("inherit") {
+                pending.push(pair[1]);
+            }
+        }
     } else {
         pending.extend(items);
     }
@@ -4402,10 +4406,7 @@ fn face_table_for_font(
     remapping: &crate::face::FaceRemapping,
 ) -> Option<crate::face::FaceTable> {
     let mut table = crate::face::FaceTable::new();
-    let mut pending = vec![Value::symbol(name)];
-    if !remapping.is_empty() {
-        pending.push(Value::symbol("default"));
-    }
+    let mut pending = vec![Value::symbol(name), Value::symbol("default")];
     let mut seen = HashSet::default();
     while let Some(reference) = pending.pop() {
         // Inheritance graphs may contain cyclic or shared mutable conses.
@@ -4424,7 +4425,13 @@ fn face_table_for_font(
         for entry in remapping.get(name).into_iter().flatten() {
             match entry {
                 crate::face::FaceRemapEntry::RemapFace(target) => pending.push(*target),
-                crate::face::FaceRemapEntry::RemapAttrs(attrs) => pending.extend(attrs.inherit),
+                crate::face::FaceRemapEntry::RemapAttrs(_, items) => {
+                    for pair in items.chunks_exact(2) {
+                        if pair[0] == Value::keyword("inherit") {
+                            pending.push(pair[1]);
+                        }
+                    }
+                }
             }
         }
     }
@@ -4438,19 +4445,17 @@ fn resolve_face_for_font(
     remapping: &crate::face::FaceRemapping,
 ) -> RuntimeFace {
     if remapping.is_empty() {
-        if let Some(face) = leaf_runtime_face_for_font(eval, frame_id, name) {
-            return face;
+        if let Some(face) = leaf_runtime_face_for_font(eval, frame_id, name)
+            && let Some(default) = leaf_runtime_face_for_font(eval, frame_id, "default")
+        {
+            return default.merge(&face);
         }
     }
-    // Only materialization is narrowed. The existing resolver still owns
-    // inheritance order, relative heights, remapping, and recursion limits.
+    // Materialize only reachable live vectors; the shared named-font resolver
+    // owns canonical-default merging, inheritance and remapping boundaries.
     let table = face_table_for_font(eval, frame_id, name, remapping)
         .unwrap_or_else(|| runtime_face_table_from_frame_lisp_faces(eval, frame_id, false));
-    if remapping.is_empty() {
-        table.resolve(name)
-    } else {
-        table.resolve_with_remapping(name, remapping)
-    }
+    table.resolve_for_font(name, remapping)
 }
 
 pub(crate) fn builtin_face_font(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {

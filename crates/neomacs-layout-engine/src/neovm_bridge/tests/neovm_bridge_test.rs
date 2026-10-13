@@ -3527,6 +3527,53 @@ fn graphic_named_face_retains_valid_frame_size_while_height_is_unrealized() {
 }
 
 #[test]
+fn named_font_queries_match_redisplay_height_resolution() {
+    let _evaluator = neovm_core::emacs_core::Context::new();
+    let mut table = FaceTable::new();
+    let mut default = NeoFace::new("default");
+    default.height = Some(FaceHeight::Absolute(180));
+    table.define("default", default);
+    let mut parent = NeoFace::new("height-parent");
+    parent.height = Some(FaceHeight::Absolute(240));
+    table.define("height-parent", parent);
+    let mut child = NeoFace::new("height-child");
+    child.inherit = Some(Value::symbol("height-parent"));
+    child.height = Some(FaceHeight::Relative(0.5));
+    table.define("height-child", child);
+    let mut relative = NeoFace::new("height-relative");
+    relative.height = Some(FaceHeight::Relative(1.5));
+    table.define("height-relative", relative);
+    let resolver = FaceResolver::new_with_font_sizing(
+        &table,
+        0x00FFFFFF,
+        0x00000000,
+        24.0,
+        Some("neo".into()),
+        crate::font::sizing::FontSizing::logical(),
+    );
+    let remapping = neovm_core::face::FaceRemapping::new();
+    for (name, height, pixels) in [
+        ("fixed-pitch", 180, 24.0),
+        ("variable-pitch", 180, 24.0),
+        ("height-child", 120, 16.0),
+        ("height-relative", 270, 36.0),
+    ] {
+        let query = table.resolve_for_font(name, &remapping);
+        assert_eq!(query.height, Some(FaceHeight::Absolute(height)), "{name}");
+        assert_eq!(
+            resolver.resolve_named_face(name).font_size,
+            pixels,
+            "redisplay {name}"
+        );
+        assert_eq!(
+            resolver.realize_face(&query).font_size,
+            pixels,
+            "font query {name}"
+        );
+    }
+}
+
+#[test]
 fn test_realize_face_height_relative() {
     let _evaluator = neovm_core::emacs_core::Context::new();
     let table = FaceTable::new();
